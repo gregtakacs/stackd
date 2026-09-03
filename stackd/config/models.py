@@ -94,8 +94,8 @@ class ContainerSpec:
     ipc_host: bool = False
     port: int | None = None            # fixed port (else stackd allocates for llama.cpp)
     stop_grace_s: int | None = None    # graceful-stop timeout before SIGKILL (None -> per-backend default)
-    # Container labels — values are os.path.expandvars'd at create time, so
-    # "${DOMAINNAME_CLOUD_SERVER}" resolves from stackd's own env (traefik routing).
+    # Container labels — values are os.path.expandvars'd at create time (so e.g.
+    # a reverse-proxy Host rule can reference an env var set on the stackd service).
     labels: dict[str, str] = field(default_factory=dict)
     # Host device paths ADDED to the resolved device_profile's (e.g. comfyui-rocm
     # needs /dev/kfd on top of the vulkan profile's /dev/dri/renderD128).
