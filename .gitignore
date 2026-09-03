@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+
+# local deployment config + state
+deploy/.env
+*.fake.json
+state.json
+*.db

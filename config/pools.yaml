@@ -1,0 +1,18 @@
+# Two independent memory pools on the one host (design note §2).
+# Every value here is an environment variable, resolved from the stackd service
+# env (deploy/.env; see .env.example). No box-specific values are baked in.
+pools:
+  # Dedicated GDDR on the discrete GPU. No host reserve; cuda0 gets the lot.
+  cuda_vram:
+    total_gib: ${CUDA_VRAM_GIB}       # RTX PRO 6000 Blackwell 96 GB
+
+  # The box's unified / system RAM. Claimed by: igpu0's VRAM budget (GTT), the
+  # host + other containers (reserve), reclaimable page-cache slack during model
+  # loads, and every engine's RAM spill.
+  host_unified:
+    total_gib: ${HOST_RAM_GIB}          # Strix Halo LPDDR5X
+    # Steady-state RAM used by everything that ISN'T stackd (host + other
+    # containers). Measure with the LLM/ComfyUI stacks stopped; trim ~2 GiB for
+    # reclaimable. Re-check under load with `stackd calibrate`.
+    host_reserve_gib: ${HOST_RESERVE_GIB}
+    load_slack_gib: 4       # reclaimable page-cache room during a model load

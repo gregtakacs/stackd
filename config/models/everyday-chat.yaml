@@ -1,0 +1,24 @@
+model: everyday-chat
+engine:
+  template: llamacpp-cuda
+  model: Qwen3.8-27B-UD-Q4_K_XL
+  params:
+    ctx: 262144
+    parallel: 4
+    # quantised KV (q8_0/q4_0) is why this measures ~30 GiB @ 262144, not ~38.
+    # flash-attn / kv-unified / cont-batching are added by the engine template.
+    extra_args: ["-ctk", "q8_0", "-ctv", "q4_0",
+                 "--spec-type", "draft-mtp", "--spec-draft-n-max", "4",
+                 "--reasoning", "on", "--reasoning-effort", "low", "--reasoning-budget", "16384",
+                 "-n", "32768",
+                 "--mmproj", "/models/Qwen3.8-27B-UD-Q4_K_XL.mmproj-BF16.gguf"]
+  container:
+    entrypoint: ["llama-server"]   # the reused proxy image's own entrypoint is the python proxy
+budget: { vram_gib: 30, ram_gib: 2 }     # fallback if catalog/ has no curve
+placement: { devices: [cuda0] }
+serves:
+  - { api_name: assistant,         preset: {} }
+  - { api_name: assistant-nothink, preset: { reasoning_effort: none, reasoning_budget: 0 } }
+  - { api_name: assistant-low,     preset: { reasoning_effort: low,  reasoning_budget: 4096 } }
+  - { api_name: assistant-med,     preset: { reasoning_effort: medium } }
+  - { api_name: assistant-xhigh,   preset: { reasoning_effort: xhigh } }

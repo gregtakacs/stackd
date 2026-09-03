@@ -1,0 +1,13 @@
+{
+  "key": "comfyui|igpu0|flux2-klein|pNone",
+  "model": "flux2-klein",
+  "engine": "comfyui",
+  "device": "igpu0",
+  "source": "estimate",
+  "measured_at": null,
+  "points": {
+    "vram": [[0, 20.0]],
+    "ram": [[0, 0.0]]
+  },
+  "notes": "OBSERVED 2026-09-03 — the comfyui-igpu container (ROCm 7.1.4.1, Radeon 8060S) was using ~18.2 GiB unified RAM after 14h with Flux.2 Klein. On the iGPU, GTT and parked components are the same physical RAM, so it's counted once as vram_gib (ram_gib=0). Flat — no context axis. Bench with `stackctl bench coding-image --ingest` (sample container RSS at generation peak)."
+}

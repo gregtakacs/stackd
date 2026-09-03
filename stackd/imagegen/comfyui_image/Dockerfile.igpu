@@ -1,0 +1,50 @@
+# ComfyUI on the AMD Radeon 8060S iGPU (Strix Halo / gfx1151), ROCm.
+# Prototype: runs on renderD128 only, leaves the RTX PRO 6000 entirely to vLLM.
+#
+# Base is AMD's pre-built ROCm 7.14.1 / PyTorch 2.12.0 image. gfx1151 (Strix
+# Halo) is now "Release Ready" in ROCm (TheRock SUPPORTED_GPUS.md: Build ✅ /
+# Sanity ✅ / Release-Ready ✅) and named explicitly in the ROCm release notes,
+# so no custom wheels or arch overrides are needed.
+# Bumped from rocm7.2_..._2.9.1 on 2026-09-02: the 7.2 stack did initialize
+# gfx1151 natively ("AMD arch: gfx1151 ... native") but a heavy Flux.2 gen at
+# ~00:54 spun kernel amdkfd svm_range_restore_work and hard-hung the host;
+# 7.13/7.14/10.x carry a year of Strix Halo KFD/SVM fixes (userland side).
+# Flash-attention is intentionally NOT compiled here (the ROCm/flash-attention
+# main_perf build takes 30+ min); ComfyUI falls back to PyTorch SDPA
+# (AOTriton, ungated via TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1).
+ARG ROCM_BASE=rocm/pytorch:rocm7.14.1_ubuntu24.04_py3.12_pytorch_release_2.12.0
+FROM ${ROCM_BASE}
+
+ARG COMFYUI_REF=master
+
+RUN git clone https://github.com/comfyanonymous/ComfyUI /opt/ComfyUI \
+ && cd /opt/ComfyUI \
+ && git checkout "${COMFYUI_REF}" \
+ && pip3 install --no-cache-dir -r requirements.txt
+
+# ComfyUI-Manager so custom nodes can be added from the UI.
+RUN git clone https://github.com/ltdrdata/ComfyUI-Manager /opt/ComfyUI/custom_nodes/ComfyUI-Manager \
+ && pip3 install --no-cache-dir -r /opt/ComfyUI/custom_nodes/ComfyUI-Manager/requirements.txt || true
+
+# Custom nodes the comfyui-mcp masked-edit graph (edit/flux2-klein-inpaint.json)
+# needs. ComfyUI-KJNodes -> ColorMatchV2 (match the inpaint result back to the
+# source). The CLIPSegMask node (nodes/clipseg_mask.py, copied below) is the
+# text->mask step: it replaced Florence-2, whose custom trust_remote_code
+# modeling returns garbage segmentation on ROCm/gfx1151 regardless of precision.
+# CLIPSegMask is stock transformers.CLIPSegForImageSegmentation
+# (CIDAS/clipseg-rd64-refined, ~150 MB, auto-downloaded to the HF cache) -- no
+# custom code, robust here. Everything else in the graph is core. ComfyUI-Florence2
+# is still installed for ad-hoc captioning; it is NOT in the masked-edit path.
+RUN git clone https://github.com/kijai/ComfyUI-KJNodes /opt/ComfyUI/custom_nodes/ComfyUI-KJNodes \
+ && pip3 install --no-cache-dir -r /opt/ComfyUI/custom_nodes/ComfyUI-KJNodes/requirements.txt \
+ && git clone https://github.com/kijai/ComfyUI-Florence2 /opt/ComfyUI/custom_nodes/ComfyUI-Florence2 \
+ && pip3 install --no-cache-dir -r /opt/ComfyUI/custom_nodes/ComfyUI-Florence2/requirements.txt
+
+COPY clipseg_mask.py /opt/ComfyUI/custom_nodes/clipseg_mask.py
+
+WORKDIR /opt/ComfyUI
+EXPOSE 8188
+
+# --highvram: keep weights resident (GTT is huge here). --disable-smart-memory
+# avoids ComfyUI's aggressive unload heuristics that assume a small dGPU.
+CMD ["python3", "main.py", "--listen", "0.0.0.0", "--port", "8188"]

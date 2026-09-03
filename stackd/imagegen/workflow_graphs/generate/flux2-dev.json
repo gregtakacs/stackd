@@ -1,0 +1,97 @@
+{
+  "1": {
+    "inputs": { "value": 1024 },
+    "class_type": "PrimitiveInt",
+    "_meta": { "title": "Width" }
+  },
+  "2": {
+    "inputs": { "value": 1024 },
+    "class_type": "PrimitiveInt",
+    "_meta": { "title": "Height" }
+  },
+  "4": {
+    "inputs": { "value": "" },
+    "class_type": "PrimitiveStringMultiline",
+    "_meta": { "title": "Positive Prompt" }
+  },
+  "12": {
+    "inputs": { "unet_name": "flux2_dev_fp8mixed.safetensors", "weight_dtype": "default" },
+    "class_type": "UNETLoader",
+    "_meta": { "title": "Load Diffusion Model (Flux.2 dev, fp8 mixed)" }
+  },
+  "67": {
+    "inputs": {
+      "lora_name": "Flux_2-Turbo-LoRA_comfyui.safetensors",
+      "strength_model": 1.0,
+      "model": ["12", 0]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": { "title": "FLUX.2-dev-Turbo LoRA (fal)" }
+  },
+  "38": {
+    "inputs": { "clip_name": "mistral_3_small_flux2_fp8.safetensors", "type": "flux2", "device": "default" },
+    "class_type": "CLIPLoader",
+    "_meta": { "title": "Load CLIP (Mistral-3-Small fp8)" }
+  },
+  "10": {
+    "inputs": { "vae_name": "flux2-vae.safetensors" },
+    "class_type": "VAELoader",
+    "_meta": { "title": "Load VAE" }
+  },
+  "6": {
+    "inputs": { "text": ["4", 0], "clip": ["38", 0] },
+    "class_type": "CLIPTextEncode",
+    "_meta": { "title": "CLIP Text Encode (Prompt)" }
+  },
+  "26": {
+    "inputs": { "guidance": 4, "conditioning": ["6", 0] },
+    "class_type": "FluxGuidance",
+    "_meta": { "title": "Flux Guidance" }
+  },
+  "22": {
+    "inputs": { "model": ["67", 0], "conditioning": ["26", 0] },
+    "class_type": "BasicGuider",
+    "_meta": { "title": "Basic Guider (no negative -- turbo)" }
+  },
+  "25": {
+    "inputs": { "noise_seed": 774944513813838 },
+    "class_type": "RandomNoise",
+    "_meta": { "title": "Seed" }
+  },
+  "16": {
+    "inputs": { "sampler_name": "euler" },
+    "class_type": "KSamplerSelect",
+    "_meta": { "title": "Sampler" }
+  },
+  "48": {
+    "inputs": { "steps": 8, "width": ["1", 0], "height": ["2", 0] },
+    "class_type": "Flux2Scheduler",
+    "_meta": { "title": "Flux2 Scheduler (8 steps -- turbo)" }
+  },
+  "47": {
+    "inputs": { "width": ["1", 0], "height": ["2", 0], "batch_size": 1 },
+    "class_type": "EmptyFlux2LatentImage",
+    "_meta": { "title": "Empty Flux 2 Latent" }
+  },
+  "13": {
+    "inputs": {
+      "noise": ["25", 0],
+      "guider": ["22", 0],
+      "sampler": ["16", 0],
+      "sigmas": ["48", 0],
+      "latent_image": ["47", 0]
+    },
+    "class_type": "SamplerCustomAdvanced",
+    "_meta": { "title": "Sampler Custom Advanced" }
+  },
+  "8": {
+    "inputs": { "samples": ["13", 0], "vae": ["10", 0] },
+    "class_type": "VAEDecode",
+    "_meta": { "title": "VAE Decode" }
+  },
+  "9": {
+    "inputs": { "filename_prefix": "F2D_txt2img", "images": ["8", 0] },
+    "class_type": "SaveImage",
+    "_meta": { "title": "Save Image" }
+  }
+}

@@ -1,0 +1,11 @@
+.git/
+.gitignore
+deploy/
+tests/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+*.md
+!README.md

@@ -1,0 +1,13 @@
+devices:
+  cuda0:
+    backend: cuda
+    vram_pool: cuda_vram          # dedicated -> no vram_budget_gib needed
+
+  igpu0:
+    backend: vulkan
+    vram_pool: host_unified
+    vram_budget_gib: ${IGPU_VRAM_BUDGET_GIB}   # GTT *ceiling* (room for a future big-model-on-iGPU profile)
+    vram_headroom_gib: 3         # slack above actual demand
+    # Charged to host_unified per-profile = min(sum(resident igpu0 stacks) + 3, budget).
+    # Raising the ceiling costs nothing while idle; the real limit for a big iGPU
+    # model is the host_unified pool math.

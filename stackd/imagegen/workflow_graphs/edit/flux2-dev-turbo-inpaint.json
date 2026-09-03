@@ -1,0 +1,487 @@
+{
+  "1": {
+    "inputs": {
+      "value": 1024
+    },
+    "class_type": "PrimitiveInt",
+    "_meta": {
+      "title": "Width"
+    }
+  },
+  "2": {
+    "inputs": {
+      "value": 1024
+    },
+    "class_type": "PrimitiveInt",
+    "_meta": {
+      "title": "Height"
+    }
+  },
+  "3": {
+    "inputs": {
+      "value": 774944513813838
+    },
+    "class_type": "PrimitiveInt",
+    "_meta": {
+      "title": "Seed"
+    }
+  },
+  "4": {
+    "inputs": {
+      "value": ""
+    },
+    "class_type": "PrimitiveStringMultiline",
+    "_meta": {
+      "title": "Positive Prompt"
+    }
+  },
+  "5": {
+    "inputs": {
+      "image": "example.png",
+      "upload": "image"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Input Image"
+    }
+  },
+  "6": {
+    "inputs": {
+      "value": "the family (the people and the dog)"
+    },
+    "class_type": "PrimitiveString",
+    "_meta": {
+      "title": "Mask Prompt"
+    }
+  },
+  "7": {
+    "inputs": {
+      "value": 0.95
+    },
+    "class_type": "PrimitiveFloat",
+    "_meta": {
+      "title": "Color Correct Strength"
+    }
+  },
+  "8": {
+    "inputs": {
+      "unet_name": "flux2_dev_fp8mixed.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "UNET (Flux2 Klein 9B)"
+    }
+  },
+  "9": {
+    "inputs": {
+      "clip_name": "mistral_3_small_flux2_fp8.safetensors",
+      "type": "flux2",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "CLIP (Qwen 3 8B)"
+    }
+  },
+  "10": {
+    "inputs": {
+      "vae_name": "flux2-vae.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "VAE (Flux2)"
+    }
+  },
+  "11": {
+    "inputs": {
+      "lora_name": "Flux_2-Turbo-LoRA_comfyui.safetensors",
+      "strength_model": 1.0,
+      "model": [
+        "8",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "FLUX.2-dev-Turbo LoRA"
+    }
+  },
+  "13": {
+    "inputs": {
+      "upscale_method": "lanczos",
+      "width": [
+        "1",
+        0
+      ],
+      "height": [
+        "2",
+        0
+      ],
+      "crop": "disabled",
+      "image": [
+        "5",
+        0
+      ]
+    },
+    "class_type": "ImageScale",
+    "_meta": {
+      "title": "Resize to Canvas"
+    }
+  },
+  "14": {
+    "inputs": {
+      "image": [
+        "13",
+        0
+      ],
+      "text": [
+        "6",
+        0
+      ],
+      "threshold": 0.3,
+      "blur": 2.0,
+      "dilation": 3,
+      "grow_frac": 0.07,
+      "feather_frac": 0.05,
+      "max_grow": 80,
+      "max_feather": 48.0
+    },
+    "class_type": "CLIPSegMask",
+    "_meta": {
+      "title": "CLIPSeg Auto Mask -- proportional grow/feather (grow_frac 0.07 / feather_frac 0.05 of sqrt(mask area)); dilation/blur are floors"
+    }
+  },
+  "16": {
+    "inputs": {
+      "expand": 12,
+      "tapered_corners": true,
+      "mask": [
+        "14",
+        0
+      ]
+    },
+    "class_type": "GrowMask",
+    "_meta": {
+      "title": "Grow Mask (margin)"
+    }
+  },
+  "18": {
+    "inputs": {
+      "text": [
+        "4",
+        0
+      ],
+      "clip": [
+        "9",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "Prompt"
+    }
+  },
+  "19": {
+    "inputs": {
+      "conditioning": [
+        "18",
+        0
+      ]
+    },
+    "class_type": "ConditioningZeroOut",
+    "_meta": {
+      "title": "Zero Neg"
+    }
+  },
+  "20": {
+    "inputs": {
+      "grow_mask_by": 6,
+      "pixels": [
+        "13",
+        0
+      ],
+      "vae": [
+        "10",
+        0
+      ],
+      "mask": [
+        "16",
+        0
+      ]
+    },
+    "class_type": "VAEEncodeForInpaint",
+    "_meta": {
+      "title": "Inpaint Encode"
+    }
+  },
+  "21": {
+    "inputs": {
+      "pixels": [
+        "13",
+        0
+      ],
+      "vae": [
+        "10",
+        0
+      ]
+    },
+    "class_type": "VAEEncode",
+    "_meta": {
+      "title": "Encode Full Image"
+    }
+  },
+  "22": {
+    "inputs": {
+      "conditioning": [
+        "40",
+        0
+      ],
+      "latent": [
+        "20",
+        0
+      ]
+    },
+    "class_type": "ReferenceLatent",
+    "_meta": {
+      "title": "Reference Latent (masked region)"
+    }
+  },
+  "23": {
+    "inputs": {
+      "conditioning": [
+        "22",
+        0
+      ],
+      "latent": [
+        "21",
+        0
+      ]
+    },
+    "class_type": "ReferenceLatent",
+    "_meta": {
+      "title": "Reference Latent (full image)"
+    }
+  },
+  "24": {
+    "inputs": {
+      "seed": [
+        "3",
+        0
+      ],
+      "control_after_generate": "randomize",
+      "steps": 14,
+      "cfg": 1,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1,
+      "model": [
+        "11",
+        0
+      ],
+      "positive": [
+        "23",
+        0
+      ],
+      "negative": [
+        "19",
+        0
+      ],
+      "latent_image": [
+        "20",
+        0
+      ]
+    },
+    "class_type": "KSampler",
+    "_meta": {
+      "title": "KSampler -- 14 steps (was 8): a large masked object swap occasionally under-propagated at 8 turbo steps (front converts, rear keeps old paint/shape); +6 steps ~+8s on the eGPU. positive from full-image ReferenceLatent (23) by default; _submit_edit rewires to node 22 when preserve_scene_context=False"
+    }
+  },
+  "25": {
+    "inputs": {
+      "tile_size": 512,
+      "overlap": 64,
+      "temporal_size": 64,
+      "temporal_overlap": 8,
+      "samples": [
+        "24",
+        0
+      ],
+      "vae": [
+        "10",
+        0
+      ]
+    },
+    "class_type": "VAEDecodeTiled",
+    "_meta": {
+      "title": "Decode"
+    }
+  },
+  "26": {
+    "inputs": {
+      "method": "mkl",
+      "strength": [
+        "7",
+        0
+      ],
+      "multithread": true,
+      "image_target": [
+        "25",
+        0
+      ],
+      "image_ref": [
+        "13",
+        0
+      ]
+    },
+    "class_type": "ColorMatchV2",
+    "_meta": {
+      "title": "Color Correct (vs original)"
+    }
+  },
+  "27": {
+    "inputs": {
+      "filename_prefix": "F2D_inpaint_automask",
+      "images": [
+        "30",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save"
+    }
+  },
+  "28": {
+    "inputs": {
+      "mask": [
+        "34",
+        0
+      ]
+    },
+    "class_type": "MaskToImage",
+    "_meta": {
+      "title": "Final Mask -> preview"
+    }
+  },
+  "29": {
+    "inputs": {
+      "images": [
+        "28",
+        0
+      ]
+    },
+    "class_type": "PreviewImage",
+    "_meta": {
+      "title": "Final Mask Preview"
+    }
+  },
+  "30": {
+    "inputs": {
+      "destination": [
+        "13",
+        0
+      ],
+      "source": [
+        "25",
+        0
+      ],
+      "mask": [
+        "34",
+        0
+      ],
+      "x": 0,
+      "y": 0,
+      "resize_source": false
+    },
+    "class_type": "ImageCompositeMasked",
+    "_meta": {
+      "title": "Feathered Composite -- source = raw inpaint (node 25); ColorMatchV2 (26) bypassed, it fights large colour changes"
+    }
+  },
+  "31": {
+    "inputs": {
+      "mask": [
+        "16",
+        0
+      ]
+    },
+    "class_type": "MaskToImage",
+    "_meta": {
+      "title": "Mask -> Image (for real blur)"
+    }
+  },
+  "32": {
+    "inputs": {
+      "image": [
+        "31",
+        0
+      ],
+      "blur_radius": 28,
+      "sigma": 9.0
+    },
+    "class_type": "ImageBlur",
+    "_meta": {
+      "title": "Gaussian Blur (contour-following soft edge)"
+    }
+  },
+  "33": {
+    "inputs": {
+      "image": [
+        "32",
+        0
+      ],
+      "channel": "red"
+    },
+    "class_type": "ImageToMask",
+    "_meta": {
+      "title": "Image -> Mask"
+    }
+  },
+  "34": {
+    "inputs": {
+      "destination": [
+        "33",
+        0
+      ],
+      "source": [
+        "35",
+        0
+      ],
+      "x": 0,
+      "y": 0,
+      "operation": "multiply"
+    },
+    "class_type": "MaskComposite",
+    "_meta": {
+      "title": "Clamp blur to paint footprint (no outward spillover)"
+    }
+  },
+  "35": {
+    "inputs": {
+      "expand": 28,
+      "tapered_corners": true,
+      "mask": [
+        "16",
+        0
+      ]
+    },
+    "class_type": "GrowMask",
+    "_meta": {
+      "title": "Clamp Margin (blur headroom)"
+    }
+  },
+  "40": {
+    "inputs": {
+      "conditioning": [
+        "18",
+        0
+      ],
+      "guidance": 5.5
+    },
+    "class_type": "FluxGuidance",
+    "_meta": {
+      "title": "Flux Guidance (dev) -- 5.5, tuned for masked object-swap"
+    }
+  }
+}

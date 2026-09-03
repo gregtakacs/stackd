@@ -1,0 +1,45 @@
+model: everyday-image
+engine:
+  template: comfyui
+  model: flux2-klein
+  params:
+    active_model: flux2-dev-turbo      # the RTX pipeline (turbo: coexists with the 27B)
+    port: 8188
+    kind: image
+    workflow_templates: [flux-txt2img, flux-img2img, flux-inpaint]
+  container:
+    name: comfyui-cuda
+    image: ${COMFYUI_CUDA_IMAGE}
+    ipc_host: true
+    env:
+      TZ: ${TZ}
+      # NO --highvram (see the eGPU/ReBAR note): a generate touches TE (~17G),
+      # UNET (~34G), VAE one at a time; --reserve-vram 4 keeps a cushion.
+      CLI_ARGS: "--reserve-vram 4"
+    mounts:
+      - { host_path: ${DOCKERDIR}/appdata/comfyui/models,        container_path: /root/ComfyUI/models, ro: false }
+      - { host_path: ${DOCKERDIR}/appdata/comfyui/custom_nodes,  container_path: /root/ComfyUI/custom_nodes, ro: false }
+      - { host_path: ${STACKD_SRC}/stackd/imagegen/comfyui_image/clipseg_mask.py, container_path: /root/ComfyUI/custom_nodes/clipseg_mask.py, ro: true }
+      # shared scratch — the two ComfyUIs never run together (see coding-image.yaml)
+      - { host_path: ${DOCKERDIR}/appdata/comfyui/scratch/output, container_path: /root/ComfyUI/output, ro: false }
+      - { host_path: ${DOCKERDIR}/appdata/comfyui/scratch/input,  container_path: /root/ComfyUI/input,  ro: false }
+      - { host_path: ${DOCKERDIR}/appdata/comfyui/scratch/temp,   container_path: /root/ComfyUI/temp,   ro: false }
+    # The shared comfyui.<domain> router — traefik picks it up off whichever of
+    # comfyui-cuda / comfyui-rocm is running (only one ever is). IDENTICAL block
+    # in coding-image.yaml. ${DOMAINNAME_*} resolve from stackd's own env.
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.comfyui-rtr.entrypoints: "https"
+      traefik.http.routers.comfyui-rtr.rule: "Host(`comfyui.${DOMAINNAME_CLOUD_SERVER}`)"
+      traefik.http.routers.comfyui-rtr.middlewares: "chain-oauth-comfyui@file"
+      traefik.http.routers.comfyui-local-rtr.entrypoints: "https"
+      traefik.http.routers.comfyui-local-rtr.rule: "Host(`comfyui.${DOMAINNAME_LOCAL_SERVER}`)"
+      traefik.http.routers.comfyui-local-rtr.middlewares: "chain-no-auth-local-only-comfyui@file"
+      traefik.http.routers.comfyui-rtr.service: "comfyui-svc"
+      traefik.http.routers.comfyui-local-rtr.service: "comfyui-svc"
+      traefik.http.services.comfyui-svc.loadbalancer.server.port: "8188"
+budget: { vram_gib: 46, ram_gib: 18 }
+placement: { devices: [cuda0] }
+# no `serves:` — the embedded image MCP (stackd/imagegen/) advertises capabilities
+# off this model's describe() (D4)
+serves: []

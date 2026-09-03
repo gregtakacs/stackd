@@ -1,0 +1,13 @@
+model: everyday-autocomplete
+engine:
+  template: llamacpp-vulkan          # stackd-created on the iGPU, image ghcr.io/ggml-org/llama.cpp:server-vulkan
+  model: Qwen2.5-Coder-1.5B.Q8_0
+  params:
+    ctx: 32768
+    parallel: 2
+    extra_args: ["--cache-reuse", "256", "--no-webui"]
+    sampling: { temp: 0.2, top_k: 20, top_p: 0.95 }   # FIM: near-deterministic
+budget: { vram_gib: 2.3, ram_gib: 0 }     # on igpu0 VRAM is unified RAM — counted once
+placement: { devices: [igpu0] }
+serves:
+  - { api_name: coding-autocomplete, preset: {} }

@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stackd"
+version = "0.0.1"
+description = "Two-device model stack/profile orchestrator"
+requires-python = ">=3.10"
+dependencies = ["pyyaml>=6"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+# The embedded image-generation MCP tools (stackd/imagegen/). Kept out of the core so
+# `import stackd.*` and the stdlib-only smoke suite need nothing but pyyaml.
+imagegen = [
+    "mcp>=2.0.0",
+    "httpx>=0.27",
+    "pillow>=10",
+    "uvicorn>=0.30",
+    "starlette>=0.37",
+    "anyio>=4",
+]
+
+[project.scripts]
+stackctl = "stackd.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["stackd*"]
+
+[tool.setuptools.package-data]
+"stackd.imagegen" = [
+    "workflow_graphs/**/*.json", "tool_docs/*.md", "prompts/*.txt",
+    "comfyui_image/*",
+]

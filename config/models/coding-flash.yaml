@@ -1,0 +1,61 @@
+model: coding-flash
+engine:
+  template: vllm-cuda
+  model: Qwen3.8-Flash-Next-NVFP4
+  params:
+    served_model_name: assistant-coder-flash
+    port: 8000
+    gpu_memory_utilization: 0.94
+    max_model_len: 262144
+  # Full recipe — stackd creates this container. Swap the image / cmd_extra to
+  # change how the big model is served (or switch `template` to llamacpp-cuda for
+  # a GGUF). PLE quant table + the two site-packages overlays are bind-mounted.
+  container:
+    image: ${VLLM_IMAGE}
+    ipc_host: true
+    stop_grace_s: 60           # let vLLM's mp workers + PLE offload worker shut down cleanly
+    env:
+      HF_HUB_OFFLINE: "1"
+      VLLM_PLE_CPU_OFFLOAD: "1"
+      VLLM_PLE_OFFLOAD_READY_TIMEOUT: "3600"
+      VLLM_PLE_QUANT_DIR: /ples_nvfp4
+      VLLM_GDN_DECODE_KERNEL: triton
+    mounts:
+      - { host_path: ${DOCKERDIR}/appdata/llm-models/flash-next-vllm, container_path: /model, ro: true }
+      - { host_path: ${DOCKERDIR}/appdata/llm-models/flash-next-ple/ples_nvfp4, container_path: /ples_nvfp4, ro: true }
+      - { host_path: ${DOCKERDIR}/appdata/llm-models/flash-next-ple/worker_image_quant.py, container_path: /usr/local/lib/python3.12/dist-packages/vllm/v1/ple_offload/worker.py, ro: true }
+      - { host_path: ${DOCKERDIR}/appdata/llm-models/flash-next-ple/ple_layer_quant.py, container_path: /usr/local/lib/python3.12/dist-packages/vllm/models/qwen3_8_flash_next/nvidia/ple_layer.py, ro: true }
+      - { host_path: ${DOCKERDIR}/appdata/vllm-flash-cache, container_path: /root/.cache/vllm, ro: false }
+    cmd_extra:
+      - --model
+      - /model
+      - --served-model-name
+      - assistant-coder-flash
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --distributed-executor-backend
+      - mp
+      - --max-model-len
+      - "262144"
+      - --gpu-memory-utilization
+      - "0.94"
+      - --max-num-seqs
+      - "8"
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - qwen3_coder
+      - --reasoning-parser
+      - qwen3
+      - --speculative-config
+      - '{"method":"mtp","num_speculative_tokens":3}'
+budget: { vram_gib: 89.9, ram_gib: 58 }   # VRAM = 0.94 x 95.6; RAM = ~51 GiB PLE offload + overhead
+placement: { devices: [cuda0] }
+serves:
+  - { api_name: assistant-coder,         preset: {} }
+  - { api_name: assistant-coder-nothink, preset: { reasoning_effort: none } }
+  - { api_name: assistant-coder-low,     preset: { reasoning_effort: low } }
+  - { api_name: assistant-coder-med,     preset: { reasoning_effort: medium } }
+  - { api_name: assistant-coder-xhigh,   preset: { reasoning_effort: xhigh } }
+  - { api_name: "assistant*",              preset: {} }   # stands in for chat while coding holds the RTX

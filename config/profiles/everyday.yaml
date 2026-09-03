@@ -1,0 +1,8 @@
+profile: everyday
+priority: 50
+default: true            # the floor — always resident, never self-evicts
+# priority = list order. The solver places each on the first fitting device.
+models:
+  - everyday-chat
+  - everyday-image
+  - everyday-autocomplete

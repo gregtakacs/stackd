@@ -1,0 +1,24 @@
+# ComfyUI on the NVIDIA RTX PRO 6000 (Blackwell) -- the eGPU instance, CUDA.
+#
+# Not wired anywhere by default. The stock CUDA path bind-mounts clipseg_mask.py
+# stock yanwk/comfyui-boot image and bind-mounts nodes/clipseg_mask.py from
+# this repo (the "lighter" setup -- no build, KJNodes/Florence2 come from the
+# megapak). This Dockerfile is here for when full parity / a self-contained
+# image is wanted: point the compose `comfyui` service at
+#   build: { context: ../comfyui-mcp/nodes, dockerfile: Dockerfile.egpu }
+# and drop the clipseg_mask.py bind-mount.
+#
+# Only difference from Dockerfile.igpu is the base image (CUDA vs ROCm) and
+# that the CUDA megapak already bundles most custom nodes.
+FROM yanwk/comfyui-boot:cu130-megapak-pt211-20260826
+
+# CLIPSegMask: text->mask for the masked-edit graph. Stock
+# transformers.CLIPSegForImageSegmentation (CIDAS/clipseg-rd64-refined) -- it
+# replaced Florence-2, which returns garbage segmentation on ROCm/gfx1151; kept
+# identical here so both instances behave the same. See nodes/clipseg_mask.py.
+COPY clipseg_mask.py /root/ComfyUI/custom_nodes/clipseg_mask.py
+
+# ComfyUI-KJNodes (ColorMatchV2) and ComfyUI-Florence2 (ad-hoc captioning) --
+# add clones here only if the megapak build in use stops bundling them.
+# RUN git clone https://github.com/kijai/ComfyUI-KJNodes /root/ComfyUI/custom_nodes/ComfyUI-KJNodes \
+#  && pip3 install --no-cache-dir -r /root/ComfyUI/custom_nodes/ComfyUI-KJNodes/requirements.txt

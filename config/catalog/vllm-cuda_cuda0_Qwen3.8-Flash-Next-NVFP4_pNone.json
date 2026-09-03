@@ -1,0 +1,23 @@
+{
+  "key": "vllm-cuda|cuda0|Qwen3.8-Flash-Next-NVFP4|pNone",
+  "model": "Qwen3.8-Flash-Next-NVFP4",
+  "engine": "vllm-cuda",
+  "device": "cuda0",
+  "source": "estimate",
+  "measured_at": null,
+  "points": {
+    "vram": [
+      [
+        0.0,
+        89.9
+      ]
+    ],
+    "ram": [
+      [
+        0,
+        58.0
+      ]
+    ]
+  },
+  "notes": "DERIVED 2026-09-03 \u2014 VRAM = --gpu-memory-utilization 0.94 x 95.6 = 89.9 (vLLM pre-allocates, deterministic). RAM ~58: with VLLM_PLE_CPU_OFFLOAD, holds a ~51 GiB quantised n-gram / per-layer-expert structure resident in host RAM (read every decode step, NOT reclaimable page cache), + ~7 GiB vLLM engine/KV staging/graphs. Still source=estimate \u2014 measure live: sample the vllm-flash container's RSS + nvidia-smi next agentic session, then `stackctl bench coding-flash --ingest`."
+}

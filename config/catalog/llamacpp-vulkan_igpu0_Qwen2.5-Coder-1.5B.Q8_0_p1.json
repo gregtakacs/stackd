@@ -1,0 +1,31 @@
+{
+  "key": "llamacpp-vulkan|igpu0|Qwen2.5-Coder-1.5B.Q8_0|p1",
+  "model": "Qwen2.5-Coder-1.5B.Q8_0",
+  "engine": "llamacpp-vulkan",
+  "device": "igpu0",
+  "source": "measured",
+  "measured_at": "2026-09-03T08:30:00+00:00",
+  "points": {
+    "vram": [
+      [
+        8192.0,
+        2.1
+      ],
+      [
+        32768.0,
+        2.3
+      ]
+    ],
+    "ram": [
+      [
+        8192.0,
+        0.15
+      ],
+      [
+        32768.0,
+        0.16
+      ]
+    ]
+  },
+  "notes": "MEASURED 2026-09-03 \u2014 `free` avail delta on start of the llama-autocomplete container (Vulkan, iGPU): ~2357 MiB unified RAM. Near-flat for a 1.5B; only the configured ctx 32768 was measured, 8192 point extrapolated."
+}

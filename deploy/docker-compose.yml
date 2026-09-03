@@ -1,0 +1,135 @@
+# stackd — standalone. An OpenAI-compatible LLM proxy + two-device model
+# orchestrator + image-generation MCP, on localhost. No reverse proxy.
+#
+#   cp .env.example .env      &&  $EDITOR .env
+#   docker compose up -d                 # stackd + the scoped docker API  (LLM proxy + MCP)
+#   docker compose --profile full up -d  # ^ + Open WebUI (chat UI, image round-trip)
+#
+#   OpenAI endpoint : http://localhost:11444/v1     (Authorization: Bearer $STACKD_API_KEY)
+#   image MCP       : http://localhost:8000/mcp     (Authorization: Bearer $MCP_API_KEY)
+#   Open WebUI      : http://localhost:3000         (--profile full)
+#
+# See README.md for pointing it at your own models.
+
+name: stackd
+
+networks:
+  default:
+    name: ${STACKD_NETWORK:-stackd-net}   # engine containers stackd creates join this by name
+
+volumes:
+  stackd_data:
+  openwebui_data:
+
+services:
+  stackd:
+    container_name: stackd
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: stackd:local
+    restart: unless-stopped
+    runtime: nvidia                        # for nvidia-smi (drain barrier + probes). Drop on a non-NVIDIA host.
+    depends_on: [docker-api]
+    ports:
+      - "11444:11444"                      # OpenAI /v1 + control plane
+      - "8000:8000"                        # image MCP (streamable HTTP)
+    environment:
+      - TZ=${TZ:-UTC}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=utility
+      - DOCKER_API_URL=http://docker-api:2375
+      - STACKD_API_KEY=${STACKD_API_KEY}
+      - STACKD_DB=/data/stackd.db
+      - STACKD_STATE=/data/state.json
+      - STACKD_ENV_FILE=/run/stackd-env/.env       # this dir is bind-mounted -> `stackctl reload` sees edits
+      # image MCP + Open WebUI wiring
+      - MCP_PORT=8000
+      - MCP_API_KEY=${MCP_API_KEY}
+      - OPENWEBUI_BASE_URL=http://open-webui:8080
+      - LLAMA_PROXY_REGISTER_URL=http://localhost:11444/register
+      - TIMEOUT_S=600
+      - LLM_BASE_URL=http://localhost:11444/v1     # self-loop for image-prompt rewriting
+      - LLM_MODEL=${LLM_REWRITE_MODEL:-}
+      - LLM_API_KEY=${STACKD_API_KEY}
+      - LLM_REWRITE_ENABLE=${LLM_REWRITE_ENABLE:-true}
+      # box-specific — consumed by config/*.yaml (see .env.example)
+      - DOCKERDIR=${DOCKERDIR}
+      - STACKD_SRC=${STACKD_SRC}
+      - STACKD_NETWORK=${STACKD_NETWORK:-stackd-net}
+      - CUDA_VRAM_GIB=${CUDA_VRAM_GIB}
+      - HOST_RAM_GIB=${HOST_RAM_GIB}
+      - HOST_RESERVE_GIB=${HOST_RESERVE_GIB}
+      - IGPU_VRAM_BUDGET_GIB=${IGPU_VRAM_BUDGET_GIB}
+      - IGPU_RENDER_NODE=${IGPU_RENDER_NODE}
+      - VIDEO_GID=${VIDEO_GID}
+      - RENDER_GID=${RENDER_GID}
+      - HSA_GFX_VERSION=${HSA_GFX_VERSION}
+      - LLAMACPP_CUDA_IMAGE=${LLAMACPP_CUDA_IMAGE}
+      - LLAMACPP_VULKAN_IMAGE=${LLAMACPP_VULKAN_IMAGE}
+      - VLLM_IMAGE=${VLLM_IMAGE}
+      - COMFYUI_CUDA_IMAGE=${COMFYUI_CUDA_IMAGE}
+      - COMFYUI_ROCM_IMAGE=${COMFYUI_ROCM_IMAGE}
+      - COMFYUI_ROCM_BASE=${COMFYUI_ROCM_BASE}
+      - COMFYUI_ROCM_REF=${COMFYUI_ROCM_REF}
+    volumes:
+      - stackd_data:/data
+      - ../config:/app/config                       # live-editable config (+ `stackctl reload`)
+      - ./:/run/stackd-env:ro                        # for .env (directory mount — survives editor rename)
+      - ${DOCKERDIR}/appdata/llm-models:/models:ro
+      - ${DOCKERDIR}/appdata/comfyui/scratch:/comfyui-scratch
+
+  # Scoped Docker Engine API — stackd creates/starts/stops/builds engine containers
+  # through this instead of holding the raw socket. Never publish it.
+  docker-api:
+    container_name: stackd-docker-api
+    image: tecnativa/docker-socket-proxy:v0.5.0
+    restart: always
+    privileged: true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - LOG_LEVEL=info
+      - AUTH=0
+      - SECRETS=0
+      - EXEC=0
+      - COMMIT=0
+      - CONTAINERS=1
+      - POST=1
+      - IMAGES=1
+      - INFO=1
+      - NETWORKS=1
+      - BUILD=1                 # `stackctl build` produces the local ROCm ComfyUI image
+      - ALLOW_START=1
+      - ALLOW_STOP=1
+      - ALLOW_RESTART=1
+
+  # --- optional: chat UI + web search (docker compose --profile full up -d) -----
+  open-webui:
+    container_name: open-webui
+    image: ghcr.io/open-webui/open-webui:0.11.1
+    restart: unless-stopped
+    profiles: ["full"]
+    depends_on: [stackd]
+    ports:
+      - "3000:8080"
+    environment:
+      - WEBUI_SECRET_KEY=${OPEN_WEBUI_SECRET_KEY}
+      - TZ=${TZ:-UTC}
+      # pre-wire stackd as the model backend
+      - OPENAI_API_BASE_URL=http://stackd:11444/v1
+      - OPENAI_API_KEY=${STACKD_API_KEY}
+      - ENABLE_OLLAMA_API=false
+      # REQUIRED for the image MCP tools (per-user key + chat image lookup)
+      - ENABLE_FORWARD_USER_INFO_HEADERS=true
+      - ENABLE_ADMIN_CHAT_ACCESS=False
+    volumes:
+      - openwebui_data:/app/backend/data
+
+  searxng:
+    container_name: searxng
+    image: searxng/searxng:latest
+    restart: unless-stopped
+    profiles: ["full"]
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8081/

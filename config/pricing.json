@@ -1,0 +1,15 @@
+{
+  "_comment": "Cost-savings policy. Optional — stackd runs on the defaults if this file is absent. `stackctl prices --refresh` pulls tier prices from OpenRouter; `manual_prices` always win and are the way to price a model OpenRouter doesn't list.",
+  "electricity_price_per_kwh": 0.15,
+  "host_baseline_w": 90,
+  "hardware_cost": 0,
+  "tiers": [
+    { "label": "midtier",  "ref": "anthropic/claude-3.5-haiku" },
+    { "label": "frontier", "ref": "anthropic/claude-sonnet-4" }
+  ],
+  "manual_prices": [
+    { "ref": "anthropic/claude-sonnet-4", "from": "2026-01-01", "input_mtok": 3.0, "output_mtok": 15.0, "cache_read_mtok": 0.3 },
+    { "ref": "anthropic/claude-3.5-haiku", "from": "2026-01-01", "input_mtok": 0.8, "output_mtok": 4.0, "cache_read_mtok": 0.08 }
+  ],
+  "exclude_models": ["coding-autocomplete"]
+}

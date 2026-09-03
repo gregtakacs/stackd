@@ -1,0 +1,39 @@
+# How stackd reaches Docker and runs engine containers. stackd runs in its own
+# container alongside a scoped docker-API proxy and talks to a scoped socket-proxy (DOCKER_API_URL).
+# Mounts + host_models_dir resolve on the DOCKER HOST.
+#
+# Every box-specific value is an environment variable, from the stackd service
+# env (deploy/.env; see .env.example). No customizations are baked in here.
+runtime:
+  host_models_dir: ${DOCKERDIR}/appdata/llm-models
+  network: ${STACKD_NETWORK}   # stackd-created engines join this so they're reachable by name
+
+  # Images for stackd-CREATED engines. vLLM + both ComfyUIs carry their own image
+  # in the model's `container:` block; the ROCm ComfyUI one has a `container.build`
+  # recipe there and is produced by `stackctl build coding-image`.
+  images:
+    llamacpp-cuda: ${LLAMACPP_CUDA_IMAGE}      # entrypoint overridden in the model
+    llamacpp-vulkan: ${LLAMACPP_VULKAN_IMAGE}
+
+  # Per-backend container knobs, merged into every stackd-created engine whose
+  # resolved device has this backend. "Run a model on the iGPU" is a config line
+  # (placement.devices: [igpu0]) — no new compose service.
+  device_profiles:
+    cuda:
+      gpus: all                                        # -> Docker DeviceRequests
+    vulkan:                                            # the integrated GPU
+      devices: ["${IGPU_RENDER_NODE}"]   # the iGPU DRI render node (NOT the dGPU's)
+      group_add: ["${VIDEO_GID}", "${RENDER_GID}"]   # host video, render GIDs
+      security_opt: ["seccomp:unconfined"]             # RADV needs it
+
+  mounts:
+    - { host_path: ${DOCKERDIR}/appdata/llm-models, container_path: /models, ro: true }
+
+  # Built-in ComfyUI scratch janitor (was the comfyui-cleaner container). `enabled`
+  # is the boot default; POST /cleaner/on|off flips it live. scratch_dir is inside
+  # stackd's container (compose mounts appdata/comfyui/scratch there).
+  comfyui_cleaner:
+    enabled: true
+    file_ttl_min: 2
+    interval_s: 90
+    scratch_dir: /comfyui-scratch

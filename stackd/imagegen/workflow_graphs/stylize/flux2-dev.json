@@ -1,0 +1,23 @@
+{
+  "1": { "inputs": { "image": "example.png", "upload": "image" }, "class_type": "LoadImage", "_meta": { "title": "Input Image" } },
+  "2": { "inputs": { "upscale_method": "bilinear", "scale_by": 1.0, "image": ["1", 0] }, "class_type": "ImageScaleBy", "_meta": { "title": "Upscale Image By" } },
+  "3": { "inputs": { "unet_name": "flux2_dev_fp8mixed.safetensors", "weight_dtype": "default" }, "class_type": "UNETLoader", "_meta": { "title": "Load Diffusion Model (Flux.2 dev, fp8 mixed)" } },
+  "6": { "inputs": { "lora_name": "Flux_2-Turbo-LoRA_comfyui.safetensors", "strength_model": 1.0, "model": ["3", 0] }, "class_type": "LoraLoaderModelOnly", "_meta": { "title": "FLUX.2-dev-Turbo LoRA (fal)" } },
+  "4": { "inputs": { "clip_name": "mistral_3_small_flux2_fp8.safetensors", "type": "flux2", "device": "default" }, "class_type": "CLIPLoader", "_meta": { "title": "Load CLIP (Mistral-3-Small fp8)" } },
+  "5": { "inputs": { "vae_name": "flux2-vae.safetensors" }, "class_type": "VAELoader", "_meta": { "title": "Load VAE" } },
+  "7": { "inputs": { "text": "", "clip": ["4", 0] }, "class_type": "CLIPTextEncode", "_meta": { "title": "Style Prompt" } },
+  "8": { "inputs": { "pixels": ["2", 0], "vae": ["5", 0] }, "class_type": "VAEEncode", "_meta": { "title": "Encode Image" } },
+  "14": { "inputs": { "guidance": 4, "conditioning": ["7", 0] }, "class_type": "FluxGuidance", "_meta": { "title": "Flux Guidance (patched per-request by _dev_stylize_guidance)" } },
+  "9": { "inputs": { "conditioning": ["14", 0], "latent": ["8", 0] }, "class_type": "ReferenceLatent", "_meta": { "title": "Reference Latent (composition lock -- same as klein)" } },
+  "10": { "inputs": { "conditioning": ["7", 0] }, "class_type": "ConditioningZeroOut", "_meta": { "title": "Zero Neg" } },
+  "11": {
+    "inputs": {
+      "seed": 624434243596488, "control_after_generate": "randomize", "steps": 8, "cfg": 1,
+      "sampler_name": "euler", "scheduler": "simple", "denoise": 1,
+      "model": ["6", 0], "positive": ["9", 0], "negative": ["10", 0], "latent_image": ["8", 0]
+    },
+    "class_type": "KSampler", "_meta": { "title": "KSampler (8-step turbo, denoise 1 + ReferenceLatent)" }
+  },
+  "12": { "inputs": { "tile_size": 512, "overlap": 64, "temporal_size": 64, "temporal_overlap": 8, "samples": ["11", 0], "vae": ["5", 0] }, "class_type": "VAEDecodeTiled", "_meta": { "title": "VAE Decode (Tiled)" } },
+  "13": { "inputs": { "filename_prefix": "F2D_stylized", "images": ["12", 0] }, "class_type": "SaveImage", "_meta": { "title": "Save Image" } }
+}

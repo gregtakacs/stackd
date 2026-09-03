@@ -1,0 +1,110 @@
+{
+  "_comment": "Pipeline registry for generate_image / edit_image / stylize_image. tools.py._profile_for() picks a model key from the resident ComfyUI's active model (Manager.capabilities()['image']); there is no user/LLM model selection. Each key maps a tool to an API-format graph in this directory plus a `nodes` map of logical role -> node id; tools.py patches by role via workflows.set_node (which picks the right input key from each node's class_type), so a ComfyUI 'Export (API)' re-save that renumbers nodes only needs the ids here updated. `prompt_rewrite` points at a prompts/*.txt system prompt used by prompt_llm.rewrite(). An `edit` tool with `inpaint: \"builtin\"` also carries `inpaint_graph` -- a CLIPSeg-segment + masked-inpaint graph (workflows.load_inpaint_graph); those graphs MUST keep the klein MASK_* node-id layout because tools.py._submit_edit rewires those ids directly, differing only in the model front-end (loaders / guidance). `validated: false` = derived from a community template, not yet run against this install (it still executes; the flag is surfaced in the tool's reply). Roles: positive/prompt (text), width, height, seed, image, denoise, scale_by, save.",
+  "default": "flux2-klein",
+  "models": {
+    "flux2-klein": {
+      "label": "Flux.2 Klein 9B -- fast distilled, 4-step, the default",
+      "validated": true,
+      "prompt_rewrite": {
+        "system": "flux2_enhance.txt",
+        "default": false,
+        "json": false
+      },
+      "tools": {
+        "generate": {
+          "graph": "generate/flux2-klein.json",
+          "nodes": {
+            "positive": "4",
+            "width": "1",
+            "height": "2",
+            "seed": "3",
+            "save": "14"
+          }
+        },
+        "edit": {
+          "graph": "edit/flux2-klein.json",
+          "nodes": {
+            "positive": "4",
+            "width": "1",
+            "height": "2",
+            "seed": "3",
+            "image": "5",
+            "denoise": "14",
+            "save": "16"
+          },
+          "inpaint": "builtin",
+          "inpaint_graph": "edit/flux2-klein-inpaint.json"
+        },
+        "stylize": {
+          "graph": "stylize/flux2-klein.json",
+          "nodes": {
+            "prompt": "7",
+            "seed": "11",
+            "image": "1",
+            "scale_by": "2",
+            "save": "13"
+          }
+        }
+      }
+    },
+    "flux2-dev-turbo": {
+      "label": "Flux.2 dev -- fp8 base + fal FLUX.2-dev-Turbo LoRA, 8-step; eGPU, everyday mode only (generate + stylize)",
+      "validated": false,
+      "prompt_rewrite": {
+        "system": "flux2_enhance.txt",
+        "default": true,
+        "json": false
+      },
+      "tools": {
+        "generate": {
+          "graph": "generate/flux2-dev.json",
+          "nodes": {
+            "positive": "4",
+            "width": "1",
+            "height": "2",
+            "seed": "25",
+            "save": "9"
+          }
+        },
+        "stylize": {
+          "graph": "stylize/flux2-dev.json",
+          "nodes": {
+            "prompt": "7",
+            "seed": "11",
+            "image": "1",
+            "scale_by": "2",
+            "save": "13",
+            "guidance": "14"
+          }
+        },
+        "_edit_note": "Masked-only path (server.py routes target_region + everyday mode here). Graph tuned 2026-09: FluxGuidance 5.5; ColorMatchV2 (node 26) BYPASSED -- ImageCompositeMasked source = raw VAEDecode (node 25) -- because it threw a teal cast + magenta halo on any real colour change, so color_correct_strength is a no-op here (still honoured by the klein graph). preserve_scene_context works normally: default keeps the full-image ReferenceLatent (node 23) for surface edits (recolour/restyle); _submit_edit rewires KSampler.positive to the masked-region ReferenceLatent (node 22) and drops 21/23 when the caller passes preserve_scene_context=False for a genuine identity swap (car->pickup). Keeps every klein MASK_* node id so server._submit_edit patches it unchanged.",
+        "edit": {
+          "inpaint": "builtin",
+          "inpaint_graph": "edit/flux2-dev-turbo-inpaint.json"
+        }
+      }
+    },
+    "ideogram4": {
+      "label": "Ideogram 4 -- 9.3B DiT; DORMANT (no tool routes here; kept for a future revive / eGPU web-UI use)",
+      "dormant": true,
+      "validated": true,
+      "prompt_rewrite": {
+        "system": "ideogram4.txt",
+        "default": true,
+        "json": true
+      },
+      "tools": {
+        "generate": {
+          "graph": "generate/ideogram4.json",
+          "nodes": {
+            "positive": "4",
+            "width": "1",
+            "height": "2",
+            "seed": "3",
+            "save": "20"
+          }
+        }
+      }
+    }
+  }
+}
