@@ -55,6 +55,11 @@ slack. `stackctl validate` proves a profile balances both before anything spawns
 `deploy/.env.example`). Edit `.env` or a config file, then `stackctl reload` — no
 restart; an engine whose spec changed is recreated, a pool/size change just re-solves.
 
+**Config overlay.** `STACKD_CONFIG_OVERLAY` (or `-O`) is a second config dir that wins
+**per file** — mount your private `pools.yaml` / `models/*.yaml` / `catalog/*.json`
+there and keep the shipped `config/` a pristine generic example. A new file adds; an
+empty overlay file deletes the base entry.
+
 ## `stackctl`
 
 ```

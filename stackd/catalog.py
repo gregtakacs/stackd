@@ -134,14 +134,16 @@ class Catalog:
     path: pathlib.Path | None = None
 
     @classmethod
-    def load(cls, directory: str | pathlib.Path) -> "Catalog":
+    def load(cls, directory: str | pathlib.Path,
+             overlay: str | pathlib.Path | None = None) -> "Catalog":
         d = pathlib.Path(directory)
         cat = cls(path=d)
-        if not d.is_dir():
-            return cat
-        for f in sorted(d.glob("*.json")):
-            raw = json.loads(f.read_text())
-            cat.curves[raw["key"]] = FootprintCurve.from_dict(raw)
+        for src in (d, pathlib.Path(overlay) if overlay else None):
+            if src is None or not src.is_dir():
+                continue
+            for f in sorted(src.glob("*.json")):
+                raw = json.loads(f.read_text())
+                cat.curves[raw["key"]] = FootprintCurve.from_dict(raw)   # overlay wins by key
         return cat
 
     def for_model(self, cfg: Config, model_name: str, device: str | None = None) -> FootprintCurve | None:

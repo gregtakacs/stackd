@@ -206,10 +206,16 @@ def t_comfyui_is_stackd_created() -> None:
         check(f"{mn}: not adopt", m.engine.container.adopt is False)
         spec = adapter_for(m, cfg.devices[dev]).launch_spec(rec._lc(dev, 8188))
         check(f"{mn}: image set", spec.image and want_img in spec.image)
-        check(f"{mn}: traefik label resolved",
-              spec.labels.get("traefik.http.services.comfyui-svc.loadbalancer.server.port") == "8188")
+        check(f"{mn}: generic config ships no reverse-proxy labels", spec.labels == {})
         if want_dev:
             check(f"{mn}: {want_dev} device path", want_dev in spec.device_paths)
+
+    # labels are still a real feature — set on a synthetic model, they pass through
+    ei = cfg.models["everyday-image"]
+    ei.engine.container.labels = {"traefik.enable": "true", "x.port": "${SOME_PORT}"}
+    lspec = adapter_for(ei, cfg.devices["cuda0"]).launch_spec(rec._lc("cuda0", 8188))
+    check("container.labels pass through to the LaunchSpec", lspec.labels.get("traefik.enable") == "true")
+    ei.engine.container.labels = {}
 
     ci = cfg.models["coding-image"]
     spec = adapter_for(ci, cfg.devices["igpu0"]).launch_spec(rec._lc("igpu0", 8188))

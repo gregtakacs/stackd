@@ -84,6 +84,25 @@ def main() -> int:
     checks.append((".env file overrides os.environ", cfg2.pools["cuda_vram"].total_gib == 42.0))
     os.environ["CUDA_VRAM_GIB"] = "95.6"
 
+    # --- config overlay: per-file replace / add / delete on top of the base ---
+    ov = pathlib.Path(tempfile.mkdtemp()) / "overlay"
+    (ov / "models").mkdir(parents=True)
+    (ov / "profiles").mkdir()
+    (ov / "profiles" / "coding.yaml").write_text(       # REPLACE: bump priority, drop coding-image
+        "profile: coding\npriority: 999\nmodels: [coding-flash, everyday-autocomplete]\n")
+    (ov / "models" / "coding-image.yaml").write_text("")   # DELETE (empty overlay file)
+    (ov / "models" / "brandnew.yaml").write_text(          # ADD
+        "model: brandnew\n"
+        "engine: { template: llamacpp-cuda, model: foo, params: { ctx: 4096, parallel: 1 } }\n"
+        "budget: { vram_gib: 1 }\nplacement: { devices: [cuda0] }\n"
+        "serves: [{ api_name: brandnew }]\n")
+    ovc = load_config(CFG, overlay=str(ov))
+    checks.append(("overlay: replaced file wins", ovc.profiles["coding"].priority == 999))
+    checks.append(("overlay: new file adds", "brandnew" in ovc.models))
+    checks.append(("overlay: empty file deletes", "coding-image" not in ovc.models))
+    checks.append(("overlay: base files untouched", "everyday-chat" in ovc.models
+                   and ovc.profiles["everyday"].priority == 50))
+
     ok = True
     for name, passed in checks:
         print(f"  {'PASS' if passed else 'FAIL'}  {name}")

@@ -19,8 +19,6 @@ import pathlib
 _FALLBACK = {
     "TZ": "UTC",
     "DOCKERDIR": "/srv/stackd",
-    "DOMAINNAME_CLOUD_SERVER": "example.com",
-    "DOMAINNAME_LOCAL_SERVER": "local.example.com",
     "STACKD_NETWORK": "stackd-net",
     "CUDA_VRAM_GIB": "95.6",
     "HOST_RAM_GIB": "128",

@@ -69,48 +69,76 @@ def _load_yaml(path: pathlib.Path, env: Mapping[str, str]) -> dict[str, Any]:
     return yaml.safe_load(_interpolate(path.read_text(), env)) or {}
 
 
-def _load_named(root: pathlib.Path, key: str, cls, id_attr: str,
-                env: Mapping[str, str]) -> dict[str, Any]:
-    """Load every *.yaml under root/<key>/. Each file is one document, or a list
-    under a top-level `<key>:` key. Returns {id_attr: cls-instance}."""
-    subdir = root / key
-    if not subdir.is_dir():
-        raise FileNotFoundError(f"missing config dir: {subdir}")
+def _pick(base: pathlib.Path, overlay: pathlib.Path | None, name: str) -> pathlib.Path:
+    """`<overlay>/<name>` if it exists, else `<base>/<name>` — a whole-file swap."""
+    if overlay is not None and (overlay / name).is_file():
+        return overlay / name
+    return base / name
+
+
+def _load_named(base: pathlib.Path, overlay: pathlib.Path | None, key: str,
+                cls, id_attr: str, env: Mapping[str, str]) -> dict[str, Any]:
+    """Load every *.yaml under `<dir>/<key>/`. The effective file set is
+    base ∪ overlay, keyed by BASENAME — an overlay file replaces the base file of
+    the same name, a new name adds, and an *empty* overlay file deletes the base
+    entry. Each file is one document or a list under a top-level `<key>:` key."""
+    files: dict[str, pathlib.Path] = {}
+    bd = base / key
+    if bd.is_dir():
+        for f in sorted(bd.glob("*.yaml")):
+            files[f.name] = f
+    if overlay is not None and (overlay / key).is_dir():
+        for f in sorted((overlay / key).glob("*.yaml")):
+            files[f.name] = f
+    if not files and not (bd.is_dir() or (overlay and (overlay / key).is_dir())):
+        raise FileNotFoundError(f"missing config dir: {bd}")
+
     out: dict[str, Any] = {}
-    for f in sorted(subdir.glob("*.yaml")):
-        doc = _load_yaml(f, env)
+    for fname in sorted(files):
+        doc = _load_yaml(files[fname], env)
+        if not doc:                      # empty overlay file -> drop this entry
+            continue
         entries = doc[key] if isinstance(doc, dict) and key in doc else [doc]
         for raw in entries:
-            obj = build(cls, raw, f.name)
+            obj = build(cls, raw, fname)
             k = getattr(obj, id_attr)
             if k in out:
-                raise ValueError(f"duplicate {id_attr} {k!r} (in {f.name})")
+                raise ValueError(f"duplicate {id_attr} {k!r} (in {fname})")
             out[k] = obj
     return out
 
 
-def load_config(root: str | pathlib.Path, *, env_file: str | None = None) -> Config:
+def load_config(root: str | pathlib.Path, *, env_file: str | None = None,
+                overlay: str | pathlib.Path | None = None) -> Config:
     """`${VAR}` in the YAML resolves from `{**os.environ, **<env_file>}` — the file
-    (default: $STACKD_ENV_FILE) WINS, so a live edit of the bind-mounted .env is
-    picked up by `Manager.reload_config()` without recreating the container."""
-    root = pathlib.Path(root)
-    if not root.is_dir():
-        raise NotADirectoryError(f"config root is not a directory: {root}")
+    (default $STACKD_ENV_FILE) WINS, so a live edit of the bind-mounted .env is
+    picked up by `Manager.reload_config()` without recreating the container.
+
+    `overlay` (default $STACKD_CONFIG_OVERLAY) is a second config dir that WINS
+    per file: mount your private pools.yaml / models/*.yaml / catalog/*.json there
+    and the shipped `config/` stays a pristine generic example.
+    """
+    base = pathlib.Path(root)
+    if not base.is_dir():
+        raise NotADirectoryError(f"config root is not a directory: {base}")
 
     env_file = env_file if env_file is not None else os.environ.get("STACKD_ENV_FILE")
     env: dict[str, str] = {**os.environ, **_parse_env_file(env_file)} if env_file else dict(os.environ)
 
-    pools_raw = _load_yaml(root / "pools.yaml", env).get("pools", {})
-    devices_raw = _load_yaml(root / "devices.yaml", env).get("devices", {})
+    ov = overlay if overlay is not None else os.environ.get("STACKD_CONFIG_OVERLAY")
+    ovp = pathlib.Path(ov) if ov and pathlib.Path(ov).is_dir() else None
+
+    pools_raw = _load_yaml(_pick(base, ovp, "pools.yaml"), env).get("pools", {})
+    devices_raw = _load_yaml(_pick(base, ovp, "devices.yaml"), env).get("devices", {})
 
     pools = {k: build(Pool, {"name": k, **v}, f"pools.yaml/{k}") for k, v in pools_raw.items()}
     devices = {
         k: build(Device, {"name": k, **v}, f"devices.yaml/{k}") for k, v in devices_raw.items()
     }
-    models = _load_named(root, "models", ModelSpec, "model", env)
-    profiles = _load_named(root, "profiles", ProfileSpec, "profile", env)
+    models = _load_named(base, ovp, "models", ModelSpec, "model", env)
+    profiles = _load_named(base, ovp, "profiles", ProfileSpec, "profile", env)
 
-    rt_path = root / "runtime.yaml"
+    rt_path = _pick(base, ovp, "runtime.yaml")
     runtime = build(Runtime, _load_yaml(rt_path, env).get("runtime", {}), "runtime.yaml") \
         if rt_path.exists() else Runtime()
 

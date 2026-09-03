@@ -8,3 +8,7 @@ deploy/.env
 *.fake.json
 state.json
 *.db
+
+# private config overlay (STACKD_CONFIG_OVERLAY)
+config.local/
+deploy/config.local/

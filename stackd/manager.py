@@ -82,10 +82,13 @@ class Manager:
             self.rec.cuda_drain_poll_s = 0.0
 
     def _load_catalog(self):
+        import os
         cdir = self.config_dir / "catalog"
-        if cdir.is_dir():
+        ov = os.environ.get("STACKD_CONFIG_OVERLAY")
+        ovc = (pathlib.Path(ov) / "catalog") if ov else None
+        if cdir.is_dir() or (ovc and ovc.is_dir()):
             from stackd.catalog import Catalog
-            return Catalog.load(cdir)
+            return Catalog.load(cdir, overlay=ovc)
         return None
 
     def reload_config(self) -> list[str]:

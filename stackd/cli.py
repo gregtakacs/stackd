@@ -86,6 +86,9 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="stackctl", description="two-device model stack/profile orchestrator"
     )
     ap.add_argument("-C", "--config", type=pathlib.Path, default=DEFAULT_CONFIG)
+    ap.add_argument("-O", "--config-overlay", default=os.environ.get("STACKD_CONFIG_OVERLAY"),
+                    help="a 2nd config dir that wins per-file (private pools/models/catalog "
+                         "on top of the generic shipped config)")
     ap.add_argument("--state", type=pathlib.Path, default=None, help="runtime state file")
     ap.add_argument("--models-dir", default="/models")
     ap.add_argument("--fake", action="store_true", help="in-memory runner (no real processes)")
@@ -298,6 +301,8 @@ def _manager(args) -> Manager:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    if args.config_overlay:      # so load_config() / Manager / serve all see it
+        os.environ["STACKD_CONFIG_OVERLAY"] = str(args.config_overlay)
 
     if args.cmd in ("build", "init"):
         return _cmd_build(args)

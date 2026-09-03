@@ -43,6 +43,7 @@ services:
       - STACKD_DB=/data/stackd.db
       - STACKD_STATE=/data/state.json
       - STACKD_ENV_FILE=/run/stackd-env/.env       # this dir is bind-mounted -> `stackctl reload` sees edits
+      - STACKD_CONFIG_OVERLAY=${STACKD_CONFIG_OVERLAY:-}   # private per-file config overlay (see below)
       # image MCP + Open WebUI wiring
       - MCP_PORT=8000
       - MCP_API_KEY=${MCP_API_KEY}
@@ -76,6 +77,8 @@ services:
       - stackd_data:/data
       - ../config:/app/config                       # live-editable config (+ `stackctl reload`)
       - ./:/run/stackd-env:ro                        # for .env (directory mount — survives editor rename)
+      # private per-file config overlay — uncomment with STACKD_CONFIG_OVERLAY in .env:
+      #- ./config.local:/app/config.local:ro
       - ${DOCKERDIR}/appdata/llm-models:/models:ro
       - ${DOCKERDIR}/appdata/comfyui/scratch:/comfyui-scratch
 

@@ -33,19 +33,8 @@ engine:
       - { host_path: ${DOCKERDIR}/appdata/comfyui/scratch/output, container_path: /opt/ComfyUI/output, ro: false }
       - { host_path: ${DOCKERDIR}/appdata/comfyui/scratch/input,  container_path: /opt/ComfyUI/input,  ro: false }
       - { host_path: ${DOCKERDIR}/appdata/comfyui/scratch/temp,   container_path: /opt/ComfyUI/temp,   ro: false }
-    # Same shared comfyui.<domain> router as everyday-image.yaml (only one of the
-    # two ComfyUIs is ever running, so publishing the same router/service is fine).
-    labels:
-      traefik.enable: "true"
-      traefik.http.routers.comfyui-rtr.entrypoints: "https"
-      traefik.http.routers.comfyui-rtr.rule: "Host(`comfyui.${DOMAINNAME_CLOUD_SERVER}`)"
-      traefik.http.routers.comfyui-rtr.middlewares: "chain-oauth-comfyui@file"
-      traefik.http.routers.comfyui-local-rtr.entrypoints: "https"
-      traefik.http.routers.comfyui-local-rtr.rule: "Host(`comfyui.${DOMAINNAME_LOCAL_SERVER}`)"
-      traefik.http.routers.comfyui-local-rtr.middlewares: "chain-no-auth-local-only-comfyui@file"
-      traefik.http.routers.comfyui-rtr.service: "comfyui-svc"
-      traefik.http.routers.comfyui-local-rtr.service: "comfyui-svc"
-      traefik.http.services.comfyui-svc.loadbalancer.server.port: "8188"
+    # container.labels: {} — see everyday-image.yaml; add reverse-proxy router
+    # labels here if you run one (env vars are expanded at create time).
 budget: { vram_gib: 20, ram_gib: 0 }      # Flux.2 Klein on ROCm; unified RAM, counted once
 placement: { devices: [igpu0] }
 serves: []

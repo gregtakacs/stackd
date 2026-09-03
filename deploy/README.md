@@ -103,6 +103,25 @@ models: [my-chat]
 Delete the example `models/*.yaml` / `profiles/*.yaml` you don't want. `stackctl
 validate` checks it fits your pools; `stackctl reload` applies it.
 
+### Keep your config private with an overlay
+
+To leave `config/` a pristine generic example and version-control your real config
+separately, use a **per-file overlay**:
+
+```bash
+mkdir -p config.local/models config.local/catalog
+cp ../config/models/my-chat.yaml config.local/models/     # then edit your copy
+```
+
+In `.env` set `STACKD_CONFIG_OVERLAY=/app/config.local` and uncomment the
+`./config.local:/app/config.local:ro` volume in `docker-compose.yml`. Now a file in
+`config.local/` **wins over** the same-named file in `config/`; a new name adds; an
+**empty** overlay file deletes that base entry. `pools.yaml` / `devices.yaml` /
+`runtime.yaml` / `catalog/*.json` overlay the same way. `stackctl reload` re-reads it.
+
+Keep `config.local/` in its own private git repo (`docker-compose.yml` + `.env` +
+`config.local/` = your whole deployment); pull this repo for code only.
+
 - **vLLM**: `template: vllm-cuda`, put the full server args in `container.cmd_extra`,
   bind-mount the weights in `container.mounts` (see `models/coding-flash.yaml`).
 - **Image gen**: `template: comfyui` — one model per ComfyUI instance; stackd creates

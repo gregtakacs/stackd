@@ -24,20 +24,9 @@ engine:
       - { host_path: ${DOCKERDIR}/appdata/comfyui/scratch/output, container_path: /root/ComfyUI/output, ro: false }
       - { host_path: ${DOCKERDIR}/appdata/comfyui/scratch/input,  container_path: /root/ComfyUI/input,  ro: false }
       - { host_path: ${DOCKERDIR}/appdata/comfyui/scratch/temp,   container_path: /root/ComfyUI/temp,   ro: false }
-    # The shared comfyui.<domain> router — traefik picks it up off whichever of
-    # comfyui-cuda / comfyui-rocm is running (only one ever is). IDENTICAL block
-    # in coding-image.yaml. ${DOMAINNAME_*} resolve from stackd's own env.
-    labels:
-      traefik.enable: "true"
-      traefik.http.routers.comfyui-rtr.entrypoints: "https"
-      traefik.http.routers.comfyui-rtr.rule: "Host(`comfyui.${DOMAINNAME_CLOUD_SERVER}`)"
-      traefik.http.routers.comfyui-rtr.middlewares: "chain-oauth-comfyui@file"
-      traefik.http.routers.comfyui-local-rtr.entrypoints: "https"
-      traefik.http.routers.comfyui-local-rtr.rule: "Host(`comfyui.${DOMAINNAME_LOCAL_SERVER}`)"
-      traefik.http.routers.comfyui-local-rtr.middlewares: "chain-no-auth-local-only-comfyui@file"
-      traefik.http.routers.comfyui-rtr.service: "comfyui-svc"
-      traefik.http.routers.comfyui-local-rtr.service: "comfyui-svc"
-      traefik.http.services.comfyui-svc.loadbalancer.server.port: "8188"
+    # container.labels: {} — the generic config assumes localhost. Behind a reverse
+    # proxy, add your router labels here (env vars are expanded at create time).
+    # Both ComfyUIs never run together, so give them one shared router/service.
 budget: { vram_gib: 46, ram_gib: 18 }
 placement: { devices: [cuda0] }
 # no `serves:` — the embedded image MCP (stackd/imagegen/) advertises capabilities
