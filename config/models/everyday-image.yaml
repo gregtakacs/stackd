@@ -1,7 +1,7 @@
 model: everyday-image
 engine:
   template: comfyui
-  model: flux2-klein
+  model: flux2
   params:
     active_model: flux2-dev-turbo      # the RTX pipeline (turbo: coexists with the 27B)
     port: 8188

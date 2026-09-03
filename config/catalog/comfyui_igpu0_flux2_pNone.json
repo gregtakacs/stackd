@@ -1,6 +1,6 @@
 {
-  "key": "comfyui|igpu0|flux2-klein|pNone",
-  "model": "flux2-klein",
+  "key": "comfyui|igpu0|flux2|pNone",
+  "model": "flux2",
   "engine": "comfyui",
   "device": "igpu0",
   "source": "estimate",

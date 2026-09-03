@@ -1,6 +1,6 @@
 {
-  "key": "comfyui|cuda0|flux2-klein|pNone",
-  "model": "flux2-klein",
+  "key": "comfyui|cuda0|flux2|pNone",
+  "model": "flux2",
   "engine": "comfyui",
   "device": "cuda0",
   "source": "estimate",
