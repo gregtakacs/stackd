@@ -8,7 +8,9 @@ from typing import Any, Mapping
 import yaml
 
 from stackd.config._build import ConfigError, build
-from stackd.config.models import Config, Device, ModelSpec, Pool, ProfileSpec, Runtime
+from stackd.config.models import (
+    Config, Device, MediaTier, ModelSpec, Pool, ProfileSpec, Runtime,
+)
 
 # ${VAR} or ${VAR:-default} — compose-style. Interpolated over the raw YAML text
 # before parsing, so every box-specific value (paths, sizes, GIDs, image tags, …)
@@ -138,9 +140,14 @@ def load_config(root: str | pathlib.Path, *, env_file: str | None = None,
     models = _load_named(base, ovp, "models", ModelSpec, "model", env)
     profiles = _load_named(base, ovp, "profiles", ProfileSpec, "profile", env)
 
+    # Optional: config/media/<kind>.yaml -> the elastic image/video/audio tiers.
+    media: dict[str, MediaTier] = {}
+    if (base / "media").is_dir() or (ovp is not None and (ovp / "media").is_dir()):
+        media = _load_named(base, ovp, "media", MediaTier, "kind", env)
+
     rt_path = _pick(base, ovp, "runtime.yaml")
     runtime = build(Runtime, _load_yaml(rt_path, env).get("runtime", {}), "runtime.yaml") \
         if rt_path.exists() else Runtime()
 
     return Config(pools=pools, devices=devices, models=models, profiles=profiles,
-                  runtime=runtime).validate()
+                  runtime=runtime, media=media).validate()

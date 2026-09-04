@@ -189,12 +189,85 @@ class Runtime:
 
 
 @dataclass
+class MediaLoadable:
+    """One entry in a media tier's ``prefer:`` list — a checkpoint/pipeline the
+    tier can load. stackd tries them top-down and loads the first that fits the
+    device it lands on; a capability the resident one lacks escalates to the first
+    *capable* entry that still fits. ``active_model`` keys
+    imagegen/workflow_graphs/models.json; ``footprint_gib`` is a VRAM estimate per
+    backend (refined by ``stackctl bench`` later)."""
+
+    active_model: str
+    capabilities: list[str] = field(default_factory=list)   # generate | stylize | edit | ...
+    backends: list[str] = field(default_factory=list)       # cuda | rocm | vulkan -> which containers[<b>]
+    footprint_gib: dict[str, float] = field(default_factory=dict)   # backend -> VRAM GiB
+
+
+@dataclass
+class MediaTier:
+    """config/media/<kind>.yaml — an elastic image/video/audio tier stackd runs in
+    whatever device capacity is left after the active profile's LLM models are
+    placed. Never displaces an LLM engine. ``active_model`` is chosen at runtime
+    from ``prefer:``, not declared here."""
+
+    kind: str                                       # "image" | "video" | "audio" (= filename stem)
+    margin_gib: float = 4.0                          # headroom safety cushion per device
+    containers: dict[str, ContainerSpec] = field(default_factory=dict)   # backend -> how to run the engine
+    prefer: list[MediaLoadable] = field(default_factory=list)            # load order
+
+
+def _missing_graphs(active_model: str, caps: list[str]) -> list[str] | None:
+    """Verbs in ``caps`` with no workflow graph for ``active_model`` in
+    imagegen/workflow_graphs/models.json, or None when the registry can't be
+    imported (core stackd without the ``[imagegen]`` extra still validates)."""
+    if not caps:
+        return []
+    try:
+        from stackd.imagegen.workflows import tools_for
+    except Exception:
+        return None
+    have = tools_for(active_model or "")
+    return [c for c in caps if c not in have]
+
+
+def _check_comfyui_capabilities(m: ModelSpec) -> None:
+    caps = list(m.engine.params.get("capabilities") or [])
+    active_model = m.engine.params.get("active_model") or ""
+    missing = _missing_graphs(active_model, caps)
+    if missing:
+        raise ConfigError(
+            f"model {m.model!r}: capabilities {missing} have no workflow graph for "
+            f"active_model {active_model!r}"
+        )
+
+
+def _check_media_tier(tier: MediaTier) -> None:
+    for i, ld in enumerate(tier.prefer):
+        where = f"media/{tier.kind}: prefer[{i}] {ld.active_model!r}"
+        if not ld.backends:
+            raise ConfigError(f"{where} lists no backends")
+        for b in ld.backends:
+            if b not in tier.containers:
+                raise ConfigError(f"{where} needs backend {b!r} but there is no containers.{b} block")
+            if b not in ld.footprint_gib:
+                raise ConfigError(f"{where} is missing footprint_gib.{b}")
+        if tier.kind == "image":
+            missing = _missing_graphs(ld.active_model, ld.capabilities)
+            if missing:
+                raise ConfigError(
+                    f"{where} capabilities {missing} have no workflow graph "
+                    f"(imagegen/workflow_graphs/models.json)"
+                )
+
+
+@dataclass
 class Config:
     pools: dict[str, Pool]
     devices: dict[str, Device]
     models: dict[str, ModelSpec]
     profiles: dict[str, ProfileSpec]
     runtime: Runtime = field(default_factory=Runtime)
+    media: dict[str, MediaTier] = field(default_factory=dict)
 
     def validate(self) -> "Config":
         from stackd.engines.registry import TEMPLATES
@@ -223,6 +296,9 @@ class Config:
             except ConfigError as e:
                 raise ConfigError(f"model {m.model!r}: {e}") from None
 
+            if m.engine.template == "comfyui":
+                _check_comfyui_capabilities(m)
+
         defaults = [p.profile for p in self.profiles.values() if p.default]
         if len(defaults) != 1:
             raise ConfigError(
@@ -236,4 +312,7 @@ class Config:
             for mn in pr.models:
                 if mn not in self.models:
                     raise ConfigError(f"profile {pr.profile!r}: unknown model {mn!r}")
+
+        for tier in self.media.values():
+            _check_media_tier(tier)
         return self

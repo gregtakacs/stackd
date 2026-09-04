@@ -54,8 +54,8 @@ budget: { vram_gib: 89.9, ram_gib: 58 }   # VRAM = 0.94 x 95.6; RAM = ~51 GiB PL
 placement: { devices: [cuda0] }
 serves:
   - { api_name: assistant-coder,         preset: {} }
-  - { api_name: assistant-coder-nothink, preset: { reasoning_effort: none } }
-  - { api_name: assistant-coder-low,     preset: { reasoning_effort: low } }
-  - { api_name: assistant-coder-med,     preset: { reasoning_effort: medium } }
-  - { api_name: assistant-coder-xhigh,   preset: { reasoning_effort: xhigh } }
+  - { api_name: assistant-coder-nothink, preset: { reasoning: off } }
+  - { api_name: assistant-coder-low,     preset: { reasoning: { effort: low, budget: 4096 } } }
+  - { api_name: assistant-coder-med,     preset: { reasoning: { effort: medium } } }
+  - { api_name: assistant-coder-xhigh,   preset: { reasoning: { effort: xhigh } } }
   - { api_name: "assistant*",              preset: {} }   # stands in for chat while coding holds the RTX

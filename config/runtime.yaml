@@ -10,7 +10,7 @@ runtime:
 
   # Images for stackd-CREATED engines. vLLM + both ComfyUIs carry their own image
   # in the model's `container:` block; the ROCm ComfyUI one has a `container.build`
-  # recipe there and is produced by `stackctl build coding-image`.
+  # recipe there and is produced by `stackctl build image:vulkan`.
   images:
     llamacpp-cuda: ${LLAMACPP_CUDA_IMAGE}      # entrypoint overridden in the model
     llamacpp-vulkan: ${LLAMACPP_VULKAN_IMAGE}

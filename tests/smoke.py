@@ -31,12 +31,14 @@ def main() -> int:
     ev = validate_profile(cfg, "everyday")
     checks.append(("everyday fits", ev.ok))
     cuda = next(p for p in ev.pools if p.pool == "cuda_vram")
-    checks.append(("everyday cuda_vram=76", _approx(cuda.used_gib, 76.0)))
+    # image generation is no longer a profile member — just the 27B chat here
+    checks.append(("everyday cuda_vram=30", _approx(cuda.used_gib, 30.0)))
     uni = next(p for p in ev.pools if p.pool == "host_unified")
-    # 28 reserve + 4 slack + (autocomplete 2 + headroom 3) + (chat 3 + image 18)
-    checks.append(("everyday host_unified=57", _approx(uni.used_gib, 57.3, 0.6)))
+    # 28 reserve + 4 slack + (autocomplete 2 + headroom 3) + chat 3
+    checks.append(("everyday host_unified=39", _approx(uni.used_gib, 39.3, 0.6)))
     checks.append(
-        ("everyday flags contention", any("contention on cuda0" in f for f in ev.flags))
+        ("everyday: no contention flag (image tier is separate)",
+         not any("contention on cuda0" in f for f in ev.flags))
     )
 
     co = validate_profile(cfg, "coding")
@@ -51,8 +53,8 @@ def main() -> int:
                    any(se.api_name == "assistant*" for se in cfg.models["coding-flash"].serves)))
 
     plan = plan_transition(cfg, "everyday", "coding")
-    checks.append(("plan teardown", plan.teardown == ["everyday-chat", "everyday-image"]))
-    checks.append(("plan spawn", sorted(plan.spawn) == ["coding-flash", "coding-image"]))
+    checks.append(("plan teardown", plan.teardown == ["everyday-chat"]))
+    checks.append(("plan spawn", sorted(plan.spawn) == ["coding-flash"]))
     checks.append(("plan keep", plan.keep == ["everyday-autocomplete"]))
 
     # ${VAR} / ${VAR:-default} interpolation + .env-file override
@@ -88,9 +90,11 @@ def main() -> int:
     ov = pathlib.Path(tempfile.mkdtemp()) / "overlay"
     (ov / "models").mkdir(parents=True)
     (ov / "profiles").mkdir()
-    (ov / "profiles" / "coding.yaml").write_text(       # REPLACE: bump priority, drop coding-image
-        "profile: coding\npriority: 999\nmodels: [coding-flash, everyday-autocomplete]\n")
-    (ov / "models" / "coding-image.yaml").write_text("")   # DELETE (empty overlay file)
+    (ov / "profiles" / "coding.yaml").write_text(       # REPLACE: bump priority, drop autocomplete
+        "profile: coding\npriority: 999\nmodels: [coding-flash]\n")
+    (ov / "profiles" / "everyday.yaml").write_text(     # REPLACE: also drop autocomplete
+        "profile: everyday\npriority: 50\ndefault: true\nmodels: [everyday-chat]\n")
+    (ov / "models" / "everyday-autocomplete.yaml").write_text("")   # DELETE (empty overlay file)
     (ov / "models" / "brandnew.yaml").write_text(          # ADD
         "model: brandnew\n"
         "engine: { template: llamacpp-cuda, model: foo, params: { ctx: 4096, parallel: 1 } }\n"
@@ -99,9 +103,9 @@ def main() -> int:
     ovc = load_config(CFG, overlay=str(ov))
     checks.append(("overlay: replaced file wins", ovc.profiles["coding"].priority == 999))
     checks.append(("overlay: new file adds", "brandnew" in ovc.models))
-    checks.append(("overlay: empty file deletes", "coding-image" not in ovc.models))
+    checks.append(("overlay: empty file deletes", "everyday-autocomplete" not in ovc.models))
     checks.append(("overlay: base files untouched", "everyday-chat" in ovc.models
-                   and ovc.profiles["everyday"].priority == 50))
+                   and load_config(CFG).profiles["everyday"].priority == 50))
 
     ok = True
     for name, passed in checks:

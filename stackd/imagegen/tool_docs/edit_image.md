@@ -1,5 +1,5 @@
-Transform an existing image according to a text prompt using the local Flux.2 Klein 9B
-ComfyUI pipeline. Use this for targeted edits: adding, removing, replacing, or restyling
+Transform an existing image according to a text prompt using a local ComfyUI Flux.2
+pipeline. Use this for targeted edits: adding, removing, replacing, or restyling
 content in an image the user already provided. There is no negative_prompt parameter --
 both underlying pipelines are distilled variants with no negative-prompt input.
 
@@ -348,7 +348,17 @@ wording written into the prompt is a better bet than an edit_image masked edit.
 :param rewrite_prompt: 'auto' (default) / 'off' / 'on' -- see generate_image. Only applies to whole-image
     edits; ignored for masked edits.
 
-There is NO model parameter. Editing always runs on the same pipeline (flux2-klein on the
-iGPU), in every mode. Ignore any user request to "use model X" for an edit -- just call
-the tool normally. The masked-region caution above is a pipeline limitation, not something
-a different model would fix.
+:param image_model: OPTIONAL. Leave this EMPTY -- the pipeline is chosen for you.
+    Set it ONLY when the user explicitly asks for a specific image model. Closest
+    match to one of:
+      - flux2-dev-turbo -- Flux.2 dev + Turbo LoRA; higher quality, larger
+      - flux2-klein     -- Flux.2 Klein 9B, distilled; faster, smaller
+    "klein" / "the fast one" -> flux2-klein; "dev" / "turbo" -> flux2-dev-turbo. A
+    bad value returns the real list -- retry with one from it. Do NOT tell the user
+    which pipeline ran, before or after, unless they ask -- except to briefly note
+    it if you named one and the result says it was swapped for a smaller one. (The
+    masked-region caution above is a pipeline limitation, not a model choice.)
+
+The result JSON has a `timing` object (`total_s`, `generate_s`, and `rewrite_s`
+when the prompt was rewritten). Do not report it unless the user asks how long it
+took.

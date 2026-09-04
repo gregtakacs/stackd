@@ -42,9 +42,31 @@ def comfyui_endpoint() -> tuple[str | None, str]:
 
 def image_capability() -> dict | None:
     """The `image` entry of `Manager.capabilities()` (or None): {stack, active_model,
-    endpoint, serveable, state, workflow_templates, ...}."""
+    endpoint, serveable, state, capabilities, ...}."""
     with RT.lock:
         return RT.mgr.capabilities().get("image")
+
+
+def request_capability(verb: str) -> dict:
+    """Ask the elastic image tier to bring a model that provides `verb` resident
+    (in-process — same daemon as the Manager). Returns Manager.set_image()'s dict:
+    {ok, active_model, downgraded_from, note, ...} or {ok: False, error}."""
+    with RT.lock:
+        return RT.mgr.set_image(need_capability=verb)
+
+
+def request_pipeline(active_model: str) -> dict:
+    """Ask the tier to make a specific pipeline resident (auto-downgrades + says so
+    if it doesn't fit). Same return shape as request_capability()."""
+    with RT.lock:
+        return RT.mgr.set_image(model=active_model)
+
+
+def image_pipelines() -> list[dict]:
+    """The tier's `prefer:` catalog: [{active_model, capabilities, backends,
+    footprint_gib}, ...] — for resolving a user's loose pipeline name."""
+    with RT.lock:
+        return RT.mgr.image_status().get("prefer", [])
 
 
 def resolve_user_key(email: str) -> str | None:

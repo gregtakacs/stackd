@@ -8,15 +8,16 @@ anyway, and the box is memory-tight).
 
 from __future__ import annotations
 
+import copy
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
-from stackd.config.models import Config
+from stackd.config.models import Budget, Config, EngineSpec, MediaTier, ModelSpec, Placement
 from stackd.engines.base import EngineState
 from stackd.engines.registry import adapter_for
 from stackd.runner import LaunchContext, Mount, Runner
-from stackd.solver import Placed, solve
-from stackd.state import RuntimeState, StackRuntime
+from stackd.solver import Placed, headroom, solve
+from stackd.state import ImageSlot, RuntimeState, StackRuntime
 
 _UNHEALTHY_LIMIT = 3
 
@@ -140,6 +141,246 @@ class Reconciler:
         self._emit("-", "drain", f"cuda drain timed out after {self.cuda_drain_timeout_s:.0f}s — proceeding")
         return True
 
+    # -------------------------------------------------------------- image tier ---
+    def _image_identity(self, tier: MediaTier, backend: str, active_model: str, device: str) -> list:
+        return [active_model, backend, device, asdict(tier.containers[backend])]
+
+    def _synth_image_model(self, tier: MediaTier, backend: str, active_model: str,
+                           caps: list[str]) -> ModelSpec:
+        """A throwaway ModelSpec so the ComfyUI engine adapter builds the LaunchSpec
+        the same way it does for any container — the checkpoint is chosen at
+        runtime, not declared."""
+        return ModelSpec(
+            model=f"image:{active_model}",
+            engine=EngineSpec(
+                template="comfyui",
+                model=active_model,
+                params={"active_model": active_model, "kind": tier.kind,
+                        "capabilities": list(caps), "port": 8188},
+                container=copy.deepcopy(tier.containers[backend]),
+            ),
+            budget=Budget(),
+            placement=Placement(),
+        )
+
+    def _dev_is_cuda(self, dev: str) -> bool:
+        d = self.cfg.devices.get(dev)
+        return bool(d) and d.backend.value == "cuda"
+
+    def _pick_image(self, tier: MediaTier, hr: dict[str, float], *,
+                    need_caps: list[str] | None = None, want_model: str | None = None):
+        """(device, backend, loadable) — the first `prefer:` entry that fits a
+        device with a matching backend, most-free device first. `want_model` /
+        `need_caps` narrow the candidates first. None if nothing fits."""
+        want = set(need_caps or [])
+        for ld in tier.prefer:
+            if want_model is not None and ld.active_model != want_model:
+                continue
+            if want and not want <= set(ld.capabilities):
+                continue
+            for backend in ld.backends:
+                fp = ld.footprint_gib.get(backend)
+                if fp is None:
+                    continue
+                for dev in sorted(
+                    (d for d in self.cfg.devices
+                     if self.cfg.devices[d].backend.value == backend),
+                    key=lambda d: -hr.get(d, 0.0),
+                ):
+                    if hr.get(dev, 0.0) + 1e-6 >= fp:
+                        return dev, backend, ld
+        return None
+
+    def _loadable(self, tier: MediaTier, active_model: str):
+        return next((l for l in tier.prefer if l.active_model == active_model), None)
+
+    def swap_image(self, state: RuntimeState, profile: str, *, model: str | None = None,
+                   need_caps: list[str] | None = None, now: float, pinned_by: str) -> dict:
+        """Programmatic image-tier swap — by explicit `model` or by `need_caps`
+        (the capability the caller needs resident). Auto-downgrades to the next
+        capable entry that fits and SAYS so; 409-style {ok:False} when nothing
+        capable fits. Never touches an LLM engine."""
+        self.events.clear()
+        tier = self.cfg.media.get("image")
+        if tier is None:
+            return {"ok": False, "error": "no image tier configured (config/media/image.yaml)"}
+        hr = headroom(self.cfg, profile, self.catalog, reserve_gib=tier.margin_gib)
+        hr_r = {k: round(v, 1) for k, v in hr.items()}
+        slot = state.image
+        live = slot is not None and slot.state in (EngineState.warming, EngineState.ready)
+
+        # already satisfied?
+        if live:
+            if model and slot.active_model == model:
+                return {"ok": True, "active_model": model, "device": slot.device,
+                        "warming": slot.state == EngineState.warming, "note": "already resident"}
+            if need_caps and set(need_caps) <= set(slot.capabilities):
+                return {"ok": True, "active_model": slot.active_model, "device": slot.device,
+                        "warming": slot.state == EngineState.warming,
+                        "note": f"resident model {slot.active_model!r} already provides "
+                                f"{', '.join(need_caps)}"}
+
+        pick = self._pick_image(tier, hr, need_caps=need_caps, want_model=model)
+        downgraded_from = None
+        if pick is None and model is not None:
+            req = self._loadable(tier, model)
+            if req is None:
+                return {"ok": False, "error": f"unknown image model {model!r}; "
+                        f"prefer: {[l.active_model for l in tier.prefer]}"}
+            pick = self._pick_image(tier, hr, need_caps=need_caps or list(req.capabilities))
+            if pick is not None:
+                downgraded_from = model
+        if pick is None:
+            what = (f"a model providing {', '.join(need_caps)}" if need_caps
+                    else f"model {model!r}" if model else "an image model")
+            return {"ok": False, "headroom": hr_r,
+                    "error": f"no {what} fits the headroom under profile {profile!r}"}
+
+        dev, backend, ld = pick
+        note = None
+        if downgraded_from:
+            dl = self._loadable(tier, downgraded_from)
+            fp = min(dl.footprint_gib.values()) if dl and dl.footprint_gib else None
+            note = (f"{downgraded_from} did not fit the free VRAM under profile "
+                    f"{profile!r}" + (f" (needs ~{fp:.0f} GiB)" if fp else "")
+                    + f" — using {ld.active_model} instead")
+
+        if live and slot.active_model == ld.active_model and slot.device == dev:
+            return {"ok": True, "active_model": ld.active_model, "device": dev,
+                    "warming": slot.state == EngineState.warming,
+                    "downgraded_from": downgraded_from,
+                    "note": note or "already resident", "headroom": hr_r}
+
+        # Same container, different checkpoint -> no bounce. One ComfyUI image runs
+        # every pipeline for its backend; the MCP picks the graph per request from
+        # `active_model`, and ComfyUI swaps the checkpoint itself. Just relabel the
+        # slot (the fit was already checked by _pick_image).
+        if (live and slot.backend == backend and slot.device == dev
+                and slot.container == tier.containers[backend].name):
+            slot.active_model = ld.active_model
+            slot.capabilities = list(ld.capabilities)
+            slot.since = now
+            slot.pinned_by = pinned_by
+            slot.identity = self._image_identity(tier, backend, ld.active_model, dev)
+            self._emit(f"image:{ld.active_model}", "reload", "pipeline swapped in place (same container)")
+            return {"ok": True, "active_model": ld.active_model, "device": dev, "backend": backend,
+                    "warming": slot.state == EngineState.warming, "in_place": True,
+                    "downgraded_from": downgraded_from, "note": note, "headroom": hr_r,
+                    "events": [f"{e.action} {e.stack}" for e in self.events]}
+
+        was_cuda = slot is not None and self._dev_is_cuda(slot.device)
+        if slot is not None:
+            self._teardown_image(state, now, why=f"swap to {ld.active_model}")
+        if self.cuda_drain_enabled and was_cuda and self._dev_is_cuda(dev):
+            self._drain_cuda([f"image:{model or ld.active_model}"])
+        self._spawn_image(state, tier, dev, backend, ld, now, pinned_by=pinned_by)
+
+        return {"ok": True, "active_model": ld.active_model, "device": dev, "backend": backend,
+                "warming": True, "downgraded_from": downgraded_from, "note": note,
+                "headroom": hr_r,
+                "events": [f"{e.action} {e.stack}" for e in self.events]}
+
+    def _spawn_image(self, state: RuntimeState, tier: MediaTier, device: str, backend: str,
+                     ld, now: float, *, pinned_by: str = "auto") -> None:
+        synth = self._synth_image_model(tier, backend, ld.active_model, ld.capabilities)
+        adapter = adapter_for(synth, self.cfg.devices[device])
+        spec = adapter.launch_spec(self._lc(device, 8188))
+        handle = self.runner.spawn(spec)
+        since = now
+        if state.image is not None and state.image.active_model == ld.active_model:
+            since = state.image.since or now
+        state.image = ImageSlot(
+            active_model=ld.active_model, kind=tier.kind, backend=backend, device=device,
+            container=spec.name, handle=handle, endpoint=adapter.endpoint(8188),
+            health_url=spec.health_url, state=EngineState.warming,
+            capabilities=list(ld.capabilities), started_at=now,
+            ready_timeout=spec.ready_timeout_s, since=since, pinned_by=pinned_by,
+            identity=self._image_identity(tier, backend, ld.active_model, device),
+        )
+        self._emit(f"image:{ld.active_model}", "spawn", f"{spec.name} on {device} ({backend})")
+
+    def _teardown_image(self, state: RuntimeState, now: float, *, why: str = "") -> None:
+        slot = state.image
+        if slot is None:
+            return
+        slot.intentional_stop = True
+        d = self.cfg.devices.get(slot.device)
+        grace = 5 if (d and d.backend.value == "cuda") else 30
+        if slot.handle or slot.container:
+            try:
+                self.runner.stop(slot.handle or slot.container, remove=True, timeout=grace)
+            except Exception as e:  # noqa: BLE001
+                self._emit(f"image:{slot.active_model}", "teardown-error", repr(e))
+        self._emit(f"image:{slot.active_model}", "teardown",
+                   f"remove ({slot.container}){' — ' + why if why else ''}")
+        state.image = None
+
+    def _reconcile_image(self, state: RuntimeState, profile: str, *, now: float,
+                         repick: bool) -> None:
+        tier = self.cfg.media.get("image")
+        if tier is None:
+            if state.image is not None:
+                self._teardown_image(state, now, why="no image tier configured")
+            return
+
+        slot = state.image
+        healthy = bool(slot and slot.handle
+                       and slot.state in (EngineState.warming, EngineState.ready))
+        if healthy and not repick:
+            want_id = self._image_identity(tier, slot.backend, slot.active_model, slot.device)
+            if slot.identity == want_id:
+                return
+            self._emit(f"image:{slot.active_model}", "reload", "image container spec changed")
+            self._teardown_image(state, now)
+            slot, healthy = None, False
+
+        hr = headroom(self.cfg, profile, self.catalog, reserve_gib=tier.margin_gib)
+        pick = self._pick_image(tier, hr)
+        if pick is None:
+            if slot is not None:
+                self._teardown_image(state, now, why="no headroom under the active profile")
+            else:
+                self._emit("image", "idle", "no device headroom for an image engine")
+            return
+
+        dev, backend, ld = pick
+        if (slot is not None and healthy and slot.active_model == ld.active_model
+                and slot.device == dev):
+            return
+        if slot is not None:
+            self._teardown_image(state, now)
+        self._spawn_image(state, tier, dev, backend, ld, now)
+
+    def _image_tick(self, state: RuntimeState, now: float) -> None:
+        slot = state.image
+        if slot is None or slot.handle is None:
+            return
+        code = self.runner.poll(slot.handle)
+        if code is not None and not slot.intentional_stop:
+            self._emit(f"image:{slot.active_model}", "crash", f"exit {code}")
+            state.image = None
+            return
+        if not slot.health_url:
+            return
+        healthy = self.runner.http_ok(slot.health_url)
+        if slot.state == EngineState.warming:
+            if healthy:
+                slot.state = EngineState.ready
+                slot.ready_at = now
+                slot.unhealthy_ticks = 0
+                self._emit(f"image:{slot.active_model}", "ready")
+            elif slot.started_at and now - slot.started_at > (slot.ready_timeout or 300.0):
+                self._emit(f"image:{slot.active_model}", "crash", "warmup timeout")
+                self._teardown_image(state, now)
+        elif slot.state == EngineState.ready:
+            if healthy:
+                slot.unhealthy_ticks = 0
+            else:
+                slot.unhealthy_ticks += 1
+                if slot.unhealthy_ticks >= _UNHEALTHY_LIMIT:
+                    self._emit(f"image:{slot.active_model}", "crash", "health flatlined")
+                    self._teardown_image(state, now)
+
     # ------------------------------------------------------------------ converge ---
     def converge(self, state: RuntimeState, target: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
@@ -161,7 +402,7 @@ class Reconciler:
         # An `adopt` container is compose-defined — stackd only start/stops it and never
         # holds its full create spec, so it cannot be recreated. An identity change on
         # one is almost always stackd-side metadata (comfyui `active_model` /
-        # `workflow_templates`, surfaced via /capabilities, not baked into the container):
+        # `capabilities`, surfaced via /capabilities, not baked into the container):
         # adopt the new identity in place, and only (re)start if it isn't running.
         adopt_changed = [n for n in changed if self.cfg.models[n].engine.container.adopt]
         reload_ = [n for n in changed if n not in adopt_changed]
@@ -174,6 +415,16 @@ class Reconciler:
         freed_cuda = [n for n in teardown + reload_
                       if n in state.stacks and _is_cuda(state.stacks[n].device)]
         spawns_on_cuda = any(_is_cuda(want[n].device) for n in spawn + reload_)
+
+        # LLM topology is changing -> the elastic image tier must give its VRAM
+        # back first (the new profile may need all of it; we can't know ahead of
+        # a real free). It rebuilds from headroom after the LLM stacks are placed.
+        llm_changed = bool(spawn or reload_ or teardown)
+        if llm_changed and state.image is not None:
+            if _is_cuda(state.image.device):
+                freed_cuda.append(f"image:{state.image.active_model}")
+                spawns_on_cuda = True
+            self._teardown_image(state, now, why=f"profile change to {target}")
 
         for n in current:  # re-tag kept
             if n in want and state.stacks[n].identity == want[n].identity:
@@ -197,7 +448,7 @@ class Reconciler:
             if not self._drain_cuda(freed_cuda):
                 if pl.unplaced:
                     self._emit("-", "unplaced", ", ".join(pl.unplaced))
-                return
+                return   # card wedging — don't pile the image tier on top either
 
         for n in adopt_changed:
             rt = state.stacks[n]
@@ -210,6 +461,11 @@ class Reconciler:
                 self._start(state, want[n], owner_of(n), now)
         for n in spawn + reload_:
             self._start(state, want[n], owner_of(n), now)
+
+        # The elastic image tier fills whatever VRAM is left. repick when the LLM
+        # set moved (choose afresh for the new headroom); otherwise only act if the
+        # slot is missing/unhealthy or its container spec changed under a reload.
+        self._reconcile_image(state, target, now=now, repick=llm_changed)
 
         # Backstop: any adopt-model container from *another* profile that is not
         # wanted here — stop it (compose may have auto-started it; e.g. the two
@@ -273,6 +529,11 @@ class Reconciler:
                         self._emit(name, "crash", "health flatlined")
                         self._schedule_restart(rt, now, "unhealthy")
                         rt.state = EngineState.error
+
+        # Image tier: advance its health, then refill the slot if it died or was
+        # never placed (e.g. boot_reset dropped it). No repick — sticky.
+        self._image_tick(state, now)
+        self._reconcile_image(state, state.active_profile, now=now, repick=False)
 
         return list(self.events)
 

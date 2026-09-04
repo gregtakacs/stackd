@@ -45,6 +45,33 @@ class StackRuntime:
 
 
 @dataclass
+class ImageSlot:
+    """The elastic image tier's single resident ComfyUI (config/media/image.yaml).
+    Not a profile member — stackd runs it in whatever device VRAM is left after
+    the active profile's LLM models are placed, and it stays put (sticky
+    `active_model`) until the profile changes or someone requests otherwise."""
+
+    active_model: str
+    kind: str = "image"
+    backend: str = ""
+    device: str = ""
+    container: str | None = None
+    handle: str | None = None
+    endpoint: str | None = None
+    health_url: str | None = None
+    state: EngineState = EngineState.down
+    capabilities: list = field(default_factory=list)
+    started_at: float | None = None
+    ready_at: float | None = None
+    ready_timeout: float = 300.0
+    unhealthy_ticks: int = 0
+    since: float | None = None            # when THIS active_model was chosen
+    pinned_by: str = "auto"              # auto | user | capability
+    identity: list = field(default_factory=list)
+    intentional_stop: bool = False
+
+
+@dataclass
 class RuntimeState:
     active_profile: str
     pinned: bool = False
@@ -52,6 +79,7 @@ class RuntimeState:
     last_switch_at: float | None = None
     last_served_at: float | None = None
     stacks: dict[str, StackRuntime] = field(default_factory=dict)
+    image: "ImageSlot | None" = None
 
     # --- persistence -------------------------------------------------------------
     @classmethod
@@ -69,6 +97,11 @@ class RuntimeState:
             for k, v in raw.get("stacks", {}).items()
         }
         raw["stacks"] = stacks
+        img = raw.get("image")
+        raw["image"] = (
+            ImageSlot(**{**img, "state": EngineState(img.get("state", "down"))})
+            if img else None
+        )
         return cls(**raw)
 
     def boot_reset(self) -> list[str]:
@@ -94,6 +127,14 @@ class RuntimeState:
                 rt.restarts = 0
                 rt.backoff_until = None
                 rt.unhealthy_ticks = 0
+        if self.image is not None and (
+            self.image.handle is None
+            or self.image.state in (EngineState.error, EngineState.down)
+        ):
+            dropped.append(f"image:{self.image.active_model}")
+            self.image = None
+        elif self.image is not None:
+            self.image.unhealthy_ticks = 0
         return dropped
 
     def save(self, path: str | pathlib.Path) -> None:
@@ -102,6 +143,9 @@ class RuntimeState:
         payload = asdict(self)
         for s in payload["stacks"].values():
             s["state"] = s["state"].value if isinstance(s["state"], EngineState) else s["state"]
+        if payload.get("image"):
+            st = payload["image"]["state"]
+            payload["image"]["state"] = st.value if isinstance(st, EngineState) else st
         fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
         with os.fdopen(fd, "w") as f:
             json.dump(payload, f, indent=2, default=str)

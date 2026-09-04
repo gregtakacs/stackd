@@ -207,6 +207,15 @@ def model_names() -> list[str]:
     return list(MODELS_MANIFEST["models"].keys())
 
 
+def tools_for(active_model: str) -> set[str]:
+    """The verbs (generate | edit | stylize | ...) that have a workflow graph for
+    this pipeline key. `_`-prefixed manifest keys (notes) are ignored. A verb whose
+    `edit` entry is masked-only still counts as supported -- `edit` is atomic at
+    the capability level; the tool returns a clean error for an unwired sub-mode."""
+    entry = MODELS_MANIFEST["models"].get(active_model) or {}
+    return {k for k in (entry.get("tools") or {}) if not k.startswith("_")}
+
+
 def default_model_name() -> str:
     return MODELS_MANIFEST.get("default") or model_names()[0]
 
@@ -250,6 +259,11 @@ def load_model(tool: str, model: str | None, fallback: str | None = None) -> tup
             f"Use one of: {', '.join(n for n, e in MODELS_MANIFEST['models'].items() if tool in (e.get('tools') or {}))}."
         )
     spec = tools[tool]
+    if "graph" not in spec:
+        raise ToolUnsupported(
+            f"Image model '{name}' has no whole-image {tool} graph "
+            f"(only a masked/inpaint variant is wired for it)."
+        )
     graph = _load_graph(spec["graph"])
     return name, graph, dict(spec.get("nodes") or {}), entry
 

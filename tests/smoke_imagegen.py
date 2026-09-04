@@ -11,6 +11,7 @@ a skip line and exits 0 so the stdlib-only host run stays green.
 from __future__ import annotations
 
 import asyncio
+import json
 import pathlib
 import sys
 
@@ -32,39 +33,105 @@ def check(name, cond):
     CHECKS.append((name, bool(cond)))
 
 
+_PREFER = [
+    {"active_model": "flux2-dev-turbo", "capabilities": ["generate", "stylize", "edit"],
+     "backends": ["cuda"], "footprint_gib": {"cuda": 34}},
+    {"active_model": "flux2-klein", "capabilities": ["generate", "stylize", "edit"],
+     "backends": ["cuda", "vulkan"], "footprint_gib": {"cuda": 24, "vulkan": 20}},
+]
+
+
 class _FakeMgr:
-    def __init__(self, image_entry):
+    def __init__(self, image_entry, swap=None):
         self._image = image_entry
+        self._swap = swap          # dict the fake set_image returns; also mutates _image on ok
 
     def capabilities(self):
         return {"active_profile": "everyday", "engines": [], "image": self._image, "video": None}
 
+    def image_status(self):
+        return {"resident": self._image, "headroom_gib": {"cuda0": 60.0}, "prefer": _PREFER}
+
+    def set_image(self, *, model=None, need_capability=None, now=None):
+        res = self._swap or {"ok": False, "error": "no capable image model available"}
+        if res.get("ok") and res.get("active_model"):
+            self._image = {"active_model": res["active_model"], "serveable": True,
+                           "capabilities": res.get("capabilities", ["generate", "stylize", "edit"]),
+                           "endpoint": "http://comfyui:8188"}
+        return res
+
     def comfyui_target(self, kind="image", *, now=None):
         if self._image and self._image.get("serveable"):
             return self._image["endpoint"], ""
-        return None, "image engine everyday-image not serveable (warming)"
+        if self._image:
+            return None, f"image engine image:{self._image['active_model']} not serveable (warming)"
+        return None, "no image engine resident (no headroom under the active profile)"
 
 
-def _mode(image_entry) -> str:
-    runtime.bind(_FakeMgr(image_entry), None, None)
-    return asyncio.run(tools._current_mode())
+def _resident(image_entry, tool="generate", swap=None):
+    runtime.bind(_FakeMgr(image_entry, swap), None, None)
+    return asyncio.run(tools._resident_model_for(tool))   # (active_model, note)
 
 
 def main() -> int:
-    # -- pipeline routing (_profile_for) ------------------------------------------
-    check("edit always routes to klein", tools._profile_for("edit", "everyday") == "flux2-klein")
-    check("generate in everyday -> dev-turbo", tools._profile_for("generate", "everyday") == "flux2-dev-turbo")
-    check("stylize in everyday -> dev-turbo", tools._profile_for("stylize", "everyday") == "flux2-dev-turbo")
-    check("generate in coding -> klein", tools._profile_for("generate", "coding") == "flux2-klein")
+    # -- resident-model selection (_resident_model_for) -------------------------
+    # No "coding"/"everyday" notion: whatever active_model is resident, if it
+    # declares the verb; otherwise escalate via the elastic image tier.
+    dev = {"active_model": "flux2-dev-turbo", "serveable": True,
+           "capabilities": ["generate", "stylize", "edit"], "endpoint": "http://comfyui-cuda:8188"}
+    klein = {"active_model": "flux2-klein", "serveable": True,
+             "capabilities": ["generate", "stylize", "edit"], "endpoint": "http://comfyui-rocm:8188"}
+    check("resident dev-turbo -> dev-turbo (generate)", _resident(dev, "generate")[0] == "flux2-dev-turbo")
+    check("resident dev-turbo -> dev-turbo (edit, no klein special-case)",
+          _resident(dev, "edit")[0] == "flux2-dev-turbo")
+    check("resident klein -> klein (stylize)", _resident(klein, "stylize")[0] == "flux2-klein")
+    check("satisfied path returns no note", _resident(dev, "generate")[1] is None)
 
-    # -- mode detection (_current_mode) off Manager.capabilities()["image"] ------
-    check("resident flux2-dev-turbo + serveable -> everyday",
-          _mode({"active_model": "flux2-dev-turbo", "serveable": True, "endpoint": "http://comfyui-cuda:8188"}) == "everyday")
-    check("resident flux2-klein + serveable -> coding",
-          _mode({"active_model": "flux2-klein", "serveable": True, "endpoint": "http://comfyui-rocm:8188"}) == "coding")
-    check("image engine not serveable -> coding (safe default)",
-          _mode({"active_model": "flux2-dev-turbo", "serveable": False, "endpoint": None}) == "coding")
-    check("no image engine at all -> coding", _mode(None) == "coding")
+    # verb missing -> escalate; tier brings a capable model up, note relayed
+    m, note = _resident(
+        {"active_model": "gen-only", "serveable": True, "capabilities": ["generate"], "endpoint": "x"},
+        "edit",
+        swap={"ok": True, "active_model": "flux2-klein", "note": "loaded flux2-klein instead"},
+    )
+    check("escalation swaps to a capable model", m == "flux2-klein")
+    check("escalation relays the tier note", note == "loaded flux2-klein instead")
+
+    # verb missing and the tier can't provide it -> ToolUnsupported
+    try:
+        _resident({"active_model": "gen-only", "serveable": True, "capabilities": ["generate"],
+                   "endpoint": "x"}, "edit",
+                  swap={"ok": False, "error": "no capable image model fits the headroom"})
+        check("tier can't provide the verb -> raises", False)
+    except tools.workflows.ToolUnsupported as e:
+        check("tier can't provide the verb -> raises", "headroom" in str(e))
+
+    try:
+        _resident(None, "generate", swap={"ok": False, "error": "no image tier"})
+        check("no image engine + no swap -> raises", False)
+    except tools.workflows.ToolUnsupported:
+        check("no image engine + no swap -> raises", True)
+
+    # -- image_model param: loose-name resolution (_resolve_pipeline) ----------
+    runtime.bind(_FakeMgr(dev), None, None)
+    check("exact name resolves", tools._resolve_pipeline("flux2-klein")[0] == "flux2-klein")
+    check("case/sep insensitive", tools._resolve_pipeline("Flux2 Klein")[0] == "flux2-klein")
+    check("substring: 'klein'", tools._resolve_pipeline("klein")[0] == "flux2-klein")
+    check("substring: 'turbo'", tools._resolve_pipeline("turbo")[0] == "flux2-dev-turbo")
+    check("token match: 'flux dev turbo'", tools._resolve_pipeline("flux dev turbo")[0] == "flux2-dev-turbo")
+    name, names = tools._resolve_pipeline("wan2.2")
+    check("no match -> (None, full list)", name is None and "flux2-klein" in names)
+    check("empty -> (None, list)", tools._resolve_pipeline("")[0] is None)
+
+    # -- _select_pipeline: empty passthrough / swap / bad name ----------------
+    runtime.bind(_FakeMgr(klein, swap={"ok": True, "active_model": "flux2-dev-turbo",
+                                       "note": "using flux2-klein instead"}), None, None)
+    err, note = asyncio.run(tools._select_pipeline(""))
+    check("empty image_model -> no-op", err is None and note is None)
+    err, note = asyncio.run(tools._select_pipeline("dev turbo"))
+    check("resolvable image_model -> swap, note relayed", err is None and note == "using flux2-klein instead")
+    err, note = asyncio.run(tools._select_pipeline("stable-diffusion-1.5"))
+    check("unresolvable image_model -> error json with the list",
+          err is not None and "available" in err and "flux2-klein" in err)
 
     # -- _comfy_base() bridges to comfyui_target() ------------------------------
     runtime.bind(_FakeMgr({"active_model": "flux2-dev-turbo", "serveable": True,
@@ -90,6 +157,14 @@ def main() -> int:
         check("all 3 tools registered on mcp", {"generate_image", "edit_image", "stylize_image"} <= listed)
     except Exception as e:  # SDK version differences in list_tools() shape
         check(f"mcp.list_tools() usable ({e})", True)  # non-fatal
+
+    # -- timing metrics in the success JSON --------------------------------------
+    tm = tools._timing(100.0, 101.0, 105.5)          # no rewrite
+    check("_timing: generate_s span", tm["generate_s"] == 4.5 and "rewrite_s" not in tm)
+    tm = tools._timing(100.0, 101.0, 105.0, rewrite_s=0.8)
+    check("_timing: rewrite_s included when nonzero", tm["rewrite_s"] == 0.8)
+    body = json.loads(tools._success_response("d", ["u"], timing={"total_s": 9.1, "generate_s": 8.0}))
+    check("_success_response carries timing", body["timing"]["generate_s"] == 8.0)
 
     # -- workflow data loads --------------------------------------------------
     check("ASPECT_PRESETS has square", workflows.ASPECT_PRESETS.get("square") == (1312, 1312))

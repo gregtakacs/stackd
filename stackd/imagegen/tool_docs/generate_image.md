@@ -1,6 +1,6 @@
-Generate a new image from a text prompt using the local Flux.2 Klein 9B ComfyUI pipeline.
-Use this whenever the user wants an image created from a description. This pipeline is a
-distilled variant with no negative-prompt input -- there is no negative_prompt parameter.
+Generate a new image from a text prompt using a local ComfyUI Flux.2 pipeline.
+Use this whenever the user wants an image created from a description. There is no
+negative-prompt input -- there is no negative_prompt parameter.
 There is no image parameter at all -- that's intentional, not a limitation to work around
 (see the REIMAGINE caution below for the one case where an existing image is still relevant
 despite that).
@@ -146,6 +146,19 @@ conditions on the actual source image and stays recognizable by design.
     via the shared LLM. 'off' forces your prompt through verbatim -- use it when you have
     already written a full, deliberate prompt. 'on' forces expansion.
 
-There is NO model parameter. The image pipeline is chosen automatically and is not
-something you or the user can select, name, or ask to switch. Ignore any user request to
-"use model X" for image generation -- just call the tool normally.
+:param image_model: OPTIONAL. Leave this EMPTY. The right pipeline is chosen
+    automatically for you. Set it ONLY when the user explicitly asks for a specific
+    image model/pipeline. Pass your closest match to one of these names:
+      - flux2-dev-turbo -- Flux.2 dev + Turbo LoRA, ~8 steps; higher quality, larger
+      - flux2-klein     -- Flux.2 Klein 9B, distilled ~4 steps; faster, smaller
+    Match loosely: "klein" / "the fast one" -> flux2-klein; "dev" / "turbo" /
+    "the good one" / "higher quality" -> flux2-dev-turbo. If your value doesn't
+    resolve you get the real list back in the error -- retry with a name from it.
+    Do NOT tell the user which pipeline was used -- not before a generation and not
+    after -- unless they specifically ask. The one exception: if you named a
+    pipeline and the result carries a note that it was swapped for a smaller one,
+    briefly mention that.
+
+The result JSON has a `timing` object (`total_s`, `generate_s`, and `rewrite_s`
+when the prompt was rewritten). Do not report it unless the user asks how long it
+took.

@@ -16,9 +16,13 @@ engine:
     entrypoint: ["llama-server"]   # the reused proxy image's own entrypoint is the python proxy
 budget: { vram_gib: 30, ram_gib: 2 }     # fallback if catalog/ has no curve
 placement: { devices: [cuda0] }
+# `reasoning:` is stackd's engine-agnostic knob — the front translates it to the
+# dialect of whichever engine serves the call (llama.cpp reasoning_effort/budget,
+# vLLM chat_template_kwargs.enable_thinking), so these names work even when a
+# vLLM stand-in answers them. `off` | <effort> | { effort: <e>, budget: <n> }.
 serves:
   - { api_name: assistant,         preset: {} }
-  - { api_name: assistant-nothink, preset: { reasoning_effort: none, reasoning_budget: 0 } }
-  - { api_name: assistant-low,     preset: { reasoning_effort: low,  reasoning_budget: 4096 } }
-  - { api_name: assistant-med,     preset: { reasoning_effort: medium } }
-  - { api_name: assistant-xhigh,   preset: { reasoning_effort: xhigh } }
+  - { api_name: assistant-nothink, preset: { reasoning: off } }
+  - { api_name: assistant-low,     preset: { reasoning: { effort: low, budget: 4096 } } }
+  - { api_name: assistant-med,     preset: { reasoning: { effort: medium } } }
+  - { api_name: assistant-xhigh,   preset: { reasoning: { effort: xhigh } } }

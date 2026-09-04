@@ -37,10 +37,12 @@ def mgr(runner=None, **kw) -> Manager:
 
 def ready_all(m: Manager, now_start: float = 0.0) -> float:
     now = now_start
-    for _ in range(6):
+    for _ in range(8):
         now += 5
         m.tick(now=now)
-        if all(s.state == EngineState.ready for s in m.state.stacks.values()):
+        stacks_ok = all(s.state == EngineState.ready for s in m.state.stacks.values())
+        img_ok = m.state.image is None or m.state.image.state == EngineState.ready
+        if stacks_ok and img_ok:
             break
     return now
 
@@ -48,15 +50,19 @@ def ready_all(m: Manager, now_start: float = 0.0) -> float:
 def t_converge_everyday() -> None:
     m = mgr()
     m.use("everyday", now=0)
-    check("everyday spawns 3 stacks", set(m.state.stacks) == {
-        "everyday-chat", "everyday-autocomplete", "everyday-image"})
+    check("everyday spawns 2 LLM stacks", set(m.state.stacks) == {
+        "everyday-chat", "everyday-autocomplete"})
     check("all warming after converge",
           all(s.state == EngineState.warming for s in m.state.stacks.values()))
+    check("elastic image tier placed dev-turbo on the RTX",
+          m.state.image is not None and m.state.image.active_model == "flux2-dev-turbo"
+          and m.state.image.device == "cuda0")
     ready_all(m)
-    check("all ready after ticks",
+    check("all LLM stacks ready after ticks",
           all(s.state == EngineState.ready for s in m.state.stacks.values()))
+    check("image slot ready after ticks", m.state.image.state == EngineState.ready)
     check("chat got a process port", m.state.stacks["everyday-chat"].port is not None)
-    check("image is a container", m.state.stacks["everyday-image"].kind == "container")
+    check("image slot has a container name", bool(m.state.image.container))
 
 
 def t_switch_to_coding_is_a_delta() -> None:
@@ -66,7 +72,9 @@ def t_switch_to_coding_is_a_delta() -> None:
     ac_handle = m.state.stacks["everyday-autocomplete"].handle
     m.use("coding", now=100)
     check("coding: chat torn down", "everyday-chat" not in m.state.stacks)
-    check("coding: image torn down", "everyday-image" not in m.state.stacks)
+    check("coding: image tier rebuilt as klein on the iGPU",
+          m.state.image is not None and m.state.image.active_model == "flux2-klein"
+          and m.state.image.device == "igpu0")
     check("coding: flash spawned", "coding-flash" in m.state.stacks)
     check("coding: autocomplete untouched (same handle)",
           m.state.stacks["everyday-autocomplete"].handle == ac_handle)
@@ -145,6 +153,42 @@ def t_reactive_entry_and_standin() -> None:
     r3 = m.route("coding-autocomplete", now=210)  # keep@igpu0 survivor
     check("autocomplete served by kept igpu0 stack", r3.status == "ok")
 
+    # an everyday reasoning name answered by the vLLM stand-in -> vLLM dialect
+    r_nt = m.route("assistant-nothink", now=212)
+    check("stand-in: reasoning:off -> vLLM enable_thinking=false",
+          r_nt.preset.get("chat_template_kwargs", {}).get("enable_thinking") is False
+          and "reasoning_budget" not in r_nt.preset)
+    r_lo = m.route("assistant-low", now=213)
+    check("stand-in: effort kept, llama.cpp budget dropped for vLLM",
+          r_lo.preset.get("reasoning_effort") == "low" and "reasoning_budget" not in r_lo.preset)
+
+
+def t_preset_translation() -> None:
+    from stackd.manager import _translate_preset
+    check("llamacpp reasoning:off",
+          _translate_preset({"reasoning": "off"}, "llamacpp-cuda")
+          == {"reasoning_effort": "none", "reasoning_budget": 0})
+    check("llamacpp effort+budget",
+          _translate_preset({"reasoning": {"effort": "low", "budget": 4096}}, "llamacpp-cuda")
+          == {"reasoning_effort": "low", "reasoning_budget": 4096})
+    check("llamacpp bare-string effort",
+          _translate_preset({"reasoning": "xhigh"}, "llamacpp-vulkan")
+          == {"reasoning_effort": "xhigh"})
+    check("vllm reasoning:off -> enable_thinking:false",
+          _translate_preset({"reasoning": "off"}, "vllm-cuda")
+          == {"chat_template_kwargs": {"enable_thinking": False}})
+    check("vllm effort kept, budget dropped",
+          _translate_preset({"reasoning": {"effort": "medium", "budget": 8192}}, "vllm-cuda")
+          == {"reasoning_effort": "medium"})
+    check("no reasoning key -> passthrough",
+          _translate_preset({"temperature": 0.2}, "vllm-cuda") == {"temperature": 0.2})
+    check("raw reasoning_effort -> passthrough (no double-translate)",
+          _translate_preset({"reasoning_effort": "high"}, "vllm-cuda")
+          == {"reasoning_effort": "high"})
+    check("vllm off merges into existing chat_template_kwargs",
+          _translate_preset({"reasoning": "off", "chat_template_kwargs": {"foo": 1}}, "vllm-cuda")
+          == {"chat_template_kwargs": {"foo": 1, "enable_thinking": False}})
+
 
 def t_cuda_drain_barrier() -> None:
     """Switching everyday->coding tears down the 27B on cuda0 then allocates
@@ -189,78 +233,72 @@ def t_tick_sweeps_stray_stacks() -> None:
     m.tick(now=200)
     check("tick swept the stray coding-flash", "coding-flash" not in m.state.stacks)
     check("everyday reconverged after sweep",
-          {"everyday-chat", "everyday-image"} <= set(m.state.stacks))
+          {"everyday-chat", "everyday-autocomplete"} <= set(m.state.stacks))
 
 
-def t_comfyui_is_stackd_created() -> None:
-    """Both ComfyUIs are created by stackd from config (no `adopt`) — image, GPU
-    wiring, per-container devices/shm and the shared traefik labels come through."""
+def t_image_tier_is_stackd_created() -> None:
+    """The elastic image tier's per-backend containers are stackd-created (no
+    adopt) — image tag, GPU wiring, /dev/kfd, shm, shared scratch all flow through
+    the synthesized ModelSpec + the ComfyUI adapter."""
     cfg = load_config(CFG)
     rec = Reconciler(cfg, FakeRunner())
+    tier = cfg.media["image"]
 
-    for mn, dev, want_img, want_dev in [
-        ("everyday-image", "cuda0", "yanwk/comfyui-boot", None),
-        ("coding-image", "igpu0", "comfyui-rocm", "/dev/kfd"),
-    ]:
-        m = cfg.models[mn]
-        check(f"{mn}: not adopt", m.engine.container.adopt is False)
-        spec = adapter_for(m, cfg.devices[dev]).launch_spec(rec._lc(dev, 8188))
-        check(f"{mn}: image set", spec.image and want_img in spec.image)
-        check(f"{mn}: generic config ships no reverse-proxy labels", spec.labels == {})
-        if want_dev:
-            check(f"{mn}: {want_dev} device path", want_dev in spec.device_paths)
+    synth = rec._synth_image_model(tier, "cuda", "flux2-dev-turbo", ["generate", "edit"])
+    check("cuda container not adopt", synth.engine.container.adopt is False)
+    spec = adapter_for(synth, cfg.devices["cuda0"]).launch_spec(rec._lc("cuda0", 8188))
+    check("cuda: stock ComfyUI image", spec.image and "yanwk/comfyui-boot" in spec.image)
+    check("cuda: generic config ships no reverse-proxy labels", spec.labels == {})
+    check("cuda: stock image has no build recipe", synth.engine.container.build is None)
 
-    # labels are still a real feature — set on a synthetic model, they pass through
-    ei = cfg.models["everyday-image"]
-    ei.engine.container.labels = {"traefik.enable": "true", "x.port": "${SOME_PORT}"}
-    lspec = adapter_for(ei, cfg.devices["cuda0"]).launch_spec(rec._lc("cuda0", 8188))
-    check("container.labels pass through to the LaunchSpec", lspec.labels.get("traefik.enable") == "true")
-    ei.engine.container.labels = {}
+    synthv = rec._synth_image_model(tier, "vulkan", "flux2-klein", ["generate", "edit"])
+    specv = adapter_for(synthv, cfg.devices["igpu0"]).launch_spec(rec._lc("igpu0", 8188))
+    check("vulkan: local comfyui-rocm image", specv.image and "comfyui-rocm" in specv.image)
+    check("vulkan: /dev/kfd device path", "/dev/kfd" in specv.device_paths)
+    check("vulkan: renderD128 from the vulkan device_profile",
+          "/dev/dri/renderD128" in specv.device_paths)
+    check("vulkan: shm_size 8g override", specv.shm_size == "8g")
+    check("vulkan: seccomp from the vulkan device_profile",
+          "seccomp:unconfined" in specv.security_opt)
+    check("vulkan: build recipe present",
+          synthv.engine.container.build is not None
+          and synthv.engine.container.build.dockerfile == "Dockerfile.igpu")
 
-    ci = cfg.models["coding-image"]
-    spec = adapter_for(ci, cfg.devices["igpu0"]).launch_spec(rec._lc("igpu0", 8188))
-    check("coding-image: renderD128 from vulkan profile", "/dev/dri/renderD128" in spec.device_paths)
-    check("coding-image: shm_size 8g override", spec.shm_size == "8g")
-    check("coding-image: seccomp from vulkan profile", "seccomp:unconfined" in spec.security_opt)
+    def _scratch(s):
+        return sorted(x.host_path for x in s.mounts if "/scratch/" in x.host_path)
+    check("cuda + vulkan share scratch host paths", _scratch(spec) == _scratch(specv))
 
-    # coding-image carries a `stackctl build` recipe; everyday-image (stock image) doesn't
-    check("coding-image: build recipe present", ci.engine.container.build is not None
-          and ci.engine.container.build.dockerfile == "Dockerfile.igpu")
-    check("everyday-image: no build recipe", cfg.models["everyday-image"].engine.container.build is None)
-
-    # both ComfyUIs mount the SAME host scratch dir (they never run together)
-    def _scratch(mn):
-        m = cfg.models[mn]
-        sp = adapter_for(m, cfg.devices[m.placement.devices[0]]).launch_spec(
-            rec._lc(m.placement.devices[0], 8188))
-        return sorted(x.host_path for x in sp.mounts if "/scratch/" in x.host_path)
-    check("everyday + coding share scratch host paths", _scratch("everyday-image") == _scratch("coding-image"))
+    tier.containers["cuda"].labels = {"traefik.enable": "true"}
+    lspec = adapter_for(rec._synth_image_model(tier, "cuda", "flux2-klein", []),
+                        cfg.devices["cuda0"]).launch_spec(rec._lc("cuda0", 8188))
+    check("container.labels pass through to the LaunchSpec",
+          lspec.labels.get("traefik.enable") == "true")
+    tier.containers["cuda"].labels = {}
 
 
-def t_identity_covers_container_spec() -> None:
-    """A ${VAR}/.env edit that lands in the `container:` block (image, env, mount,
-    label, …) changes model_identity -> converge recreates the engine on reload,
-    no `docker rm -f`."""
-    from stackd.solver import model_identity
+def t_image_identity_covers_container_spec() -> None:
+    """A ${VAR}/.env edit landing in the image tier's container block changes the
+    slot identity -> the next converge rebuilds the ComfyUI even with no LLM
+    change, no `docker rm -f`."""
     cfg = load_config(CFG)
-    base = model_identity(cfg, "everyday-image", "cuda0")
-    cfg.models["everyday-image"].engine.container.image = "some/other:tag"
-    check("image change -> new identity", model_identity(cfg, "everyday-image", "cuda0") != base)
-    cfg.models["everyday-image"].engine.container.image = None
-    cfg.models["everyday-image"].engine.container.env["RELOAD_TEST"] = "1"
-    check("env change -> new identity", model_identity(cfg, "everyday-image", "cuda0") != base)
+    rec = Reconciler(cfg, FakeRunner())
+    tier = cfg.media["image"]
+    base = rec._image_identity(tier, "cuda", "flux2-dev-turbo", "cuda0")
+    tier.containers["cuda"].env["RELOAD_TEST"] = "1"
+    check("container env change -> new image identity",
+          rec._image_identity(tier, "cuda", "flux2-dev-turbo", "cuda0") != base)
 
-    # and the reconciler acts on it: changed identity -> reload_ (stop+remove, respawn)
     fake = FakeRunner(ready_after=1)
     m = mgr(fake)
     m.use("everyday", now=0)
     ready_all(m)
-    cn = m.state.stacks["everyday-image"].container            # "comfyui-cuda"
-    m.cfg.models["everyday-image"].engine.container.env["RELOAD_TEST"] = "1"   # simulate a reload edit
-    ev = m.rec.converge(m.state, "everyday", now=200) or m.rec.events
-    check("engine removed on spec change", cn in fake.removed)
-    check("engine respawned fresh", m.state.stacks["everyday-image"].container == cn
-          and m.state.stacks["everyday-image"].state != EngineState.ready)
+    cn = m.state.image.container
+    m.cfg.media["image"].containers["cuda"].env["RELOAD_TEST"] = "1"   # simulate a reload edit
+    m.rec.converge(m.state, "everyday", now=200)
+    check("image container removed on spec change", cn in fake.removed)
+    check("image slot respawned fresh",
+          m.state.image is not None and m.state.image.container == cn
+          and m.state.image.state != EngineState.ready)
 
 
 def t_reload_config() -> None:
@@ -292,6 +330,112 @@ def t_reload_config() -> None:
           m.cfg.pools["host_unified"].host_reserve_gib == 12)
 
 
+def t_image_tier_scheduler() -> None:
+    """The elastic image tier: sticky within a profile, rebuilt from headroom on a
+    switch, torn down before the LLMs spawn, and never at an LLM's expense."""
+    fake = FakeRunner(ready_after=1)
+    m = mgr(fake)
+    m.use("everyday", now=0)
+    ready_all(m)
+    slot0 = m.state.image
+    check("everyday -> dev-turbo on cuda0", slot0.active_model == "flux2-dev-turbo"
+          and slot0.device == "cuda0")
+    h0 = slot0.handle
+
+    # sticky: a no-op converge on the same profile leaves the slot alone
+    m.rec.converge(m.state, "everyday", now=50)
+    check("no-op converge doesn't touch the image slot", m.state.image.handle == h0)
+
+    # switch: image torn down BEFORE coding-flash spawns, then rebuilt from the
+    # new headroom (klein on the iGPU — vLLM claims the RTX)
+    ev = m.use("coding", now=100)
+    order = [e.action for e in ev if e.stack.startswith("image:") or e.stack == "coding-flash"]
+    check("image teardown emitted on the switch", "teardown" in order)
+    check("image rebuilt as klein on the iGPU",
+          m.state.image.active_model == "flux2-klein" and m.state.image.device == "igpu0")
+    ready_all(m, now_start=100)
+    check("coding LLM + image both ready",
+          m.state.stacks["coding-flash"].state == EngineState.ready
+          and m.state.image.state == EngineState.ready)
+
+    # crash: tick clears the dead slot and the same tick refills it
+    m.state.image.handle = None
+    m.state.image.state = EngineState.error
+    m.tick(now=500)
+    check("tick respawned the crashed image slot",
+          m.state.image is not None and m.state.image.handle is not None)
+
+    # boot_reset drops a handle-less slot; the next tick brings it back
+    m.state.image.handle = None
+    dropped = m.state.boot_reset()
+    check("boot_reset drops the dead image slot",
+          m.state.image is None and any(d.startswith("image:") for d in dropped))
+    m.tick(now=600)
+    check("tick refills the slot after boot_reset", m.state.image is not None)
+
+
+def t_image_tier_no_headroom() -> None:
+    """A profile that fills every device leaves no image tier — and the MCP path
+    says why instead of pointing at a nonexistent engine."""
+    m = mgr(FakeRunner(ready_after=1))
+    # coding: vLLM claims ~90/96 on cuda0; shrink the iGPU budget so klein won't fit
+    m.cfg.media["image"].prefer[1].footprint_gib["vulkan"] = 999.0
+    m.use("coding", now=0)
+    ready_all(m)
+    check("no image slot when nothing fits", m.state.image is None)
+    check("capabilities.image is None", m.capabilities()["image"] is None)
+    ep, why = m.comfyui_target()
+    check("comfyui_target explains the lack of headroom",
+          ep is None and "headroom" in why)
+
+
+def t_image_swap() -> None:
+    """Manager.set_image — explicit model swap, capability request, auto-downgrade
+    with a surfaced note, and a 409 when nothing capable fits."""
+    m = mgr(FakeRunner(ready_after=1))
+    m.use("everyday", now=0)
+    ready_all(m)
+    check("resident starts as dev-turbo", m.state.image.active_model == "flux2-dev-turbo")
+
+    h0 = m.state.image.handle
+    r = m.set_image(model="flux2-klein", now=10)
+    check("explicit swap ok", r["ok"] and r["active_model"] == "flux2-klein")
+    check("swap marks the slot user-pinned", m.state.image.pinned_by == "user")
+    check("same-container swap is in-place (no bounce)",
+          r.get("in_place") is True and m.state.image.handle == h0)
+    ready_all(m, now_start=10)
+
+    r = m.set_image(model="flux2-klein", now=20)
+    check("swap to the resident model is a no-op", r["ok"] and "already resident" in (r.get("note") or ""))
+
+    # a capability the resident model already covers -> no-op
+    r = m.set_image(need_capability="edit", now=25)
+    check("capability already covered -> no-op", r["ok"] and "already provides" in (r.get("note") or ""))
+
+    # downgrade: resident is klein; ask for dev-turbo but make it not fit
+    m2 = mgr(FakeRunner(ready_after=1))
+    m2.use("everyday", now=0)
+    ready_all(m2)
+    m2.set_image(model="flux2-klein", now=5)          # resident := klein
+    ready_all(m2, now_start=5)
+    m2.cfg.media["image"].prefer[0].footprint_gib["cuda"] = 999.0
+    r = m2.set_image(model="flux2-dev-turbo", now=30)
+    check("downgrade: served a smaller capable model",
+          r["ok"] and r["active_model"] == "flux2-klein"
+          and r["downgraded_from"] == "flux2-dev-turbo")
+    check("downgrade: note explains it", "did not fit" in (r.get("note") or ""))
+
+    # 409: nothing capable fits at all
+    m2.cfg.media["image"].prefer[1].footprint_gib["cuda"] = 999.0
+    m2.cfg.media["image"].prefer[1].footprint_gib["vulkan"] = 999.0
+    r = m2.set_image(model="flux2-dev-turbo", now=40)
+    check("no fit -> not ok + headroom reported",
+          r["ok"] is False and "headroom" in r and "fit" in r["error"])
+
+    r = m2.set_image(need_capability="teleport", now=45)
+    check("unknown capability -> not ok", r["ok"] is False)
+
+
 def t_reactive_entry_refused_when_not_outranking() -> None:
     m = mgr(FakeRunner(ready_after=1))
     m.use("coding", now=0)
@@ -312,10 +456,14 @@ def main() -> int:
         t_idle_self_evict,
         t_pin_blocks_self_evict,
         t_reactive_entry_and_standin,
+        t_preset_translation,
         t_cuda_drain_barrier,
         t_tick_sweeps_stray_stacks,
-        t_comfyui_is_stackd_created,
-        t_identity_covers_container_spec,
+        t_image_tier_is_stackd_created,
+        t_image_identity_covers_container_spec,
+        t_image_tier_scheduler,
+        t_image_tier_no_headroom,
+        t_image_swap,
         t_reload_config,
         t_reactive_entry_refused_when_not_outranking,
     ]:

@@ -1,5 +1,5 @@
 Apply one or more curated, hand-tuned adjustments to an existing image in a single
-generation, using the local Flux.2 Klein 9B ComfyUI pipeline. This is NOT a
+generation, using a local ComfyUI Flux.2 pipeline. This is NOT a
 free-text style/transformation tool -- there is no prompt parameter, every adjustment comes
 from the fixed menu below, and it cannot apply anything that isn't already in that menu.
 
@@ -139,7 +139,17 @@ against a single denoise value the way img2img does.
     (not an absolute width/height). Default 1.0 (no upscale). Values above 1.0 increase
     output resolution and detail at the cost of more VRAM/time.
 :param seed: Fixed seed for reproducibility, or -1 for a random seed.
-There is NO model parameter. The stylize pipeline is chosen automatically and is not
-something you or the user can select or name. Ignore any user request to "use model X" --
-just call the tool normally. Composition is always held (denoise-1 + ReferenceLatent);
-only the requested treatment changes.
+:param image_model: OPTIONAL. Leave this EMPTY -- the pipeline is chosen for you.
+    Set it ONLY when the user explicitly asks for a specific image model. Closest
+    match to one of:
+      - flux2-dev-turbo -- Flux.2 dev + Turbo LoRA; higher quality, larger
+      - flux2-klein     -- Flux.2 Klein 9B, distilled; faster, smaller
+    "klein" / "the fast one" -> flux2-klein; "dev" / "turbo" -> flux2-dev-turbo. A
+    bad value returns the real list -- retry with one from it. Do NOT tell the user
+    which pipeline ran, before or after, unless they ask -- except to briefly note
+    it if you named one and the result says it was swapped for a smaller one.
+    Composition is always held (denoise-1 + ReferenceLatent); only the requested
+    treatment changes.
+
+The result JSON has a `timing` object (`total_s`, `generate_s`). Do not report it
+unless the user asks how long it took.

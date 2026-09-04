@@ -118,36 +118,83 @@ def _load_prompt_file(name: str) -> str:
 
 
 # -----------------------------------------------------------------------------
-# Model selection is NOT exposed. The MCP picks the pipeline purely from which
-# stackd profile is live -- read from Manager.capabilities()["image"], which knows
-# the resident image engine AND whether it is serveable *right now* (not mid-swap):
-#
-#   coding mode   (vLLM owns the RTX): flux2-klein on comfyui-rocm / the iGPU for
-#                 generate + stylize + edit.
-#   everyday mode (RTX has room): flux2-dev-turbo on comfyui-cuda for generate +
-#                 stylize; flux2-klein on the iGPU for edit.
+# Model selection is NOT exposed. The MCP runs against whichever image engine the
+# live stackd profile has resident -- read from Manager.capabilities()["image"],
+# which carries the pipeline key (`active_model`), the verbs it offers
+# (`capabilities`), and whether it is serveable *right now* (not mid-swap). The MCP
+# has no notion of "coding" vs "everyday": it just uses the resident model and
+# errors cleanly if that model does not declare the requested verb.
 #
 # No `model=` argument, no sticky state, no per-chat memory -- callers/users have
 # no say and no visibility into which pipeline ran.
 # -----------------------------------------------------------------------------
 
 
-async def _current_mode() -> str:
-    """'everyday' if stackd's resident, serveable image engine is a flux2-dev* pipeline,
-    else 'coding' (klein). Reads Manager.capabilities()["image"] in-process."""
-    cap = runtime.image_capability()
-    if cap and cap.get("serveable"):
-        model = (cap.get("active_model") or "").lower()
-        return "everyday" if model.startswith("flux2-dev") else "coding"
-    return "coding"
+def _resolve_pipeline(q: str) -> tuple[str | None, list[str]]:
+    """Map a caller's loose pipeline name to an exact `prefer:` entry. Returns
+    (active_model | None, all_names). Match order: exact, separator/case-insensitive,
+    then substring either way (so 'klein' -> flux2-klein, 'turbo' -> flux2-dev-turbo).
+    The LLM does the semantic step ('the fast one' -> 'flux2-klein') before calling."""
+    names = [p["active_model"] for p in runtime.image_pipelines()]
+    if not q:
+        return None, names
+    norm = lambda s: s.strip().lower().replace("_", "-").replace(" ", "-")
+    nq = norm(q)
+    for n in names:
+        if norm(n) == nq:
+            return n, names
+    hits = [n for n in names if nq in norm(n) or norm(n) in nq]
+    if len(hits) == 1:
+        return hits[0], names
+    toks = [t for t in nq.replace("-", " ").split() if t]
+    tokhits = [n for n in names if toks and all(t in norm(n) for t in toks)]
+    return (tokhits[0] if len(tokhits) == 1 else None), names
 
 
-def _profile_for(tool: str, mode: str) -> str:
-    """models.json profile for a tool call. edit is always klein-on-iGPU;
-    generate/stylize follow the mode."""
-    if tool == "edit":
-        return "flux2-klein"
-    return "flux2-dev-turbo" if mode == "everyday" else "flux2-klein"
+async def _select_pipeline(image_model: str) -> tuple[str | None, str | None]:
+    """Handle a tool's optional `image_model` arg: resolve it, ask the tier to make
+    it resident, return (error_json | None, note). ('', None) when unset."""
+    if not (image_model or "").strip():
+        return None, None
+    name, choices = _resolve_pipeline(image_model)
+    if name is None:
+        return json.dumps({
+            "error": f"no image pipeline matches {image_model!r}. Available: {', '.join(choices)}.",
+            "available": choices,
+        }), None
+    res = runtime.request_pipeline(name)
+    if not res.get("ok"):
+        return json.dumps({"error": res.get("error", f"could not load {name!r}"),
+                           "available": choices}), None
+    return None, res.get("note")
+
+
+async def _resident_model_for(tool: str) -> tuple[str, str | None]:
+    """(active_model, note) for the image pipeline that will serve `tool`. If the
+    resident model doesn't declare `tool`, ask the elastic image tier to bring a
+    capable one up (auto-downgrading if the best doesn't fit — `note` says so).
+    Raises workflows.UnknownModel / workflows.ToolUnsupported (each tool catches
+    both -> a JSON error) when nothing capable can be made resident."""
+    cap = runtime.image_capability() or {}
+    model = cap.get("active_model")
+    if model and tool in (cap.get("capabilities") or []):
+        return model, None
+
+    res = runtime.request_capability(tool)
+    if not res.get("ok"):
+        raise workflows.ToolUnsupported(
+            res.get("error")
+            or f"no resident image model provides {tool!r} and none could be loaded"
+        )
+    cap = runtime.image_capability() or {}
+    model = cap.get("active_model")
+    if not model:
+        raise workflows.UnknownModel("no image engine is resident in the active stackd profile")
+    if tool not in (cap.get("capabilities") or []):
+        raise workflows.ToolUnsupported(
+            f"the image tier loaded {model!r}, which still does not provide {tool!r}"
+        )
+    return model, res.get("note")
 
 
 async def _maybe_rewrite(
@@ -444,7 +491,19 @@ async def _autodetect_source_aspect(ctx: Context, api_key: str) -> tuple[int, in
         return None
 
 
-def _success_response(detail: str, urls: list[str]) -> str:
+def _timing(t0: float, gen0: float, gen1: float, rewrite_s: float = 0.0) -> dict:
+    """Wall-clock breakdown for a tool call. `total_s` covers the whole call;
+    `generate_s` is just the ComfyUI submit -> images span (the model run);
+    `rewrite_s` (omitted when 0) is the prompt-rewrite LLM call."""
+    out = {"total_s": round(time.monotonic() - t0, 2),
+           "generate_s": round(gen1 - gen0, 2)}
+    if rewrite_s:
+        out["rewrite_s"] = round(rewrite_s, 2)
+    return out
+
+
+def _success_response(detail: str, urls: list[str], *, note: str | None = None,
+                      timing: dict | None = None) -> str:
     """Builds the JSON a tool call returns on success. There is no __event_emitter__
     available here to push a 'chat:message:files' event and make the image display
     automatically -- an MCP tool's return value is just text the calling model reads
@@ -462,10 +521,14 @@ def _success_response(detail: str, urls: list[str]) -> str:
     reasoning" framing below is a low-cost nudge in that direction.
     """
     image_md = "\n".join(f"![Image]({u})" for u in urls)
+    if note:
+        detail = f"{detail} (note: {note})"
     return json.dumps(
         {
             "status": "success",
             "detail": detail,
+            "image_model_note": note,
+            "timing": timing,
             "images": [{"url": u} for u in urls],
             "message": (
                 f"{detail} Done reasoning -- write your final reply to the user now "
@@ -776,15 +839,22 @@ async def generate_image(
     height: int = 0,
     seed: int = -1,
     rewrite_prompt: str = "auto",
+    image_model: str = "",
 ) -> str:
-    """Text-to-image. The pipeline is chosen automatically from the current mode
-    (see _profile_for). LLM-facing description: tool_docs/generate_image.md (this
-    docstring is never sent to the model -- see _load_tool_doc's own comment)."""
+    """Text-to-image on the resident image pipeline (or `image_model` if the user
+    named one). LLM-facing description: tool_docs/generate_image.md (this docstring
+    is never sent to the model -- see _load_tool_doc's own comment)."""
     if not prompt:
         return json.dumps({"error": "prompt is required (no chat-history fallback available over MCP)."})
 
-    profile = _profile_for("generate", await _current_mode())
+    t0 = time.monotonic()
+    rewrite_s = 0.0
+    err, model_note = await _select_pipeline(image_model)
+    if err:
+        return err
     try:
+        profile, verb_note = await _resident_model_for("generate")
+        model_note = model_note or verb_note
         model_name, graph, nodes, entry = workflows.load_model("generate", profile)
     except (workflows.UnknownModel, workflows.ToolUnsupported) as e:
         return json.dumps({"error": str(e)})
@@ -821,6 +891,7 @@ async def generate_image(
 
     seed = seed if seed >= 0 else random.randint(0, 2**31 - 1)
 
+    _rw0 = time.monotonic()
     final_prompt, rw_note = await _maybe_rewrite(
         entry.get("prompt_rewrite") or {},
         prompt,
@@ -830,6 +901,7 @@ async def generate_image(
         width=w,
         height=h,
     )
+    rewrite_s = time.monotonic() - _rw0
     if rw_note:
         notes.append(rw_note)
 
@@ -843,6 +915,7 @@ async def generate_image(
     if not comfy_base:
         return json.dumps({"error": base_note})
 
+    _g0 = time.monotonic()
     try:
         prompt_id = await comfyui_client.submit_workflow(graph, base=comfy_base)
         images_by_node = await comfyui_client.wait_and_fetch(prompt_id, {save_node}, base=comfy_base)
@@ -852,6 +925,7 @@ async def generate_image(
     except TimeoutError as e:
         logger.exception("generate_image: timed out waiting for ComfyUI")
         return json.dumps({"error": str(e)})
+    _g1 = time.monotonic()
 
     images_raw = images_by_node.get(save_node, [])
     if not images_raw:
@@ -868,7 +942,8 @@ async def generate_image(
         detail += " (this pipeline's graph is not yet live-validated on this install)"
     if notes:
         detail += " " + " ".join(notes)
-    return _success_response(detail, urls)
+    return _success_response(detail, urls, note=model_note,
+                             timing=_timing(t0, _g0, _g1, rewrite_s))
 
 
 # -----------------------------------------------------------------------------
@@ -1014,22 +1089,24 @@ async def edit_image(
     preserve_scene_context: bool = True,
     edge_softness: int = 28,
     rewrite_prompt: str = "auto",
+    image_model: str = "",
 ) -> str:
-    """Targeted image edit (whole-image or masked). Routing (see _current_mode /
-    the target_region branch below): a MASKED edit in everyday mode runs on
-    flux2-dev-turbo on the eGPU (CLIPSeg auto-mask + inpaint, ~15-20s, tuned in
-    edit/flux2-dev-turbo-inpaint.json); every other case -- whole-image edits, and
-    anything in coding mode -- stays on flux2-klein on the iGPU. LLM-facing
-    description: tool_docs/edit_image.md (never sent to the model -- see
-    _load_tool_doc).
+    """Targeted image edit (whole-image or masked). Runs on whichever image model
+    the live stackd profile has resident (or `image_model` if the user named one):
+    a MASKED edit (target_region set) uses
+    that model's builtin CLIPSeg auto-mask + inpaint graph; a whole-image edit uses
+    its `edit` graph. If the resident model wires only one of those, the other
+    returns a clean error. LLM-facing description: tool_docs/edit_image.md (never
+    sent to the model -- see _load_tool_doc).
 
-    Note: the dev-turbo inpaint graph skips ColorMatchV2 (it cast a colour tint
-    + halo on real colour changes), so color_correct_strength is a no-op on that
-    path -- still honoured by the klein graph. preserve_scene_context works
-    normally on both."""
+    Note: some inpaint graphs skip ColorMatchV2 (it cast a colour tint + halo on
+    real colour changes), so color_correct_strength can be a no-op on that path --
+    still honoured by the klein graph. preserve_scene_context works normally."""
     if not prompt:
         return json.dumps({"error": "prompt is required (no chat-history fallback available over MCP)."})
 
+    t0 = time.monotonic()
+    rewrite_s = 0.0
     target_region = (target_region or "").strip()
 
     # TEMP diagnostic (2026-09-02): masked "convert to blue Audi R8" kept failing
@@ -1048,13 +1125,15 @@ async def edit_image(
             prompt, seed, rewrite_prompt, aspect_ratio, width, height,
         )
 
-    # Masked (target_region) edits run on flux2-dev-turbo on the eGPU in everyday
-    # mode -- much faster to iterate on than the emulated-fp8 iGPU. Whole-image
-    # edits, and any edit in coding mode, stay on flux2-klein on the iGPU.
-    if target_region and (await _current_mode()) == "everyday":
-        model_name = "flux2-dev-turbo"
-    else:
-        model_name = "flux2-klein"
+    err, model_note = await _select_pipeline(image_model)
+    if err:
+        return err
+    # Both masked and whole-image edits run on the resident image model.
+    try:
+        model_name, verb_note = await _resident_model_for("edit")
+        model_note = model_note or verb_note
+    except (workflows.UnknownModel, workflows.ToolUnsupported) as e:
+        return json.dumps({"error": str(e)})
     _n, model_meta = workflows.model_entry(model_name)
     edit_spec = ((model_meta.get("tools") or {}).get("edit")) or {}
 
@@ -1156,6 +1235,7 @@ async def edit_image(
         # original-object tokens don't fight the inpaint (see _describe_edit_target).
         final_prompt = _describe_edit_target(prompt)
     else:
+        _rw0 = time.monotonic()
         final_prompt, rw_note = await _maybe_rewrite(
             model_meta.get("prompt_rewrite") or {},
             prompt,
@@ -1165,6 +1245,7 @@ async def edit_image(
             width=w,
             height=h,
         )
+        rewrite_s = time.monotonic() - _rw0
 
     comfy_base, base_note = _comfy_base()
     if not comfy_base:
@@ -1202,6 +1283,7 @@ async def edit_image(
             workflows.set_node(workflow, nodes.get("image"), "image", comfy_filename)
             workflows.set_node(workflow, nodes.get("denoise"), "denoise", edit_strength)
             fetch_nodes = {save_node}
+        _g0 = time.monotonic()
         prompt_id = await comfyui_client.submit_workflow(workflow, base=comfy_base)
         images_by_node = await comfyui_client.wait_and_fetch(prompt_id, fetch_nodes, base=comfy_base)
     except httpx.HTTPError as e:
@@ -1210,6 +1292,7 @@ async def edit_image(
     except TimeoutError as e:
         logger.exception("edit_image: timed out waiting for ComfyUI")
         return json.dumps({"error": str(e)})
+    _g1 = time.monotonic()
 
     edit_images = images_by_node.get(save_node, [])
     if not edit_images:
@@ -1261,7 +1344,8 @@ async def edit_image(
         notes.append(rw_note)
     if notes:
         detail += " " + " ".join(notes)
-    return _success_response(detail, urls)
+    return _success_response(detail, urls, note=model_note,
+                             timing=_timing(t0, _g0, _g1, rewrite_s))
 
 
 # -----------------------------------------------------------------------------
@@ -1279,13 +1363,19 @@ async def stylize_image(
     weather: str = "",
     upscale_by: float = 1.0,
     seed: int = -1,
+    image_model: str = "",
 ) -> str:
-    """Curated stylize/mood presets. Pipeline chosen from the current mode
-    (dev-turbo-on-eGPU in everyday mode, klein-on-iGPU in coding mode); both hold
-    composition via denoise-1 + ReferenceLatent and change only the requested
+    """Curated stylize/mood presets, run on the resident image model (or
+    `image_model` if the user named one); holds
+    composition via denoise-1 + ReferenceLatent and changes only the requested
     treatment. LLM-facing description: tool_docs/stylize_image.md."""
-    profile = _profile_for("stylize", await _current_mode())
+    t0 = time.monotonic()
+    err, model_note = await _select_pipeline(image_model)
+    if err:
+        return err
     try:
+        profile, verb_note = await _resident_model_for("stylize")
+        model_note = model_note or verb_note
         model_name, graph, nodes, model_meta = workflows.load_model("stylize", profile)
     except (workflows.UnknownModel, workflows.ToolUnsupported) as e:
         return json.dumps({"error": str(e)})
@@ -1349,6 +1439,7 @@ async def stylize_image(
         workflows.set_node(workflow, nodes.get("image"), "image", comfy_filename)
         workflows.set_node(workflow, nodes.get("scale_by"), "scale_by", upscale_by)
         workflows.set_node(workflow, nodes.get("seed"), "seed", seed)
+        _g0 = time.monotonic()
         prompt_id = await comfyui_client.submit_workflow(workflow, base=comfy_base)
         images_by_node = await comfyui_client.wait_and_fetch(prompt_id, {save_node}, base=comfy_base)
     except httpx.HTTPError as e:
@@ -1357,6 +1448,7 @@ async def stylize_image(
     except TimeoutError as e:
         logger.exception("stylize_image: timed out waiting for ComfyUI")
         return json.dumps({"error": str(e)})
+    _g1 = time.monotonic()
 
     images_raw = images_by_node.get(save_node, [])
     if not images_raw:
@@ -1382,7 +1474,8 @@ async def stylize_image(
     detail = f"applied: {', '.join(applied)}; upscale_by {upscale_by}, seed {seed}."
     if not model_meta.get("validated", False):
         detail += " (this pipeline's graph is not yet live-validated on this install)"
-    return _success_response(detail, urls)
+    return _success_response(detail, urls, note=model_note,
+                             timing=_timing(t0, _g0, _g1))
 
 
 class BearerAuthMiddleware:

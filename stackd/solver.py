@@ -105,3 +105,20 @@ def solve(cfg: Config, profile: str, catalog=None, *, port_from: int = 11500) ->
         out.placed[name] = Placed(name, dev, m.engine.template, port, round(v, 2),
                                   round(r, 2), src, model_identity(cfg, name, dev))
     return out
+
+
+def headroom(cfg: Config, profile: str, catalog=None, *, reserve_gib: float = 0.0) -> dict[str, float]:
+    """Free VRAM GiB per device once `profile`'s LLM models are placed — the budget
+    the elastic media tiers get. `reserve_gib` (a tier's `margin_gib`) is held back
+    on every device. Never negative. This is a *declared-budget* estimate: it can't
+    see a vLLM engine that pre-claims the whole card, so keep footprints honest."""
+    from stackd.fit import device_ceiling
+
+    pl = solve(cfg, profile, catalog)
+    used: dict[str, float] = {d: 0.0 for d in cfg.devices}
+    for p in pl.placed.values():
+        used[p.device] = used.get(p.device, 0.0) + p.vram_gib
+    return {
+        d: max(0.0, device_ceiling(cfg, d) - used.get(d, 0.0) - reserve_gib)
+        for d in cfg.devices
+    }

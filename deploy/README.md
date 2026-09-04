@@ -68,8 +68,9 @@ config/
   pools.yaml        memory budgets (cuda_vram, host_unified)  ← mostly from .env
   devices.yaml      cuda0 (cuda) / igpu0 (vulkan)             ← mostly from .env
   runtime.yaml      engine base images, per-backend knobs, the ComfyUI cleaner
-  models/*.yaml     one file per engine
+  models/*.yaml     one file per LLM engine
   profiles/*.yaml   priority-ordered lists of model names
+  media/image.yaml  the elastic image tier (ComfyUI): per-backend container + `prefer:` catalog
 ```
 
 **Replace the `models/` and `profiles/` files with your own.** A minimal single-model
@@ -117,16 +118,20 @@ In `.env` set `STACKD_CONFIG_OVERLAY=/app/config.local` and uncomment the
 `./config.local:/app/config.local:ro` volume in `docker-compose.yml`. Now a file in
 `config.local/` **wins over** the same-named file in `config/`; a new name adds; an
 **empty** overlay file deletes that base entry. `pools.yaml` / `devices.yaml` /
-`runtime.yaml` / `catalog/*.json` overlay the same way. `stackctl reload` re-reads it.
+`runtime.yaml` / `catalog/*.json` / `media/*.yaml` overlay the same way. `stackctl reload` re-reads it.
 
 Keep `config.local/` in its own private git repo (`docker-compose.yml` + `.env` +
 `config.local/` = your whole deployment); pull this repo for code only.
 
 - **vLLM**: `template: vllm-cuda`, put the full server args in `container.cmd_extra`,
   bind-mount the weights in `container.mounts` (see `models/coding-flash.yaml`).
-- **Image gen**: `template: comfyui` — one model per ComfyUI instance; stackd creates
-  the container and the MCP advertises its capabilities. The CUDA image is stock; the
-  ROCm image is a local build: `docker compose exec stackd stackctl build <model>`.
+- **Image gen** is not a model file — it's `config/media/image.yaml`: a `containers:`
+  block per GPU backend (`cuda` stock, `vulkan` a local build via
+  `docker compose exec stackd stackctl build image:vulkan`) and an ordered `prefer:`
+  list of loadable pipelines with a `footprint_gib` each. stackd runs one ComfyUI in
+  whatever VRAM a profile leaves free and loads the first entry that fits; swap it with
+  `stackctl image use <model>` or let a `generate_image` / `edit_image` call escalate
+  automatically. It's torn down before LLMs spawn on a switch and never displaces one.
 
 ## `stackctl`
 
@@ -134,11 +139,13 @@ Keep `config.local/` in its own private git repo (`docker-compose.yml` + `.env` 
 docker compose exec stackd stackctl status          # what's running, pool usage
 docker compose exec stackd stackctl validate        # does every profile fit?
 docker compose exec stackd stackctl reload          # re-read config + .env, re-converge (no restart)
+docker compose exec stackd stackctl image show      # resident image model + free VRAM + prefer list
+docker compose exec stackd stackctl image use flux2-klein     # swap the image pipeline
 docker compose exec stackd stackctl use <profile>   # NOTE: only when the daemon is NOT running;
                                                     #   with it running use the HTTP control plane:
 curl -X POST http://localhost:11444/profiles/<profile>/activate -H "Authorization: Bearer $STACKD_API_KEY"
 docker compose exec stackd stackctl bench <model>   # measure a model's real VRAM/RAM footprint
-docker compose exec stackd stackctl build <model>   # build a model's local image (container.build)
+docker compose exec stackd stackctl build image:vulkan   # build a local image (a model name, or "<kind>:<backend>")
 ```
 
 ---
@@ -160,8 +167,11 @@ backend. First run:
 3. **Add the image MCP** as a tool server: Open WebUI → *Admin → Settings → Tools →
    Add* → URL `http://stackd:8000/mcp`, Auth *Bearer*, key = your `MCP_API_KEY`.
 
-Now `generate_image` / `edit_image` / `stylize_image` are available in chat, and the
-model that runs is whichever ComfyUI the active profile has resident.
+Now `generate_image` / `edit_image` / `stylize_image` are available in chat. The
+pipeline that runs is whatever the elastic image tier has resident for the active
+profile; a call for a capability the resident model lacks makes the tier swap to one
+that has it (auto-downgrading to a smaller model if the best doesn't fit the free VRAM,
+and telling you so in the reply).
 
 ---
 
@@ -175,7 +185,10 @@ docker compose exec stackd stackctl reload
 ```
 
 No container recreate. An engine whose spec changed (image tag, mounts, env) is
-recreated by that reload; a pool/size change just re-runs the solver.
+recreated by that reload; a pool/size change just re-runs the solver. Editing
+`config/media/image.yaml` works the same way — a changed `containers:` block rebuilds
+the ComfyUI, a reordered `prefer:` / retuned `footprint_gib` takes effect on the next
+converge.
 
 **Still needs `docker compose up -d stackd`:** `DOCKERDIR`, `STACKD_NETWORK`, and the
 published ports — those shape the compose file itself, not just stackd's config.

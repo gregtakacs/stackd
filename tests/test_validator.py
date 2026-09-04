@@ -60,6 +60,6 @@ def test_coding_fits_on_its_own(cfg):
 
 def test_plan_everyday_to_coding_is_a_delta(cfg):
     p = plan_transition(cfg, "everyday", "coding")
-    assert p.teardown == ["everyday-chat", "everyday-image"]
-    assert sorted(p.spawn) == ["coding-flash", "coding-image"]
+    assert p.teardown == ["everyday-chat"]
+    assert sorted(p.spawn) == ["coding-flash"]
     assert p.keep == ["everyday-autocomplete"]  # untouched by the switch

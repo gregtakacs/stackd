@@ -53,6 +53,41 @@ def _serves(cfg: Config, model_name: str, api_name: str) -> tuple[bool, bool]:
     return matches, exact
 
 
+def _translate_preset(raw: dict, template: str) -> dict:
+    """Expand stackd's engine-agnostic ``reasoning:`` preset key into the request
+    dialect of the engine that will actually serve the call. Everything else
+    passes through untouched, so raw ``reasoning_effort`` / ``chat_template_kwargs``
+    presets still work.
+
+      reasoning: off                        -> llamacpp: reasoning_effort=none, reasoning_budget=0
+                                               vllm:     chat_template_kwargs.enable_thinking=false
+      reasoning: low | {effort: low}        -> both:     reasoning_effort=low
+      reasoning: {effort: low, budget: N}   -> llamacpp: + reasoning_budget=N   (vllm has no per-request budget)
+    """
+    if "reasoning" not in raw:
+        return dict(raw)
+    out = {k: v for k, v in raw.items() if k != "reasoning"}
+    spec = raw["reasoning"]
+    is_vllm = template.startswith("vllm")
+    if spec in ("off", False, None):
+        if is_vllm:
+            ctk = dict(out.get("chat_template_kwargs") or {})
+            ctk["enable_thinking"] = False
+            out["chat_template_kwargs"] = ctk
+        else:
+            out["reasoning_effort"] = "none"
+            out["reasoning_budget"] = 0
+        return out
+    if isinstance(spec, str):
+        spec = {"effort": spec}
+    if isinstance(spec, dict):
+        if spec.get("effort"):
+            out["reasoning_effort"] = spec["effort"]
+        if spec.get("budget") is not None and not is_vllm:
+            out["reasoning_budget"] = spec["budget"]
+    return out
+
+
 def _profiles_serving(cfg: Config, api_name: str) -> list[str]:
     hits = []
     for pr in cfg.profiles.values():
@@ -103,6 +138,7 @@ class Manager:
             ("profile", self.cfg.profiles, new.profiles),
             ("pool", self.cfg.pools, new.pools),
             ("device", self.cfg.devices, new.devices),
+            ("media", self.cfg.media, new.media),
         ):
             for k in sorted(set(old_map) | set(new_map)):
                 if k not in new_map:
@@ -171,13 +207,17 @@ class Manager:
         self._save()
 
     # -------------------------------------------------------------------- route ---
-    def _preset_for(self, api_name: str) -> dict:
+    def _preset_for(self, api_name: str, serving_template: str | None = None) -> dict:
         """The preset wherever this exact name is defined (so a glob-matched
-        request still lands in the right reasoning mode)."""
+        request still lands in the right reasoning mode), translated into the
+        dialect of the engine that will serve it (``serving_template``); falls
+        back to the defining model's own template."""
         for m in self.cfg.models.values():
             for se in m.serves:
                 if se.api_name == api_name:
-                    return dict(se.preset)
+                    return _translate_preset(
+                        dict(se.preset), serving_template or m.engine.template
+                    )
         return {}
 
     def _served_name(self, model_name: str) -> str | None:
@@ -199,7 +239,7 @@ class Manager:
                 return RouteResult(
                     status, api_name, rt.endpoint or None, self.state.active_profile,
                     stack=mn, served_model_name=self._served_name(mn),
-                    preset=self._preset_for(api_name),
+                    preset=self._preset_for(api_name, self.cfg.models[mn].engine.template),
                     route_kind="native" if exact else "standin",
                     note="" if status == "ok" else f"{mn} is {rt.state.value}",
                 )
@@ -238,30 +278,60 @@ class Manager:
         return any(o != model and ort.device == dev and ort.state == EngineState.warming
                    for o, ort in self.state.stacks.items())
 
+    def _slot_entry(self, slot) -> dict:
+        codev = any(rt.device == slot.device and rt.state == EngineState.warming
+                    for rt in self.state.stacks.values())
+        return {
+            "stack": f"image:{slot.active_model}", "kind": slot.kind,
+            "active_model": slot.active_model,
+            "capabilities": list(slot.capabilities),
+            "state": slot.state.value,
+            "serveable": slot.state == EngineState.ready and not codev,
+            "co_device_warming": codev, "endpoint": slot.endpoint,
+            "device": slot.device, "backend": slot.backend,
+            "since": slot.since, "pinned_by": slot.pinned_by,
+        }
+
     def capabilities(self) -> dict:
-        engines: list[dict] = []
-        by_kind: dict[str, dict] = {}
-        for name, rt in self.state.stacks.items():
-            m = self.cfg.models.get(name)
-            if not m or m.engine.template != "comfyui":
-                continue
-            p = m.engine.params
-            codev = self._codevice_warming(name)
-            entry = {
-                "stack": name, "kind": p.get("kind", "image"),
-                "active_model": p.get("active_model"),
-                "workflow_templates": list(p.get("workflow_templates") or []),
-                "state": rt.state.value,
-                "serveable": rt.state == EngineState.ready and not codev,
-                "co_device_warming": codev, "endpoint": rt.endpoint,
-                "device": rt.device, "owner_profile": rt.owner_profile,
-            }
-            engines.append(entry)
-            k = entry["kind"]
-            if k not in by_kind or (entry["serveable"] and not by_kind[k]["serveable"]):
-                by_kind[k] = entry
-        return {"active_profile": self.state.active_profile, "engines": engines,
+        slot = self.state.image
+        entry = self._slot_entry(slot) if slot is not None else None
+        by_kind = {entry["kind"]: entry} if entry else {}
+        return {"active_profile": self.state.active_profile,
+                "engines": [entry] if entry else [],
                 "image": by_kind.get("image"), "video": by_kind.get("video")}
+
+    def image_status(self) -> dict:
+        """State of the elastic image tier: what's resident, the free VRAM it has
+        to work with under the active profile, and the load-order catalog."""
+        from stackd.solver import headroom
+        tier = self.cfg.media.get("image")
+        slot = self.state.image
+        hr = (headroom(self.cfg, self.state.active_profile, self.catalog,
+                       reserve_gib=tier.margin_gib) if tier else {})
+        return {
+            "resident": self._slot_entry(slot) if slot is not None else None,
+            "headroom_gib": {k: round(v, 1) for k, v in hr.items()},
+            "prefer": [
+                {"active_model": l.active_model, "capabilities": list(l.capabilities),
+                 "backends": list(l.backends), "footprint_gib": dict(l.footprint_gib)}
+                for l in (tier.prefer if tier else [])
+            ],
+        }
+
+    def set_image(self, *, model: str | None = None, need_capability: str | None = None,
+                  now: float | None = None) -> dict:
+        """Request an image-tier swap — by explicit model or by a capability the
+        caller needs. Returns swap_image()'s result dict ({ok, active_model,
+        downgraded_from, note, ...} or {ok:False, error})."""
+        now = time.time() if now is None else now
+        caps = [need_capability] if need_capability else None
+        pinned = "user" if model else ("capability" if need_capability else "auto")
+        res = self.rec.swap_image(self.state, self.state.active_profile,
+                                  model=model, need_caps=caps, now=now, pinned_by=pinned)
+        if res.get("ok"):
+            self.state.last_served_at = now
+        self._save()
+        return res
 
     def engines(self) -> list[dict]:
         out = []
@@ -274,16 +344,15 @@ class Manager:
             out.append({"stack": name, "owner_profile": rt.owner_profile, "state": d.state.value,
                         "active_model": d.active_model, "served": d.served,
                         "endpoint": rt.endpoint or d.endpoint, "extra": d.extra})
+        slot = self.state.image
+        if slot is not None:
+            out.append({"stack": f"image:{slot.active_model}", "owner_profile": "media:image",
+                        "state": slot.state.value, "active_model": slot.active_model,
+                        "served": list(slot.capabilities), "endpoint": slot.endpoint,
+                        "extra": {"kind": slot.kind, "device": slot.device,
+                                  "backend": slot.backend, "since": slot.since,
+                                  "pinned_by": slot.pinned_by}})
         return out
-
-    def _profile_with_comfyui(self, kind: str | None = None) -> str | None:
-        for pr in sorted(self.cfg.profiles.values(), key=lambda p: -p.priority):
-            for mn in pr.models:
-                m = self.cfg.models[mn]
-                if m.engine.template == "comfyui" and (
-                        kind is None or m.engine.params.get("kind", "image") == kind):
-                    return pr.profile
-        return None
 
     def comfyui_target(self, kind: str = "image", *, now: float | None = None):
         now = time.time() if now is None else now
@@ -296,9 +365,10 @@ class Manager:
         if entry and not entry["serveable"]:
             why = "co-device stack warming" if entry["co_device_warming"] else entry["state"]
             return None, f"image engine {entry['stack']} not serveable ({why})"
-        owner = self._profile_with_comfyui(kind)
-        return None, (f"no {kind} engine resident — activate profile {owner!r}"
-                      if owner else f"no profile provides a {kind} engine")
+        if kind in self.cfg.media:
+            return None, (f"no {kind} engine resident — no device headroom under "
+                          f"profile {self.state.active_profile!r}")
+        return None, f"no {kind} tier configured (config/media/{kind}.yaml)"
 
     # ------------------------------------------------------------------ catalog ---
     def models_catalog(self) -> list[dict]:
@@ -333,6 +403,15 @@ class Manager:
                     "endpoint": rt.endpoint, "restarts": rt.restarts}
                 for n, rt in self.state.stacks.items()
             },
+            "image": (
+                {"active_model": self.state.image.active_model,
+                 "state": self.state.image.state.value,
+                 "device": self.state.image.device,
+                 "backend": self.state.image.backend,
+                 "container": self.state.image.container,
+                 "pinned_by": self.state.image.pinned_by}
+                if self.state.image is not None else None
+            ),
             "missing": [n for n in report.resident if n not in running],
             "pools": [{"pool": p.pool, "used": p.used_gib, "limit": p.limit_gib, "ok": p.ok}
                       for p in report.pools],

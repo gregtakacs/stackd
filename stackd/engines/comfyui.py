@@ -12,7 +12,11 @@ class ComfyuiParams:
     active_model: str
     port: int = 8188
     base_url: str | None = None
-    workflow_templates: list[str] = field(default_factory=list)
+    # what the resident model can do -- generate | stylize | edit (video verbs
+    # later). The MCP gates each tool on this list; the loader cross-checks that
+    # every verb here has a workflow graph for `active_model` in
+    # imagegen/workflow_graphs/models.json.
+    capabilities: list[str] = field(default_factory=list)
     kind: str = "image"          # "image" | "video"
 
 
@@ -45,7 +49,7 @@ class ComfyuiAdapter(EngineAdapter):
         return DescribeResult(
             state=state,
             active_model=self.params.active_model,
-            served=list(self.params.workflow_templates),
+            served=list(self.params.capabilities),
             endpoint=self._url(),
             extra={"kind": self.params.kind, "advertiser": "comfyui-mcp"},
         )

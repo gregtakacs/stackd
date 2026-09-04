@@ -53,11 +53,8 @@ def main() -> int:
     fc.write_curve(curve_key(cfg, "everyday-chat", "cuda0"), model="m", engine="llamacpp-cuda",
                    device="cuda0", source="estimate",
                    vram_points=[[65536, 22.0], [262144, 40.0]], ram_points=[[65536, 2.0], [262144, 4.0]])
-    fc.write_curve(curve_key(cfg, "everyday-image", "cuda0"), model="m", engine="comfyui",
-                   device="cuda0", source="estimate",
-                   vram_points=[[0, 46.0]], ram_points=[[0, 18.0]])
     cat = Catalog.load(fix)
-    check("fixture catalog loaded", len(cat.curves) == 2)
+    check("fixture catalog loaded", len(cat.curves) == 1)
     cur = cat.for_model(cfg, "everyday-chat", "cuda0")
     check("curve matched by config-signature", cur is not None and cur.source == "estimate")
     check("slope from 2 points", approx(cur.vram.slope, (40.0 - 22.0) / (262144 - 65536), 1e-6))
@@ -70,7 +67,7 @@ def main() -> int:
     cuda_base = next(p for p in base.pools if p.pool == "cuda_vram").used_gib
     cuda_cat = next(p for p in withcat.pools if p.pool == "cuda_vram").used_gib
     check("catalog changes the pool total", cuda_cat != cuda_base)
-    check("cuda_vram with curves = 40 + 46", approx(cuda_cat, 86.0, 0.2))
+    check("cuda_vram with the chat curve = 40", approx(cuda_cat, 40.0, 0.2))
     check("source recorded as estimate", withcat.sources["everyday-chat"] == "estimate")
     check("delta vs declared recorded (40 curve - 30 declared)",
           withcat.deltas["everyday-chat"][0] == 10.0)
@@ -84,18 +81,15 @@ def main() -> int:
     tmp = pathlib.Path(tempfile.mkdtemp()) / "cat"
     tmp.mkdir(parents=True)
     icat = Catalog(path=tmp)
-    icat.write_curve(curve_key(cfg, "everyday-image", "cuda0"), model="m", engine="comfyui",
-                     device="cuda0", source="estimate",
-                     vram_points=[[0, 46.0]], ram_points=[[0, 18.0]])
     ingest(cfg, "everyday-chat", icat,
            {"vram": [[262144, 41.0]], "ram": [[262144, 3.2]]}, notes="hand-measured")
     icat2 = Catalog.load(tmp)
     rep = validate_profile(cfg, "everyday", catalog=icat2)
     check("ingested curve is 'measured'", rep.sources["everyday-chat"] == "measured")
     check("everyday-chat no longer unmeasured", "everyday-chat" not in rep.unmeasured)
-    check("image (estimate) still unmeasured", "everyday-image" in rep.unmeasured)
-    check("measured value used (41 + 46 vram)",
-          approx(next(p for p in rep.pools if p.pool == "cuda_vram").used_gib, 87.0, 0.5))
+    check("a model with no curve is still unmeasured", "everyday-autocomplete" in rep.unmeasured)
+    check("measured value used (41 vram)",
+          approx(next(p for p in rep.pools if p.pool == "cuda_vram").used_gib, 41.0, 0.5))
 
     # --- bench harness with fakes ----------------------------------------------------
     bdir = pathlib.Path(tempfile.mkdtemp()) / "bench"

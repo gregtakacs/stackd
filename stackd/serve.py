@@ -148,6 +148,9 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path == "/capabilities":
             with self.lock:
                 return self._send_json(200, self.mgr.capabilities())
+        if self.path == "/image":
+            with self.lock:
+                return self._send_json(200, self.mgr.image_status())
         if self.path == "/engines":
             with self.lock:
                 return self._send_json(200, {"engines": self.mgr.engines()})
@@ -171,6 +174,9 @@ class _Handler(BaseHTTPRequestHandler):
 
         if self.path == "/reload":
             return self._reload()
+
+        if self.path in ("/image/model", "/image/capability"):
+            return self._image_swap()
 
         if self.path in ("/cleaner/on", "/cleaner/off"):
             if self.cleaner is None:
@@ -318,6 +324,29 @@ class _Handler(BaseHTTPRequestHandler):
                        for e in events or []],
             "status": self.mgr.status(),
         })
+
+    def _image_swap(self):
+        """POST /image/model {name} | /image/capability {need} — bring a different
+        image model resident. 200 with the swap result (incl. `note` on a
+        downgrade); 409 when nothing capable fits the headroom."""
+        try:
+            body = json.loads(self._read_body() or b"{}")
+        except json.JSONDecodeError:
+            return self._send_json(400, {"error": {"message": "invalid JSON body"}})
+        with self.lock:
+            if self.path.endswith("/model"):
+                name = (body.get("name") or body.get("model") or "").strip()
+                if not name:
+                    return self._send_json(400, {"error": {"message": "body needs {\"name\": ...}"}})
+                res = self.mgr.set_image(model=name)
+            else:
+                need = (body.get("need") or body.get("capability") or "").strip()
+                if not need:
+                    return self._send_json(400, {"error": {"message": "body needs {\"need\": ...}"}})
+                res = self.mgr.set_image(need_capability=need)
+        for line in res.get("events") or []:
+            print(f"[{time.strftime('%H:%M:%S')}] {line} (image swap)")
+        return self._send_json(200 if res.get("ok") else 409, res)
 
     def _completions(self):
         raw = self._read_body()

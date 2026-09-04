@@ -66,6 +66,13 @@ def _fmt_status(s: dict) -> str:
         loc = f":{st['port']}" if st["port"] else (st["container"] or "")
         rs = f"  restarts={st['restarts']}" if st["restarts"] else ""
         out.append(f"  {st['state']:<8} {n:<24} {st['kind']:<9} {loc}{rs}")
+    img = s.get("image")
+    if img:
+        out.append(f"  {img['state']:<8} image:{img['active_model']:<18} "
+                   f"{img['device']}/{img['backend']:<7} {img['container'] or ''}"
+                   f"  ({img['pinned_by']})")
+    elif "image" in s:
+        out.append("  (no image tier resident — no device headroom)")
     out.append("pools:")
     for p in s["pools"]:
         mark = "ok  " if p["ok"] else "FAIL"
@@ -173,9 +180,10 @@ def _build_parser() -> argparse.ArgumentParser:
     pc.add_argument("--db", default=os.environ.get("STACKD_DB"))
     pc.add_argument("--pricing", type=pathlib.Path, default=None)
 
-    bd = sub.add_parser("build", help="build a model's local image (container.build) via the Docker API")
-    bd.add_argument("models", nargs="*", help="model names; default: all with a build recipe")
-    bd.add_argument("--all", action="store_true", help="build every model that declares container.build")
+    bd = sub.add_parser("build", help="build a local image (container.build) via the Docker API")
+    bd.add_argument("models", nargs="*",
+                    help="model names or media targets like 'image:vulkan'; default: all with a build recipe")
+    bd.add_argument("--all", action="store_true", help="build everything that declares container.build")
     bd.add_argument("--docker-url", default=os.environ.get("DOCKER_API_URL"),
                     help="Docker Engine API base (default: $DOCKER_API_URL)")
 
@@ -185,6 +193,14 @@ def _build_parser() -> argparse.ArgumentParser:
     rl.add_argument("--host", default=os.environ.get("STACKD_HOST", "127.0.0.1"))
     rl.add_argument("--port", type=int, default=int(os.environ.get("STACKD_PORT", "11444")))
     rl.add_argument("--api-key", default=_env_or_file("STACKD_API_KEY"))
+
+    im = sub.add_parser("image", help="inspect / swap the elastic image tier (talks to the daemon)")
+    im.add_argument("action", nargs="?", default="show", choices=["show", "use", "capability"],
+                    help="show (default) | use <model> | capability <verb>")
+    im.add_argument("arg", nargs="?", help="model name for `use`, verb for `capability`")
+    im.add_argument("--host", default=os.environ.get("STACKD_HOST", "127.0.0.1"))
+    im.add_argument("--port", type=int, default=int(os.environ.get("STACKD_PORT", "11444")))
+    im.add_argument("--api-key", default=_env_or_file("STACKD_API_KEY"))
     return ap
 
 
@@ -213,9 +229,16 @@ def _cmd_build(args) -> int:
         print(f"config error: {e}", file=sys.stderr)
         return 2
 
+    # a model's container.build, plus each media tier's per-backend containers
+    # (keyed "<kind>:<backend>", e.g. "image:vulkan" for the local ROCm ComfyUI)
     buildable = {
-        n: m for n, m in cfg.models.items() if m.engine.container.build is not None
+        n: m.engine.container for n, m in cfg.models.items()
+        if m.engine.container.build is not None
     }
+    for kind, tier in cfg.media.items():
+        for backend, cs in tier.containers.items():
+            if cs.build is not None:
+                buildable[f"{kind}:{backend}"] = cs
     if args.cmd == "build" and getattr(args, "models", None):
         missing = [n for n in args.models if n not in buildable]
         if missing:
@@ -229,9 +252,8 @@ def _cmd_build(args) -> int:
         return 2
 
     if not buildable:
-        print("no models declare container.build — nothing to build")
-    for name, m in buildable.items():
-        c = m.engine.container
+        print("nothing declares container.build — nothing to build")
+    for name, c in buildable.items():
         tag = c.image or f"stackd-{name}:local"
         print(f"=== build {name} -> {tag} ===")
         try:
@@ -289,6 +311,68 @@ def _cmd_reload(args) -> int:
     return 0
 
 
+def _cmd_image(args) -> int:
+    """GET /image, or POST /image/model|/image/capability — always to the daemon."""
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    base = f"http://{args.host}:{args.port}/image"
+    headers = {"content-type": "application/json"}
+    if args.api_key:
+        headers["authorization"] = f"Bearer {args.api_key}"
+    if args.action == "show":
+        req = urllib.request.Request(base, method="GET", headers=headers)
+    elif args.action == "use":
+        if not args.arg:
+            print("usage: stackctl image use <model>", file=sys.stderr)
+            return 2
+        req = urllib.request.Request(base + "/model", method="POST", headers=headers,
+                                     data=_json.dumps({"name": args.arg}).encode())
+    else:  # capability
+        if not args.arg:
+            print("usage: stackctl image capability <verb>", file=sys.stderr)
+            return 2
+        req = urllib.request.Request(base + "/capability", method="POST", headers=headers,
+                                     data=_json.dumps({"need": args.arg}).encode())
+    try:
+        with urllib.request.urlopen(req, timeout=300) as r:
+            body = _json.loads(r.read() or b"{}")
+        code = 200
+    except urllib.error.HTTPError as e:
+        body = _json.loads(e.read() or b"{}")
+        code = e.code
+    except urllib.error.URLError as e:
+        print(f"image: {e} — is `stackctl serve` running on {args.host}:{args.port}?",
+              file=sys.stderr)
+        return 1
+
+    if args.action == "show":
+        r = body.get("resident")
+        if r:
+            print(f"resident : {r['active_model']} ({r['state']}) on {r['device']}/"
+                  f"{r.get('backend', '?')}  [{', '.join(r.get('capabilities') or [])}]  "
+                  f"({r.get('pinned_by', 'auto')})")
+        else:
+            print("resident : (none — no device headroom under the active profile)")
+        hr = ", ".join(f"{k} {v:g}G" for k, v in (body.get("headroom_gib") or {}).items())
+        print(f"headroom : {hr or '-'}")
+        print("prefer   :")
+        for p in body.get("prefer", []):
+            fp = ", ".join(f"{k}:{v:g}" for k, v in p["footprint_gib"].items())
+            print(f"  {p['active_model']:<20} [{', '.join(p['capabilities'])}]  {fp}")
+        return 0
+
+    if body.get("note"):
+        print(f"note: {body['note']}")
+    if code == 200:
+        print(f"image: {body.get('active_model')} "
+              f"({'warming' if body.get('warming') else 'resident'})")
+        return 0
+    print(f"image swap refused (HTTP {code}): {body.get('error', '')}", file=sys.stderr)
+    return 1
+
+
 def _manager(args) -> Manager:
     state = pathlib.Path(args.state or default_state_path())
     runner = (
@@ -309,6 +393,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "reload":
         return _cmd_reload(args)
+
+    if args.cmd == "image":
+        return _cmd_image(args)
 
     # config-only commands don't need a runner/state
     if args.cmd in ("show", "validate", "plan", "probe", "bench", "solve"):

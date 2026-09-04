@@ -11,7 +11,9 @@ A single daemon that is three things for a small multi-GPU host:
   containers (llama.cpp, vLLM, ComfyUI) on demand, rebuilding only the delta on a
   profile switch
 - **an image-generation MCP** — `generate_image` / `edit_image` / `stylize_image` over
-  MCP streamable-HTTP at `/mcp`, backed by a ComfyUI stackd manages
+  MCP streamable-HTTP at `/mcp`, backed by an *elastic image tier*: stackd runs one
+  ComfyUI in whatever VRAM the active profile leaves free, picking the model from a
+  preference list and swapping it on demand — never at an LLM's expense
 
 Only runtime dependency for the core is **PyYAML** (the image MCP adds `mcp`, `httpx`,
 `pillow`, `uvicorn` via the `imagegen` extra). Config is stdlib `dataclasses` built
@@ -50,6 +52,15 @@ budgets. A *dedicated* pool is a discrete GPU's VRAM; a *shared* pool is unified
 RAM, charged for an integrated GPU's GTT, a host reserve, model RAM spill, and load
 slack. `stackctl validate` proves a profile balances both before anything spawns.
 
+**Media tier** (`config/media/image.yaml`; `video`/`audio` later) — an *elastic*
+image-generation layer that is **not** a profile member. After a profile's LLM models
+are placed, stackd computes the free VRAM per device and runs one ComfyUI there,
+loading the first entry from an ordered `prefer:` list that fits. It stays put (sticky)
+until the profile changes or a request needs a capability the resident model lacks —
+then it swaps, auto-downgrading to a smaller capable model if the best doesn't fit and
+saying so. It is torn down before LLMs spawn on a switch and can never displace one.
+Drive it with `stackctl image` or `POST /image/{model,capability}`.
+
 **Config is environment-driven.** Every box-specific value in `config/*.yaml` is a
 `${VAR}` resolved at load from the environment + a bind-mounted `.env` (see
 `deploy/.env.example`). Edit `.env` or a config file, then `stackctl reload` — no
@@ -63,12 +74,13 @@ empty overlay file deletes the base entry.
 ## `stackctl`
 
 ```
-stackctl show | validate | status         # inspect config / what fits / what's running
-stackctl reload                           # re-read config + .env, re-converge (talks to the daemon)
-stackctl bench <model> [--verify <prof>]  # measure a model's real VRAM/RAM footprint
-stackctl build <model>                    # build a model's local image (container.build)
-stackctl serve                            # the daemon: OpenAI front + MCP + supervisor
-stackctl --fake use|tick|route|status     # dry-run the control loop with no GPUs/docker
+stackctl show | validate | status          # inspect config / what fits / what's running
+stackctl reload                            # re-read config + .env, re-converge (talks to the daemon)
+stackctl image show | use <m> | capability <v>   # inspect / swap the elastic image tier
+stackctl bench <model> [--verify <prof>]   # measure a model's real VRAM/RAM footprint
+stackctl build <target>                    # build a local image — a model, or "image:vulkan"
+stackctl serve                             # the daemon: OpenAI front + MCP + supervisor
+stackctl --fake use|tick|route|status      # dry-run the control loop with no GPUs/docker
 ```
 
 Switch profiles on a running daemon via the control plane, not `stackctl use`:
@@ -84,16 +96,16 @@ stackd/
   config/            models.py (dataclass schema) + _build.py + loader.py (${VAR} interpolation)
   engines/           EngineAdapter ABC + one module per template (llamacpp / vllm / comfyui)
   runner.py          LaunchSpec + Runner: DockerApiRunner (scoped socket-proxy), LocalRunner, FakeRunner
-  solver.py          placement fit-solver + model_identity (delta-reconcile key)
-  reconciler.py      converge() + tick() — teardown/spawn ordering, cuda drain barrier, crash-restart
-  manager.py         priority gating, stand-in routing, idle-evict, capabilities(), reload_config()
-  serve.py           OpenAI HTTP front + control plane + /capabilities + /comfyui + /register + /savings + /reload
+  solver.py          placement fit-solver + model_identity (delta-reconcile key) + headroom()
+  reconciler.py      converge() + tick() + the image tier — teardown/spawn ordering, cuda drain barrier, crash-restart
+  manager.py         priority gating, stand-in routing, idle-evict, capabilities(), reload_config(), set_image()
+  serve.py           OpenAI HTTP front + control plane + /capabilities + /image + /comfyui + /register + /savings + /reload
   cleaner.py         the ComfyUI scratch janitor (POST /cleaner/on|off)
   builder.py         `stackctl build` — image builds via the Docker /build API
   store.py           SQLite: per-user OWU keys + usage/cost ledger + prices + energy
   catalog.py bench.py probe.py pricing.py validator.py planner.py
   imagegen/          the image MCP: tools.py + workflow graphs + the ComfyUI custom node + Dockerfiles
-config/              a worked example config (two profiles) — replace models/ + profiles/ with your own
+config/              a worked example config — replace models/ + profiles/ + media/ with your own
 deploy/              docker-compose + .env.example + setup guide
 tests/               smoke*.py (stdlib, no deps) + test_validator.py (pytest)
 ```
@@ -101,6 +113,6 @@ tests/               smoke*.py (stdlib, no deps) + test_validator.py (pytest)
 ## Tests
 
 ```bash
-for t in tests/smoke*.py; do python3 "$t"; done   # ~190 checks, stdlib only
+for t in tests/smoke*.py; do python3 "$t"; done   # ~280 checks, stdlib only
 pytest                                             # test_validator.py, if available
 ```

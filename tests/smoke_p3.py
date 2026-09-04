@@ -51,9 +51,11 @@ class _Comfy(BaseHTTPRequestHandler):
         self._reply({"queued": True, "echo": json.loads(self.rfile.read(n) or b"{}")})
 
 
-def _get(url, token=None, method="GET"):
-    r = urllib.request.Request(url, method=method,
-                               data=(b"{}" if method == "POST" else None))
+def _get(url, token=None, method="GET", body=None):
+    data = None
+    if method == "POST":
+        data = json.dumps(body).encode() if body is not None else b"{}"
+    r = urllib.request.Request(url, method=method, data=data)
     if token:
         r.add_header("authorization", f"Bearer {token}")
     try:
@@ -77,16 +79,17 @@ def main() -> int:
     m = Manager(CFG, state, FakeRunner(ready_after=1))
     m.use("everyday", now=0)
     ready(m)
-    m.state.stacks["everyday-image"].endpoint = up_url
+    m.state.image.endpoint = up_url
 
     caps = m.capabilities()
     img = caps["image"]
     check("capabilities.image present", img is not None)
-    check("everyday image active_model = flux2-dev-turbo (RTX)", img["active_model"] == "flux2-dev-turbo")
-    check("image workflow_templates surfaced", "flux-inpaint" in img["workflow_templates"])
+    check("elastic image tier picked dev-turbo on the RTX for everyday",
+          img["active_model"] == "flux2-dev-turbo" and img["device"] == "cuda0")
+    check("image capabilities surfaced", "edit" in img["capabilities"])
     check("image serveable when ready", img["serveable"] is True)
-    check("video slot empty (no video stack)", caps["video"] is None)
-    check("engines() lists all 3 running stacks", len(m.engines()) == 3)
+    check("video slot empty (no video tier)", caps["video"] is None)
+    check("engines() lists 2 LLM stacks + the image slot", len(m.engines()) == 3)
 
     # mid-swap contention: a co-device (cuda0) stack warming -> image not serveable
     m.state.stacks["everyday-chat"].state = EngineState.warming
@@ -100,27 +103,29 @@ def main() -> int:
     ep, why = m.comfyui_target()
     check("comfyui_target returns endpoint when serveable", ep == up_url)
 
-    # coding carries its own image engine (Flux Klein on the iGPU)
+    # switching to coding: vLLM claims the RTX, so the image tier rebuilds itself
+    # as Flux Klein on the iGPU (derived from headroom, not declared)
     m.use("coding", now=1000)
     ready(m, t0=1000)
     cimg = m.capabilities()["image"]
-    check("coding image engine is the iGPU stack", bool(cimg) and cimg["stack"] == "coding-image")
-    check("coding image engine is on igpu0", cimg["device"] == "igpu0")
+    check("image tier rebuilt on the iGPU under coding",
+          bool(cimg) and cimg["device"] == "igpu0" and cimg["backend"] == "vulkan")
     check("coding image active_model = flux2-klein", cimg["active_model"] == "flux2-klein")
-    m.state.stacks["coding-image"].endpoint = up_url
+    m.state.image.endpoint = up_url
     ep, why = m.comfyui_target()
     check("comfyui_target routes to the iGPU image engine under coding", ep == up_url)
 
     # back to everyday, drive it over HTTP
     m.use("everyday", now=2000)
     ready(m, t0=2000)
-    m.state.stacks["everyday-image"].endpoint = up_url
+    m.state.image.endpoint = up_url
     httpd = make_server(m, "127.0.0.1", 0, api_key="k", warm_wait_s=2)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{httpd.server_address[1]}"
     try:
         code, body = _get(f"{base}/capabilities", token="k")
-        check("GET /capabilities -> 200", code == 200 and body["image"]["stack"] == "everyday-image")
+        check("GET /capabilities -> 200",
+              code == 200 and body["image"]["active_model"] == "flux2-dev-turbo")
         code, _ = _get(f"{base}/capabilities")
         check("GET /capabilities needs auth", code == 401)
         code, body = _get(f"{base}/engines", token="k")
@@ -136,10 +141,33 @@ def main() -> int:
         check("POST /reload -> 200 + shape",
               code == 200 and "reloaded" in body and "status" in body)
 
+        # --- elastic image tier control plane ---------------------------------
+        code, body = _get(f"{base}/image", token="k")
+        check("GET /image -> 200 + shape",
+              code == 200 and body["resident"]["active_model"] == "flux2-dev-turbo"
+              and "headroom_gib" in body and len(body["prefer"]) == 2)
+        code, _ = _get(f"{base}/image")
+        check("GET /image needs auth", code == 401)
+
+        code, body = _get(f"{base}/image/model", token="k", method="POST",
+                          body={"name": "flux2-klein"})
+        check("POST /image/model swaps the pipeline",
+              code == 200 and body["ok"] and body["active_model"] == "flux2-klein")
+        ready(m, t0=2100)
+        code, body = _get(f"{base}/image/capability", token="k", method="POST",
+                          body={"need": "edit"})
+        check("POST /image/capability (already covered) -> 200 ok",
+              code == 200 and body["ok"])
+        code, body = _get(f"{base}/image/model", token="k", method="POST",
+                          body={"name": "no-such-pipeline"})
+        check("POST /image/model unknown -> 409", code == 409 and body["ok"] is False)
+        code, _ = _get(f"{base}/image/model", method="POST", body={"name": "flux2-klein"})
+        check("POST /image/model needs auth", code == 401)
+
         # under coding, /comfyui follows to the iGPU Flux engine (not 503)
         m.use("coding", now=3000)
         ready(m, t0=3000)
-        m.state.stacks["coding-image"].endpoint = up_url
+        m.state.image.endpoint = up_url
         code, body = _get(f"{base}/comfyui/system_stats", token="k")
         check("GET /comfyui/* under coding routes to the iGPU image engine",
               code == 200 and body.get("path") == "/system_stats")
