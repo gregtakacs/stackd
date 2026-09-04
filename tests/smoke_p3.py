@@ -145,7 +145,7 @@ def main() -> int:
         code, body = _get(f"{base}/image", token="k")
         check("GET /image -> 200 + shape",
               code == 200 and body["resident"]["active_model"] == "flux2-dev-turbo"
-              and "headroom_gib" in body and len(body["prefer"]) == 2)
+              and "headroom_gib" in body and len(body["prefer"]) == 3)
         code, _ = _get(f"{base}/image")
         check("GET /image needs auth", code == 401)
 

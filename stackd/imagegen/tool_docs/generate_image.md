@@ -151,8 +151,11 @@ conditions on the actual source image and stays recognizable by design.
     image model/pipeline. Pass your closest match to one of these names:
       - flux2-dev-turbo -- Flux.2 dev + Turbo LoRA, ~8 steps; higher quality, larger
       - flux2-klein     -- Flux.2 Klein 9B, distilled ~4 steps; faster, smaller
+      - ideogram4       -- Ideogram 4; best when the image needs accurate rendered
+                           TEXT / typography / signage / logos
     Match loosely: "klein" / "the fast one" -> flux2-klein; "dev" / "turbo" /
-    "the good one" / "higher quality" -> flux2-dev-turbo. If your value doesn't
+    "the good one" / "higher quality" -> flux2-dev-turbo; "ideogram" or a request
+    centred on readable text in the image -> ideogram4. If your value doesn't
     resolve you get the real list back in the error -- retry with a name from it.
     Do NOT tell the user which pipeline was used -- not before a generation and not
     after -- unless they specifically ask. The one exception: if you named a

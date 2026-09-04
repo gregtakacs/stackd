@@ -38,6 +38,8 @@ _PREFER = [
      "backends": ["cuda"], "footprint_gib": {"cuda": 34}},
     {"active_model": "flux2-klein", "capabilities": ["generate", "stylize", "edit"],
      "backends": ["cuda", "vulkan"], "footprint_gib": {"cuda": 24, "vulkan": 20}},
+    {"active_model": "ideogram4", "capabilities": ["generate"],
+     "backends": ["cuda"], "footprint_gib": {"cuda": 34}},
 ]
 
 
@@ -118,6 +120,7 @@ def main() -> int:
     check("substring: 'klein'", tools._resolve_pipeline("klein")[0] == "flux2-klein")
     check("substring: 'turbo'", tools._resolve_pipeline("turbo")[0] == "flux2-dev-turbo")
     check("token match: 'flux dev turbo'", tools._resolve_pipeline("flux dev turbo")[0] == "flux2-dev-turbo")
+    check("substring: 'ideogram'", tools._resolve_pipeline("ideogram")[0] == "ideogram4")
     name, names = tools._resolve_pipeline("wan2.2")
     check("no match -> (None, full list)", name is None and "flux2-klein" in names)
     check("empty -> (None, list)", tools._resolve_pipeline("")[0] is None)

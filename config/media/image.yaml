@@ -75,3 +75,11 @@ prefer:
     capabilities: [generate, stylize, edit]
     backends: [cuda, vulkan]
     footprint_gib: { cuda: 24, vulkan: 20 }
+  # generate-only specialist (typography / text-in-image). Last in the list, so
+  # it's only auto-picked when the others don't fit — reach it explicitly with
+  # `image_model: ideogram4` or `stackctl image use ideogram4`. Needs the
+  # ideogram4 + Qwen3-VL + flux2-vae checkpoints in the models dir.
+  - active_model: ideogram4
+    capabilities: [generate]
+    backends: [cuda]
+    footprint_gib: { cuda: 34 }

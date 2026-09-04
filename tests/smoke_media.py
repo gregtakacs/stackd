@@ -76,8 +76,10 @@ def main() -> int:
           t.containers["vulkan"].build is not None
           and t.containers["vulkan"].build.dockerfile == "Dockerfile.igpu")
     check("vulkan container keeps /dev/kfd", "/dev/kfd" in t.containers["vulkan"].devices)
-    check("prefer[] is ordered dev-turbo then klein",
-          [ld.active_model for ld in t.prefer] == ["flux2-dev-turbo", "flux2-klein"])
+    check("prefer[] is ordered dev-turbo, klein, ideogram4",
+          [ld.active_model for ld in t.prefer] == ["flux2-dev-turbo", "flux2-klein", "ideogram4"])
+    check("ideogram4 is generate-only, cuda-only",
+          t.prefer[2].capabilities == ["generate"] and t.prefer[2].backends == ["cuda"])
     check("first entry is cuda-only", t.prefer[0].backends == ["cuda"])
     check("klein runs on either backend", set(t.prefer[1].backends) == {"cuda", "vulkan"})
     check("footprint per backend", t.prefer[1].footprint_gib == {"cuda": 24.0, "vulkan": 20.0})

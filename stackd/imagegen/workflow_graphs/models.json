@@ -85,8 +85,7 @@
       }
     },
     "ideogram4": {
-      "label": "Ideogram 4 -- 9.3B DiT; DORMANT (no tool routes here; kept for a future revive / eGPU web-UI use)",
-      "dormant": true,
+      "label": "Ideogram 4 -- 9.3B DiT (Qwen3-VL 8B text encoder, dual-model guider); strong at typography / text-in-image. generate only, cuda only.",
       "validated": true,
       "prompt_rewrite": {
         "system": "ideogram4.txt",
