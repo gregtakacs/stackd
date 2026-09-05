@@ -43,27 +43,27 @@ def main() -> int:
 
     co = validate_profile(cfg, "coding")
     checks.append(("coding fits", co.ok))
-    checks.append(("coding keeps autocomplete", "chat-autocomplete" in co.resident))
+    checks.append(("coding keeps autocomplete", "code-autocomplete" in co.resident))
     checks.append(("coding drops chat", "chat" not in co.resident))
 
     cuda = next(p for p in co.pools if p.pool == "cuda_vram")
     checks.append(("coding fills cuda0 (tight but ok)", co.ok and cuda.headroom_gib < 10))
-    checks.append(("coding-flash stands in for chat (serves assistant*)",
-                   any(se.api_name == "assistant*" for se in cfg.models["coding-flash"].serves)))
+    checks.append(("coding stands in for chat (serves assistant*)",
+                   any(se.api_name == "assistant*" for se in cfg.models["coding"].serves)))
 
     plan = plan_transition(cfg, "chat", "coding")
     checks.append(("plan teardown", plan.teardown == ["chat"]))
-    checks.append(("plan spawn", sorted(plan.spawn) == ["coding-flash"]))
-    # chat-autocomplete is NOT a plain "keep" across this switch: it's the
+    checks.append(("plan spawn", sorted(plan.spawn) == ["coding"]))
+    # code-autocomplete is NOT a plain "keep" across this switch: it's the
     # second llamacpp port-consumer behind `chat` (11501) but the FIRST behind
-    # `coding-flash`, a non-llamacpp vLLM model that never consumes a port slot
+    # `coding`, a non-llamacpp vLLM model that never consumes a port slot
     # (11500) -- a genuine port reassignment, correctly caught as `reload`
     # since the port-identity fix (2026-09-04). Before that fix this silently
     # showed up as `keep`, which was the exact bug: an old container kept
     # running on its stale port while stackd's health check followed the new
     # (wrong) one.
     checks.append(("plan reload (port reassigned, not silently kept)",
-                   plan.reload == ["chat-autocomplete"]))
+                   plan.reload == ["code-autocomplete"]))
     checks.append(("plan keep is empty", plan.keep == []))
 
     # --- llamacpp's dynamically-assigned port must be part of the identity
@@ -71,37 +71,37 @@ def main() -> int:
     # switch that changes which llamacpp model claims 11500 first) leaves an
     # old container running on its stale --port forever, while stackd's OWN
     # health check follows the newly-computed (wrong) port: permanent
-    # "warming", never crashing, never healing (chat-autocomplete got stuck
+    # "warming", never crashing, never healing (code-autocomplete got stuck
     # exactly this way after a bench-image -> chat switch, 2026-09-04). ---
     from stackd.solver import model_identity, solve
 
     dev = "igpu0"
-    id_11500 = model_identity(cfg, "chat-autocomplete", dev, port=11500)
-    id_11501 = model_identity(cfg, "chat-autocomplete", dev, port=11501)
+    id_11500 = model_identity(cfg, "code-autocomplete", dev, port=11500)
+    id_11501 = model_identity(cfg, "code-autocomplete", dev, port=11501)
     checks.append(("model_identity: different port -> different identity", id_11500 != id_11501))
     checks.append(("model_identity: same port -> same identity",
-                   model_identity(cfg, "chat-autocomplete", dev, port=11500) == id_11500))
+                   model_identity(cfg, "code-autocomplete", dev, port=11500) == id_11500))
 
-    # end-to-end: solve() with chat-autocomplete FIRST in the profile's model
+    # end-to-end: solve() with code-autocomplete FIRST in the profile's model
     # list (as if it were the only llamacpp model, like AI-STACK's real
     # bench-image profile) assigns it 11500; with it SECOND (chat's real
     # order) it gets 11501 -- these must carry different identities.
     pr = cfg.profiles["chat"]
     original_models = list(pr.models)
     try:
-        pr.models = ["chat-autocomplete"]
+        pr.models = ["code-autocomplete"]
         pl_alone = solve(cfg, "chat", None)
         pr.models = original_models
         pl_with_chat = solve(cfg, "chat", None)
     finally:
         pr.models = original_models
-    checks.append(("solve(): chat-autocomplete alone -> port 11500",
-                   pl_alone.placed["chat-autocomplete"].port == 11500))
-    checks.append(("solve(): chat-autocomplete behind chat -> port 11501",
-                   pl_with_chat.placed["chat-autocomplete"].port == 11501))
+    checks.append(("solve(): code-autocomplete alone -> port 11500",
+                   pl_alone.placed["code-autocomplete"].port == 11500))
+    checks.append(("solve(): code-autocomplete behind chat -> port 11501",
+                   pl_with_chat.placed["code-autocomplete"].port == 11501))
     checks.append(("solve(): the port shift changes the diffed identity",
-                   pl_alone.placed["chat-autocomplete"].identity
-                   != pl_with_chat.placed["chat-autocomplete"].identity))
+                   pl_alone.placed["code-autocomplete"].identity
+                   != pl_with_chat.placed["code-autocomplete"].identity))
 
     # ${VAR} / ${VAR:-default} interpolation + .env-file override
     import tempfile
@@ -184,21 +184,40 @@ def main() -> int:
     (ov / "models").mkdir(parents=True)
     (ov / "profiles").mkdir()
     (ov / "profiles" / "coding.yaml").write_text(       # REPLACE: bump priority, drop autocomplete
-        "profile: coding\npriority: 999\nmodels: [coding-flash]\n")
+        "profile: coding\npriority: 999\nmodels: [coding]\n")
     (ov / "profiles" / "chat.yaml").write_text(     # REPLACE: also drop autocomplete
         "profile: chat\npriority: 50\ndefault: true\nmodels: [chat]\n")
-    (ov / "models" / "chat-autocomplete.yaml").write_text("")   # DELETE (empty overlay file)
+    (ov / "models" / "code-autocomplete.yaml").write_text("")   # DELETE (empty overlay file)
     (ov / "models" / "brandnew.yaml").write_text(          # ADD
-        "model: brandnew\n"
+        "name: brandnew\n"
         "engine: { template: llamacpp-cuda, model: foo, params: { ctx: 4096, parallel: 1 } }\n"
         "budget: { vram_gib: 1 }\nplacement: { devices: [cuda0] }\n"
         "serves: [{ api_name: brandnew }]\n")
     ovc = load_config(CFG, overlay=str(ov))
     checks.append(("overlay: replaced file wins", ovc.profiles["coding"].priority == 999))
     checks.append(("overlay: new file adds", "brandnew" in ovc.models))
-    checks.append(("overlay: empty file deletes", "chat-autocomplete" not in ovc.models))
+    checks.append(("overlay: empty file deletes", "code-autocomplete" not in ovc.models))
     checks.append(("overlay: base files untouched", "chat" in ovc.models
                    and load_config(CFG).profiles["chat"].priority == 50))
+
+    # --- catalog overlay: read base ∪ overlay, write to the overlay dir ---
+    from stackd.catalog import Catalog, curve_key
+    base_cat = CFG / "catalog"
+    over_cat = ov / "catalog"
+    cat = Catalog.load(base_cat, overlay=over_cat)
+    n_base = len(cat.curves)
+    checks.append(("catalog: base curves load", n_base > 0))
+    cat.path = over_cat                                   # bench writes here (CLI wires this)
+    out = cat.write_curve("vllm-cuda|cuda0|Heretic|pNone", model="Heretic",
+                          engine="vllm-cuda", device="cuda0",
+                          vram_points=[[0, 89.9]], ram_points=[[0, 58.0]])
+    checks.append(("catalog: curve written under the overlay dir",
+                   out.parent == over_cat and out.is_file()))
+    checks.append(("catalog: overlay curve is visible on reload",
+                   "vllm-cuda|cuda0|Heretic|pNone"
+                   in Catalog.load(base_cat, overlay=over_cat).curves))
+    checks.append(("catalog: base dir untouched by the overlay write",
+                   len(Catalog.load(base_cat).curves) == n_base))
 
     ok = True
     for name, passed in checks:

@@ -36,6 +36,7 @@ class RouteResult:
     endpoint: str | None = None
     profile: str | None = None
     stack: str | None = None
+    artifact: str | None = None            # the checkpoint on disk (engine.model) — for the ledger
     served_model_name: str | None = None   # set -> the HTTP front rewrites body["model"]
     preset: dict = field(default_factory=dict)
     route_kind: str = "native"             # native | standin
@@ -163,11 +164,41 @@ class Manager:
     def _enter(self, name: str, now: float, *, switching: bool) -> None:
         self.state.active_profile = name
         if switching:
-            self.state.pinned = False
+            pr = self.cfg.profiles[name]
+            # A profile with no idle-evict timer sits resident indefinitely
+            # anyway; pin it on entry so reactive routing can't quietly swap it
+            # out either. The floor profile is never auto-pinned — reactive entry
+            # to the real profiles has to stay possible.
+            self.state.pinned = not pr.idle_evict and not pr.default
             self.state.entered_at = now
             self.state.last_switch_at = now
         self.state.last_served_at = now
         self.rec.converge(self.state, name, now=now)
+
+    def _profile_loaded_at(self) -> float | None:
+        """Epoch time the active profile finished loading — the latest ``ready_at``
+        across the stacks it wants. ``None`` while any wanted stack is still
+        warming: the idle-evict countdown only starts once the profile is up."""
+        pr = self.cfg.profiles[self.state.active_profile]
+        wanted = [self.state.stacks[mn] for mn in pr.models if mn in self.state.stacks]
+        if not wanted or any(rt.state == EngineState.warming for rt in wanted):
+            return None
+        ready_ats = [rt.ready_at for rt in wanted if rt.ready_at is not None]
+        return max(ready_ats) if ready_ats else None
+
+    def _idle_evict_at(self, now: float) -> float | None:
+        """Epoch time idle-evict will fire for the active profile, or ``None``
+        (floor / pinned / no timer / still loading). The countdown runs from when
+        the profile finished loading, bumped forward by the last served request —
+        not from activation, so a slow warm-up doesn't eat the idle window."""
+        pr = self.cfg.profiles[self.state.active_profile]
+        if pr.default or not pr.idle_evict or self.state.pinned:
+            return None
+        loaded = self._profile_loaded_at()
+        if loaded is None:
+            return None
+        since = max(loaded, self.state.last_served_at or 0.0)
+        return since + parse_duration(pr.idle_evict)
 
     def use(self, name: str, *, manual: bool = True, now: float | None = None) -> list:
         now = time.time() if now is None else now
@@ -176,6 +207,8 @@ class Manager:
         active = self.cfg.profiles[self.state.active_profile]
         target = self.cfg.profiles[name]
         if not manual:
+            if target.manual_only:
+                raise Outranked(f"{name} is manual-only — load it by hand")
             if target.priority <= active.priority:
                 raise Outranked(
                     f"{name} (pri {target.priority}) does not outrank active "
@@ -222,7 +255,9 @@ class Manager:
 
     def _served_name(self, model_name: str) -> str | None:
         e = self.cfg.models[model_name].engine
-        return e.params.get("served_model_name") if e.template == "vllm-cuda" else None
+        # vLLM validates body["model"] against its --served-model-name; stackd
+        # rewrites the body to this. Defaults to the stack name (see VllmCudaAdapter).
+        return (e.params.get("served_model_name") or model_name) if e.template == "vllm-cuda" else None
 
     def route(self, api_name: str, *, now: float | None = None) -> RouteResult:
         now = time.time() if now is None else now
@@ -238,13 +273,17 @@ class Manager:
                 status = "ok" if rt.state == EngineState.ready else "warming"
                 return RouteResult(
                     status, api_name, rt.endpoint or None, self.state.active_profile,
-                    stack=mn, served_model_name=self._served_name(mn),
+                    stack=mn, artifact=self.cfg.models[mn].engine.model,
+                    served_model_name=self._served_name(mn),
                     preset=self._preset_for(api_name, self.cfg.models[mn].engine.template),
                     route_kind="native" if exact else "standin",
                     note="" if status == "ok" else f"{mn} is {rt.state.value}",
                 )
 
-        owners = _profiles_serving(self.cfg, api_name)
+        # manual_only profiles are invisible to reactive entry — they load only on
+        # an explicit `stackctl use` / activate.
+        owners = [o for o in _profiles_serving(self.cfg, api_name)
+                  if not self.cfg.profiles[o].manual_only]
         if not owners:
             return RouteResult("unknown", api_name, note="no model serves this name")
         top = owners[0]
@@ -262,13 +301,12 @@ class Manager:
         now = time.time() if now is None else now
         events = self.rec.tick(self.state, now=now)
         pr = self.cfg.profiles[self.state.active_profile]
-        if (pr.idle_evict and not pr.default and not self.state.pinned
-                and self.state.last_served_at is not None
-                and now - self.state.last_served_at > parse_duration(pr.idle_evict)
+        deadline = self._idle_evict_at(now)
+        if (deadline is not None and now > deadline
                 and now - (self.state.entered_at or now) > self.min_residency_s):
+            evicted = self.state.active_profile
             self.evict(now=now)
-            events.append(_Evt(self.state.active_profile, "idle-evict",
-                               f"no traffic for {pr.idle_evict}"))
+            events.append(_Evt(evicted, "idle-evict", f"no traffic for {pr.idle_evict}"))
         self._save()
         return events
 
@@ -391,15 +429,17 @@ class Manager:
                     # native  = the ACTIVE profile serves this name via an EXACT
                     #           `serves` entry (its home model).
                     # standin = only a glob match answers for it in the active
-                    #           profile (a cover model, e.g. coding-flash's
-                    #           `assistant*` standing in for chat).
+                    #           profile (a cover model, e.g. coding's
+                    #           `TakacsAI*` standing in for chat).
                     exact_here = any(_serves(self.cfg, x, se.api_name)[1] for x in pr_active.models)
                     glob_here = any(_serves(self.cfg, x, se.api_name)[0] for x in pr_active.models)
                     up = any(x in running for x in pr_active.models
                              if _serves(self.cfg, x, se.api_name)[0])
                     seen[se.api_name] = {
                         "id": se.api_name, "context_length": ctx,
-                        "owner_profile": pr.profile,
+                        # who actually answers this right now: the active profile
+                        # if it serves the name, else its highest-priority home.
+                        "owner_profile": self.state.active_profile if glob_here else pr.profile,
                         "native": exact_here,
                         "standin": glob_here and not exact_here,
                         "ready": (exact_here or glob_here) and up,
@@ -412,11 +452,11 @@ class Manager:
         running = set(self.state.stacks)
         pr = self.cfg.profiles[self.state.active_profile]
         # seconds until idle-evict fires (None = never: floor / pinned / no timer /
-        # never served). Can go negative during the min-residency hold.
-        idle_evict_in = None
-        if pr.idle_evict and not pr.default and not self.state.pinned and self.state.last_served_at:
-            idle_evict_in = round(parse_duration(pr.idle_evict)
-                                  - (time.time() - self.state.last_served_at))
+        # still loading). Counts from profile-loaded, not activation. Can go
+        # negative during the min-residency hold.
+        now = time.time()
+        deadline = self._idle_evict_at(now)
+        idle_evict_in = None if deadline is None else round(deadline - now)
         return {
             "active_profile": self.state.active_profile,
             "pinned": self.state.pinned,
@@ -448,6 +488,8 @@ class Manager:
                         for d in report.devices],
             "sources": report.sources,
             "deltas": {m: list(v) for m, v in report.deltas.items()},
+            "model_vram": report.model_vram,
+            "model_ram": report.model_ram,
             "flags": report.flags,
         }
 

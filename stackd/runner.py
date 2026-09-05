@@ -188,15 +188,27 @@ class DockerApiRunner:
         return json.loads(raw) if code == 200 else None
 
     def spawn(self, spec: LaunchSpec) -> str:
+        # adopt (compose-defined) container: stackd holds no create spec for it,
+        # only start/stops it in place.
         if spec.image is None:
             self._req("POST", f"/containers/{spec.name}/start")
             return spec.name
-        info = self._exists(spec.name)
-        if info is None:
-            code, raw = self._req("POST", f"/containers/create?name={spec.name}",
-                                  _create_payload(spec))
-            if code not in (201, 204):
-                raise RuntimeError(f"create {spec.name}: {code} {raw[:200]!r}")
+        # stackd-owned: the launch spec is authoritative. A container already
+        # carrying this name is from a previous life and may have been created
+        # with different args — most notably a dynamically-assigned llamacpp
+        # `--port`, which shifts when the profile order changes which model claims
+        # 11500 first. Blindly starting the stale one leaves its real
+        # --port/env/mounts out of sync with the spec stackd health-checks
+        # against, and it never heals (permanent "warming"). Recreate instead.
+        if self._exists(spec.name) is not None:
+            dc, dr = self._req("DELETE", f"/containers/{spec.name}?force=1", timeout=45)
+            if dc not in (204, 404) and self._exists(spec.name) is not None:
+                raise RuntimeError(f"replace {spec.name}: stale container won't "
+                                   f"remove: {dc} {dr[:200]!r}")
+        code, raw = self._req("POST", f"/containers/create?name={spec.name}",
+                              _create_payload(spec))
+        if code not in (201, 204):
+            raise RuntimeError(f"create {spec.name}: {code} {raw[:200]!r}")
         self._req("POST", f"/containers/{spec.name}/start")
         return spec.name
 
@@ -252,11 +264,16 @@ class LocalRunner:
     """stackd on the host, driving the `docker` CLI."""
 
     def spawn(self, spec: LaunchSpec) -> str:
-        if spec.image is None or subprocess.run(
-            ["docker", "inspect", spec.name], capture_output=True
-        ).returncode == 0:
+        # adopt (compose-defined) container: only start/stop it in place.
+        if spec.image is None:
             subprocess.run(["docker", "start", spec.name], check=True, timeout=60)
             return spec.name
+        # stackd-owned: the spec is authoritative — drop any stale container of
+        # this name and recreate from the current spec (see DockerApiRunner.spawn
+        # for why blindly starting the old one strands the engine).
+        if subprocess.run(["docker", "inspect", spec.name],
+                          capture_output=True).returncode == 0:
+            subprocess.run(["docker", "rm", "-f", spec.name], capture_output=True, timeout=60)
         cmd = ["docker", "create", "--name", spec.name, "--restart", "no"]
         if spec.network:
             cmd += ["--network", spec.network]

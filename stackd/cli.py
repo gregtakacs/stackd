@@ -560,8 +560,9 @@ def main(argv: list[str] | None = None) -> int:
 
         def _load_catalog(explicit):
             from stackd.catalog import Catalog
-            d = explicit or (args.config / "catalog")
-            return Catalog.load(d) if pathlib.Path(d).is_dir() else Catalog()
+            over = (pathlib.Path(args.config_overlay) / "catalog") if getattr(args, "config_overlay", None) else None
+            d = pathlib.Path(explicit) if explicit else (args.config / "catalog")
+            return Catalog.load(d, overlay=over)   # base ∪ overlay, overlay wins by key
 
         if args.cmd == "show":
             print(f"config   : {args.config}")
@@ -638,9 +639,16 @@ def main(argv: list[str] | None = None) -> int:
         from stackd.bench import bench_stack, ingest
         from stackd.catalog import Catalog
         import json as _json
-        cat_dir = args.catalog or (args.config / "catalog")
-        catalog = Catalog.load(cat_dir)
-        catalog.path = pathlib.Path(cat_dir)
+        base_cat = args.config / "catalog"
+        over_cat = (pathlib.Path(args.config_overlay) / "catalog") if getattr(args, "config_overlay", None) else None
+        catalog = Catalog.load(base_cat, overlay=over_cat)      # read base ∪ overlay
+        # Write curves to the durable location: an explicit --catalog, else the
+        # config overlay dir when one is set (it's the bind-mounted / persistent
+        # copy in a container deploy — the base dir lives in the image layer and
+        # is wiped on every rebuild), else the base config dir.
+        catalog.path = pathlib.Path(args.catalog) if args.catalog else (over_cat or base_cat)
+        catalog.path.mkdir(parents=True, exist_ok=True)
+        print(f"catalog write dir: {catalog.path}")
         if args.stack not in cfg.models:
             print(f"unknown stack: {args.stack}", file=sys.stderr)
             return 2

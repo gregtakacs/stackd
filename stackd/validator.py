@@ -58,6 +58,8 @@ class FitReport:
     deltas: dict[str, tuple[float, float]] = field(default_factory=dict)  # model -> (Δvram, Δram) vs declared
     unmeasured: list[str] = field(default_factory=list)       # placed but source != "measured"
     unplaced: list[str] = field(default_factory=list)         # in the profile but fit nowhere
+    model_vram: dict[str, float] = field(default_factory=dict)  # model -> planned VRAM GiB on its device
+    model_ram: dict[str, float] = field(default_factory=dict)   # model -> planned host-RAM spill GiB
 
     @property
     def ok(self) -> bool:
@@ -75,7 +77,7 @@ def validate_profile(cfg: Config, profile: str, catalog: "Catalog | None" = None
     for p in pl.placed.values():
         dev_vram[p.device] += p.vram_gib
         dev_ram[p.device] += p.ram_gib
-        dev_models[p.device].append(p.model)
+        dev_models[p.device].append(p.name)
 
     ok, pools_raw, devs_raw = check(cfg, dev_vram, dev_ram)
     pools = [PoolBalance(pn, lim, used, bd) for pn, (used, lim, bd) in pools_raw.items()]
@@ -103,7 +105,7 @@ def validate_profile(cfg: Config, profile: str, catalog: "Catalog | None" = None
         flags.append(f"won't fit, unavailable in this profile: {', '.join(pl.unplaced)}")
 
     unmeasured = (
-        [p.model for p in pl.placed.values() if p.source != "measured"]
+        [p.name for p in pl.placed.values() if p.source != "measured"]
         if catalog is not None else []
     )
     if unmeasured:
@@ -113,14 +115,16 @@ def validate_profile(cfg: Config, profile: str, catalog: "Catalog | None" = None
     deltas: dict[str, tuple[float, float]] = {}
     if catalog is not None:
         for p in pl.placed.values():
-            decl = cfg.models[p.model].budget
+            decl = cfg.models[p.name].budget
             if p.source != "declared":
-                deltas[p.model] = (round(p.vram_gib - decl.vram_gib, 2),
+                deltas[p.name] = (round(p.vram_gib - decl.vram_gib, 2),
                                    round(p.ram_gib - decl.ram_gib, 2))
 
     return FitReport(
         profile, list(pl.placed), pools, devices, flags,
-        placement={p.model: p.device for p in pl.placed.values()},
-        sources={p.model: p.source for p in pl.placed.values()},
+        placement={p.name: p.device for p in pl.placed.values()},
+        sources={p.name: p.source for p in pl.placed.values()},
         deltas=deltas, unmeasured=unmeasured, unplaced=list(pl.unplaced),
+        model_vram={p.name: p.vram_gib for p in pl.placed.values()},
+        model_ram={p.name: p.ram_gib for p in pl.placed.values() if p.ram_gib},
     )

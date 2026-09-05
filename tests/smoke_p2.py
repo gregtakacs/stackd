@@ -51,7 +51,7 @@ def t_converge_chat() -> None:
     m = mgr()
     m.use("chat", now=0)
     check("chat spawns 2 LLM stacks", set(m.state.stacks) == {
-        "chat", "chat-autocomplete"})
+        "chat", "code-autocomplete"})
     check("all warming after converge",
           all(s.state == EngineState.warming for s in m.state.stacks.values()))
     check("elastic image tier placed dev-turbo on the RTX",
@@ -69,17 +69,17 @@ def t_switch_to_coding_is_a_delta() -> None:
     m = mgr()
     m.use("chat", now=0)
     ready_all(m)
-    ac_handle = m.state.stacks["chat-autocomplete"].handle
+    ac_handle = m.state.stacks["code-autocomplete"].handle
     m.use("coding", now=100)
     check("coding: chat torn down", "chat" not in m.state.stacks)
     check("coding: image tier rebuilt as klein on the iGPU",
           m.state.image is not None and m.state.image.active_model == "flux2-klein"
           and m.state.image.device == "igpu0")
-    check("coding: flash spawned", "coding-flash" in m.state.stacks)
+    check("coding: flash spawned", "coding" in m.state.stacks)
     check("coding: autocomplete untouched (same handle)",
-          m.state.stacks["chat-autocomplete"].handle == ac_handle)
+          m.state.stacks["code-autocomplete"].handle == ac_handle)
     check("coding: autocomplete now owned by coding (listed there)",
-          m.state.stacks["chat-autocomplete"].owner_profile == "coding")
+          m.state.stacks["code-autocomplete"].owner_profile == "coding")
 
 
 def t_cuda_teardown_uses_kill_and_probe() -> None:
@@ -134,6 +134,38 @@ def t_pin_blocks_self_evict() -> None:
     check("pinned coding survives 60m idle", m.state.active_profile == "coding")
 
 
+def t_idle_evict_counts_from_load_not_activation() -> None:
+    # a slow warm-up must not eat the idle window — the countdown starts when the
+    # profile's stacks go ready, not when it was activated.
+    m = mgr(FakeRunner(ready_after=2), min_residency_s=1)
+    m.use("chat", now=0)
+    ready_all(m)
+    m.use("coding", now=1000)
+    check("countdown not started while coding warms", m._idle_evict_at(1000) is None)
+    ready_all(m, now_start=1000)
+    loaded = max(rt.ready_at for rt in m.state.stacks.values())
+    check("countdown anchored to load time",
+          m._idle_evict_at(loaded) == loaded + 45 * 60)
+    m.tick(now=loaded + 44 * 60)
+    check("stays at 44m since load", m.state.active_profile == "coding")
+    m.tick(now=loaded + 46 * 60)
+    check("evicts at 46m since load (not since activation)",
+          m.state.active_profile == "chat")
+
+
+def t_no_timer_profile_autopins_on_entry() -> None:
+    m = mgr(FakeRunner(ready_after=1), switch_cooldown_s=0)
+    m.use("chat", now=0)
+    check("floor profile is never auto-pinned", not m.state.pinned)
+    m.cfg.profiles["coding"].idle_evict = None      # a profile with no timer
+    m.use("coding", now=10)
+    check("no-timer profile auto-pins on entry", m.state.pinned)
+    m.tick(now=10 + 6 * 60 * 60)
+    check("auto-pinned profile is not idle-evicted", m.state.active_profile == "coding")
+    m.evict(now=20 + 6 * 60 * 60)
+    check("evicting back to the floor clears the pin", not m.state.pinned)
+
+
 def t_reactive_entry_and_standin() -> None:
     m = mgr(FakeRunner(ready_after=1), switch_cooldown_s=0)
     m.use("chat", now=0)
@@ -147,8 +179,8 @@ def t_reactive_entry_and_standin() -> None:
     r2 = m.route("assistant", now=200)  # chat-owned, coding is active + masks assistant*
     check("chat request served by stand-in (mask)", r2.status == "ok")
     check("stand-in did NOT switch down", m.state.active_profile == "coding")
-    check("stand-in endpoint is coding-flash",
-          r2.endpoint == m.state.stacks["coding-flash"].endpoint)
+    check("stand-in endpoint is coding",
+          r2.endpoint == m.state.stacks["coding"].endpoint)
 
     r3 = m.route("coding-autocomplete", now=210)  # keep@igpu0 survivor
     check("autocomplete served by kept igpu0 stack", r3.status == "ok")
@@ -192,7 +224,7 @@ def t_preset_translation() -> None:
 
 def t_cuda_drain_barrier() -> None:
     """Switching chat->coding tears down the 27B on cuda0 then allocates
-    coding-flash on top. The drain barrier waits for free VRAM to settle first,
+    coding on top. The drain barrier waits for free VRAM to settle first,
     and aborts the spawn if nvidia-smi stops responding (card wedging)."""
     # healthy: free VRAM ramps as the scrubber releases, then plateaus -> proceed
     fake = FakeRunner(ready_after=1)
@@ -202,7 +234,7 @@ def t_cuda_drain_barrier() -> None:
     ready_all(m)
     ev = m.use("coding", now=100)
     check("drain ran on the cuda switch", any(e.action == "drain" for e in ev))
-    check("coding-flash spawned after drain settled", "coding-flash" in m.state.stacks)
+    check("coding spawned after drain settled", "coding" in m.state.stacks)
     check("27B torn down", "chat" not in m.state.stacks)
 
     # wedge: nvidia-smi stops answering -> abort the spawn, don't pile on
@@ -213,7 +245,7 @@ def t_cuda_drain_barrier() -> None:
     fake2.gpu_free_values = [8000, None, None, None]
     ev2 = m2.use("coding", now=100)
     check("wedge -> degraded event", any(e.action == "degraded" for e in ev2))
-    check("wedge -> coding-flash NOT spawned on the stuck card", "coding-flash" not in m2.state.stacks)
+    check("wedge -> coding NOT spawned on the stuck card", "coding" not in m2.state.stacks)
 
 
 def t_tick_sweeps_stray_stacks() -> None:
@@ -226,14 +258,14 @@ def t_tick_sweeps_stray_stacks() -> None:
     ready_all(m)
     m.use("coding", now=100)
     ready_all(m, now_start=100)
-    # simulate a half-done switch back: active=chat but coding-flash lingers
+    # simulate a half-done switch back: active=chat but coding lingers
     from stackd.solver import solve
     m.state.active_profile = "chat"
-    check("coding-flash lingering in state", "coding-flash" in m.state.stacks)
+    check("coding lingering in state", "coding" in m.state.stacks)
     m.tick(now=200)
-    check("tick swept the stray coding-flash", "coding-flash" not in m.state.stacks)
+    check("tick swept the stray coding", "coding" not in m.state.stacks)
     check("chat reconverged after sweep",
-          {"chat", "chat-autocomplete"} <= set(m.state.stacks))
+          {"chat", "code-autocomplete"} <= set(m.state.stacks))
 
 
 def t_image_tier_is_stackd_created() -> None:
@@ -346,16 +378,16 @@ def t_image_tier_scheduler() -> None:
     m.rec.converge(m.state, "chat", now=50)
     check("no-op converge doesn't touch the image slot", m.state.image.handle == h0)
 
-    # switch: image torn down BEFORE coding-flash spawns, then rebuilt from the
+    # switch: image torn down BEFORE coding spawns, then rebuilt from the
     # new headroom (klein on the iGPU — vLLM claims the RTX)
     ev = m.use("coding", now=100)
-    order = [e.action for e in ev if e.stack.startswith("image:") or e.stack == "coding-flash"]
+    order = [e.action for e in ev if e.stack.startswith("image:") or e.stack == "coding"]
     check("image teardown emitted on the switch", "teardown" in order)
     check("image rebuilt as klein on the iGPU",
           m.state.image.active_model == "flux2-klein" and m.state.image.device == "igpu0")
     ready_all(m, now_start=100)
     check("coding LLM + image both ready",
-          m.state.stacks["coding-flash"].state == EngineState.ready
+          m.state.stacks["coding"].state == EngineState.ready
           and m.state.image.state == EngineState.ready)
 
     # crash: tick clears the dead slot and the same tick refills it
@@ -569,6 +601,8 @@ def main() -> int:
         t_crash_restart_with_backoff,
         t_idle_self_evict,
         t_pin_blocks_self_evict,
+        t_idle_evict_counts_from_load_not_activation,
+        t_no_timer_profile_autopins_on_entry,
         t_reactive_entry_and_standin,
         t_preset_translation,
         t_cuda_drain_barrier,
