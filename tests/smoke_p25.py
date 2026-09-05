@@ -69,12 +69,12 @@ def main() -> int:
 
     state = pathlib.Path("/tmp") / f"stackd-p25-{time.time_ns()}.json"
     mgr = Manager(CFG, state, FakeRunner(ready_after=1))
-    mgr.use("everyday", now=0)
+    mgr.use("chat", now=0)
     for i in range(4):
         mgr.tick(now=(i + 1) * 5)
-    check("everyday ready",
+    check("chat ready",
           all(s.state == EngineState.ready for s in mgr.state.stacks.values()))
-    mgr.state.stacks["everyday-chat"].endpoint = up_url
+    mgr.state.stacks["chat"].endpoint = up_url
 
     httpd = make_server(mgr, "127.0.0.1", 0, api_key="secret", warm_wait_s=3)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
@@ -108,7 +108,7 @@ def main() -> int:
                          body={"model": "no-such-model", "messages": []})
         check("unknown model -> 404", code == 404)
 
-        # reactive entry: agentic label outranks everyday -> 503 warming (no tick thread here)
+        # reactive entry: agentic label outranks chat -> 503 warming (no tick thread here)
         code, res = _req(f"{base}/v1/chat/completions", token="secret",
                          body={"model": "assistant-coder", "messages": []})
         check("agentic request triggers entry -> 503 warming",
@@ -122,13 +122,13 @@ def main() -> int:
         mgr.state.stacks["coding-flash"].endpoint = up_url
         code, res = _req(f"{base}/v1/chat/completions", token="secret",
                          body={"model": "assistant", "messages": []})
-        check("stand-in serves everyday name while coding active", code == 200)
+        check("stand-in serves chat name while coding active", code == 200)
         check("vllm stand-in: model rewritten to served_model_name",
               res.get("echo", {}).get("model") == "assistant-coder-flash")
 
-        code, st = _req(f"{base}/profiles/everyday/activate", token="secret", body={})
-        check("control: /profiles/everyday/activate -> 200", code == 200)
-        check("control: active profile is everyday", mgr.state.active_profile == "everyday")
+        code, st = _req(f"{base}/profiles/chat/activate", token="secret", body={})
+        check("control: /profiles/chat/activate -> 200", code == 200)
+        check("control: active profile is chat", mgr.state.active_profile == "chat")
     finally:
         httpd.shutdown()
         up.shutdown()

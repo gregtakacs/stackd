@@ -172,9 +172,11 @@ def _build_parser() -> argparse.ArgumentParser:
     sv.add_argument("--pricing", type=pathlib.Path, default=None)
     sv.add_argument("--json", action="store_true")
 
-    mg = sub.add_parser("migrate", help="import a prior proxy's user_keys.json export into the DB")
+    mg = sub.add_parser("migrate", help="backfill from a prior llama-priority-proxy (keys and/or usage history)")
     mg.add_argument("--db", default=os.environ.get("STACKD_DB"))
-    mg.add_argument("--keys", type=pathlib.Path, required=True)
+    mg.add_argument("--keys", type=pathlib.Path, default=None, help="a user_keys.json export")
+    mg.add_argument("--proxy-db", type=pathlib.Path, default=None,
+                    help="a llama-priority-proxy usage.sqlite — backfill usage / energy / prices")
 
     pc = sub.add_parser("prices", help="refresh tier prices from OpenRouter (needs --db)")
     pc.add_argument("--db", default=os.environ.get("STACKD_DB"))
@@ -194,8 +196,26 @@ def _build_parser() -> argparse.ArgumentParser:
     rl.add_argument("--port", type=int, default=int(os.environ.get("STACKD_PORT", "11444")))
     rl.add_argument("--api-key", default=_env_or_file("STACKD_API_KEY"))
 
-    im = sub.add_parser("image", help="inspect / swap the elastic image tier (talks to the daemon)")
-    im.add_argument("action", nargs="?", default="show", choices=["show", "use", "capability"],
+    im = sub.add_parser("image", help="inspect / swap / bench the elastic image tier (talks to the daemon)")
+    im.add_argument("--sizes", default="1024", help="bench: comma-separated square px (e.g. 1024,1536)")
+    im.add_argument("--prompt", default=None, help="bench: generation prompt override")
+    im.add_argument("--json", action="store_true", help="bench: machine-readable output")
+    im.add_argument("--force", action="store_true",
+                    help="bench: proceed even if an LLM is co-resident on the target device")
+    im.add_argument("--backend", choices=["cuda", "vulkan"], default=None,
+                    help="use/bench: force this backend instead of the prefer-ladder's auto pick "
+                    "(e.g. bench a cuda-preferred model on vulkan without editing config)")
+    im.add_argument("--unsafe", action="store_true",
+                    help="use/bench: bypass BOTH the device-VRAM fit check and the "
+                    "real-host-RAM guard (reconciler.py::_real_host_ram_avail) that normally "
+                    "decide whether a candidate is allowed to load. For measuring a model's TRUE "
+                    "footprint when the current footprint_gib/host_ram_gib estimate is what's "
+                    "blocking it -- exactly the case that estimate is supposed to be corrected "
+                    "from. Requires --backend (an unsafe load must target a specific, deliberate "
+                    "device, never 'wherever fits'). The container's mem_limit_gib hard ceiling "
+                    "still applies regardless -- this bypasses the SOFT, estimate-based checks "
+                    "only, not the OS-level backstop.")
+    im.add_argument("action", nargs="?", default="show", choices=["show", "use", "capability", "bench"],
                     help="show (default) | use <model> | capability <verb>")
     im.add_argument("arg", nargs="?", help="model name for `use`, verb for `capability`")
     im.add_argument("--host", default=os.environ.get("STACKD_HOST", "127.0.0.1"))
@@ -214,8 +234,13 @@ def _db_path(args) -> pathlib.Path:
 def _pricing_path(args) -> pathlib.Path | None:
     if getattr(args, "pricing", None):
         return args.pricing
-    p = args.config.parent / "pricing.json"
-    return p if p.is_file() else None
+    # overlay wins, then the base config dir (this used to look in args.config.parent
+    # — the wrong dir — so config/pricing.json was silently never loaded).
+    for base in ([pathlib.Path(args.config_overlay)] if getattr(args, "config_overlay", None) else []) + [args.config]:
+        p = base / "pricing.json"
+        if p.is_file():
+            return p
+    return None
 
 
 def _cmd_build(args) -> int:
@@ -311,6 +336,115 @@ def _cmd_reload(args) -> int:
     return 0
 
 
+def _cmd_image_bench(args, base, headers) -> int:
+    """`stackctl image bench <model>` — make the model resident, run one real
+    generate per --sizes while sampling nvidia-smi, report the true footprint."""
+    import asyncio
+    import json as _json
+    import time as _time
+    import urllib.error
+    import urllib.request
+
+    model = args.arg
+    if not model:
+        print("usage: stackctl image bench <model> [--sizes 1024,1536] [--prompt ...]", file=sys.stderr)
+        return 2
+    try:
+        sizes = [int(x) for x in str(args.sizes).split(",") if x.strip()]
+    except ValueError:
+        print("--sizes must be comma-separated integers", file=sys.stderr)
+        return 2
+
+    def _post(path, body):
+        r = urllib.request.Request(base + path, method="POST", headers=headers,
+                                   data=_json.dumps(body).encode())
+        with urllib.request.urlopen(r, timeout=300) as resp:
+            return _json.loads(resp.read() or b"{}")
+
+    def _get():
+        r = urllib.request.Request(base, method="GET", headers=headers)
+        with urllib.request.urlopen(r, timeout=30) as resp:
+            return _json.loads(resp.read() or b"{}")
+
+    if args.unsafe and not args.backend:
+        print("--unsafe requires --backend (an unsafe load must target a specific, "
+              "deliberate device, never 'wherever fits')", file=sys.stderr)
+        return 2
+
+    try:
+        print(f"→ making {model} resident on the elastic tier …"
+              + (f"  [UNSAFE: bypassing fit checks, forced onto {args.backend}]" if args.unsafe else ""))
+        body = {"name": model}
+        if args.backend:
+            body["backend"] = args.backend
+        if args.unsafe:
+            body["unsafe"] = True
+        res = _post("/model", body)
+        if not res.get("ok", True):
+            print(f"could not load {model}: {res.get('error') or res}", file=sys.stderr)
+            return 1
+        if res.get("note"):
+            print(f"note: {res['note']}")
+        for _ in range(120):
+            r = (_get().get("resident") or {})
+            if r.get("active_model") == model and r.get("state") == "ready" and r.get("serveable"):
+                endpoint, backend, device = r["endpoint"], r.get("backend", "cuda"), r.get("device", "")
+                break
+            _time.sleep(2)
+        else:
+            print("timed out waiting for the model to be ready", file=sys.stderr)
+            return 1
+        # guard: co-resident LLM on the same device = ComfyUI model-reload thrash,
+        # slow and (seen 2026-09-04) able to wedge the container. Refuse unless --force.
+        sreq = urllib.request.Request(f"http://{args.host}:{args.port}/status", headers=headers)
+        with urllib.request.urlopen(sreq, timeout=15) as sr:
+            devs = _json.loads(sr.read() or b"{}").get("devices", [])
+        co = next((d.get("models") for d in devs if d.get("device") == device and d.get("models")), None)
+        if co and not args.force:
+            print(f"refusing: {', '.join(co)} {'is' if len(co)==1 else 'are'} resident on {device} — "
+                  f"benching an image model there thrashes ComfyUI model reloads and can wedge it.\n"
+                  f"Bench where it isn't contended (e.g. `stackctl evict` the profile first, or a "
+                  f"profile that puts the image tier on the iGPU), or pass --force to override.",
+                  file=sys.stderr)
+            return 2
+    except urllib.error.URLError as e:
+        print(f"image bench: {e} — is `stackctl serve` running on {args.host}:{args.port}?", file=sys.stderr)
+        return 1
+
+    try:
+        from stackd.imagegen.bench import DEFAULT_PROMPT, bench_image
+    except ImportError as e:
+        print(f"image bench needs the imagegen extra ({e}) — run inside the stackd container", file=sys.stderr)
+        return 1
+
+    print(f"→ benching on {endpoint} ({backend}), sizes {sizes} …  (each generation ~10–60s)")
+    out = asyncio.run(bench_image(model, sizes, args.prompt or DEFAULT_PROMPT, endpoint, backend=backend))
+
+    if args.json:
+        print(_json.dumps(out, indent=2))
+        return 0
+    print(f"\n{model}  (baseline VRAM on device: {out['baseline_total_gib']}G, "
+          f"baseline host RAM: {out['baseline_host_gib']}G)")
+    print(f"  {'size':>7}  {'secs':>6}  {'added':>8}  {'total peak':>11}  {'comfy-pid':>10}  "
+          f"{'+host RAM':>10}  {'host peak':>10}")
+    for p in out["points"]:
+        if not p.get("ok"):
+            print(f"  {p['px']:>5}²  {'ABORTED' if 'exceeded' in p.get('error','') else 'FAILED'} — {p.get('error', '')[:90]}")
+            continue
+        print(f"  {p['px']:>5}²  {p['secs']:>6}  {p['added_gib']:>6}G  {p['peak_total_gib']:>9}G  "
+              f"{p['peak_comfy_gib']:>8}G  {p['added_host_gib']:>9}G  {p['peak_host_gib']:>9}G")
+    print(f"\nfootprint (peak VRAM the pipeline added): {out['footprint_gib']}G")
+    print(f"host RAM this generation added: {out['added_host_gib']}G "
+          f"(peak {out['peak_host_gib']}G of whole-machine RAM in use) — checked live against real "
+          f"available memory by reconciler.py::_real_host_ram_avail on every pick/swap.")
+    print(f"→ suggested  footprint_gib: {{ {backend}: {out['suggest_footprint_gib']} }}  "
+          f"host_ram_gib: {{ {backend}: {out['suggest_host_ram_gib']} }}  (each: measured + 3G cushion)")
+    print(f"  paste both into config.local/media/image.yaml under `- active_model: {model}`. "
+          f"NOTE the model is pinned_by=user now — activate another profile / `stackctl image "
+          f"use <m>` to release.")
+    return 0
+
+
 def _cmd_image(args) -> int:
     """GET /image, or POST /image/model|/image/capability — always to the daemon."""
     import json as _json
@@ -321,14 +455,26 @@ def _cmd_image(args) -> int:
     headers = {"content-type": "application/json"}
     if args.api_key:
         headers["authorization"] = f"Bearer {args.api_key}"
+
+    if args.action == "bench":
+        return _cmd_image_bench(args, base, headers)
+
     if args.action == "show":
         req = urllib.request.Request(base, method="GET", headers=headers)
     elif args.action == "use":
         if not args.arg:
-            print("usage: stackctl image use <model>", file=sys.stderr)
+            print("usage: stackctl image use <model> [--backend cuda|vulkan] [--unsafe]", file=sys.stderr)
             return 2
+        if args.unsafe and not args.backend:
+            print("--unsafe requires --backend", file=sys.stderr)
+            return 2
+        body = {"name": args.arg}
+        if args.backend:
+            body["backend"] = args.backend
+        if args.unsafe:
+            body["unsafe"] = True
         req = urllib.request.Request(base + "/model", method="POST", headers=headers,
-                                     data=_json.dumps({"name": args.arg}).encode())
+                                     data=_json.dumps(body).encode())
     else:  # capability
         if not args.arg:
             print("usage: stackctl image capability <verb>", file=sys.stderr)
@@ -528,8 +674,20 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "migrate":
             import json as _json
             store = Store.open(str(db))
-            n = store.import_user_keys_json(_json.loads(args.keys.read_text()))
-            print(f"imported {n} keys into {db}")
+            did = False
+            if args.keys:
+                n = store.import_user_keys_json(_json.loads(args.keys.read_text()))
+                print(f"imported {n} keys into {db}")
+                did = True
+            if args.proxy_db:
+                r = store.import_proxy_db(str(args.proxy_db))
+                print(f"backfilled {db}: {r['usage_daily_rows']} usage_daily row(s) "
+                      f"({r['reqs']} reqs), {r['energy_days']} energy day(s), "
+                      f"{r['price_points']} price point(s)")
+                did = True
+            if not did:
+                print("nothing to do — pass --keys and/or --proxy-db", file=sys.stderr)
+                return 2
             return 0
         if not db.exists() and args.cmd != "users":
             print(f"no datastore at {db} — start `stackd serve` once, or `migrate`", file=sys.stderr)

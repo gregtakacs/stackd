@@ -3,12 +3,30 @@
 #
 #   nvidia-smi is injected by the NVIDIA container runtime (NVIDIA_DRIVER_
 #   CAPABILITIES=utility) — not installed here.
-#   rocm-smi is best-effort; without it the iGPU probe falls back to sysfs/free.
+#   The dashboard's live iGPU stats (GET /gpu -> igpu0) read the amdgpu sysfs
+#   node first (needs the container to see /dev/dri + the always-mounted /sys),
+#   with rocm-smi installed below as a fallback. Neither works unless the compose
+#   service grants /dev/kfd + /dev/dri and the video/render groups.
 FROM python:3.12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl tini \
+        ca-certificates curl gnupg tini \
     && rm -rf /var/lib/apt/lists/*
+
+# rocm-smi — a *fallback* for the iGPU telemetry (the amdgpu-sysfs reader in
+# telemetry.py is primary and needs no package). Its own best-effort apt layer:
+# a repo hiccup or a non-AMD base must not break the image build. Pin ROCM_APT to bump.
+ARG ROCM_APT=6.2.4
+RUN set -eu; \
+    ( curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor > /usr/share/keyrings/rocm.gpg \
+      && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/${ROCM_APT} jammy main" \
+         > /etc/apt/sources.list.d/rocm.list \
+      && apt-get update \
+      && apt-get install -y --no-install-recommends rocm-smi-lib \
+      && ln -sf /opt/rocm/bin/rocm-smi /usr/local/bin/rocm-smi ) \
+    || echo "WARN: rocm-smi install skipped — iGPU telemetry falls back to amdgpu sysfs"; \
+    rm -rf /var/lib/apt/lists/*
+ENV PATH=/opt/rocm/bin:$PATH
 
 RUN pip install --no-cache-dir "pyyaml>=6"
 

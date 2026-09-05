@@ -18,8 +18,8 @@ Numbers are seeded from a prior proxy's
 `scenario_everyday` comment. **Replace them with real measurements:**
 
 ```
-stackctl bench everyday-chat      --points 131072,262144,393216
-stackctl bench everyday-autocomplete --points 8192,16384,32768
+stackctl bench chat              --points 131072,262144,393216
+stackctl bench chat-autocomplete --points 8192,16384,32768
 stackctl bench coding-flash       --ingest coding-flash.measured.json   # vLLM: 1 point
 stackctl bench <image-model>      --ingest <image-model>.measured.json  # ComfyUI: 1 point
 ```
@@ -31,8 +31,8 @@ sweep the footprint.
 ## Checking the fit
 
 ```
-stackctl validate everyday --catalog catalog            # shows source + Δ vs declared per stack
-stackctl validate everyday --catalog catalog --strict   # non-zero exit if any curve is not "measured"
-stackctl solve everyday-chat --catalog catalog --budget-gib 42   # max ctx that fits
-stackctl bench --verify everyday                         # spawn the profile, diff prediction vs reality (2 GiB tol)
+stackctl validate chat --catalog catalog            # shows source + Δ vs declared per stack
+stackctl validate chat --catalog catalog --strict   # non-zero exit if any curve is not "measured"
+stackctl solve chat --catalog catalog --budget-gib 42   # max ctx that fits
+stackctl bench --verify chat                        # spawn the profile, diff prediction vs reality (2 GiB tol)
 ```

@@ -80,6 +80,13 @@ class RuntimeState:
     last_served_at: float | None = None
     stacks: dict[str, StackRuntime] = field(default_factory=dict)
     image: "ImageSlot | None" = None
+    # "<profile>:<resident image active_model>" the `image: warm` forced
+    # generation has already fired for. Reset to None on every profile switch
+    # (converge()) so re-activating a warm profile warms it again; also
+    # naturally re-arms on a manual `/image/model` swap under the SAME
+    # profile, since the resident model in the key changes — see
+    # Reconciler._maybe_warm_image.
+    warmed_for: str | None = None
 
     # --- persistence -------------------------------------------------------------
     @classmethod

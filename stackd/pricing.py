@@ -5,15 +5,22 @@ trimmed to a flat per-dimension breakdown."""
 
 from __future__ import annotations
 
+import datetime
 import json
 import pathlib
 
 from stackd.store import Store
 
+
+def _d(iso: str) -> datetime.date:
+    return datetime.date.fromisoformat(iso)
+
 _DEFAULTS = {
+    "currency": "USD",
     "electricity_price_per_kwh": 0.15,
     "host_baseline_w": 90,
     "hardware_cost": 0,
+    "payback_tier": None,          # tier label whose net drives the payback %
     "tiers": [
         {"label": "midtier", "ref": "anthropic/claude-3.5-haiku"},
         {"label": "frontier", "ref": "anthropic/claude-sonnet-4"},
@@ -62,6 +69,17 @@ def _group(rows: list[dict], key: str) -> dict[str, list[dict]]:
     return out
 
 
+def _tier_rows(rows: list[dict], tier: dict) -> list[dict]:
+    """A tier may scope to `served_models` — only price rows served by one of
+    those. stackd only keeps `requested_model` at day grain, so match loosely
+    (exact or substring); an unscoped tier prices everything."""
+    sm = tier.get("served_models")
+    if not sm:
+        return rows
+    return [r for r in rows if any(
+        s == (r["requested_model"] or "") or s in (r["requested_model"] or "") for s in sm)]
+
+
 def savings(store: Store, cfg: dict, *, from_day: str | None = None,
             to_day: str | None = None) -> dict:
     rows = [r for r in store.usage_rows(from_day, to_day)
@@ -70,38 +88,66 @@ def savings(store: Store, cfg: dict, *, from_day: str | None = None,
     energy = store.energy_between(days[0], days[-1]) if days else {"gpu_kwh": 0.0, "host_kwh": 0.0}
     kwh = energy["gpu_kwh"] + energy["host_kwh"]
     energy_cost = round(kwh * cfg["electricity_price_per_kwh"], 4)
+    span_days = ((_d(days[-1]) - _d(days[0])).days + 1) if days else 0
 
     tok_total = sum(r["prompt_tokens"] + r["completion_tokens"] for r in rows) or 1
+    tier_refs = [t["ref"] for t in cfg.get("tiers", [])]
+    priced_refs = {ref for ref in tier_refs if any(store.price_on(ref, d) for d in (days or []))}
+    pricing_stale = bool(tier_refs) and not all(r in priced_refs for r in tier_refs)
 
     def tier_block(tier: dict) -> dict:
-        gross = _gross_for(rows, store, tier["ref"])
+        trows = _tier_rows(rows, tier)
+        gross = _gross_for(trows, store, tier["ref"])
+        # apportion energy to a breakdown key by its share of this tier's gross
+        def _net(g_gross: float) -> float:
+            share = (g_gross / gross) if gross else 0.0
+            return round(g_gross - energy_cost * share, 4)
         by = {
             dim: {
                 k: {
-                    "gross": _gross_for(g, store, tier["ref"]),
+                    "gross": (kg := _gross_for(g, store, tier["ref"])),
+                    "net": _net(kg),
                     "prompt_tokens": sum(x["prompt_tokens"] for x in g),
                     "completion_tokens": sum(x["completion_tokens"] for x in g),
                     "reqs": sum(x["reqs"] for x in g),
                 }
-                for k, g in _group(rows, dim).items()
+                for k, g in _group(trows, dim).items()
             }
             for dim in ("day", "user_email", "requested_model", "served_profile")
         }
+        net = round(gross - energy_cost, 4)
+        price = store.price_on(tier["ref"], days[-1]) if days else None
         return {
             "label": tier["label"], "ref": tier["ref"],
-            "gross": gross, "net": round(gross - energy_cost, 4),
+            "scoped": bool(tier.get("served_models")),
+            "served_models": tier.get("served_models") or [],
+            "price": price,
+            "gross": gross, "net": net,
+            "annualized": round(net / span_days * 365, 2) if span_days else 0.0,
             "by": by,
         }
 
+    blocks = [tier_block(t) for t in cfg.get("tiers", [])]
+    hw = float(cfg.get("hardware_cost", 0) or 0)
+    pay_label = cfg.get("payback_tier") or (blocks[-1]["label"] if blocks else None)
+    pay = next((b for b in blocks if b["label"] == pay_label), blocks[-1] if blocks else None)
+    payback_pct = round(max(0.0, pay["net"]) / hw * 100, 2) if (hw > 0 and pay) else None
+
     return {
         "from": days[0] if days else None, "to": days[-1] if days else None,
+        "span_days": span_days,
+        "currency": cfg.get("currency", "USD"),
         "reqs": sum(r["reqs"] for r in rows),
         "prompt_tokens": sum(r["prompt_tokens"] for r in rows),
         "completion_tokens": sum(r["completion_tokens"] for r in rows),
         "energy": {**energy, "kwh": round(kwh, 4), "cost": energy_cost,
                    "price_per_kwh": cfg["electricity_price_per_kwh"]},
-        "tiers": [tier_block(t) for t in cfg.get("tiers", [])],
-        "hardware_cost": cfg.get("hardware_cost", 0),
+        "tiers": blocks,
+        "payback_tier": pay_label,
+        "payback_pct": payback_pct,
+        "hardware_cost": hw or None,
+        "pricing_stale": pricing_stale,
+        "last_openrouter_fetch": store.get_meta("last_openrouter_fetch"),
         "token_total_for_share": tok_total,
     }
 

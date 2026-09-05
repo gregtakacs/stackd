@@ -1,0 +1,1355 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>stackd</title>
+<link rel="stylesheet" href="/static/uplot.min.css">
+<style>
+  :root {
+    --bg:#0f1117; --surface:#1a1d27; --surface2:#222633; --border:#2e3345;
+    --text:#e1e4ed; --dim:#8b8fa3; --accent:#6c8cff; --accent-dim:#3a4a8c;
+    --green:#4ade80; --yellow:#facc15; --red:#f87171; --orange:#fb923c; --purple:#a855f7;
+    --radius:10px;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:system-ui,-apple-system,"Segoe UI",sans-serif; background:var(--bg); color:var(--text); padding:20px; }
+  a { color:var(--accent); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  h1 { font-size:1.3rem; font-weight:600; letter-spacing:-.02em; }
+  h1 span { color:var(--accent); }
+  h2 { font-size:.82rem; text-transform:uppercase; letter-spacing:.08em; color:var(--dim); margin-bottom:12px; font-weight:600; }
+  .muted { color:var(--dim); }
+  .grid { display:grid; gap:16px; }
+  .g2 { grid-template-columns:1fr 1fr; }
+  @media (max-width:1000px){ .g2 { grid-template-columns:1fr; } }
+  .card { background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:16px 18px; }
+  .row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  .spacer { flex:1; }
+  button, select {
+    font:inherit; color:var(--text); background:var(--surface2); border:1px solid var(--border);
+    border-radius:7px; padding:6px 12px; cursor:pointer;
+  }
+  button:hover:not(:disabled) { border-color:var(--accent); }
+  button:disabled { opacity:.45; cursor:default; }
+  button.primary { background:var(--accent-dim); border-color:var(--accent); }
+  button.nav.on { background:var(--accent-dim); border-color:var(--accent); }
+  button.sm { padding:3px 9px; font-size:.8rem; }
+  input[type=password], input[type=text] {
+    font:inherit; color:var(--text); background:var(--bg); border:1px solid var(--border);
+    border-radius:7px; padding:8px 10px;
+  }
+  .pill { display:inline-flex; align-items:center; gap:5px; font-size:.74rem; font-weight:600;
+    padding:2px 9px; border-radius:999px; background:var(--surface2); border:1px solid var(--border); }
+  .pill.ok { color:var(--green); border-color:#2c5138; }
+  .pill.warn { color:var(--yellow); border-color:#5c5222; }
+  .pill.bad { color:var(--red); border-color:#5c2c2c; }
+  .pill.info { color:var(--accent); border-color:#33417a; }
+  .dot { width:8px; height:8px; border-radius:50%; display:inline-block; background:var(--dim); flex-shrink:0; }
+  .dot.ready { background:var(--green); } .dot.warming { background:var(--yellow); animation:pulse 1.4s infinite; }
+  .dot.crashed,.dot.error { background:var(--red); } .dot.stopped { background:var(--dim); }
+  @keyframes pulse { 50% { opacity:.35; } }
+  .flag { font-size:.78rem; color:var(--orange); background:#2a1f14; border:1px solid #4a331c;
+    border-radius:6px; padding:5px 9px; margin-top:6px; }
+
+  /* placement map */
+  #mapLanes { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:14px; }
+  .lane { background:var(--bg); border:1px solid var(--border); border-radius:9px; padding:12px;
+    display:flex; gap:14px; }
+  .lane .bar { width:56px; flex-shrink:0; }
+  .lane-body { flex:1; min-width:0; }
+  .lane-body h3 { font-size:.9rem; font-weight:600; }
+  .lane-body .sub { font-size:.74rem; color:var(--dim); margin:2px 0 6px; }
+  .lane-stat { font-size:.8rem; color:var(--dim); }
+  .lane-stat b { color:var(--text); font-variant-numeric:tabular-nums; }
+  .lane-real { font-size:.76rem; margin-top:1px; }
+  .lane-real .over { color:var(--orange); }
+  .seglist { margin-top:9px; display:flex; flex-direction:column; gap:3px; font-size:.78rem; }
+  .seg-row { display:flex; align-items:center; gap:7px; }
+  .seg-row .sw { width:9px; height:9px; border-radius:2px; flex-shrink:0; }
+  .seg-row .sw.elastic { background-image:repeating-linear-gradient(45deg,#0000,#0000 3px,#ffffff40 3px,#ffffff40 6px); }
+  .seg-row .nm { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .seg-row .gb { font-variant-numeric:tabular-nums; color:var(--text); }
+  .seg-row .tg { font-size:.66rem; color:var(--dim); flex-shrink:0; }
+  .seg-row.free-row { color:var(--dim); }
+  .lane-note { font-size:.72rem; color:var(--dim); margin-top:7px; line-height:1.5; }
+  .bar { position:relative; height:260px; border-radius:7px; background:var(--surface2);
+    border:1px solid var(--border); overflow:hidden; display:flex; flex-direction:column-reverse; }
+  .seg { border-top:1px solid rgba(0,0,0,.3); min-height:1px; }
+  .seg.elastic { background-image:repeating-linear-gradient(45deg,transparent,transparent 5px,rgba(255,255,255,.1) 5px,rgba(255,255,255,.1) 10px); }
+  .seg.resv { background:#2a2f3d !important; }
+  .bar .free { flex:1; }
+  .marker { position:absolute; left:-4px; right:-4px; border-top:2px dashed var(--accent); z-index:5; transition:bottom .4s ease; }
+  .marker span { position:absolute; right:0; top:-14px; font-size:.62rem; color:var(--accent); background:var(--bg); padding:0 2px; }
+  .ghost { font-size:.76rem; color:var(--dim); border:1px dashed var(--border); border-radius:6px; padding:4px 8px; margin-top:6px; display:inline-block; }
+
+  /* profiles */
+  .prof { border:1px solid var(--border); border-radius:9px; padding:11px 13px; margin-bottom:10px; background:var(--bg); }
+  .prof.active { border-color:var(--accent); background:#161a2b; }
+  .prof.pending { border-color:var(--yellow); border-style:dashed; animation:pulse 1.4s infinite; }
+  .prof .chips { display:flex; flex-wrap:wrap; gap:5px; margin:7px 0; }
+  .chip { font-size:.73rem; padding:2px 8px; border-radius:6px; background:var(--surface2); border:1px solid var(--border); }
+  .chip.res { color:var(--green); border-color:#2c5138; }
+  .chip.load { color:var(--yellow); border-color:#5c5222; animation:pulse 1.4s infinite; }
+  .chip.plan { color:var(--dim); }
+  .chip.unplaced { color:var(--red); border-color:#5c2c2c; text-decoration:line-through; }
+
+  /* image ladder */
+  .ladder { display:flex; flex-direction:column; gap:6px; }
+  .rung { display:flex; align-items:center; gap:9px; font-size:.82rem; padding:7px 10px; border-radius:7px;
+    background:var(--bg); border:1px solid var(--border); }
+  .rung.here { border-color:var(--purple); }
+  .rung.toobig { opacity:.5; }
+  .toobig-inline { color:var(--red); }
+
+  /* events */
+  #events { max-height:340px; overflow-y:auto; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.78rem; }
+  .ev { display:flex; gap:8px; padding:3px 2px; border-bottom:1px solid var(--surface2); }
+  .ev time { color:var(--dim); flex-shrink:0; }
+  .ev .k { flex-shrink:0; font-weight:700; min-width:96px; color:var(--dim); }
+  .ev .k.spawn, .ev .k.start, .ev .k.activate { color:var(--green); }
+  .ev .k.stop, .ev .k.teardown, .ev .k.evict, .ev .k.idle-evict { color:var(--orange); }
+  .ev .k.restart, .ev .k.crash, .ev .k.boot-reset { color:var(--red); }
+  .ev .k.image-swap, .ev .k.reload, .ev .k.drain { color:var(--accent); }
+
+  /* tables */
+  .tblwrap { min-width:0; max-width:100%; overflow-x:auto; }
+  /* breakdown tables: wrap the key column instead of scrolling — narrower, better spaced */
+  .tblwrap table { table-layout:fixed; }
+  .tblwrap td:first-child, .tblwrap th:first-child { white-space:normal; overflow-wrap:anywhere; }
+  .tblwrap th { white-space:normal; }
+  table { width:100%; border-collapse:collapse; font-size:.83rem; }
+  th { text-align:left; color:var(--dim); font-weight:600; font-size:.72rem; text-transform:uppercase;
+    letter-spacing:.04em; padding:6px 10px; border-bottom:1px solid var(--border); white-space:nowrap; }
+  td { padding:6px 10px; border-bottom:1px solid var(--surface2); }
+  td.num, th.num { text-align:right; font-variant-numeric:tabular-nums; }
+  tr:last-child td { border-bottom:none; }
+
+  /* live gauges */
+  #gauges { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:10px 22px; }
+  .gauge { display:grid; grid-template-columns:78px 1fr auto; align-items:center; gap:10px; font-size:.78rem; }
+  .gauge .glabel { color:var(--dim); }
+  .gtrack { height:9px; border-radius:5px; background:var(--surface2); overflow:hidden; }
+  .gfill { height:100%; width:0; border-radius:5px; transition:width .4s ease, background .4s ease; }
+  .gauge .gval { font-variant-numeric:tabular-nums; min-width:64px; text-align:right; color:var(--text); }
+
+  .stat { display:flex; flex-direction:column; gap:2px; }
+  .stat b { font-size:1.15rem; font-weight:700; }
+  .stat span { font-size:.74rem; color:var(--dim); }
+  .statrow { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:14px; }
+  .slotdots { display:flex; align-items:center; gap:5px; margin-top:10px; flex-wrap:wrap; }
+  .slotdots .lbl { font-size:.72rem; color:var(--dim); margin-right:4px; }
+  .pdot { width:9px; height:9px; border-radius:2px; background:var(--surface2,#23283a);
+    border:1px solid var(--border); flex-shrink:0; }
+  .pdot.busy { background:var(--green); border-color:#2c5138; }
+  .pdot.queued { background:var(--yellow); border-color:#5c5222; animation:pulse 1.4s infinite; }
+
+  /* charts */
+  .chartwrap { width:100%; min-width:0; overflow:hidden; }
+  /* uPlot legend: static (live:false) + wrapping + centered so a changing
+     value can never reflow the chart or its neighbours. */
+  .u-legend { font-size:.7rem; display:flex !important; flex-wrap:wrap; gap:2px 12px;
+    justify-content:center; padding-top:4px; }
+  .u-legend .u-series { display:inline-flex !important; align-items:center; cursor:default; }
+  .u-legend .u-series > * { display:inline-block; }
+  .u-legend .u-value, .u-legend td.u-value { display:none !important; }  /* no live value */
+  /* custom hover readout — pinned near the cursor, pointer-events:none so it
+     never slips out from under the mouse; only updates when the mouse moves. */
+  .u-tooltip { position:fixed; left:0; top:0; pointer-events:none; z-index:9999;
+    background:var(--surface); border:1px solid var(--border); border-radius:6px;
+    padding:5px 9px; font-size:.72rem; line-height:1.55; white-space:nowrap;
+    box-shadow:0 6px 22px rgba(0,0,0,.45); display:none; }
+  .u-tooltip b { color:var(--text); }
+  .u-tooltip .sw { display:inline-block; width:8px; height:8px; border-radius:2px; margin-right:5px; vertical-align:middle; }
+  .livegrid { display:grid; grid-template-columns:repeat(3,1fr); gap:14px; }
+  @media (max-width:1100px){ .livegrid { grid-template-columns:repeat(2,1fr); } }
+  @media (max-width:700px){ .livegrid { grid-template-columns:1fr; } }
+  .livegrid > *, .grid > * { min-width:0; }
+  .livecell { min-width:0; overflow:hidden; }
+  .livecell .cap { font-size:.76rem; color:var(--dim); margin-bottom:4px; display:flex; gap:8px; align-items:baseline; flex-wrap:wrap; }
+  .livecell .cap b { color:var(--text); font-size:.82rem; }
+
+  .toast { position:fixed; right:18px; bottom:18px; background:var(--surface); border:1px solid var(--accent);
+    border-radius:9px; padding:12px 16px; font-size:.85rem; max-width:360px; box-shadow:0 8px 30px rgba(0,0,0,.4); z-index:50; }
+  #gate { position:fixed; inset:0; background:var(--bg); display:flex; align-items:center; justify-content:center; z-index:100; }
+  #gate .card { width:340px; text-align:center; }
+  .hidden { display:none !important; }
+  .collapse-h { cursor:pointer; user-select:none; }
+  .collapse-h::before { content:"▸ "; color:var(--dim); }
+  .collapse-h.open::before { content:"▾ "; }
+</style>
+</head>
+<body>
+
+<div id="gate">
+  <div class="card">
+    <h1>🗄 <span>stackd</span></h1>
+    <p class="muted" style="margin:10px 0 14px; font-size:.86rem;">Enter the API token</p>
+    <div class="row" style="justify-content:center;">
+      <input type="password" id="gateKey" placeholder="Bearer token" autocomplete="current-password">
+      <button class="primary" id="gateGo">Unlock</button>
+    </div>
+    <p id="gateErr" class="hidden" style="color:var(--red); margin-top:10px; font-size:.82rem;"></p>
+  </div>
+</div>
+
+<div id="app" class="hidden">
+  <div class="row" style="margin-bottom:16px;">
+    <h1>🗄 <span>stackd</span></h1>
+    <button class="sm nav on" id="navMain">Dashboard</button>
+    <button class="sm nav" id="navUsage">Usage &amp; savings</button>
+    <a class="pill" href="/register" target="_blank" rel="noopener">Register a key ↗</a>
+    <div class="spacer"></div>
+    <span id="hdrProfile" class="pill info"></span>
+    <span id="hdrIdle" class="pill hidden" title="time until this profile idle-evicts back to the floor"></span>
+    <span id="hdrPinned" class="pill hidden"></span>
+    <span id="hdrClean" class="pill hidden"></span>
+    <span id="hdrUpdated" class="muted" style="font-size:.76rem;"></span>
+    <select id="refreshRate" title="refresh interval">
+      <option value="1000">1s</option><option value="2000">2s</option>
+      <option value="3000" selected>3s</option><option value="5000">5s</option>
+      <option value="10000">10s</option><option value="30000">30s</option>
+      <option value="0">paused</option>
+    </select>
+    <button class="sm" id="btnReload">Reload config</button>
+    <button class="sm" id="btnCleaner">Cleaner</button>
+    <button class="sm" id="btnLogout">Log out</button>
+  </div>
+  <div id="topErr" class="flag hidden" style="margin-bottom:12px;"></div>
+
+  <!-- ============ MAIN VIEW ============ -->
+  <div id="viewMain">
+    <div class="card" style="margin-bottom:16px;">
+      <h2>Loaded where</h2>
+      <div id="gauges"></div>
+      <div id="mapLanes" style="margin-top:14px;"></div>
+      <div id="mapFlags"></div>
+      <div id="mapUnplaced"></div>
+    </div>
+
+    <div id="engineCards" class="grid" style="grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); margin-bottom:16px;"></div>
+
+    <div class="card" style="margin-bottom:16px;">
+      <div class="row"><h2 style="margin:0;">Live · last 10 min</h2>
+        <div class="spacer"></div><span class="muted" style="font-size:.72rem;">sampled every refresh</span></div>
+      <div class="livegrid" id="liveGrid" style="margin-top:14px;"></div>
+    </div>
+
+    <div class="grid g2" style="margin-bottom:16px;">
+      <div class="card">
+        <h2>Profiles</h2>
+        <div id="profiles"></div>
+      </div>
+      <div class="card">
+        <h2>Image tier <span class="muted" style="text-transform:none; letter-spacing:0; font-weight:400;">— elastic, never at an LLM's expense</span></h2>
+        <div id="imageTier"></div>
+      </div>
+    </div>
+
+    <div class="grid g2" style="margin-bottom:16px;">
+      <div class="card">
+        <h2>Served models</h2>
+        <div id="catalog"></div>
+      </div>
+      <div class="card">
+        <div class="row"><h2 style="margin:0;">Scheduler events</h2><div class="spacer"></div>
+          <span class="muted" style="font-size:.72rem;">newest first · hover to pause</span></div>
+        <div id="events" style="margin-top:10px;"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ USAGE VIEW ============ -->
+  <div id="viewUsage" class="hidden">
+    <div class="card" style="margin-bottom:16px;">
+      <div class="row"><h2 style="margin:0;">Usage &amp; savings</h2><span class="muted" id="usgRange"></span>
+        <div class="spacer"></div>
+        <button class="sm" data-days="7">7d</button>
+        <button class="sm" data-days="14">14d</button>
+        <button class="sm" data-days="30">30d</button>
+        <button class="sm" data-days="90">90d</button>
+        <button class="sm" data-days="all">all</button>
+        <label class="muted" style="font-size:.78rem;">from&nbsp;<input type="date" id="usgFrom"></label>
+        <label class="muted" style="font-size:.78rem;">to&nbsp;<input type="date" id="usgTo"></label>
+        <button class="sm primary" id="usgApply">Apply</button>
+      </div>
+      <div class="statrow" id="usgStats" style="margin-top:14px;"></div>
+    </div>
+
+    <div class="card" style="margin-bottom:16px;">
+      <div class="row"><h2 style="margin:0;">Comparison tiers</h2>
+        <span class="muted" id="usgPricing" style="font-size:.76rem;"></span>
+        <div class="spacer"></div>
+        <button class="sm" id="usgRefresh">↻ Refresh OpenRouter pricing</button>
+        <button class="sm" id="usgCsv">Export CSV</button>
+      </div>
+      <div id="usgTiers" style="margin-top:12px;"></div>
+      <div class="muted" id="usgPayback" style="font-size:.82rem; margin-top:8px;"></div>
+    </div>
+
+    <div class="card" style="margin-bottom:16px;">
+      <div class="grid" style="grid-template-columns:1fr 1fr 1fr; gap:18px;" id="usgChartGrid">
+        <div><div class="muted" style="font-size:.78rem; margin-bottom:4px;">Requests / day (by profile)</div><div id="chReq" class="chartwrap"></div></div>
+        <div><div class="muted" style="font-size:.78rem; margin-bottom:4px;">Tokens / day</div><div id="chTok" class="chartwrap"></div></div>
+        <div><div class="muted" style="font-size:.78rem; margin-bottom:4px;">Energy (kWh) &amp; cumulative net savings ($)</div><div id="chEng" class="chartwrap"></div></div>
+      </div>
+    </div>
+
+    <div class="grid g2" style="margin-bottom:16px;">
+      <div class="card"><h2>By user</h2><div class="tblwrap" id="usgByUser"></div></div>
+      <div class="card"><h2>By model</h2><div class="tblwrap" id="usgByModel"></div></div>
+    </div>
+    <div class="grid g2">
+      <div class="card"><h2>By profile</h2><div class="tblwrap" id="usgByProfile"></div></div>
+      <div class="card"><h2>By day</h2><div class="tblwrap" id="usgByDay"></div></div>
+    </div>
+  </div>
+
+  <div class="card hidden" id="usersCard" style="margin-top:16px;">
+    <h2 class="collapse-h" id="usersH">Registered users</h2>
+    <div id="users" class="hidden" style="margin-top:10px;"></div>
+  </div>
+</div>
+
+<script src="/static/uplot.min.js"></script>
+<script>
+"use strict";
+const $ = s => document.querySelector(s);
+const el = (t, c, txt) => { const e = document.createElement(t); if (c) e.className = c; if (txt != null) e.textContent = txt; return e; };
+const KEY = () => sessionStorage.getItem("stackd_key") || "";
+const fmtGib = v => (v == null ? "–" : (Math.round(v * 10) / 10).toLocaleString() + " GiB");
+const fmtNum = v => (v == null ? "–" : Number(v).toLocaleString());
+const fmtUsd = v => (v == null ? "–" : "$" + Number(v).toLocaleString(undefined, {maximumFractionDigits:2}));
+function fmtSI(n){ n = +n; const a = Math.abs(n);
+  if (a >= 1e9) return (n/1e9).toFixed(a>=1e10?0:1)+"B";
+  if (a >= 1e6) return (n/1e6).toFixed(a>=1e7?0:1)+"M";
+  if (a >= 1e3) return (n/1e3).toFixed(0)+"k";
+  return String(Math.round(n)); }
+const mdDate = s => { const d = new Date(s*1000); return (d.getMonth()+1)+"/"+d.getDate(); };
+const p2 = n => String(n).padStart(2, "0");
+const hms = s => { const d = new Date(s*1000); return p2(d.getHours())+":"+p2(d.getMinutes())+":"+p2(d.getSeconds()); };
+const avgNZ = arr => { const v = (arr || []).filter(x => x != null && x > 0);
+  return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null; };
+
+let timer = null, evPaused = false, lastEvSeq = 0, view = "main";
+const H = {};                       // history-chart uPlot instances
+const LC = {};                      // live-chart uPlot instances
+const GENHIST = {};                 // engine -> [{t, gen, prompt, mtp}] — one point per COMPLETED request
+const genSeq = {};                  // engine -> last seen last_request.seq
+const TS = [];                      // live sample timestamps (s)
+const SER = {};                     // live series: name -> number[] aligned to TS
+const guard = { _: {} };            // anti-flicker: skip a rebuild when data is unchanged
+function unchanged(key, data) {
+  const s = JSON.stringify(data);
+  if (guard._[key] === s) return true;
+  guard._[key] = s; return false;
+}
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, { ...opts, headers: { "Authorization": "Bearer " + KEY(),
+    ...(opts.body ? {"content-type":"application/json"} : {}), ...(opts.headers||{}) } });
+  if (r.status === 401) { showGate("Token rejected."); throw new Error("401"); }
+  const ct = r.headers.get("content-type") || "";
+  const body = ct.includes("json") ? await r.json() : await r.text();
+  if (!r.ok) throw Object.assign(new Error((body && body.error && body.error.message) || r.statusText), { body, status: r.status });
+  return body;
+}
+function showGate(msg) {
+  $("#gate").classList.remove("hidden"); $("#app").classList.add("hidden");
+  if (timer) clearInterval(timer);
+  if (msg) { $("#gateErr").textContent = msg; $("#gateErr").classList.remove("hidden"); }
+}
+function toast(msg, bad) {
+  const t = el("div", "toast", msg);
+  if (bad) t.style.borderColor = "var(--red)";
+  document.body.appendChild(t); setTimeout(() => t.remove(), 5000);
+}
+
+// ---- live gauges (color-coded bars) -----------------------------------
+const GAUGES = [
+  ["cuda-util", "cuda0 util"], ["cuda-pow", "cuda0 power"],
+  ["igpu-util", "igpu0 util"], ["igpu-pow", "igpu0 power"],
+  ["cpu", "host CPU"], ["ram", "host RAM"],
+];
+function buildGauges() {
+  const g = $("#gauges"); if (g.children.length) return;
+  for (const [id, label] of GAUGES) {
+    const row = el("div", "gauge"); row.id = "gg_" + id;
+    row.append(el("span", "glabel", label));
+    const tr = el("div", "gtrack"); tr.append(el("div", "gfill"));
+    row.append(tr);
+    row.append(el("span", "gval", "–"));
+    g.append(row);
+  }
+}
+function gColor(p) { return p == null ? "var(--dim)" : p < 60 ? "var(--green)" : p < 85 ? "var(--yellow)" : "var(--red)"; }
+function setGauge(id, pct, text) {
+  const row = $("#gg_" + id); if (!row) return;
+  const p = pct == null ? null : Math.max(0, Math.min(100, pct));
+  row.querySelector(".gfill").style.width = (p ?? 0) + "%";
+  row.querySelector(".gfill").style.background = gColor(pct);
+  row.querySelector(".gval").textContent = text;
+}
+function renderGauges(gpu, host) {
+  buildGauges();
+  const c = gpu && gpu.cuda0, ig = gpu && gpu.igpu0;
+  setGauge("cuda-util", c ? c.util_pct : null, c && c.util_pct != null ? c.util_pct + "%" : "–");
+  setGauge("cuda-pow", c && c.power_w != null ? 100 * c.power_w / (c.power_limit_w || 600) : null,
+    c && c.power_w != null ? Math.round(c.power_w) + " W" : "–");
+  setGauge("igpu-util", ig ? ig.util_pct : null, ig && ig.util_pct != null ? ig.util_pct + "%" : "–");
+  setGauge("igpu-pow", ig && ig.power_w != null ? 100 * ig.power_w / (ig.power_limit_w || 130) : null,
+    ig && ig.power_w != null ? Math.round(ig.power_w) + " W" : "–");
+  setGauge("cpu", host ? host.cpu_pct : null, host && host.cpu_pct != null ? host.cpu_pct + "%" : "–");
+  const ru = host && host.mem_used_gib, rt = host && host.mem_total_gib;
+  setGauge("ram", ru != null && rt ? 100 * ru / rt : null,
+    ru != null && rt ? `${ru.toFixed(0)} / ${rt.toFixed(0)} GiB` : "–");
+}
+
+// ---- placement map --------------------------------------------------------
+const RESV_KEYS = /reserve|slack|headroom|budget|gtt|overhead/i;
+function hue(str){ let h=0; for(const c of str) h=(h*31+c.charCodeAt(0))>>>0; return h%360; }
+
+function segColor(s) {
+  return s.color || (s.cls === "resv" ? "#2a2f3d" : `hsl(${hue(s.label)} 55% 62%)`);
+}
+function laneEl(o) {
+  const lane = el("div", "lane"); lane.dataset.name = o.name;
+  lane.dataset.budgeted = o.budgeted ?? 0;
+  lane.dataset.realLabel = o.realLabel || "actual";
+  const bar = el("div", "bar");
+  let used = 0;
+  for (const s of (o.segs || [])) {
+    if (!s.gib || s.gib <= 0.02) continue;
+    used += s.gib;
+    const d = el("div", "seg" + (s.cls ? " " + s.cls : ""));
+    d.style.height = Math.max(0.4, (s.gib / o.limit) * 100) + "%";
+    d.style.background = segColor(s);
+    d.title = `${s.label} — ${fmtGib(s.gib)}${s.tag ? " (" + s.tag + ")" : ""}`;
+    bar.append(d);
+  }
+  bar.append(el("div", "free"));
+  const m = el("div", "marker"); m.dataset.limit = o.limit; m.hidden = true;
+  bar.append(m);
+  lane.append(bar);
+
+  const body = el("div", "lane-body");
+  body.append(el("h3", null, o.name));
+  if (o.sub) body.append(el("div", "sub", o.sub));
+  const bud = o.budgeted ?? used;
+  lane.dataset.budgeted = bud;
+  const st1 = el("div", "lane-stat");
+  st1.innerHTML = `budgeted <b>${fmtGib(bud)}</b> / ${fmtGib(o.limit)}`;
+  body.append(st1);
+  // .lane-real is refreshed every tick by laneLive() — always render the slot
+  body.append(el("div", "lane-real muted"));
+  const sl = el("div", "seglist");
+  for (const s of (o.segs || [])) {
+    if (!s.gib || s.gib <= 0.02) continue;
+    const row = el("div", "seg-row");
+    const sw = el("span", "sw" + (s.cls === "elastic" ? " elastic" : "")); sw.style.background = segColor(s);
+    row.append(sw, el("span", "nm", s.label), el("span", "gb", fmtGib(s.gib)));
+    if (s.tag) row.append(el("span", "tg", s.tag));
+    sl.append(row);
+  }
+  const fr = el("div", "seg-row free-row");
+  fr.append(el("span", "sw"), el("span", "nm", "free"),
+            el("span", "gb", fmtGib(Math.max(0, o.limit - used))));
+  sl.append(fr);
+  body.append(sl);
+  if (o.note) body.append(el("div", "lane-note", o.note));
+  lane.append(body);
+  return lane;
+}
+function laneLive(lane, val) {   // per-tick: real-usage marker + the "real" header line
+  if (!lane) return;
+  const m = lane.querySelector(".marker");
+  const lim = m ? +m.dataset.limit : 0;
+  if (m) {
+    if (val == null || val <= 0 || val >= lim) m.hidden = true;
+    else { m.hidden = false; m.style.bottom = (val / lim) * 100 + "%";
+           m.innerHTML = ""; m.append(el("span", null, "real " + fmtGib(val))); }
+  }
+  const r = lane.querySelector(".lane-real");
+  if (r && val != null) {
+    const bud = +lane.dataset.budgeted || 0;
+    const over = val - bud;
+    r.innerHTML = `${lane.dataset.realLabel || "actual"} <b style="color:var(--text)">${fmtGib(val)}</b>`
+      + (Math.abs(over) >= 1 ? ` <span class="${over > 0 ? "over" : ""}">(${over > 0 ? "+" : ""}${fmtGib(over)})</span>` : "");
+  }
+}
+
+function renderMap(st, eng, img, gpu, host) {
+  const engState = {};
+  (eng.engines || []).forEach(e => engState[e.stack] = e.state);
+  const stackState = n => (st.stacks[n] && st.stacks[n].state) || engState[n] || engState["image:" + n];
+  const RESV_LBL = { host_reserve: "host reserve (non-stackd est.)", load_slack: "page-cache load slack",
+    "vram:igpu0 (≤90)": "iGPU VRAM charge", "vram:cuda0": null, "ram:cuda0": "cuda0 engine RAM spill" };
+  const srcTag = m => (st.sources || {})[m] || "";
+  const segFor = (label, gib) => {
+    const resv = RESV_KEYS.test(label);
+    const s = stackState(label);
+    let color = "";
+    if (s === "ready") color = "var(--green)";
+    else if (s === "warming") color = "var(--yellow)";
+    else if (s === "crashed" || s === "error") color = "var(--red)";
+    return { label: RESV_LBL[label] || label, gib, cls: resv ? "resv" : "", color,
+             tag: resv ? "reservation" : srcTag(label) };
+  };
+  const imgSeg = () => ({ label: "image · " + img.resident.active_model, gib: imgFootprint(img),
+    cls: "elastic", tag: "elastic · pinned " + img.resident.pinned_by });
+  const pool = n => (st.pools || []).find(p => p.pool === n);
+  const dev = n => (st.devices || []).find(d => d.device === n);
+  const resKey = img && img.resident ? [img.resident.active_model, img.resident.device, img.resident.pinned_by] : null;
+
+  if (!unchanged("map", [st.pools, st.devices, st.flags, st.unplaced, st.sources, resKey,
+      (eng.engines||[]).map(e => [e.stack, e.state])])) {
+    const lanes = $("#mapLanes"); lanes.innerHTML = "";
+
+    const cv = pool("cuda_vram");
+    if (cv) {
+      const segs = Object.entries(cv.breakdown || {}).map(([k, v]) => segFor(k, v));
+      if (resKey && img.resident.device === "cuda0") segs.push(imgSeg());
+      const budgeted = segs.reduce((a, s) => a + (s.gib || 0), 0);
+      lanes.append(laneEl({
+        name: "cuda0", sub: "RTX PRO 6000 · dedicated VRAM", limit: cv.limit, segs, budgeted,
+        real: gpu && gpu.cuda0 && gpu.cuda0.vram_used_gib, realLabel: "nvidia-smi",
+        note: "nvidia-smi is the real allocation — it also includes the CUDA context, "
+          + "cuBLAS/cuDNN workspaces, allocator fragmentation, and the image model running "
+          + "larger than its catalog estimate. The budget is what the solver plans against.",
+      }));
+    }
+    const ig = dev("igpu0");
+    if (ig) {
+      const hb = (pool("host_unified") || {}).breakdown || {};
+      const segs = (ig.models || []).map(m => segFor(m, hb[m] || (ig.used / Math.max(1, ig.models.length))));
+      if (resKey && img.resident.device === "igpu0") segs.push(imgSeg());
+      const igBudgeted = segs.reduce((a, s) => a + (s.gib || 0), 0) || ig.used;
+      lanes.append(laneEl({
+        name: "igpu0", sub: "Radeon 8060S · Vulkan, GTT carved from unified RAM",
+        limit: ig.budget, segs, budgeted: igBudgeted,
+        real: gpu && gpu.igpu0 && gpu.igpu0.vram_used_gib, realLabel: "amdgpu sysfs",
+      }));
+    }
+    const hu = pool("host_unified");
+    if (hu) {
+      const segs = Object.entries(hu.breakdown || {}).map(([k, v]) => segFor(k, v));
+      // GTT (the iGPU's VRAM) is carved from this same unified pool -- unlike
+      // cuda0, whose VRAM is a separate dedicated pool the image tier never
+      // touches here. The backend's own "vram:igpu0 (≤90)" breakdown entry is
+      // LLM-stack-only (the image tier isn't a profile member the solver knows
+      // about; see solver.py headroom()), so without this the resident image
+      // model's real host-RAM cost never shows up here at all, on ANY swap.
+      if (resKey && img.resident.device === "igpu0") segs.push(imgSeg());
+      const huBudgeted = segs.reduce((a, s) => a + (s.gib || 0), 0) || hu.used;
+      lanes.append(laneEl({
+        name: "host RAM", sub: "unified LPDDR5X — the solver's placement budget",
+        limit: hu.limit, segs, budgeted: huBudgeted,
+        real: host && host.mem_used_gib, realLabel: "OS used",
+        note: "The lane is stackd's budget for placing engines. The OS number is real "
+          + "memory pressure — ComfyUI/engine RSS and multi-GiB model-file page cache "
+          + "aren't in the budget (only 'load slack' gestures at it).",
+      }));
+    }
+    const fl = $("#mapFlags"); fl.innerHTML = "";
+    (st.flags || []).forEach(f => fl.append(el("div", "flag", "⚠ " + f)));
+    const up = $("#mapUnplaced"); up.innerHTML = "";
+    (st.unplaced || []).forEach(m => up.append(el("span", "ghost", "won't fit: " + m)));
+  }
+  // real numbers (marker + "real" header line) refresh every tick, no rebuild
+  for (const lane of $("#mapLanes").children) {
+    const nm = lane.dataset.name;
+    if (nm === "cuda0") laneLive(lane, gpu && gpu.cuda0 && gpu.cuda0.vram_used_gib);
+    else if (nm === "igpu0") laneLive(lane, gpu && gpu.igpu0 && gpu.igpu0.vram_used_gib);
+    else if (nm === "host RAM") laneLive(lane, host && host.mem_used_gib);
+  }
+}
+function imgFootprint(img) {
+  if (!img.resident) return 0;
+  const p = (img.prefer || []).find(x => x.active_model === img.resident.active_model);
+  const be = img.resident.backend;
+  return (p && p.footprint_gib && (p.footprint_gib[be] ?? Object.values(p.footprint_gib)[0])) || 0;
+}
+
+// ---- header -------------------------------------------------------------
+let IDLE_DEADLINE = null;
+function paintIdle() {
+  const e = $("#hdrIdle");
+  if (IDLE_DEADLINE == null) { e.className = "pill hidden"; return; }
+  const s = Math.round((IDLE_DEADLINE - Date.now()) / 1000);
+  const m = Math.floor(Math.abs(s) / 60), ss = String(Math.abs(s) % 60).padStart(2, "0");
+  e.textContent = "⏱ idle-evict " + (s < 0 ? "now" : m + ":" + ss);
+  e.className = "pill " + (s <= 60 ? "warn" : "info");
+}
+function renderHeader(st, cleaner) {
+  const loading = Object.entries(st.stacks || {}).filter(([, v]) => v.state === "warming").map(([k]) => k);
+  const imgWarming = st.image && st.image.state === "warming";
+  const hp = $("#hdrProfile");
+  hp.textContent = "profile: " + st.active_profile + ((loading.length || imgWarming) ? " · loading…" : "");
+  hp.className = "pill " + ((loading.length || imgWarming) ? "warn" : "info");
+  hp.title = loading.length ? "warming: " + loading.join(", ") : "";
+  IDLE_DEADLINE = (typeof st.idle_evict_in_s === "number")
+    ? Date.now() + st.idle_evict_in_s * 1000 : null;
+  paintIdle();
+  const p = $("#hdrPinned");
+  p.className = "pill " + (st.pinned ? "warn" : "hidden");
+  p.textContent = st.pinned ? "📌 pinned" : "";
+  if (cleaner) {
+    const c = $("#hdrClean");
+    c.className = "pill " + (cleaner.enabled ? "ok" : "");
+    c.classList.remove("hidden");
+    c.textContent = "cleaner " + (cleaner.enabled ? "on" : "off");
+    $("#btnCleaner").textContent = cleaner.enabled ? "Cleaner: on" : "Cleaner: off";
+  }
+  $("#hdrUpdated").textContent = "updated " + new Date().toLocaleTimeString();
+}
+
+// ---- profiles ---------------------------------------------------------
+function renderProfiles(data) {
+  if (unchanged("profiles", data.profiles)) return;
+  const box = $("#profiles"); box.innerHTML = "";
+  for (const pr of data.profiles) {
+    const d = el("div", "prof" + (pr.active ? " active" : ""));
+    const r = el("div", "row");
+    r.append(el("b", null, pr.name));
+    r.append(el("span", "pill info", "pri " + pr.priority));
+    if (pr.default) r.append(el("span", "pill", "floor"));
+    if (pr.idle_evict) r.append(el("span", "pill", "idle→" + pr.idle_evict));
+    r.append(el("span", "pill " + (pr.fits ? "ok" : "bad"), pr.fits ? "fits" : "won't fit"));
+    if (pr.active && Object.values(pr.states || {}).some(s => s === "warming"))
+      r.append(el("span", "pill warn", "⏳ loading"));
+    r.append(el("div", "spacer"));
+    if (pr.active) {
+      const pinBtn = el("button", "sm", pr.pinned ? "Unpin" : "Pin");
+      pinBtn.onclick = () => ctl(pr.name, pr.pinned ? "unpin" : "pin");
+      const evBtn = el("button", "sm", "Evict");
+      evBtn.disabled = pr.default;
+      evBtn.onclick = () => ctl(pr.name, "evict");
+      r.append(pinBtn, evBtn);
+    } else {
+      const b = el("button", "sm primary", "Activate");
+      b.onclick = () => {
+        const ev = pr.would_evict || [];
+        if (ev.length && !confirm(`Activate "${pr.name}"?\n\nThis tears down: ${ev.join(", ")}`)) return;
+        b.disabled = true; b.textContent = "Activating…";
+        d.classList.add("pending");
+        ctl(pr.name, "activate");
+      };
+      r.append(b);
+    }
+    d.append(r);
+    const chips = el("div", "chips");
+    for (const m of pr.models) {
+      const s = (pr.states || {})[m];
+      const cls = (pr.unplaced || []).includes(m) ? "unplaced"
+        : s === "warming" ? "load"
+        : (s === "ready" || (pr.resident || []).includes(m)) ? "res"
+        : (s === "crashed" || s === "error") ? "unplaced" : "plan";
+      const c = el("span", "chip " + cls, m + (cls === "load" ? " ⏳" : ""));
+      c.title = (pr.placement && pr.placement[m] ? "→ " + pr.placement[m] : "") + (s ? "  (" + s + ")" : "");
+      chips.append(c);
+    }
+    d.append(chips);
+    (pr.flags || []).forEach(f => d.append(el("div", "flag", "⚠ " + f)));
+    box.append(d);
+  }
+}
+async function ctl(name, verb) {
+  const ing = { activate: "activating", pin: "pinning", unpin: "unpinning", evict: "evicting" }[verb] || verb;
+  toast(`${ing} ${name}…`);                       // instant feedback — the POST can block on a cuda drain
+  if (verb === "activate") {
+    const hp = $("#hdrProfile");
+    hp.textContent = "profile: " + name + " · switching…";
+    hp.className = "pill warn";
+  }
+  try {
+    await api(`/profiles/${encodeURIComponent(name)}/${verb}`, { method: "POST", body: "{}" });
+    toast(`${verb} ${name} — ok`);
+  } catch (e) {
+    toast(`${verb} ${name} failed: ${e.message}`, true);
+  } finally {
+    tick(); loadProfiles();
+  }
+}
+
+// ---- image tier -----------------------------------------------------
+function renderImage(img) {
+  if (unchanged("image", [img.resident, img.headroom_gib, img.prefer])) return;
+  const box = $("#imageTier"); box.innerHTML = "";
+  const res = img.resident;
+  const head = el("div", "row");
+  if (res) {
+    head.append(el("span", "pill " + (res.serveable ? "ok" : "warn"),
+      (res.serveable ? "● " : "○ ") + res.active_model));
+    head.append(el("span", "muted", `${res.device} · ${res.backend} · pinned_by ${res.pinned_by}`));
+    if (res.co_device_warming) head.append(el("span", "pill warn", "co-device warming"));
+  } else {
+    head.append(el("span", "muted", "no image engine resident"));
+  }
+  box.append(head);
+  const hr = el("div", "row"); hr.style.margin = "8px 0";
+  for (const [dv, g] of Object.entries(img.headroom_gib || {}))
+    hr.append(el("span", "pill", `${dv} headroom ${fmtGib(g)}`));
+  box.append(hr);
+  const ladder = el("div", "ladder");
+  const devFor = be => be === "cuda" ? "cuda0" : "igpu0";
+  for (const p of img.prefer || []) {
+    const here = res && res.active_model === p.active_model;
+    // Per-backend footprints, each tagged with whether THIS model would land
+    // there right now (first backend, in the model's own listed order, whose
+    // device has enough headroom) — not the resident model's backend applied
+    // to every row, which showed the wrong device's number for every
+    // non-resident candidate and never said which GPU it'd actually occupy.
+    let landsOn = null;
+    const perBackend = (p.backends || []).map(be => {
+      const dv = devFor(be);
+      const fp = p.footprint_gib[be];
+      const head4 = (img.headroom_gib || {})[dv];
+      const fits = fp == null || head4 == null || fp <= head4;
+      if (fits && landsOn == null) landsOn = dv;
+      return { be, dv, fp, fits };
+    });
+    const toobig = !here && landsOn == null;
+    const rung = el("div", "rung" + (here ? " here" : "") + (toobig ? " toobig" : ""));
+    rung.append(el("span", "dot " + (here ? "ready" : "")));
+    rung.append(el("b", null, p.active_model));
+    const bd = el("span", "muted");
+    bd.append(...perBackend.map((b, i) => {
+      const dv = here && res.backend === b.be ? res.device : b.dv;
+      const txt = `${b.be}:${fmtGib(b.fp)} → ${dv}` + (b.fits ? "" : " (won't fit)");
+      return el("span", b.fits ? "" : "toobig-inline", (i ? "  ·  " : "") + txt);
+    }));
+    rung.append(bd);
+    if (!here && landsOn) rung.append(el("span", "pill", "would load on " + landsOn));
+    rung.append(el("span", "muted", (p.capabilities || []).join(" ")));
+    rung.append(el("div", "spacer"));
+    if (!here) {
+      const b = el("button", "sm", "Load");
+      b.onclick = () => swapImage("model", p.active_model);
+      rung.append(b);
+    }
+    ladder.append(rung);
+  }
+  box.append(ladder);
+  const caps = el("div", "row"); caps.style.marginTop = "10px";
+  caps.append(el("span", "muted", "need capability:"));
+  for (const v of ["generate", "edit", "stylize"]) {
+    const b = el("button", "sm", v);
+    b.onclick = () => swapImage("capability", v);
+    caps.append(b);
+  }
+  box.append(caps);
+}
+async function swapImage(kind, val) {
+  try {
+    const b = kind === "model" ? { name: val } : { need: val };
+    const r = await api("/image/" + kind, { method: "POST", body: JSON.stringify(b) });
+    toast(r.note ? `image: ${r.active_model} — ${r.note}` : `image → ${r.active_model || val}`);
+    tick();
+  } catch (e) { toast("image swap failed: " + e.message, true); }
+}
+
+// ---- served models ------------------------------------------------
+function renderCatalog(models, activeProfile) {
+  const rows = (models.data || []).map(m => {
+    const s = m.stackd || {};
+    return [m.id, s.owner_profile || "", !!s.ready, m.context_length,
+            s.native !== false, !!s.standin];
+  });
+  if (unchanged("catalog", [rows, activeProfile])) return;
+  const box = $("#catalog"); box.innerHTML = "";
+  const t = el("table");
+  t.innerHTML = "<thead><tr><th>model</th><th>owner profile</th><th class=num>ctx</th><th>state</th></tr></thead>";
+  const tb = el("tbody");
+  for (const [id, owner, ready, ctx, native, standin] of rows) {
+    const tr = el("tr");
+    tr.append(el("td", null, id));
+    const oc = el("td");
+    oc.append(el("span", null, owner || "–"));
+    tr.append(oc);
+    tr.append(el("td", "num", ctx ? fmtNum(ctx) : "–"));
+    const stc = el("td");
+    const lbl = native ? (ready ? " native · ready" : " native · loading")
+              : standin ? (ready ? " served by stand-in" : " stand-in not loaded")
+              : " not served (profile unloaded)";
+    stc.append(el("span", "dot " + (ready ? "ready" : "stopped")));
+    stc.append(el("span", "muted", lbl));
+    tr.append(stc);
+    tb.append(tr);
+  }
+  t.append(tb); box.append(t);
+}
+
+// ---- events ------------------------------------------------------
+function renderEvents(snap, reset) {
+  const box = $("#events");
+  if (reset) { box.innerHTML = ""; lastEvSeq = 0; }
+  for (const e of snap.events || []) {
+    lastEvSeq = Math.max(lastEvSeq, e.seq);
+    const d = el("div", "ev");
+    d.append(el("time", null, new Date(e.ts * 1000).toLocaleTimeString()));
+    d.append(el("span", "k " + e.kind, e.kind));
+    d.append(el("span", null, [e.stack, e.detail].filter(Boolean).join(" — ") + (e.source ? `  (${e.source})` : "")));
+    box.prepend(d);
+  }
+  while (box.children.length > 300) box.lastChild.remove();
+}
+
+// ---- engine cards (skeleton once, values in place) --------------
+function engineSkeleton(names) {
+  if (unchanged("engineNames", names)) return;
+  const box = $("#engineCards"); box.innerHTML = "";
+  for (const name of names) {
+    const card = el("div", "card"); card.dataset.stack = name;
+    const r = el("div", "row");
+    r.append(el("span", "dot", ""));
+    r.append(el("b", null, name));
+    r.append(el("span", "muted e-where", ""));
+    r.append(el("div", "spacer"));
+    r.append(el("span", "pill e-restarts hidden", ""));
+    r.append(el("span", "pill e-live hidden", "generating"));
+    card.append(r);
+    const sr = el("div", "statrow"); sr.style.marginTop = "10px";
+    for (const [k, lbl] of [["gen","tok/s gen"],["pp","tok/s prefill"],["kv","context"],["req","in-flight"],["mtp","MTP accept"]]) {
+      const s = el("div", "stat");
+      s.append(el("b", "e-" + k, "–")); s.append(el("span", "e-" + k + "-lbl", lbl));
+      sr.append(s);
+    }
+    card.append(sr);
+    const sd = el("div", "slotdots e-slots hidden");
+    card.append(sd); box.append(card);
+  }
+}
+function fillEngine(name, rt, tel) {
+  const card = $(`#engineCards .card[data-stack="${CSS.escape(name)}"]`);
+  if (!card) return;
+  card.querySelector(".dot").className = "dot " + (rt.state || "");
+  card.querySelector(".e-where").textContent = `${rt.device || "?"} · ${rt.kind || ""}`;
+  const rp = card.querySelector(".e-restarts");
+  rp.classList.toggle("hidden", !rt.restarts);
+  rp.classList.add("bad"); rp.textContent = (rt.restarts || 0) + " restarts";
+  const set = (c, v) => { const e = card.querySelector(c); if (e) e.textContent = v; };
+  if (!tel || tel.error) {
+    ["gen","pp","kv","req","mtp"].forEach(k => set(".e-"+k, "–"));
+    card.querySelector(".e-slots").classList.add("hidden");
+    return;
+  }
+  const active = !!tel.active;
+  card.querySelector(".e-live").classList.toggle("hidden", !active);
+  const n1 = v => v == null ? "–" : (+v).toFixed(1);
+  const n0 = v => v == null ? "–" : (+v).toFixed(0);
+  // active -> live number; idle -> last completed session's average (sticky)
+  set(".e-gen", n1(tel.gen_tok_s));
+  set(".e-pp",  n0(tel.prompt_tok_s));
+  set(".e-mtp", tel.mtp_accept_pct != null ? n0(tel.mtp_accept_pct) + "%" : "–");
+  set(".e-gen-lbl", active ? "tok/s gen (live)" : "tok/s gen (last session)");
+  set(".e-pp-lbl",  active ? "tok/s prefill (live)" : "tok/s prefill (session)");
+  set(".e-mtp-lbl", active ? "MTP accept (live)" : "MTP accept (session)");
+  set(".e-kv",  tel.kv_pct != null ? n1(tel.kv_pct) + "%" : "–");
+  const km = tel.ctx_tokens != null && tel.ctx_max
+    ? `${active ? "context" : "peak context"} · ${(tel.ctx_tokens/1000).toFixed(1)}k / ${(tel.ctx_max/1000).toFixed(0)}k` : "context";
+  set(".e-kv-lbl", km);
+  set(".e-req", (tel.running ?? 0) + (tel.waiting ? " +" + tel.waiting + " queued" : ""));
+  // concurrency lights: one square per slot, lit = a request occupies it.
+  // slot count unknown for vLLM idle -> fall back to running+waiting.
+  const sd = card.querySelector(".e-slots");
+  const slots = tel.slots || ((tel.running ?? 0) + (tel.waiting ?? 0)) || 0;
+  const busy = tel.running ?? 0, queued = tel.waiting ?? 0;
+  if (slots > 0 && slots <= 64) {
+    sd.classList.remove("hidden");
+    sd.innerHTML = "";
+    sd.append(el("span", "lbl", `${busy}/${slots} slots${queued ? " · " + queued + " queued" : ""}`));
+    for (let i = 0; i < slots; i++)
+      sd.append(el("span", "pdot" + (i < busy ? " busy" : "")));
+    for (let i = 0; i < Math.min(queued, 16); i++)
+      sd.append(el("span", "pdot queued"));
+  } else {
+    sd.classList.add("hidden");
+  }
+}
+
+// ---- live 10-min charts ----------------------------------------
+function liveCell(id, title) {
+  const c = el("div", "livecell"); c.id = "cell_" + id;
+  const cap = el("div", "cap"); cap.append(el("span", null, title), el("b", "lv-" + id, ""));
+  const box = el("div", "chartwrap"); box.id = "lchart_" + id;
+  c.append(cap, box); return c;
+}
+function ensureLiveGrid(engineNames) {
+  const want = ["gpuutil","gpupow","vram","kv","tokps","mtp"];
+  if (!unchanged("livecells", [want, engineNames])) {
+    const g = $("#liveGrid"); g.innerHTML = "";
+    for (const k of Object.keys(LC)) { LC[k].destroy(); delete LC[k]; }
+    g.append(liveCell("gpuutil", "GPU utilization % · host CPU / load"));
+    g.append(liveCell("gpupow", "GPU power W"));
+    g.append(liveCell("vram", "VRAM used GiB"));
+    g.append(liveCell("kv", "Context · KV cache %"));
+    g.append(liveCell("tokps", "Generation tok/s"));
+    g.append(liveCell("mtp", "MTP acceptance %"));
+  }
+}
+function col(name) { const a = SER[name] || []; return TS.map((_, i) => a[i] ?? null); }
+function mkLive(id, series, opts = {}) {
+  const box = $("#lchart_" + id); if (!box) return;
+  if (LC[id]) { LC[id].destroy(); }
+  const xseries = { value: (u, v) => v == null ? "" : hms(v) };   // hover readout: hh:mm:ss, no date
+  const o = {
+    width: box.clientWidth || 320, height: 120,
+    legend: { show: series.length > 2, live: false },   // live:false -> legend can't reflow on hover
+    cursor: { points: { size: 4 } },
+    plugins: [hoverTip(hms, (v) => (Math.round(v * 10) / 10).toLocaleString())],
+    scales: { x: { time: true }, ...(opts.scales || {}) },
+    axes: [
+      { stroke: "#8b8fa3", grid: { stroke: "#23283a" }, ticks: { stroke: "#23283a" }, space: 62,
+        values: (u, sp) => sp.map(hms) },
+      { stroke: "#8b8fa3", grid: { stroke: "#23283a" }, ticks: { stroke: "#23283a" }, size: 42,
+        values: (u, sp) => sp.map(v => fmtSI(v)) },
+      ...(opts.axis2 ? [{ stroke: "#8b8fa3", side: 1, scale: opts.axis2, size: 38, grid: { show: false },
+        values: (u, sp) => sp.map(v => fmtSI(v)) }] : []),
+    ],
+    series: [xseries, ...series.slice(1)],
+  };
+  LC[id] = new uPlot(o, [TS.slice(), ...series.slice(1).map(s => col(s._n))], box);
+}
+const PAL = ["#3987e5", "#d95926", "#199e70", "#a855f7", "#facc15", "#f87171", "#38bdf8"];
+// smooth (Catmull-Rom) interpolation for the live charts — the 3 s sample cadence
+// makes straight segments look jagged. undefined if the vendored uPlot lacks it.
+const SPLINE = (window.uPlot && uPlot.paths && uPlot.paths.spline) ? uPlot.paths.spline() : undefined;
+
+// shared uPlot hover tooltip — attached to <body> as position:fixed so no
+// ancestor `overflow:hidden` (or the chart title) can clip it; pointer-events:none
+// so it can't steal the cursor; only moves on mousemove.
+function hoverTip(fmtX, fmtVal) {
+  let tip;
+  const hide = () => { if (tip) tip.style.display = "none"; };
+  return {
+    hooks: {
+      init(u) {
+        tip = document.createElement("div"); tip.className = "u-tooltip";
+        document.body.appendChild(tip);
+        u.over.addEventListener("mouseleave", hide);
+      },
+      destroy() { if (tip) tip.remove(); },
+      setCursor(u) {
+        const { left, top, idx } = u.cursor;
+        if (idx == null || left == null || left < 0) { hide(); return; }
+        const parts = [`<b>${fmtX(u.data[0][idx])}</b>`];
+        for (let s = 1; s < u.series.length; s++) {
+          const ser = u.series[s];
+          if (ser.show === false) continue;
+          const v = u.data[s][idx];
+          if (v == null) continue;
+          const c = typeof ser.stroke === "function" ? ser.stroke(u, s) : (ser.stroke || "#8b8fa3");
+          parts.push(`<span class="sw" style="background:${c}"></span>${ser.label}: ${fmtVal(v, ser)}`);
+        }
+        tip.innerHTML = parts.join("<br>");
+        tip.style.display = "block";
+        const r = u.over.getBoundingClientRect();
+        const tw = tip.offsetWidth, th = tip.offsetHeight;
+        let x = r.left + left + 16, y = r.top + top + 12;
+        if (x + tw > window.innerWidth - 6) x = r.left + left - tw - 16;
+        if (x < 6) x = 6;
+        if (y + th > window.innerHeight - 6) y = r.top + top - th - 12;
+        if (y < 6) y = 6;
+        tip.style.left = Math.round(x) + "px";
+        tip.style.top = Math.round(y) + "px";
+      },
+    },
+  };
+}
+// mean over the completed-request points (across engines) whose timestamp falls
+// in the trailing `winS` seconds ending at time `tEnd`. Returns null when no
+// request happened in that window — so the avg line simply isn't drawn over
+// idle stretches, never dragged toward a held value.
+function genWinMean(engineNames, key, tEnd, winS) {
+  const lo = tEnd - winS;
+  let sum = 0, n = 0;
+  for (const e of engineNames) {
+    for (const p of (GENHIST[e] || [])) {
+      if (p.t > lo && p.t <= tEnd && p[key] != null) { sum += p[key]; n++; }
+    }
+  }
+  return n ? Math.round(sum / n * 10) / 10 : null;
+}
+function renderLive(engineNames) {
+  ensureLiveGrid(engineNames);
+  const line = (name, label, i, scale) => ({ _n: name, label, stroke: PAL[i % PAL.length],
+    width: 2.5, spanGaps: true, points: { show: false }, paths: SPLINE, ...(scale ? { scale } : {}) });
+  const avgLine = name => ({ _n: name, label: "avg (active only)", stroke: "#e1e4ed", width: 1.75,
+    dash: [6, 4], spanGaps: true, points: { show: false }, paths: SPLINE });
+
+  // rolling avg lines from the per-request points only (10-min trailing window)
+  SER["tok_roll"] = TS.map(t => genWinMean(engineNames, "gen", t, 600));
+  SER["mtp_roll"] = TS.map(t => genWinMean(engineNames, "mtp", t, 600));
+
+  const defs = {
+    gpuutil: [{}, line("gu_cuda0","cuda0 GPU",0), line("gu_igpu0","igpu0 GPU",1),
+                  line("h_cpu","host CPU",2), line("h_load","load 1m",3,"load")],
+    gpupow:  [{}, line("gp_cuda0","cuda0",0), line("gp_igpu0","igpu0",1)],
+    vram:    [{}, line("gv_cuda0","cuda0",0), line("gv_igpu0","igpu0",1)],
+    kv:      [{}, ...engineNames.map((n,i) => line("kv_" + n, n, i))],
+    tokps:   [{}, ...engineNames.map((n,i) => line("tok_" + n, n, i)), avgLine("tok_roll")],
+    mtp:     [{}, ...engineNames.map((n,i) => line("mtp_" + n, n, i)), avgLine("mtp_roll")],
+  };
+  for (const [id, series] of Object.entries(defs)) {
+    const opts = id === "gpuutil" ? { axis2: "load", scales: { load: {} } } : {};
+    if (!LC[id]) mkLive(id, series, opts);
+    else LC[id].setData([TS.slice(), ...series.slice(1).map(s => col(s._n))]);
+  }
+  const rnd = v => v == null ? null : Math.round(v * 10) / 10;
+  const last = n => { const a = SER[n] || []; for (let i = a.length-1; i>=0; i--) if (a[i]!=null) return a[i]; return null; };
+  const cap = (id, v, suf) => { const e = $(".lv-" + id); if (e) e.textContent = v==null ? "" : rnd(v) + (suf||""); };
+  // caption: latest (sticky) value · 10-min per-request average (idle excluded)
+  const capReq = (id, series, key, suf) => {
+    const e = $(".lv-" + id); if (!e) return;
+    const l = last(series), a = genWinMean(engineNames, key, Date.now() / 1000, 600);
+    const n = (GENHIST[engineNames[0]] || []).length;
+    e.textContent = l == null && a == null ? ""
+      : `${rnd(l) ?? "–"}${suf} · avg ${a == null ? "–" : rnd(a) + suf}${a == null ? "" : ` (${n} pts)`}`;
+  };
+  const e0 = engineNames[0];
+  { const gu = last("gu_cuda0"), cp = last("h_cpu"), e = $(".lv-gpuutil");
+    if (e) e.textContent = `GPU ${rnd(gu) ?? "–"}% · CPU ${rnd(cp) ?? "–"}%`; }
+  cap("gpupow", last("gp_cuda0"), " W");
+  cap("vram", last("gv_cuda0"), " GiB");
+  { const e = $(".lv-kv"), pct = e0 ? last("kv_" + e0) : null, ct = e0 ? last("ctxt_" + e0) : null;
+    if (e) e.textContent = pct == null ? ""
+      : (ct != null ? fmtSI(ct) + " tok · " : "") + rnd(pct) + "%"; }
+  if (e0) { capReq("tokps", "tok_" + e0, "gen", ""); capReq("mtp", "mtp_" + e0, "mtp", "%"); }
+  else { cap("tokps", null); cap("mtp", null); }
+}
+function sampleLive(now, gpu, host, engTel) {
+  TS.push(now / 1000);
+  const put = (n, v) => { const a = SER[n] ||= []; while (a.length < TS.length - 1) a.push(null); a.push(v == null ? null : +v); };
+  put("gu_cuda0", gpu?.cuda0?.util_pct); put("gu_igpu0", gpu?.igpu0?.util_pct);
+  put("gp_cuda0", gpu?.cuda0?.power_w);  put("gp_igpu0", gpu?.igpu0?.power_w);
+  put("gv_cuda0", gpu?.cuda0?.vram_used_gib); put("gv_igpu0", gpu?.igpu0?.vram_used_gib);
+  put("h_cpu", host?.cpu_pct); put("h_load", host?.loadavg ? host.loadavg[0] : null);
+  for (const [name, t] of Object.entries(engTel || {})) {
+    put("tok_" + name, t && t.gen_tok_s);        // sticky (main line)
+    put("mtp_" + name, t && t.mtp_accept_pct);
+    put("kv_" + name, t && t.kv_pct);
+    put("ctxt_" + name, t && t.ctx_tokens);      // absolute token count, for the caption
+  }
+  // trim to 10 min
+  const cut = now / 1000 - 600;
+  let i = 0; while (i < TS.length && TS[i] < cut) i++;
+  if (i) { TS.splice(0, i); for (const k in SER) SER[k].splice(0, i); }
+}
+
+// ---- history charts (usage view) -----------------------------
+function mkHist(id, series, data, opts = {}) {
+  const box = $(id); if (!box) return;
+  if (H[id]) { H[id].destroy(); delete H[id]; }
+  const o = {
+    width: box.clientWidth || 360, height: 210,
+    legend: { show: true, live: false },
+    plugins: [hoverTip(mdDate, (v, ser) => (ser.scale === "usd" ? "$" : "") + fmtSI(v))],
+    scales: { x: { time: true }, ...(opts.scales || {}) },
+    series: [{ value: (u, v) => v == null ? "" : mdDate(v) }, ...series],
+    axes: [
+      { stroke: "#8b8fa3", grid: { stroke: "#23283a" }, ticks: { stroke: "#23283a" }, space: 46,
+        values: (u, sp) => sp.map(mdDate) },
+      { stroke: "#8b8fa3", grid: { stroke: "#23283a" }, ticks: { stroke: "#23283a" }, size: 58,
+        values: (u, sp) => sp.map(fmtSI) },
+      ...(opts.axis2 ? [{ stroke: "#8b8fa3", side: 1, scale: opts.axis2, size: 60, grid: { show: false },
+        values: (u, sp) => sp.map(v => "$" + fmtSI(v)) }] : []),
+    ],
+  };
+  H[id] = new uPlot(o, data, box);
+}
+function sumSeries(obj) {
+  const keys = Object.keys(obj || {});
+  if (!keys.length) return [];
+  const n = obj[keys[0]].length, out = new Array(n).fill(0);
+  for (const k of keys) obj[k].forEach((v, i) => out[i] += v || 0);
+  return out;
+}
+function renderHistoryCharts(h) {
+  const xs = h.days.map(d => Date.parse(d + "T00:00:00Z") / 1000);
+  const profs = Object.keys(h.requests || {});
+  mkHist("#chReq",
+    profs.map((p, i) => ({ label: p, stroke: PAL[i % PAL.length], width: 2.5, points: { show: false } })),
+    [xs, ...profs.map(p => h.requests[p])]);
+  mkHist("#chTok",
+    [{ label: "prompt", stroke: PAL[0], width: 2.5, points: { show: false } },
+     { label: "completion", stroke: PAL[1], width: 2.5, points: { show: false } },
+     { label: "cached", stroke: PAL[2], width: 2.5, points: { show: false } }],
+    [xs, sumSeries(h.tokens_in), sumSeries(h.tokens_out), sumSeries(h.tokens_cached)]);
+  const kwh = h.days.map((_, i) => (h.energy.gpu_kwh[i] || 0) + (h.energy.host_kwh[i] || 0));
+  let cum = 0; const sav = h.savings.net_usd.map(v => (cum += (v || 0)));
+  mkHist("#chEng",
+    [{ label: "kWh/day", stroke: PAL[4], fill: "rgba(250,204,21,.15)", width: 2.5, points: { show: false } },
+     { label: "cum. savings $", stroke: PAL[2], width: 2.5, points: { show: false }, scale: "usd" }],
+    [xs, kwh, sav], { axis2: "usd", scales: { usd: {} } });
+}
+
+// ---- usage view ---------------------------------------------
+let LAST_SV = null;
+function tierAgg(sv, dim) {
+  // dim -> [{key,reqs,tin,tout,byTier:{label:{gross,net}}}], sorted by first tier's net desc
+  const tiers = sv.tiers || [];
+  const keys = new Set();
+  tiers.forEach(t => Object.keys((t.by || {})[dim] || {}).forEach(k => keys.add(k)));
+  const rows = [...keys].map(k => {
+    const c = (((tiers[0] || {}).by || {})[dim] || {})[k] || {};
+    const byTier = {};
+    tiers.forEach(t => { const e = (((t.by || {})[dim] || {})[k]) || {}; byTier[t.label] = { gross: e.gross || 0, net: e.net || 0 }; });
+    return { key: k, reqs: c.reqs || 0, tin: c.prompt_tokens || 0, tout: c.completion_tokens || 0, byTier };
+  });
+  rows.sort((a, b) => ((Object.values(b.byTier)[0] || {}).net || 0) - ((Object.values(a.byTier)[0] || {}).net || 0));
+  return rows;
+}
+function renderBreakTable(elId, sv, dim, keyHdr) {
+  const rows = tierAgg(sv, dim);
+  const tiers = (sv.tiers || []).map(t => t.label);
+  const box = $(elId); box.innerHTML = "";
+  if (!rows.length) { box.append(el("p", "muted", "no usage in range")); return; }
+  const t = el("table");
+  t.innerHTML = `<thead><tr><th>${keyHdr}</th><th class=num>reqs</th><th class=num>tok in</th><th class=num>tok out</th>` +
+    tiers.map(l => `<th class=num>${l}<br><span style="font-weight:400;font-size:.9em">net $</span></th>`).join("") + "</tr></thead>";
+  const tb = el("tbody");
+  for (const r of rows) {
+    const tr = el("tr");
+    tr.append(el("td", null, r.key));
+    tr.append(el("td", "num", fmtNum(r.reqs)));
+    tr.append(el("td", "num", fmtSI(r.tin)));
+    tr.append(el("td", "num", fmtSI(r.tout)));
+    for (const l of tiers) {
+      const td = el("td", "num", fmtUsd(r.byTier[l].net));
+      td.title = `gross ${fmtUsd(r.byTier[l].gross)}`;
+      tr.append(td);
+    }
+    tb.append(tr);
+  }
+  t.append(tb); box.append(t);
+}
+function pricePerMtok(p) { return p ? `$${p.input_mtok}/$${p.output_mtok} per Mtok` : "no price"; }
+function tiny(txt) { const d = el("div", "muted", txt); d.style.fontSize = ".72rem"; return d; }
+function renderTierCards(sv) {
+  const box = $("#usgTiers"); box.innerHTML = "";
+  const grid = el("div"); grid.style.cssText = "display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px";
+  for (const t of sv.tiers || []) {
+    const c = el("div", "card"); c.style.cssText = "background:var(--bg);padding:12px 14px";
+    const h = el("div", "row"); h.append(el("b", null, t.label));
+    if (t.label === sv.payback_tier) h.append(el("span", "pill info", "payback"));
+    if (t.scoped) h.append(el("span", "pill", "scoped"));
+    c.append(h);
+    c.append(tiny(`${t.ref} · ${pricePerMtok(t.price)}`));
+    const net = el("div"); net.style.cssText = "font-size:1.35rem;font-weight:700;margin-top:6px";
+    net.textContent = fmtUsd(t.net);
+    net.style.color = (t.net >= 0) ? "var(--green)" : "var(--red)";
+    c.append(net);
+    c.append(tiny(`net saved · gross ${fmtUsd(t.gross)}`));
+    c.append(tiny(`≈ ${fmtUsd(t.annualized)}/yr at this rate`));
+    grid.append(c);
+  }
+  box.append(grid);
+  // pricing status
+  const ps = $("#usgPricing");
+  ps.textContent = sv.pricing_stale ? "⚠ pricing missing for some tiers"
+    : sv.last_openrouter_fetch ? `prices: OpenRouter ${sv.last_openrouter_fetch}`
+    : "prices: manual only (Refresh to pull OpenRouter)";
+  ps.style.color = sv.pricing_stale ? "var(--orange)" : "var(--dim)";
+  // payback
+  const pb = $("#usgPayback");
+  if (sv.payback_pct != null)
+    pb.textContent = `Hardware payback (${sv.payback_tier}): ${sv.payback_pct}% of ${fmtUsd(sv.hardware_cost)} recovered · window ${sv.span_days}d`;
+  else pb.textContent = sv.hardware_cost ? `Hardware ${fmtUsd(sv.hardware_cost)} — no net savings yet` : "";
+}
+function isoNDaysAgo(n) { const d = new Date(Date.now() - n * 86400000); return d.toISOString().slice(0, 10); }
+async function loadUsage() {
+  const from = $("#usgFrom").value, to = $("#usgTo").value;
+  const qs = new URLSearchParams();
+  if (from) qs.set("from", from);
+  if (to) qs.set("to", to);
+  let sv, h;
+  try { sv = await api("/savings" + (qs.toString() ? "?" + qs : "")); }
+  catch (e) { toast("savings: " + e.message, true); return; }
+  LAST_SV = sv;
+  const hq = new URLSearchParams();
+  if (from || to) { if (from) hq.set("from", from); if (to) hq.set("to", to); }
+  else if (sv.from) { hq.set("from", sv.from); hq.set("to", sv.to); }
+  else hq.set("days", "14");
+  try { h = await api("/history?" + hq); } catch (e) {}
+  $("#usgRange").textContent = sv.from ? ` — ${sv.from} → ${sv.to} · ${fmtNum(sv.reqs)} req` : " — no usage yet";
+  const box = $("#usgStats"); box.innerHTML = "";
+  const pay = (sv.tiers || []).find(t => t.label === sv.payback_tier) || (sv.tiers || [])[sv.tiers.length - 1];
+  box.append(stat(fmtNum(sv.reqs), "requests"));
+  box.append(stat(fmtSI((sv.prompt_tokens || 0) + (sv.completion_tokens || 0)), "tokens"));
+  if (pay) { box.append(stat(fmtUsd(pay.gross), `would cost · ${pay.label}`)); box.append(stat(fmtUsd(pay.net), "net of energy")); }
+  if (sv.energy) box.append(stat(fmtUsd(sv.energy.cost), `energy · ${(sv.energy.kwh||0).toFixed(1)} kWh @ $${sv.energy.price_per_kwh}`));
+  renderTierCards(sv);
+  if (h && h.days) renderHistoryCharts(h);
+  renderBreakTable("#usgByUser", sv, "user_email", "user");
+  renderBreakTable("#usgByModel", sv, "requested_model", "model");
+  renderBreakTable("#usgByProfile", sv, "served_profile", "profile");
+  renderBreakTable("#usgByDay", sv, "day", "day");
+}
+function stat(b, s) { const d = el("div", "stat"); d.append(el("b", null, b)); d.append(el("span", null, s)); return d; }
+function exportCsv() {
+  const sv = LAST_SV; if (!sv) return;
+  const tiers = (sv.tiers || []).map(t => t.label);
+  const lines = [["dimension", "key", "reqs", "tok_in", "tok_out",
+    ...tiers.flatMap(l => [l + "_gross", l + "_net"])].join(",")];
+  for (const dim of ["user_email", "requested_model", "served_profile", "day"]) {
+    for (const r of tierAgg(sv, dim)) {
+      lines.push([dim, r.key, r.reqs, r.tin, r.tout,
+        ...tiers.flatMap(l => [r.byTier[l].gross, r.byTier[l].net])].join(","));
+    }
+  }
+  const blob = new Blob([lines.join("\n")], { type: "text/csv" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `stackd-savings_${sv.from || "x"}_${sv.to || "x"}.csv`;
+  a.click();
+}
+
+// ---- users -----------------------------------------------
+async function loadUsers() {
+  try {
+    const u = await api("/register/users");
+    $("#usersCard").classList.remove("hidden");
+    const box = $("#users"); box.innerHTML = "";
+    const t = el("table");
+    t.innerHTML = "<thead><tr><th>email</th><th>registered</th><th></th></tr></thead>";
+    const tb = el("tbody");
+    for (const row of u.users || []) {
+      const tr = el("tr");
+      tr.append(el("td", null, row.email));
+      tr.append(el("td", "muted", row.registered_at ? new Date(row.registered_at * 1000).toLocaleDateString() : "–"));
+      const bc = el("td");
+      const b = el("button", "sm", "delete");
+      b.onclick = async () => { if (confirm("Delete key for " + row.email + "?")) {
+        await api("/register/users/" + encodeURIComponent(row.email), { method: "DELETE" }); loadUsers(); } };
+      bc.append(b); tr.append(bc); tb.append(tr);
+    }
+    t.append(tb); box.append(t);
+    box.append(el("p", "muted", "Self-service registration page: "));
+    box.lastChild.append(Object.assign(document.createElement("a"), { href: "/register", target: "_blank", textContent: "/register ↗" }));
+  } catch (e) { /* no datastore / not admin — leave the card hidden */ }
+}
+
+// ---- poll loop --------------------------------------------
+async function tick() {
+  // don't yank a native <select>/<input> popup out from under the user mid-click
+  const ae = document.activeElement;
+  if (ae && (ae.tagName === "SELECT" || ae.tagName === "INPUT" || ae.tagName === "OPTION")) return;
+  try {
+    const [st, eng, img, models, gpu, host, cleaner] = await Promise.all([
+      api("/status"), api("/engines"), api("/image"), api("/v1/models"),
+      api("/gpu"), api("/host").catch(() => ({})), api("/cleaner").catch(() => null),
+    ]);
+    $("#topErr").classList.add("hidden");
+    renderHeader(st, cleaner);
+    renderGauges(gpu, host);
+    renderMap(st, eng, img, gpu, host);
+    renderImage(img);
+    renderCatalog(models, st.active_profile);
+
+    const names = Object.keys(st.stacks || {}).sort();
+    engineSkeleton(names);
+    const tel = {};
+    await Promise.all(names.map(async n => {
+      try { tel[n] = await api("/engine/" + encodeURIComponent(n)); } catch (e) { tel[n] = { error: String(e) }; }
+      fillEngine(n, st.stacks[n], tel[n]);
+      // one data point per COMPLETED request — the only real "generation happened"
+      // measurement; the rolling avg is computed from these, never from idle polls.
+      const lr = tel[n] && tel[n].last_request;
+      if (lr && lr.seq && lr.seq > (genSeq[n] || 0)) {
+        genSeq[n] = lr.seq;
+        (GENHIST[n] ||= []).push({ t: lr.at || Date.now() / 1000,
+          gen: lr.gen_tok_s, prompt: lr.prompt_tok_s, mtp: lr.mtp_accept_pct });
+      } else if (tel[n] && tel[n].active && !lr && (tel[n].gen_tok_s != null || tel[n].mtp_accept_pct != null)) {
+        // vLLM has no per-request `timings` block -> fall back to live-poll
+        // samples taken only while a request is actually running, so the
+        // "avg (active periods only)" line still has something to average
+        (GENHIST[n] ||= []).push({ t: Date.now() / 1000, gen: tel[n].gen_tok_s,
+          prompt: tel[n].prompt_tok_s, mtp: tel[n].mtp_accept_pct });
+      }
+      const cut = Date.now() / 1000 - 600;
+      if (GENHIST[n]) GENHIST[n] = GENHIST[n].filter(p => p.t >= cut);
+    }));
+
+    sampleLive(Date.now(), gpu, host, tel);
+    renderLive(names);
+
+    if (!evPaused) renderEvents(await api("/events?since=" + lastEvSeq), false);
+  } catch (e) {
+    if (e.message !== "401") { $("#topErr").textContent = "poll error: " + e.message; $("#topErr").classList.remove("hidden"); }
+  }
+}
+async function loadProfiles() { try { renderProfiles(await api("/profiles")); } catch (e) {} }
+function schedule() {
+  if (timer) clearInterval(timer);
+  const ms = +$("#refreshRate").value;
+  if (ms) timer = setInterval(tick, ms);
+}
+function setView(v) {
+  view = v;
+  $("#viewMain").classList.toggle("hidden", v !== "main");
+  $("#viewUsage").classList.toggle("hidden", v !== "usage");
+  $("#navMain").classList.toggle("on", v === "main");
+  $("#navUsage").classList.toggle("on", v === "usage");
+  if (v === "usage") loadUsage();
+}
+
+// ---- boot -----------------------------------------------
+async function start() {
+  try { await api("/status"); } catch (e) { return; }
+  $("#gate").classList.add("hidden"); $("#app").classList.remove("hidden");
+  await tick();
+  renderEvents(await api("/events"), true);
+  loadProfiles(); loadUsers();
+  schedule();
+  setInterval(loadProfiles, 15000);
+  setInterval(paintIdle, 1000);
+}
+
+$("#gateGo").onclick = () => { sessionStorage.setItem("stackd_key", $("#gateKey").value.trim());
+  $("#gateErr").classList.add("hidden"); start(); };
+$("#gateKey").addEventListener("keydown", e => { if (e.key === "Enter") $("#gateGo").click(); });
+$("#btnLogout").onclick = () => { sessionStorage.removeItem("stackd_key"); showGate(); };
+$("#refreshRate").onchange = schedule;
+$("#navMain").onclick = () => setView("main");
+$("#navUsage").onclick = () => setView("usage");
+$("#usgApply").onclick = loadUsage;
+$("#usgFrom").onchange = loadUsage;
+$("#usgTo").onchange = loadUsage;
+$("#usgCsv").onclick = exportCsv;
+$("#usgRefresh").onclick = async () => {
+  const b = $("#usgRefresh"); b.disabled = true; b.textContent = "↻ refreshing…";
+  try { const r = await api("/savings/refresh", { method: "POST", body: "{}" });
+    toast(`OpenRouter: ${r.updated} price point(s) updated`); await loadUsage();
+  } catch (e) { toast("price refresh failed: " + e.message, true); }
+  finally { b.disabled = false; b.textContent = "↻ Refresh OpenRouter pricing"; }
+};
+document.querySelectorAll("#viewUsage [data-days]").forEach(b => b.onclick = () => {
+  const d = b.dataset.days;
+  if (d === "all") { $("#usgFrom").value = ""; $("#usgTo").value = ""; }
+  else { $("#usgFrom").value = isoNDaysAgo(+d - 1); $("#usgTo").value = isoNDaysAgo(0); }
+  loadUsage();
+});
+$("#btnReload").onclick = async () => {
+  if (!confirm("Reload config + .env and re-converge?")) return;
+  try { const r = await api("/reload", { method: "POST", body: "{}" });
+    toast("reloaded: " + ((r.reloaded || []).join("; ") || "no changes")); tick();
+  } catch (e) { toast("reload failed: " + e.message, true); }
+};
+$("#btnCleaner").onclick = async () => {
+  try { const cur = await api("/cleaner");
+    await api("/cleaner/" + (cur.enabled ? "off" : "on"), { method: "POST", body: "{}" });
+    renderHeader(await api("/status"), await api("/cleaner"));
+  } catch (e) { toast("cleaner toggle failed: " + e.message, true); }
+};
+$("#usersH").onclick = () => { $("#usersH").classList.toggle("open"); $("#users").classList.toggle("hidden"); };
+$("#events").addEventListener("mouseenter", () => evPaused = true);
+$("#events").addEventListener("mouseleave", () => evPaused = false);
+let rT; addEventListener("resize", () => { clearTimeout(rT); rT = setTimeout(() => {
+  for (const k in LC) LC[k].setSize({ width: ($("#lchart_" + k)?.clientWidth || 320), height: 120 });
+  for (const id in H) { const b = document.querySelector(id); if (b) H[id].setSize({ width: b.clientWidth, height: 210 }); }
+}, 200); });
+
+if (KEY()) start(); else showGate();
+</script>
+</body>
+</html>

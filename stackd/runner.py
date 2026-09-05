@@ -70,6 +70,8 @@ class LaunchSpec:
     network: str | None = None
     ipc_host: bool = False
     shm_size: str | None = None
+    ulimits: dict[str, int] = field(default_factory=dict)   # e.g. {"nofile": 65536} -- soft==hard
+    mem_limit_gib: float | None = None           # hard cgroup memory ceiling (memory == memory-swap)
     labels: dict[str, str] = field(default_factory=dict)
     health_url: str | None = None
     ready_timeout_s: float = 300.0
@@ -141,6 +143,12 @@ def _create_payload(spec: LaunchSpec) -> dict:
         host["SecurityOpt"] = spec.security_opt
     if (sh := _bytes(spec.shm_size)):
         host["ShmSize"] = sh
+    if spec.ulimits:
+        host["Ulimits"] = [{"Name": k, "Soft": v, "Hard": v} for k, v in spec.ulimits.items()]
+    if spec.mem_limit_gib:
+        mem_bytes = int(spec.mem_limit_gib * 1024 ** 3)
+        host["Memory"] = mem_bytes
+        host["MemorySwap"] = mem_bytes   # == Memory -> no additional swap, clean OOM-kill at the ceiling
     body: dict = {
         "Image": spec.image, "Cmd": spec.cmd, "HostConfig": host,
         "Env": [f"{k}={v}" for k, v in spec.env.items()],
@@ -262,6 +270,10 @@ class LocalRunner:
             cmd += ["--security-opt", s]
         if spec.shm_size:
             cmd += ["--shm-size", spec.shm_size]
+        for k, v in spec.ulimits.items():
+            cmd += ["--ulimit", f"{k}={v}:{v}"]
+        if spec.mem_limit_gib:
+            cmd += ["--memory", f"{spec.mem_limit_gib}g", "--memory-swap", f"{spec.mem_limit_gib}g"]
         if spec.ipc_host:
             cmd += ["--ipc", "host"]
         for m in spec.mounts:

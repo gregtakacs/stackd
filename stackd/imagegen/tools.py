@@ -78,7 +78,7 @@ mcp = MCPServer("comfyui-flux2-klein")
 
 def _comfy_base() -> tuple[str | None, str]:
     """(endpoint, error_note) for the ComfyUI the active profile has resident right now
-    -- comfyui-cuda in 'everyday', comfyui-rocm in 'coding' -- via stackd's
+    -- comfyui-cuda in 'chat', comfyui-rocm in 'coding' -- via stackd's
     Manager.comfyui_target(). endpoint is None (with a human note) when nothing is
     serveable (e.g. the image engine is still warming after a profile switch)."""
     return runtime.comfyui_endpoint()
@@ -122,7 +122,7 @@ def _load_prompt_file(name: str) -> str:
 # live stackd profile has resident -- read from Manager.capabilities()["image"],
 # which carries the pipeline key (`active_model`), the verbs it offers
 # (`capabilities`), and whether it is serveable *right now* (not mid-swap). The MCP
-# has no notion of "coding" vs "everyday": it just uses the resident model and
+# has no notion of "coding" vs "chat": it just uses the resident model and
 # errors cleanly if that model does not declare the requested verb.
 #
 # No `model=` argument, no sticky state, no per-chat memory -- callers/users have

@@ -1,0 +1,144 @@
+# =============================================================================
+# llama.cpp CUDA build — targets NVIDIA Blackwell (sm_120 / RTX PRO 6000)
+# =============================================================================
+# Moved into stackd 2026-09-05 from LLM-Tools/llama-priority-proxy (now dead,
+# safe to delete) to break stackd's LLAMACPP_CUDA_IMAGE dependency on that
+# repo. Trimmed on the move: the original also built ninfer-serve (a second
+# inference engine) and a Python "priority proxy" that used to be this
+# container's entrypoint — nothing in stackd uses either (stackd runs
+# llama-server directly; see the `container:` block on the `chat` model),
+# so both are gone. Only the llama.cpp CUDA build survives.
+#
+# Stage 1: build llama.cpp from source with CUDA support
+# Stage 2: slim runtime image with only the compiled binary + shared libs
+# ---------------------------------------------------------------------------
+# Stage 1: Builder
+# ---------------------------------------------------------------------------
+# Pinned by digest, not just tag — nvidia/cuda:13.3.1-devel-ubuntu22.04 is a
+# mutable tag that NVIDIA republishes; without the digest a rebuild can pull a
+# new image and invalidate every layer after FROM, forcing a full CUDA
+# recompile even though LLAMA_CPP_COMMIT below never changed.
+FROM nvidia/cuda:13.3.1-devel-ubuntu22.04@sha256:c13e01184a7fb2a90814153fdff2250f08312377887d2673cf5bc769876a37f3 AS builder
+
+ARG CMAKE_CUDA_ARCHITECTURES="120a"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake git libcurl4-openssl-dev curl wget \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build/llama.cpp
+
+# Clone a pinned commit of llama.cpp.
+#
+# 2026-08-28: bumped 2f3923bc (refs/pull/27342/head, the xsn/dflash2 INTEGRATION
+# branch) -> d7bd3bf on plain master. Two things landed on master since the
+# previous bump, which together retire the PR-head pin and unblock a new model:
+#   * DFlash2 speculative decoding reached master. #27342 was ported via #27816
+#     (commit b10f9ca, "spec : add DFlash2 support (local convolution +
+#     candidate selector)"). draft-mtp, DFlash v1, and the DFlash2 draft-dflash
+#     tensor set + candidate selector are ALL in this tree
+#     (common/speculative.cpp: is_dflash2 = selector_top_k > 0), so
+#     config/model_options.json's TakacsAI-Coder (draft-mtp) and
+#     TakacsAI-Coder-DFlash (draft-dflash + a v2 -md checkpoint) both keep
+#     working unchanged. This is the "move the pin to a plain master SHA once
+#     xsn/dflash2 lands on master" the previous note asked for.
+#   * qwen4exp support: #27742 "model: add Qwen3.8-Flash-Next (qwen4exp)" plus
+#     #27880 "reduce number of graph splits". This is the architecture the
+#     Unsloth Qwen3.8-Flash-Next-UD-Q3_K_XL GGUF reports; every tree before
+#     #27742 dies on it with "unknown model architecture: 'qwen4exp'". Needed
+#     for config/scenario_coding_flash.json -- primary
+#     Qwen3.8-Flash-Next-UD-Q3_K_XL, run with -ot per_layer_token_embd=CPU
+#     --load-mode mmap so the ~26.8 GiB PLE n-gram embedding table lives in
+#     host RAM (this box has 62 GiB, can't hold the ~50 GiB of experts too, so
+#     experts stay on GPU -- NOT --cpu-moe here).
+#   * Now a plain master SHA, so the `git fetch origin pull/27342/head` the old
+#     pin needed is gone -- a normal clone reaches d7bd3bf.
+#   * Roll back with: LLAMA_CPP_COMMIT=2f3923bc81346046aa5765dda15fb28497f49ac6
+#     (also restore the `git fetch origin pull/27342/head` line below), or all
+#     the way to LLAMA_CPP_COMMIT=fe235f434368dfbdf3091a6cea92c00a98d2cee4.
+# DFlash2 / qwen4exp add CUDA kernels but no new cmake option -- the GGML_CUDA=ON
+# / GGML_CUDA_FA_ALL_QUANTS=ON build below covers them unchanged.
+#
+# compose-version-audit (Docker-Tools/compose-version-audit) tracks this pin
+# against upstream ggml-org/llama.cpp HEAD like any other git pin — see
+# LLM-Tools/stackd/stackd-images.audit.yml.
+ARG LLAMA_CPP_COMMIT=d7bd3bfcad3e29c7e49fd26f38c79ee3e9a3fd6b
+RUN git clone https://github.com/ggml-org/llama.cpp.git . && \
+    git checkout ${LLAMA_CPP_COMMIT}
+
+# Configure and build
+# -DCMAKE_LIBRARY_PATH points at the CUDA driver stub (no real driver present
+# during a `docker build`) and -Wl,--allow-shlib-undefined lets the linker
+# defer resolution of driver-API symbols (cuMemCreate, etc.) to container
+# runtime, when nvidia-container-toolkit injects the real libcuda.so.1.
+# -DLLAMA_BUILD_UI=OFF + -DLLAMA_USE_PREBUILT_UI=OFF: llama-server's bundled
+# web UI build (tools/ui/CMakeLists.txt) is an ALL target that always runs;
+# these two flags independently gate its two asset-provisioning paths (npm
+# build, then a "latest" prebuilt dist.tar.gz pulled from Hugging Face at
+# build time -- a moving target that can drift out of sync with what this
+# pinned commit's asset-embedding tool validates; hit this directly: build
+# failed on "missing required asset(s): loading.html"). Setting only
+# LLAMA_BUILD_UI=OFF still hits the HF path since LLAMA_USE_PREBUILT_UI is
+# independently ON by default -- both are needed to reach
+# scripts/ui-assets.cmake's actual "no UI" fallback (an empty stub, builds
+# clean). We don't use llama-server's own UI at all (Open WebUI is the
+# actual frontend), so skip it entirely.
+# GGML_CUDA_FA_ALL_QUANTS=ON: without this, ggml-cuda/fattn.cu's
+# ggml_cuda_get_best_fattn_kernel() explicitly refuses any flash-attention
+# call where K->type != V->type (see its `#ifndef GGML_CUDA_FA_ALL_QUANTS`
+# guard) -- returns BEST_FATTN_KERNEL_NONE, and GGML's backend scheduler
+# then silently routes that op through the CPU backend instead, per layer,
+# per token. A mixed KV cache quant pair (e.g. --cache-type-k q8_0
+# --cache-type-v q4_0) is exactly this case. Invisible at short context
+# (tiny CPU-copy penalty); catastrophic once real conversations reach a
+# few thousand tokens (confirmed empirically: 12.6x slower prompt eval,
+# 3.8x slower decode on an identical ~6500-token prompt vs f16 KV cache,
+# which doesn't hit this path). Costs meaningfully longer compile time
+# (many more kernel template instantiations) -- worth it to actually use
+# quantized KV cache safely instead of unknowingly falling back to CPU.
+RUN mkdir -p build && cd build && \
+    cmake .. \
+        -DGGML_CUDA=ON \
+        -DCMAKE_CUDA_ARCHITECTURES="${CMAKE_CUDA_ARCHITECTURES}" \
+        -DLLAMA_CURL=OFF \
+        -DBUILD_SHARED_LIBS=ON \
+        -DLLAMA_BUILD_EXAMPLES=OFF \
+        -DLLAMA_BUILD_TESTS=OFF \
+        -DGGML_CUDA_FORCE_CUBLAS=OFF \
+        -DGGML_CUDA_FA_ALL_QUANTS=ON \
+        -DCMAKE_LIBRARY_PATH=/usr/local/cuda/lib64/stubs \
+        -DCMAKE_EXE_LINKER_FLAGS="-Wl,--allow-shlib-undefined" \
+        -DLLAMA_BUILD_UI=OFF \
+        -DLLAMA_USE_PREBUILT_UI=OFF && \
+    cmake --build . --config Release -j$(nproc)
+
+# ---------------------------------------------------------------------------
+# Stage 2: Runtime
+# ---------------------------------------------------------------------------
+# Still ubuntu24.04 (not matching the 22.04 builder): unrelated to this move,
+# purely "older-glibc binaries run fine on a newer runtime" forward
+# compatibility, same as before.
+FROM nvidia/cuda:13.3.1-runtime-ubuntu24.04@sha256:63da350831208559df18c7b8f3e0d5d1c984eaa815cdde690aacd6606cd0cb11 AS runtime
+
+LABEL org.opencontainers.image.source="https://github.com/ggml-org/llama.cpp"
+LABEL org.opencontainers.image.description="llama.cpp CUDA server for RTX PRO 6000 (Blackwell)"
+
+# libgomp1 is required at runtime (OpenMP, used by llama-server's CPU
+# backend) -- missing this causes: "error while loading shared libraries:
+# libgomp.so.1".
+RUN mkdir -p /models && \
+    apt-get update && apt-get install -y --no-install-recommends \
+        libgomp1 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/llama.cpp/build/bin/llama-server /usr/local/bin/llama-server
+COPY --from=builder /build/llama.cpp/build/bin/*.so* /usr/local/lib/
+
+ENV LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH}
+
+# No EXPOSE, no HEALTHCHECK: stackd assigns each llama-server instance its own
+# port at container-create time (stackd/runner.py) and does its own readiness
+# polling against that port (LaunchSpec.health_url) rather than reading
+# Docker's own container-health status, so neither would reflect reality baked
+# in at build time the way they did for the old fixed-port proxy image.
+ENTRYPOINT ["llama-server"]

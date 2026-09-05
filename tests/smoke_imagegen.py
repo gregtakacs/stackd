@@ -49,7 +49,7 @@ class _FakeMgr:
         self._swap = swap          # dict the fake set_image returns; also mutates _image on ok
 
     def capabilities(self):
-        return {"active_profile": "everyday", "engines": [], "image": self._image, "video": None}
+        return {"active_profile": "chat", "engines": [], "image": self._image, "video": None}
 
     def image_status(self):
         return {"resident": self._image, "headroom_gib": {"cuda0": 60.0}, "prefer": _PREFER}
@@ -77,7 +77,7 @@ def _resident(image_entry, tool="generate", swap=None):
 
 def main() -> int:
     # -- resident-model selection (_resident_model_for) -------------------------
-    # No "coding"/"everyday" notion: whatever active_model is resident, if it
+    # No "coding"/"chat" notion: whatever active_model is resident, if it
     # declares the verb; otherwise escalate via the elastic image tier.
     dev = {"active_model": "flux2-dev-turbo", "serveable": True,
            "capabilities": ["generate", "stylize", "edit"], "endpoint": "http://comfyui-cuda:8188"}

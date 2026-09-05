@@ -319,15 +319,21 @@ class Manager:
         }
 
     def set_image(self, *, model: str | None = None, need_capability: str | None = None,
+                  backend: str | None = None, unsafe: bool = False,
                   now: float | None = None) -> dict:
         """Request an image-tier swap — by explicit model or by a capability the
-        caller needs. Returns swap_image()'s result dict ({ok, active_model,
+        caller needs. `backend`/`unsafe` are the deliberate-measurement escape
+        hatch (see reconciler.py::swap_image) — forcing a specific backend and/or
+        bypassing the device-VRAM and real-host-RAM fit checks, for benching a
+        model whose own current footprint_gib/host_ram_gib estimate is what's
+        wrongly blocking it. Returns swap_image()'s result dict ({ok, active_model,
         downgraded_from, note, ...} or {ok:False, error})."""
         now = time.time() if now is None else now
         caps = [need_capability] if need_capability else None
         pinned = "user" if model else ("capability" if need_capability else "auto")
         res = self.rec.swap_image(self.state, self.state.active_profile,
-                                  model=model, need_caps=caps, now=now, pinned_by=pinned)
+                                  model=model, need_caps=caps, now=now, pinned_by=pinned,
+                                  backend=backend, unsafe=unsafe)
         if res.get("ok"):
             self.state.last_served_at = now
         self._save()
@@ -382,19 +388,40 @@ class Manager:
                 for se in m.serves:
                     if se.api_name in seen or "*" in se.api_name:
                         continue
-                    ready = any(_serves(self.cfg, x, se.api_name)[0] and x in running
-                                for x in pr_active.models)
-                    seen[se.api_name] = {"id": se.api_name, "context_length": ctx,
-                                         "owner_profile": pr.profile, "ready": ready}
+                    # native  = the ACTIVE profile serves this name via an EXACT
+                    #           `serves` entry (its home model).
+                    # standin = only a glob match answers for it in the active
+                    #           profile (a cover model, e.g. coding-flash's
+                    #           `assistant*` standing in for chat).
+                    exact_here = any(_serves(self.cfg, x, se.api_name)[1] for x in pr_active.models)
+                    glob_here = any(_serves(self.cfg, x, se.api_name)[0] for x in pr_active.models)
+                    up = any(x in running for x in pr_active.models
+                             if _serves(self.cfg, x, se.api_name)[0])
+                    seen[se.api_name] = {
+                        "id": se.api_name, "context_length": ctx,
+                        "owner_profile": pr.profile,
+                        "native": exact_here,
+                        "standin": glob_here and not exact_here,
+                        "ready": (exact_here or glob_here) and up,
+                    }
         return list(seen.values())
 
     # ------------------------------------------------------------------- status ---
     def status(self) -> dict:
         report = validate_profile(self.cfg, self.state.active_profile, self.catalog)
         running = set(self.state.stacks)
+        pr = self.cfg.profiles[self.state.active_profile]
+        # seconds until idle-evict fires (None = never: floor / pinned / no timer /
+        # never served). Can go negative during the min-residency hold.
+        idle_evict_in = None
+        if pr.idle_evict and not pr.default and not self.state.pinned and self.state.last_served_at:
+            idle_evict_in = round(parse_duration(pr.idle_evict)
+                                  - (time.time() - self.state.last_served_at))
         return {
             "active_profile": self.state.active_profile,
             "pinned": self.state.pinned,
+            "idle_evict": pr.idle_evict,
+            "idle_evict_in_s": idle_evict_in,
             "placement": report.placement,
             "unplaced": report.unplaced,
             "stacks": {
@@ -413,8 +440,14 @@ class Manager:
                 if self.state.image is not None else None
             ),
             "missing": [n for n in report.resident if n not in running],
-            "pools": [{"pool": p.pool, "used": p.used_gib, "limit": p.limit_gib, "ok": p.ok}
+            "pools": [{"pool": p.pool, "used": p.used_gib, "limit": p.limit_gib,
+                       "headroom": p.headroom_gib, "ok": p.ok, "breakdown": p.breakdown}
                       for p in report.pools],
+            "devices": [{"device": d.device, "budget": d.budget_gib, "used": d.used_gib,
+                         "headroom": d.headroom_gib, "ok": d.ok, "models": d.models}
+                        for d in report.devices],
+            "sources": report.sources,
+            "deltas": {m: list(v) for m, v in report.deltas.items()},
             "flags": report.flags,
         }
 

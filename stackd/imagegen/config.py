@@ -60,7 +60,7 @@ LLAMA_PROXY_REGISTER_URL = _env("LLAMA_PROXY_REGISTER_URL", "")
 # Prompt-rewrite LLM (see prompt_llm.py). Turns a plain user idea into the input a given
 # image model wants -- replacing the ComfyUI-side "magic prompt" nodes with a call to
 # the same OpenAI-compatible endpoint the rest of the stack runs. Default target is
-# stackd's own /v1 on localhost (the resident everyday 27B). Any failure falls back to
+# stackd's own /v1 on localhost (the resident chat 27B). Any failure falls back to
 # the prompt verbatim -- a rewrite must never block a generation.
 LLM_BASE_URL = _env("LLM_BASE_URL", "http://localhost:11444/v1")
 LLM_API_KEY = _env("LLM_API_KEY", "")

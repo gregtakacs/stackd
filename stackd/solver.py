@@ -15,13 +15,24 @@ from stackd.engines.registry import TEMPLATES
 from stackd.fit import check
 
 
-def model_identity(cfg: Config, model_name: str, device: str) -> list:
+def model_identity(cfg: Config, model_name: str, device: str, port: int | None = None) -> list:
     """JSON-native signature — same identity ⇒ same running container, keep it.
 
     Includes the FULLY-RESOLVED `container:` spec (image, env, mounts, labels,
     devices, shm, build) so an ${VAR}/.env edit that lands in the container is
     seen by converge → the engine is recreated on `stackctl reload`, no
-    `docker rm -f` needed."""
+    `docker rm -f` needed.
+
+    `port` is the DYNAMICALLY-assigned port for llamacpp models with no fixed
+    `container.port` (solve() hands out 11500, 11501, ... in profile order).
+    It genuinely changes the launched container's `--port` CLI arg, so it MUST
+    be part of the identity: a model's own config can stay byte-identical
+    while its assigned port shifts (e.g. a profile switch reorders which
+    llamacpp model claims 11500 first) — without this, converge() sees an
+    unchanged identity, keeps the OLD container running on its OLD port, and
+    stackd's own health_url points at the NEW port forever after — permanent
+    "warming", never crashing, never healing on its own (found 2026-09-04,
+    chat-autocomplete stuck this way across a `bench-image` -> `chat` switch)."""
     e = cfg.models[model_name].engine
     p = e.params
     return [
@@ -31,6 +42,7 @@ def model_identity(cfg: Config, model_name: str, device: str) -> list:
         p.get("served_model_name"), p.get("active_model"), p.get("gpu_memory_utilization"),
         e.container.name, e.container.adopt,
         asdict(e.container),
+        port,
     ]
 
 
@@ -103,7 +115,7 @@ def solve(cfg: Config, profile: str, catalog=None, *, port_from: int = 11500) ->
             port = next_port
             next_port += 1
         out.placed[name] = Placed(name, dev, m.engine.template, port, round(v, 2),
-                                  round(r, 2), src, model_identity(cfg, name, dev))
+                                  round(r, 2), src, model_identity(cfg, name, dev, port))
     return out
 
 
@@ -122,3 +134,32 @@ def headroom(cfg: Config, profile: str, catalog=None, *, reserve_gib: float = 0.
         d: max(0.0, device_ceiling(cfg, d) - used.get(d, 0.0) - reserve_gib)
         for d in cfg.devices
     }
+
+
+def host_ram_headroom(cfg: Config, profile: str, catalog=None, *, reserve_gib: float = 0.0) -> float:
+    """Free `host_unified` RAM GiB once `profile`'s LLM models are placed —
+    mirrors `headroom()` but for the shared system-RAM pool as a whole, not a
+    single device's VRAM/GTT ceiling.
+
+    Why this exists: on igpu0, VRAM/GTT is carved from the SAME system RAM
+    stackd's `host_unified` pool budgets — but ComfyUI's own real host-RAM
+    footprint (process RSS, CLIP/VAE staging, page cache) runs well above the
+    GTT figure a `footprint_gib` VRAM check alone catches (measured this way:
+    flux2-dev-turbo on igpu0 costs ~62G VRAM/GTT but ~110-121G REAL host RAM —
+    close to the whole box on a 128G machine). Without this, `_pick_image()`
+    could auto-load — or a manual `/image/model` swap could force-load — a
+    model whose device-VRAM fit looks fine while its real host-RAM cost pushes
+    the box toward OOM alongside a co-resident LLM. Returns +inf if no
+    `host_unified` pool is configured (nothing to guard against)."""
+    from stackd.fit import pool_charge
+
+    if "host_unified" not in cfg.pools:
+        return float("inf")
+    pl = solve(cfg, profile, catalog)
+    dev_vram: dict[str, float] = {d: 0.0 for d in cfg.devices}
+    dev_ram: dict[str, float] = {d: 0.0 for d in cfg.devices}
+    for p in pl.placed.values():
+        dev_vram[p.device] += p.vram_gib
+        dev_ram[p.device] += p.ram_gib
+    used, _ = pool_charge(cfg, "host_unified", dev_vram, dev_ram)
+    return max(0.0, cfg.pools["host_unified"].total_gib - used - reserve_gib)

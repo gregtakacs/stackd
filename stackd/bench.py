@@ -20,7 +20,7 @@ from typing import Protocol
 from stackd.catalog import Catalog, curve_key, primary_device
 from stackd.config.models import Config
 from stackd.engines.registry import adapter_for
-from stackd.runner import LaunchContext, Mount, Runner
+from stackd.runner import DeviceKnobs, LaunchContext, Mount, Runner
 from stackd.validator import validate_profile
 
 _WARM_PROMPT = {"messages": [{"role": "user", "content": "ok"}], "max_tokens": 1, "stream": False}
@@ -33,16 +33,23 @@ class Sampler(Protocol):
 
 class NvidiaProcSampler:
     def vram_used_gib(self, backend: str, index: int) -> float:
-        q = "memory.used" if backend == "cuda" else "memory.used"
-        tool = (["nvidia-smi", f"--query-gpu={q}", "--format=csv,noheader,nounits", "-i", str(index)]
-                if backend == "cuda"
-                else ["rocm-smi", "--showmemuse", "--json"])
-        out = subprocess.run(tool, capture_output=True, text=True, timeout=15).stdout
         if backend == "cuda":
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits",
+                 "-i", str(index)], capture_output=True, text=True, timeout=15).stdout
             return round(float(out.strip().splitlines()[0]) / 1024, 2)
-        # rocm: best-effort parse
-        digits = "".join(c for c in out if c.isdigit())
-        return round(int(digits or 0) / 1024**3, 2)
+        # integrated AMD GPU: amdgpu sysfs first (no tool needed), then rocm-smi
+        from stackd.telemetry import _igpu0_sysfs
+        s = _igpu0_sysfs()
+        if s and s.get("vram_used_gib") is not None:
+            return round(s["vram_used_gib"], 2)
+        try:
+            out = subprocess.run(["rocm-smi", "--showmemuse", "--json"],
+                                 capture_output=True, text=True, timeout=15).stdout
+            digits = "".join(c for c in out if c.isdigit())
+            return round(int(digits or 0) / 1024**3, 2)
+        except (FileNotFoundError, subprocess.SubprocessError):
+            return 0.0
 
     def proc_ram_gib(self, pid: int) -> float:
         try:
@@ -74,7 +81,8 @@ class FakeSampler:
         return round(self.ram0 + self.ram_per_ktok * self._ctx / 1000, 2)
 
 
-def _wait_ready(runner: Runner, url: str | None, timeout: float) -> bool:
+def _wait_ready(runner: Runner, url: str | None, timeout: float,
+                handle: str | None = None) -> bool:
     if not url:
         time.sleep(0.1)
         return True
@@ -82,6 +90,11 @@ def _wait_ready(runner: Runner, url: str | None, timeout: float) -> bool:
     while time.time() < deadline:
         if runner.http_ok(url):
             return True
+        if handle is not None:
+            code = runner.poll(handle)
+            if code is not None:                       # container exited / gone
+                raise RuntimeError(f"engine container exited (code {code}) before it "
+                                   f"became ready — check the image / GPU access")
         time.sleep(1.0)
     return False
 
@@ -114,6 +127,13 @@ def bench_stack(
     ram_pts: list[tuple[int, float]] = []
 
     lc_mounts = [Mount(m.host_path, m.container_path, m.ro) for m in cfg.runtime.mounts]
+    # per-backend container knobs (GPU access etc.) — same as the reconciler applies
+    dp = cfg.runtime.device_profiles.get(dev.backend.value)
+    knobs = DeviceKnobs(
+        gpus=dp.gpus, devices=list(dp.devices), group_add=list(dp.group_add),
+        security_opt=list(dp.security_opt), ipc_host=dp.ipc_host,
+        shm_size=dp.shm_size, env=dict(dp.env),
+    ) if dp else DeviceKnobs()
     for ctx in ctx_points:
         st = copy.deepcopy(st0)
         if "ctx" in st.engine.params or st.engine.template.startswith("llamacpp"):
@@ -124,19 +144,23 @@ def bench_stack(
         spec = adapter.launch_spec(LaunchContext(
             host_models_dir=cfg.runtime.host_models_dir or models_dir,
             network=cfg.runtime.network, port=p, device_index=idx,
-            images=dict(cfg.runtime.images), extra_mounts=lc_mounts,
+            images=dict(cfg.runtime.images), extra_mounts=lc_mounts, device=knobs,
         ))
         if hasattr(sampler, "for_ctx"):
             sampler.for_ctx(ctx)  # FakeSampler
 
         handle = runner.spawn(spec)
         try:
-            _wait_ready(runner, spec.health_url, min(spec.ready_timeout_s, 900))
+            _wait_ready(runner, spec.health_url, min(spec.ready_timeout_s, 900), handle)
             _warm(adapter.endpoint(p))
             vram_pts.append((ctx, round(sampler.vram_used_gib(dev.backend.value, idx) - base_vram, 2)))
             ram_pts.append((ctx, sampler.proc_ram_gib(-1)))
         finally:
-            runner.stop(handle, remove=True, timeout=5 if dev.backend.value == "cuda" else 20)
+            # honour the model's stop_grace_s (vLLM needs a clean worker shutdown —
+            # a 5s SIGKILL mid-teardown is what wedges the RTX); else fast on cuda.
+            grace = spec.stop_grace_s if spec.stop_grace_s is not None else (
+                5 if dev.backend.value == "cuda" else 20)
+            runner.stop(handle, remove=True, timeout=grace)
             time.sleep(0.2)
 
     return catalog.write_curve(

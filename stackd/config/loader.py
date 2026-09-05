@@ -110,11 +110,31 @@ def _load_named(base: pathlib.Path, overlay: pathlib.Path | None, key: str,
     return out
 
 
+def _apply_dynamic_gpu_env(env: dict[str, str]) -> None:
+    """Override IGPU_RENDER_NODE with a freshly-detected value from sysfs
+    (see gpu_discovery.py) — render node NUMBERS drift across reboots/PCI
+    topology changes even though the physical card doesn't, so a static
+    .env value silently goes stale. Auto-detection wins over whatever the
+    env already had; if it finds nothing (no AMD GPU, sysfs unavailable —
+    e.g. off the real host), the existing value/​`${VAR}` missing-error
+    path still applies downstream, unchanged."""
+    try:
+        from stackd.gpu_discovery import render_nodes_by_vendor
+        amd = render_nodes_by_vendor("amd")
+    except OSError:
+        amd = []
+    if amd:
+        env["IGPU_RENDER_NODE"] = amd[0]   # igpu0 -> first AMD card, PCI-address order
+
+
 def load_config(root: str | pathlib.Path, *, env_file: str | None = None,
                 overlay: str | pathlib.Path | None = None) -> Config:
-    """`${VAR}` in the YAML resolves from `{**os.environ, **<env_file>}` — the file
-    (default $STACKD_ENV_FILE) WINS, so a live edit of the bind-mounted .env is
-    picked up by `Manager.reload_config()` without recreating the container.
+    """`${VAR}` in the YAML resolves from `{**os.environ, **<env_file>, **dynamic
+    GPU detection}` — the file (default $STACKD_ENV_FILE) wins over the process
+    env, and detected GPU render nodes win over both (see
+    `_apply_dynamic_gpu_env`), so a live edit of the bind-mounted .env AND a
+    host reboot that renumbers /dev/dri are both picked up by
+    `Manager.reload_config()` without recreating the container.
 
     `overlay` (default $STACKD_CONFIG_OVERLAY) is a second config dir that WINS
     per file: mount your private pools.yaml / models/*.yaml / catalog/*.json there
@@ -126,6 +146,7 @@ def load_config(root: str | pathlib.Path, *, env_file: str | None = None,
 
     env_file = env_file if env_file is not None else os.environ.get("STACKD_ENV_FILE")
     env: dict[str, str] = {**os.environ, **_parse_env_file(env_file)} if env_file else dict(os.environ)
+    _apply_dynamic_gpu_env(env)
 
     ov = overlay if overlay is not None else os.environ.get("STACKD_CONFIG_OVERLAY")
     ovp = pathlib.Path(ov) if ov and pathlib.Path(ov).is_dir() else None

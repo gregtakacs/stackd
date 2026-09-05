@@ -20,6 +20,12 @@ class ReconcileMode(str, Enum):
     full = "full"
 
 
+class ImageSupport(str, Enum):
+    none = "none"    # elastic image tier is torn down and never auto-filled while this profile is active
+    cold = "cold"     # today's default: tier fills leftover headroom, first request pays the load
+    warm = "warm"     # like cold, plus a throwaway generation is forced as soon as this profile's LLM stacks are ready
+
+
 @dataclass
 class Pool:
     """A memory pool the validator balances as one budget.
@@ -101,6 +107,15 @@ class ContainerSpec:
     # needs /dev/kfd on top of the vulkan profile's /dev/dri/renderD128).
     devices: list[str] = field(default_factory=list)
     shm_size: str | None = None        # per-container override of the device_profile's
+    ulimits: dict[str, int] = field(default_factory=dict)   # e.g. {nofile: 65536} -- soft==hard
+    # Hard cgroup memory ceiling (docker run --memory / --memory-swap, both set
+    # to this so the container can't spill into swap past it). A backstop, not
+    # the primary safety mechanism (see solver.py::host_ram_headroom for that):
+    # this protects the HOST even if a footprint estimate is wrong or a single
+    # request runs unusually large -- the container gets OOM-killed and the
+    # reconciler's crash-restart path picks it back up, instead of the whole
+    # box (and every other container on it) going down together.
+    mem_limit_gib: float | None = None
 
 
 @dataclass
@@ -163,6 +178,8 @@ class ProfileSpec:
     # The solver places each on the first fitting device; ones that fit nowhere
     # are reported unplaced (a request for them can still trigger reactive entry).
     models: list[str] = field(default_factory=list)
+    # Elastic image tier behavior while this profile is active — see ImageSupport.
+    image: ImageSupport = ImageSupport.cold
 
 
 @dataclass
@@ -201,6 +218,12 @@ class MediaLoadable:
     capabilities: list[str] = field(default_factory=list)   # generate | stylize | edit | ...
     backends: list[str] = field(default_factory=list)       # cuda | rocm | vulkan -> which containers[<b>]
     footprint_gib: dict[str, float] = field(default_factory=dict)   # backend -> VRAM GiB
+    # backend -> REAL peak host RAM GiB (process RSS + staging + page cache —
+    # NOT the same number as footprint_gib; on igpu0 it runs well above the
+    # VRAM/GTT figure, see solver.py::host_ram_headroom). Optional per entry:
+    # a backend missing here skips the host-RAM fit check for that pick, same
+    # as an un-benched footprint_gib falls back to no VRAM check.
+    host_ram_gib: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass

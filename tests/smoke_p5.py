@@ -111,10 +111,10 @@ def main() -> int:
     old = time.time() - 30 * 86400
     for i in range(3):
         st.record_usage(user_email="u@x.com", requested_model="assistant",
-                        served_stack="everyday-chat", served_profile="everyday",
+                        served_stack="chat", served_profile="chat",
                         prompt_tokens=1000, completion_tokens=500, cached_tokens=200, now=old)
     st.record_usage(user_email="u@x.com", requested_model="assistant",
-                    served_stack="everyday-chat", served_profile="everyday",
+                    served_stack="chat", served_profile="chat",
                     prompt_tokens=2000, completion_tokens=800)  # today
     moved = st.rollup(retain_days=7)
     check("rollup folds old rows", moved == 3)
@@ -122,6 +122,41 @@ def main() -> int:
     check("usage_rows spans raw + folded", len(rows) == 2)
     check("folded totals preserved",
           sum(r["prompt_tokens"] for r in rows) == 1000 * 3 + 2000)
+
+    # --- backfill from a llama-priority-proxy usage.sqlite ------------------------
+    import sqlite3 as _sq
+    oldpx = tmp / "oldproxy.sqlite"
+    oc = _sq.connect(str(oldpx))
+    oc.executescript(
+        "CREATE TABLE requests(id INTEGER PRIMARY KEY, ts REAL, day TEXT, requested_label TEXT,"
+        " served_model TEXT, scenario TEXT, engine TEXT, prompt_tokens INT, completion_tokens INT,"
+        " cached_tokens INT, reasoning_tokens INT, user TEXT, client TEXT, ok INT, off_home INT);"
+        "CREATE TABLE daily(day TEXT, requested_label TEXT, served_model TEXT, scenario TEXT,"
+        " engine TEXT, user TEXT, ok INT, req_count INT, prompt_tokens INT, completion_tokens INT,"
+        " cached_tokens INT, reasoning_tokens INT, off_home_count INT);"
+        "CREATE TABLE energy(day TEXT PRIMARY KEY, gpu_wh REAL, host_wh REAL);"
+        "CREATE TABLE price_points(model TEXT, effective_from TEXT, input_mtok REAL, output_mtok REAL,"
+        " cache_read_mtok REAL, source TEXT, fetched_at REAL);")
+    oc.execute("INSERT INTO requests VALUES(1,1e9,'2026-07-01','TakacsAI-low','q','everyday','llama.cpp',900,100,50,0,'A@B.com','c',1,0)")
+    oc.execute("INSERT INTO requests VALUES(2,1e9,'2026-07-01','TakacsAI-low','q','everyday','llama.cpp',100,20,0,0,'shared','c',1,0)")
+    oc.execute("INSERT INTO daily VALUES('2026-06-01','TakacsAI','q','coding','vllm','greg@x.com',1,5,7000,300,0,0,0)")
+    oc.execute("INSERT INTO energy VALUES('2026-06-01',1000,500)")
+    oc.execute("INSERT INTO price_points VALUES('anthropic/claude-x','2026-06-01',3.0,15.0,0.3,'manual',1e9)")
+    oc.commit(); oc.close()
+
+    bf = Store.open(str(tmp / "backfill.db"))
+    bf.add_energy("2026-06-01", gpu_wh=42, host_wh=1)   # pre-existing -> import must NOT touch it
+    res = bf.import_proxy_db(str(oldpx))
+    check("import_proxy_db reports rows", res["reqs"] == 7 and res["usage_daily_rows"] == 3)
+    brows = {(r["day"], r["user_email"], r["served_profile"]): r for r in bf.usage_rows()}
+    check("requests folded, scenario->profile, shared->direct",
+          brows[("2026-07-01", "direct", "everyday")]["prompt_tokens"] == 100
+          and brows[("2026-07-01", "a@b.com", "everyday")]["prompt_tokens"] == 900)
+    check("daily rows imported too", brows[("2026-06-01", "greg@x.com", "coding")]["completion_tokens"] == 300)
+    er = {r["day"]: r for r in bf.energy_rows("2026-01-01", "2026-12-01")}
+    check("energy: pre-existing day left untouched", er["2026-06-01"]["gpu_wh"] == 42)
+    check("price point carried over",
+          bf.price_on("anthropic/claude-x", "2026-06-02")["output_mtok"] == 15.0)
 
     # --- pricing --------------------------------------------------------------------
     pcfg = load_pricing(CFG / "pricing.json")
@@ -135,7 +170,26 @@ def main() -> int:
     # 5000 in tok * $3/M + 2100 out * $15/M  - cache discount ; > 0 and net < gross
     check("savings gross positive", front["gross"] > 0)
     check("savings net = gross - energy", front["net"] < front["gross"])
-    check("per-profile breakdown present", "everyday" in front["by"]["served_profile"])
+    check("per-profile breakdown present", "chat" in front["by"]["served_profile"])
+    check("breakdown carries per-tier net",
+          "net" in next(iter(front["by"]["served_profile"].values())))
+    check("tier carries its resolved price + annualized",
+          front["price"] and "input_mtok" in front["price"] and "annualized" in front)
+    check("savings exposes pricing status", "pricing_stale" in sv and "last_openrouter_fetch" in sv)
+    pcfg2 = {**pcfg, "hardware_cost": 1000, "payback_tier": "frontier"}
+    check("payback_pct computed when hardware_cost set",
+          savings(st, pcfg2)["payback_pct"] is not None)
+
+    # --- OpenRouter refresh (fake fetch) ------------------------------------------
+    from stackd.pricing import refresh_openrouter
+    fake_or = {"data": [
+        {"id": "anthropic/claude-sonnet-4",
+         "pricing": {"prompt": "0.000004", "completion": "0.00002", "input_cache_read": "0.0000004"}},
+    ]}
+    n_upd = refresh_openrouter(st, pcfg, today="2026-09-10", fetch=lambda: fake_or)
+    check("refresh_openrouter writes a changed point + stamps meta",
+          n_upd == 1 and st.get_meta("last_openrouter_fetch") == "2026-09-10"
+          and st.price_on("anthropic/claude-sonnet-4", "2026-09-10")["input_mtok"] == 4.0)
 
     # --- _extract_usage --------------------------------------------------------------
     check("_extract_usage from JSON",
@@ -149,7 +203,7 @@ def main() -> int:
     fake_url = f"http://127.0.0.1:{fake.server_address[1]}"
 
     mgr = Manager(CFG, tmp / "state.json", FakeRunner(ready_after=1))
-    mgr.use("everyday", now=0)
+    mgr.use("chat", now=0)
 
     # boot_reset: a persisted give-up / crash limbo must not survive a daemon restart
     from stackd.engines.base import EngineState as _ES
@@ -164,7 +218,7 @@ def main() -> int:
           names[1] in mgr.state.stacks and mgr.state.stacks[names[1]].restarts == 0)
     for i in range(4):
         mgr.tick(now=(i + 1) * 5)
-    mgr.state.stacks["everyday-chat"].endpoint = fake_url
+    mgr.state.stacks["chat"].endpoint = fake_url
 
     hstore = Store.open(str(tmp / "http.db"))
     httpd = make_server(mgr, "127.0.0.1", 0, api_key="admin", warm_wait_s=2,

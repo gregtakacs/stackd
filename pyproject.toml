@@ -29,6 +29,7 @@ stackctl = "stackd.cli:main"
 include = ["stackd*"]
 
 [tool.setuptools.package-data]
+"stackd" = ["web/*.html", "web/vendor/*"]
 "stackd.imagegen" = [
     "workflow_graphs/**/*.json", "tool_docs/*.md", "prompts/*.txt",
     "comfyui_image/*",

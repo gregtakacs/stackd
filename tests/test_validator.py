@@ -17,11 +17,11 @@ def cfg():
 def test_config_loads(cfg):
     assert set(cfg.pools) == {"cuda_vram", "host_unified"}
     assert set(cfg.devices) == {"cuda0", "igpu0"}
-    assert set(cfg.profiles) == {"everyday", "coding"}
+    assert set(cfg.profiles) == {"chat", "coding"}
 
 
-def test_everyday_fits(cfg):
-    r = validate_profile(cfg, "everyday")
+def test_chat_fits(cfg):
+    r = validate_profile(cfg, "chat")
     assert r.ok
     cuda = next(p for p in r.pools if p.pool == "cuda_vram")
     assert cuda.used_gib == pytest.approx(88.0, abs=0.5)  # 42 chat + 46 image
@@ -31,8 +31,8 @@ def test_everyday_fits(cfg):
     assert unified.ok
 
 
-def test_everyday_flags_image_llm_contention(cfg):
-    r = validate_profile(cfg, "everyday")
+def test_chat_flags_image_llm_contention(cfg):
+    r = validate_profile(cfg, "chat")
     assert any("contention on cuda0" in f for f in r.flags)
 
 
@@ -40,15 +40,10 @@ def test_coding_fits_and_keeps_autocomplete(cfg):
     r = validate_profile(cfg, "coding")
     assert r.ok
     assert "coding-flash" in r.resident
-    assert "everyday-autocomplete" in r.resident  # kept via mask: keep@igpu0
-    assert "everyday-chat" not in r.resident
+    assert "chat-autocomplete" in r.resident  # kept via mask: keep@igpu0
+    assert "chat" not in r.resident
     cuda = next(p for p in r.pools if p.pool == "cuda_vram")
     assert cuda.used_gib == pytest.approx(88.0, abs=0.5)
-
-
-def test_coding_flags_cuda_teardown(cfg):
-    r = validate_profile(cfg, "coding")
-    assert any("R1 discipline" in f for f in r.flags)
 
 
 def test_coding_fits_on_its_own(cfg):
@@ -58,8 +53,8 @@ def test_coding_fits_on_its_own(cfg):
     assert cuda.headroom_gib < 10  # coding fills cuda0
 
 
-def test_plan_everyday_to_coding_is_a_delta(cfg):
-    p = plan_transition(cfg, "everyday", "coding")
-    assert p.teardown == ["everyday-chat"]
+def test_plan_chat_to_coding_is_a_delta(cfg):
+    p = plan_transition(cfg, "chat", "coding")
+    assert p.teardown == ["chat"]
     assert sorted(p.spawn) == ["coding-flash"]
-    assert p.keep == ["everyday-autocomplete"]  # untouched by the switch
+    assert p.keep == ["chat-autocomplete"]  # untouched by the switch

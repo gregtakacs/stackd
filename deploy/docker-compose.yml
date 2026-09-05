@@ -30,6 +30,14 @@ services:
     image: stackd:local
     restart: unless-stopped
     runtime: nvidia                        # for nvidia-smi (drain barrier + probes). Drop on a non-NVIDIA host.
+    # Uncomment on a host with an AMD integrated GPU to get its live stats in the
+    # dashboard (GET /gpu -> igpu0). Read-only telemetry — no compute.
+    # devices:
+    #   - /dev/kfd
+    #   - /dev/dri
+    # group_add:
+    #   - "${VIDEO_GID}"
+    #   - "${RENDER_GID}"
     depends_on: [docker-api]
     ports:
       - "11444:11444"                      # OpenAI /v1 + control plane

@@ -15,9 +15,14 @@ A single daemon that is three things for a small multi-GPU host:
   ComfyUI in whatever VRAM the active profile leaves free, picking the model from a
   preference list and swapping it on demand — never at an LLM's expense
 
+- **a web dashboard** — `GET /` serves a single-page UI (token-gated, no build step): a
+  live map of what is loaded on which device, the profile list with activate / pin / evict,
+  the elastic image tier with model / capability swap, a scheduler-event feed, per-engine
+  telemetry, and the usage / energy / savings history
+
 Only runtime dependency for the core is **PyYAML** (the image MCP adds `mcp`, `httpx`,
-`pillow`, `uvicorn` via the `imagegen` extra). Config is stdlib `dataclasses` built
-through a small typed constructor.
+`pillow`, `uvicorn` via the `imagegen` extra; the dashboard vendors uPlot, no install).
+Config is stdlib `dataclasses` built through a small typed constructor.
 
 ## Run it
 
@@ -31,7 +36,8 @@ docker compose up -d                      # OpenAI proxy on :11444, image MCP on
 docker compose --profile full up -d       # + Open WebUI on :3000
 ```
 
-Then point any OpenAI client at `http://localhost:11444/v1`.
+Then point any OpenAI client at `http://localhost:11444/v1`, or open
+`http://localhost:11444/` for the dashboard (unlock with the same API token).
 
 ## Concepts
 
@@ -100,14 +106,21 @@ stackd/
   reconciler.py      converge() + tick() + the image tier — teardown/spawn ordering, cuda drain barrier, crash-restart
   manager.py         priority gating, stand-in routing, idle-evict, capabilities(), reload_config(), set_image()
   serve.py           OpenAI HTTP front + control plane + /capabilities + /image + /comfyui + /register + /savings + /reload
+                     + the dashboard: / (shell) /static/* /events /gpu /host /history /profiles /engine|/slots/<stack>
+  events.py telemetry.py   ring buffer of scheduler actions + nvidia-smi / amdgpu-sysfs / /proc + per-engine metric parsing
+  web/               dashboard.html (single page, no build) + vendored uplot
   cleaner.py         the ComfyUI scratch janitor (POST /cleaner/on|off)
   builder.py         `stackctl build` — image builds via the Docker /build API
   store.py           SQLite: per-user OWU keys + usage/cost ledger + prices + energy
   catalog.py bench.py probe.py pricing.py validator.py planner.py
   imagegen/          the image MCP: tools.py + workflow graphs + the ComfyUI custom node + Dockerfiles
+  llamacpp_image/    Dockerfile.cuda — the CUDA llama.cpp build (`chat` model's container.build)
 config/              a worked example config — replace models/ + profiles/ + media/ with your own
 deploy/              docker-compose + .env.example + setup guide
 tests/               smoke*.py (stdlib, no deps) + test_validator.py (pytest)
+stackd-images.audit.yml   compose-shaped manifest (NOT a real compose file) listing every image/build
+                     stackd creates directly via the Docker API — none of it appears in any real
+                     compose file, so it's otherwise invisible to Docker-Tools/compose-version-audit
 ```
 
 ## Tests

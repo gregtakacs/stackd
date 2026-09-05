@@ -165,6 +165,81 @@ class Store:
             n += 1
         return n
 
+    def import_proxy_db(self, path: str) -> dict:
+        """Backfill history from a llama-priority-proxy `usage.sqlite`: its
+        `requests` + `daily` fold into our `usage_daily` (scenario -> profile,
+        requested_label -> requested_model, `shared`/blank user -> `direct`);
+        `energy` is copied for days we don't already have (no double-count on the
+        hand-over day); `price_points` are added without clobbering ours
+        (`manual` wins over `openrouter` within the source data)."""
+        src = sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True)
+        src.row_factory = sqlite3.Row
+        out = {"usage_daily_rows": 0, "reqs": 0, "energy_days": 0, "price_points": 0}
+
+        def _key(day, user, label, scen):
+            u = (user or "").strip().lower()
+            return (day, ("direct" if u in ("", "shared") else u),
+                    (label or "?"), (scen or "?"))
+
+        try:
+            agg: dict[tuple, list[int]] = {}
+            for r in src.execute(
+                "SELECT day, user, requested_label, scenario, COUNT(*) reqs, "
+                "SUM(prompt_tokens) pt, SUM(completion_tokens) ct, SUM(cached_tokens) cc "
+                "FROM requests GROUP BY day, user, requested_label, scenario"):
+                a = agg.setdefault(_key(r["day"], r["user"], r["requested_label"], r["scenario"]),
+                                   [0, 0, 0, 0])
+                a[0] += r["reqs"]; a[1] += r["pt"] or 0; a[2] += r["ct"] or 0; a[3] += r["cc"] or 0
+            try:
+                for r in src.execute(
+                    "SELECT day, user, requested_label, scenario, req_count reqs, "
+                    "prompt_tokens pt, completion_tokens ct, cached_tokens cc FROM daily"):
+                    a = agg.setdefault(_key(r["day"], r["user"], r["requested_label"], r["scenario"]),
+                                       [0, 0, 0, 0])
+                    a[0] += r["reqs"] or 0; a[1] += r["pt"] or 0
+                    a[2] += r["ct"] or 0; a[3] += r["cc"] or 0
+            except sqlite3.OperationalError:
+                pass
+            for (day, u, m, p), (reqs, pt, ct, cc) in agg.items():
+                self.conn.execute(
+                    "INSERT INTO usage_daily(day,user_email,requested_model,served_profile,reqs,"
+                    "prompt_tokens,completion_tokens,cached_tokens) VALUES(?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(day,user_email,requested_model,served_profile) DO UPDATE SET "
+                    "reqs=reqs+excluded.reqs, prompt_tokens=prompt_tokens+excluded.prompt_tokens, "
+                    "completion_tokens=completion_tokens+excluded.completion_tokens, "
+                    "cached_tokens=cached_tokens+excluded.cached_tokens",
+                    (day, u, m, p, reqs, pt, ct, cc))
+                out["usage_daily_rows"] += 1
+                out["reqs"] += reqs
+
+            have = {r[0] for r in self.conn.execute("SELECT day FROM energy")}
+            for r in src.execute("SELECT day, gpu_wh, host_wh FROM energy"):
+                if r["day"] in have:
+                    continue
+                self.conn.execute("INSERT OR IGNORE INTO energy(day,gpu_wh,host_wh) VALUES(?,?,?)",
+                                  (r["day"], r["gpu_wh"] or 0, r["host_wh"] or 0))
+                out["energy_days"] += 1
+
+            try:
+                pick: dict[tuple, sqlite3.Row] = {}
+                for r in src.execute("SELECT model,effective_from,input_mtok,output_mtok,"
+                                     "cache_read_mtok,source FROM price_points"):
+                    k = (r["model"], r["effective_from"])
+                    if k not in pick or r["source"] == "manual":
+                        pick[k] = r
+                for (ref, eff), r in pick.items():
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO price_points(ref,effective_from,input_mtok,"
+                        "output_mtok,cache_read_mtok) VALUES(?,?,?,?,?)",
+                        (ref, eff, r["input_mtok"], r["output_mtok"], r["cache_read_mtok"]))
+                    out["price_points"] += 1
+            except sqlite3.OperationalError:
+                pass
+            self.conn.commit()
+        finally:
+            src.close()
+        return out
+
     # -- usage ledger ------------------------------------------------------------------
     def record_usage(self, *, user_email: str | None, requested_model: str | None,
                      served_stack: str | None, served_profile: str | None,
@@ -259,3 +334,10 @@ class Store:
             "FROM energy WHERE day BETWEEN ? AND ?", (start_day, end_day)
         ).fetchone()
         return {"gpu_kwh": r["g"] / 1000.0, "host_kwh": r["h"] / 1000.0}
+
+    def energy_rows(self, start_day: str, end_day: str) -> list[dict]:
+        """Per-day energy in the range (for the dashboard's history chart)."""
+        return [dict(r) for r in self.conn.execute(
+            "SELECT day, gpu_wh, host_wh FROM energy WHERE day BETWEEN ? AND ? "
+            "ORDER BY day", (start_day, end_day)
+        ).fetchall()]

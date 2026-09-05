@@ -9,6 +9,16 @@
 # gfx1151 natively ("AMD arch: gfx1151 ... native") but a heavy Flux.2 gen at
 # ~00:54 spun kernel amdkfd svm_range_restore_work and hard-hung the host;
 # 7.13/7.14/10.x carry a year of Strix Halo KFD/SVM fixes (userland side).
+# Picked 7.14.1 over 10.x deliberately, not because 10.x wasn't out yet (it
+# was, days earlier) -- rocm/pytorch has no single canonical "latest": at
+# rocm10.0 alone Docker Hub carries 12 tags (4 ubuntu/python pairings x 3
+# pytorch releases each), so right after the 7.2 hang, staying on the one
+# clean already-validated pin beat picking blind among a dozen untested
+# combos. compose-version-audit (Docker-Tools/compose-version-audit) now
+# cross-tabulates all four version axes and reports the best full combo if
+# this ever gets revisited: as of 2026-09-05, rocm10.0_ubuntu26.04_py3.14_
+# pytorch_release_2.13.0 -- notably the only rocm10.0 build matching this
+# host's actual Ubuntu 26.04, but still untested here.
 # Flash-attention is intentionally NOT compiled here (the ROCm/flash-attention
 # main_perf build takes 30+ min); ComfyUI falls back to PyTorch SDPA
 # (AOTriton, ungated via TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1).

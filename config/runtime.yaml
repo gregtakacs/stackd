@@ -8,11 +8,12 @@ runtime:
   host_models_dir: ${DOCKERDIR}/appdata/llm-models
   network: ${STACKD_NETWORK}   # stackd-created engines join this so they're reachable by name
 
-  # Images for stackd-CREATED engines. vLLM + both ComfyUIs carry their own image
-  # in the model's `container:` block; the ROCm ComfyUI one has a `container.build`
-  # recipe there and is produced by `stackctl build image:vulkan`.
+  # Images for stackd-CREATED engines. vLLM, both ComfyUIs, and the CUDA
+  # llama.cpp server (`chat`) all carry their own image in the model's
+  # `container:` block, the CUDA llama.cpp + ROCm ComfyUI ones with their own
+  # `container.build` recipe (`stackctl build chat` / `stackctl build image:vulkan`).
+  # Only llamacpp-vulkan is left here -- a plain vendor pull, no model overrides it.
   images:
-    llamacpp-cuda: ${LLAMACPP_CUDA_IMAGE}      # entrypoint overridden in the model
     llamacpp-vulkan: ${LLAMACPP_VULKAN_IMAGE}
 
   # Per-backend container knobs, merged into every stackd-created engine whose

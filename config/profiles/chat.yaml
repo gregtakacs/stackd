@@ -1,9 +1,9 @@
-profile: everyday
+profile: chat
 priority: 50
 default: true            # the floor — always resident, never self-evicts
 # priority = list order. The solver places each on the first fitting device.
 models:
-  - everyday-chat
-  - everyday-autocomplete
+  - chat
+  - chat-autocomplete
 # image generation is not a profile member — the elastic image tier
 # (config/media/image.yaml) runs a ComfyUI in whatever VRAM is left over.

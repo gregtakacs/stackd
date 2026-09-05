@@ -77,14 +77,14 @@ def main() -> int:
 
     state = pathlib.Path("/tmp") / f"stackd-p3-{time.time_ns()}.json"
     m = Manager(CFG, state, FakeRunner(ready_after=1))
-    m.use("everyday", now=0)
+    m.use("chat", now=0)
     ready(m)
     m.state.image.endpoint = up_url
 
     caps = m.capabilities()
     img = caps["image"]
     check("capabilities.image present", img is not None)
-    check("elastic image tier picked dev-turbo on the RTX for everyday",
+    check("elastic image tier picked dev-turbo on the RTX for chat",
           img["active_model"] == "flux2-dev-turbo" and img["device"] == "cuda0")
     check("image capabilities surfaced", "edit" in img["capabilities"])
     check("image serveable when ready", img["serveable"] is True)
@@ -92,13 +92,13 @@ def main() -> int:
     check("engines() lists 2 LLM stacks + the image slot", len(m.engines()) == 3)
 
     # mid-swap contention: a co-device (cuda0) stack warming -> image not serveable
-    m.state.stacks["everyday-chat"].state = EngineState.warming
+    m.state.stacks["chat"].state = EngineState.warming
     caps2 = m.capabilities()
     check("image not serveable while co-device warms", caps2["image"]["serveable"] is False)
     check("co_device_warming flagged", caps2["image"]["co_device_warming"] is True)
     ep, why = m.comfyui_target()
     check("comfyui_target refuses during co-device warm", ep is None and "warming" in why)
-    m.state.stacks["everyday-chat"].state = EngineState.ready
+    m.state.stacks["chat"].state = EngineState.ready
 
     ep, why = m.comfyui_target()
     check("comfyui_target returns endpoint when serveable", ep == up_url)
@@ -115,10 +115,34 @@ def main() -> int:
     ep, why = m.comfyui_target()
     check("comfyui_target routes to the iGPU image engine under coding", ep == up_url)
 
-    # back to everyday, drive it over HTTP
-    m.use("everyday", now=2000)
+    # back to chat, drive it over HTTP
+    m.use("chat", now=2000)
     ready(m, t0=2000)
     m.state.image.endpoint = up_url
+
+    # --- image: warm — forced generation on profile-ready, AND re-armed by a
+    # manual /image/model swap (dashboard "Load" button), not just the first
+    # model a profile ever lands on. ---
+    from stackd.config.models import ImageSupport
+    m.cfg.profiles["chat"].image = ImageSupport.warm
+    m.state.warmed_for = None
+    evs = m.tick(now=2005)
+    check("warm-fire event once LLM + image tier are ready",
+          any(e.action == "warm-fire" for e in evs))
+    check("warmed_for keyed by profile:model", m.state.warmed_for == "chat:flux2-dev-turbo")
+    evs2 = m.tick(now=2010)
+    check("no duplicate warm-fire while resident model is unchanged",
+          not any(e.action == "warm-fire" for e in evs2))
+    m.set_image(model="flux2-klein")
+    m.state.image.endpoint = up_url
+    evs3 = m.tick(now=2015)
+    check("manual swap re-arms warm-fire for the newly-picked model",
+          any(e.action == "warm-fire" for e in evs3))
+    check("warmed_for follows the swap", m.state.warmed_for == "chat:flux2-klein")
+    m.cfg.profiles["chat"].image = ImageSupport.cold   # restore state for the rest of this file's checks
+    m.set_image(model="flux2-dev-turbo")
+    m.state.image.endpoint = up_url
+
     httpd = make_server(m, "127.0.0.1", 0, api_key="k", warm_wait_s=2)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{httpd.server_address[1]}"

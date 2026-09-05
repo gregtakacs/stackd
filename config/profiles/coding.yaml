@@ -1,12 +1,12 @@
 profile: coding
-priority: 500             # outranks everyday; may evict it, never the reverse
+priority: 500             # outranks chat; may evict it, never the reverse
 idle_evict: 45m          # revert to the default profile after this idle span
 # coding-flash's serves include "assistant*", so it stands in for chat.
-# everyday-autocomplete is listed here too -> the solver places it on igpu0 with
-# the same identity as under `everyday`, so a switch leaves it running untouched.
+# chat-autocomplete is listed here too -> the solver places it on igpu0 with
+# the same identity as under `chat`, so a switch leaves it running untouched.
 # No image entry — the elastic image tier (config/media/image.yaml) rebuilds
 # itself from whatever VRAM this profile leaves free (klein on the iGPU here,
 # since vLLM claims the RTX).
 models:
   - coding-flash
-  - everyday-autocomplete
+  - chat-autocomplete

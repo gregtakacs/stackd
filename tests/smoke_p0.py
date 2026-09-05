@@ -50,29 +50,29 @@ def main() -> int:
     fix = pathlib.Path(tempfile.mkdtemp()) / "cat"
     fix.mkdir(parents=True)
     fc = Catalog(path=fix)
-    fc.write_curve(curve_key(cfg, "everyday-chat", "cuda0"), model="m", engine="llamacpp-cuda",
+    fc.write_curve(curve_key(cfg, "chat", "cuda0"), model="m", engine="llamacpp-cuda",
                    device="cuda0", source="estimate",
                    vram_points=[[65536, 22.0], [262144, 40.0]], ram_points=[[65536, 2.0], [262144, 4.0]])
     cat = Catalog.load(fix)
     check("fixture catalog loaded", len(cat.curves) == 1)
-    cur = cat.for_model(cfg, "everyday-chat", "cuda0")
+    cur = cat.for_model(cfg, "chat", "cuda0")
     check("curve matched by config-signature", cur is not None and cur.source == "estimate")
     check("slope from 2 points", approx(cur.vram.slope, (40.0 - 22.0) / (262144 - 65536), 1e-6))
     check("estimate @ 262144 == 40", approx(cur.estimate(262144)[0], 40.0, 0.1))
     check("max_x inverts the line", approx(cur.vram.max_x(31.0), 163840, 2000))
 
     # --- validator prefers the catalog + reports source/delta -------------------
-    base = validate_profile(cfg, "everyday")
-    withcat = validate_profile(cfg, "everyday", catalog=cat)
+    base = validate_profile(cfg, "chat")
+    withcat = validate_profile(cfg, "chat", catalog=cat)
     cuda_base = next(p for p in base.pools if p.pool == "cuda_vram").used_gib
     cuda_cat = next(p for p in withcat.pools if p.pool == "cuda_vram").used_gib
     check("catalog changes the pool total", cuda_cat != cuda_base)
     check("cuda_vram with the chat curve = 40", approx(cuda_cat, 40.0, 0.2))
-    check("source recorded as estimate", withcat.sources["everyday-chat"] == "estimate")
+    check("source recorded as estimate", withcat.sources["chat"] == "estimate")
     check("delta vs declared recorded (40 curve - 30 declared)",
-          withcat.deltas["everyday-chat"][0] == 10.0)
+          withcat.deltas["chat"][0] == 10.0)
     check("models with no curve flagged unmeasured",
-          "everyday-autocomplete" in withcat.unmeasured)
+          "chat-autocomplete" in withcat.unmeasured)
     check("no-catalog: sources all 'declared'",
           set(base.sources.values()) == {"declared"})
     check("no-catalog: nothing flagged unmeasured", base.unmeasured == [])
@@ -81,13 +81,13 @@ def main() -> int:
     tmp = pathlib.Path(tempfile.mkdtemp()) / "cat"
     tmp.mkdir(parents=True)
     icat = Catalog(path=tmp)
-    ingest(cfg, "everyday-chat", icat,
+    ingest(cfg, "chat", icat,
            {"vram": [[262144, 41.0]], "ram": [[262144, 3.2]]}, notes="hand-measured")
     icat2 = Catalog.load(tmp)
-    rep = validate_profile(cfg, "everyday", catalog=icat2)
-    check("ingested curve is 'measured'", rep.sources["everyday-chat"] == "measured")
-    check("everyday-chat no longer unmeasured", "everyday-chat" not in rep.unmeasured)
-    check("a model with no curve is still unmeasured", "everyday-autocomplete" in rep.unmeasured)
+    rep = validate_profile(cfg, "chat", catalog=icat2)
+    check("ingested curve is 'measured'", rep.sources["chat"] == "measured")
+    check("chat no longer unmeasured", "chat" not in rep.unmeasured)
+    check("a model with no curve is still unmeasured", "chat-autocomplete" in rep.unmeasured)
     check("measured value used (41 vram)",
           approx(next(p for p in rep.pools if p.pool == "cuda_vram").used_gib, 41.0, 0.5))
 
@@ -95,25 +95,25 @@ def main() -> int:
     bdir = pathlib.Path(tempfile.mkdtemp()) / "bench"
     bcat = Catalog(path=bdir)
     sampler = FakeSampler(vram0=30.0, vram_per_ktok=0.04, ram0=2.0, ram_per_ktok=0.005)
-    out = bench_stack(cfg, "everyday-chat", FakeRunner(ready_after=1), sampler, bcat,
+    out = bench_stack(cfg, "chat", FakeRunner(ready_after=1), sampler, bcat,
                       ctx_points=[131072, 262144, 393216], models_dir="/models",
                       source="estimate")
     check("bench wrote a curve file", out.exists())
-    fitted = bcat.for_model(cfg, "everyday-chat", "cuda0")
+    fitted = bcat.for_model(cfg, "chat", "cuda0")
     # FakeSampler is linear in ctx; slope should recover vram_per_ktok/1000
     check("bench recovered the vram slope", approx(fitted.vram.slope, 0.04 / 1000, 1e-6))
     check("bench recovered the ram slope", approx(fitted.ram.slope, 0.005 / 1000, 1e-6))
     check("bench curve key is the config-signature",
-          fitted.key == curve_key(cfg, "everyday-chat", "cuda0"))
+          fitted.key == curve_key(cfg, "chat", "cuda0"))
 
     # --- verify (predicted vs measured diff) — self-consistent vs the prediction
-    pred = {p.pool: p.used_gib for p in validate_profile(cfg, "everyday", catalog=icat2).pools}
+    pred = {p.pool: p.used_gib for p in validate_profile(cfg, "chat", catalog=icat2).pools}
     near = {k: v + 1.0 for k, v in pred.items()}
     far = {k: v + 5.0 for k, v in pred.items()}
-    vr = verify(cfg, "everyday", icat2, near, tol_gib=2.0)
+    vr = verify(cfg, "chat", icat2, near, tol_gib=2.0)
     check("verify computes per-pool deltas", len(vr["pools"]) == 2)
     check("verify passes within 2 GiB", vr["pass"] is True)
-    vr2 = verify(cfg, "everyday", icat2, far, tol_gib=2.0)
+    vr2 = verify(cfg, "chat", icat2, far, tol_gib=2.0)
     check("verify fails when off by >2 GiB", vr2["pass"] is False)
 
     # --- probe parsers -----------------------------------------------------------

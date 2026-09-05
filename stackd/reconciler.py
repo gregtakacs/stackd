@@ -9,14 +9,15 @@ anyway, and the box is memory-tight).
 from __future__ import annotations
 
 import copy
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 
-from stackd.config.models import Budget, Config, EngineSpec, MediaTier, ModelSpec, Placement
+from stackd.config.models import Budget, Config, EngineSpec, ImageSupport, MediaTier, ModelSpec, Placement
 from stackd.engines.base import EngineState
 from stackd.engines.registry import adapter_for
 from stackd.runner import LaunchContext, Mount, Runner
-from stackd.solver import Placed, headroom, solve
+from stackd.solver import Placed, headroom, host_ram_headroom, solve
 from stackd.state import ImageSlot, RuntimeState, StackRuntime
 
 _UNHEALTHY_LIMIT = 3
@@ -168,19 +169,34 @@ class Reconciler:
         return bool(d) and d.backend.value == "cuda"
 
     def _pick_image(self, tier: MediaTier, hr: dict[str, float], *,
-                    need_caps: list[str] | None = None, want_model: str | None = None):
+                    need_caps: list[str] | None = None, want_model: str | None = None,
+                    host_ram_avail: float = float("inf"), want_backend: str | None = None):
         """(device, backend, loadable) — the first `prefer:` entry that fits a
         device with a matching backend, most-free device first. `want_model` /
-        `need_caps` narrow the candidates first. None if nothing fits."""
+        `need_caps` narrow the candidates first. `want_backend` forces trying
+        only that backend instead of iterating the entry's listed order (still
+        under full fit checks — a SAFE preference hint, unlike `unsafe=True` on
+        swap_image(), which skips fit checks altogether). `host_ram_avail`
+        additionally guards the shared system-RAM pool a device-VRAM check alone
+        can't see (see solver.py::host_ram_headroom) — a candidate whose known
+        host_ram_gib would exceed it is skipped even if its device VRAM/GTT
+        fits, so this also protects an explicit manual swap, not just
+        auto-pick. None if nothing fits."""
         want = set(need_caps or [])
         for ld in tier.prefer:
             if want_model is not None and ld.active_model != want_model:
                 continue
             if want and not want <= set(ld.capabilities):
                 continue
-            for backend in ld.backends:
+            backends = [want_backend] if want_backend else ld.backends
+            for backend in backends:
+                if backend not in ld.backends:
+                    continue
                 fp = ld.footprint_gib.get(backend)
                 if fp is None:
+                    continue
+                host_fp = ld.host_ram_gib.get(backend)
+                if host_fp is not None and host_fp > host_ram_avail + 1e-6:
                     continue
                 for dev in sorted(
                     (d for d in self.cfg.devices
@@ -194,23 +210,56 @@ class Reconciler:
     def _loadable(self, tier: MediaTier, active_model: str):
         return next((l for l in tier.prefer if l.active_model == active_model), None)
 
+    def _real_host_ram_avail(self, tier: MediaTier, profile: str) -> float:
+        """Real currently-free host RAM (GiB), minus the tier's margin — NOT
+        solver.py::host_ram_headroom()'s budget figure, which bakes in the
+        host_unified pool's host_reserve/load_slack PLANNING constants (meant
+        for deciding where an LLM CAN go before it's resident) rather than
+        reflecting memory that's actually free right now. Those constants
+        made the image-tier safety check far too conservative in practice
+        (2026-09-04: it refused every candidate, including ones well under
+        half of what was genuinely free) — checking real availability is both
+        more accurate and more honest about what this guard actually protects
+        against. Falls back to the budget figure only if /proc/meminfo can't
+        be read (some non-host test/dev environment)."""
+        from stackd.telemetry import host_stats
+
+        avail = host_stats().get("mem_available_gib")
+        if avail is None:
+            return host_ram_headroom(self.cfg, profile, self.catalog, reserve_gib=tier.margin_gib)
+        return max(0.0, avail - tier.margin_gib)
+
     def swap_image(self, state: RuntimeState, profile: str, *, model: str | None = None,
-                   need_caps: list[str] | None = None, now: float, pinned_by: str) -> dict:
+                   need_caps: list[str] | None = None, now: float, pinned_by: str,
+                   backend: str | None = None, unsafe: bool = False) -> dict:
         """Programmatic image-tier swap — by explicit `model` or by `need_caps`
         (the capability the caller needs resident). Auto-downgrades to the next
         capable entry that fits and SAYS so; 409-style {ok:False} when nothing
-        capable fits. Never touches an LLM engine."""
+        capable fits. Never touches an LLM engine.
+
+        `backend` forces a specific backend instead of the prefer-ladder's auto
+        pick. `unsafe=True` (requires `backend`) skips `_pick_image()` and its
+        device-VRAM / real-host-RAM checks entirely — for deliberately measuring
+        a model's TRUE footprint when the CURRENT footprint_gib/host_ram_gib
+        estimate is itself what's wrongly blocking it (the exact case that
+        estimate exists to be corrected from — 2026-09-04, benching
+        flux2-dev-turbo kept failing because its own conservative estimate
+        exceeded every real-available-memory reading on the box, even fully
+        idle). The container's mem_limit_gib hard ceiling still applies
+        regardless; this bypasses only the soft, estimate-based checks."""
         self.events.clear()
         tier = self.cfg.media.get("image")
         if tier is None:
             return {"ok": False, "error": "no image tier configured (config/media/image.yaml)"}
         hr = headroom(self.cfg, profile, self.catalog, reserve_gib=tier.margin_gib)
         hr_r = {k: round(v, 1) for k, v in hr.items()}
+        host_ram_avail = self._real_host_ram_avail(tier, profile)
         slot = state.image
         live = slot is not None and slot.state in (EngineState.warming, EngineState.ready)
 
-        # already satisfied?
-        if live:
+        # already satisfied? (an unsafe request still re-checks backend below —
+        # "already resident on the WRONG backend" must not short-circuit here)
+        if live and not unsafe:
             if model and slot.active_model == model:
                 return {"ok": True, "active_model": model, "device": slot.device,
                         "warming": slot.state == EngineState.warming, "note": "already resident"}
@@ -220,21 +269,56 @@ class Reconciler:
                         "note": f"resident model {slot.active_model!r} already provides "
                                 f"{', '.join(need_caps)}"}
 
-        pick = self._pick_image(tier, hr, need_caps=need_caps, want_model=model)
+        if unsafe:
+            if not model or not backend:
+                return {"ok": False, "error": "--unsafe requires both a model and a backend"}
+            ld = self._loadable(tier, model)
+            if ld is None:
+                return {"ok": False, "error": f"unknown image model {model!r}; "
+                        f"prefer: {[l.active_model for l in tier.prefer]}"}
+            if backend not in ld.backends:
+                return {"ok": False, "error": f"{model!r} doesn't support backend {backend!r} "
+                        f"(supports: {ld.backends})"}
+            dev = next((d for d in self.cfg.devices
+                       if self.cfg.devices[d].backend.value == backend), None)
+            if dev is None:
+                return {"ok": False, "error": f"no device configured for backend {backend!r}"}
+            if live and slot.active_model == model and slot.device == dev:
+                return {"ok": True, "active_model": model, "device": dev, "backend": backend,
+                        "warming": slot.state == EngineState.warming,
+                        "note": "already resident on the requested backend", "unsafe": True}
+            self._emit(f"image:{ld.active_model}", "unsafe-load",
+                       f"BYPASSING fit checks (device VRAM + real host RAM) — forced onto {dev}/{backend}")
+            was_cuda = slot is not None and self._dev_is_cuda(slot.device)
+            if slot is not None:
+                self._teardown_image(state, now, why=f"unsafe swap to {ld.active_model}")
+            if self.cuda_drain_enabled and was_cuda and self._dev_is_cuda(dev):
+                self._drain_cuda([f"image:{model}"])
+            self._spawn_image(state, tier, dev, backend, ld, now, pinned_by=pinned_by)
+            return {"ok": True, "active_model": ld.active_model, "device": dev, "backend": backend,
+                    "warming": True, "unsafe": True,
+                    "note": "fit checks bypassed — NOT verified against device VRAM or real host "
+                            "RAM availability; watch it yourself",
+                    "events": [f"{e.action} {e.stack}" for e in self.events]}
+
+        pick = self._pick_image(tier, hr, need_caps=need_caps, want_model=model,
+                                host_ram_avail=host_ram_avail, want_backend=backend)
         downgraded_from = None
         if pick is None and model is not None:
             req = self._loadable(tier, model)
             if req is None:
                 return {"ok": False, "error": f"unknown image model {model!r}; "
                         f"prefer: {[l.active_model for l in tier.prefer]}"}
-            pick = self._pick_image(tier, hr, need_caps=need_caps or list(req.capabilities))
+            pick = self._pick_image(tier, hr, need_caps=need_caps or list(req.capabilities),
+                                    host_ram_avail=host_ram_avail, want_backend=backend)
             if pick is not None:
                 downgraded_from = model
         if pick is None:
             what = (f"a model providing {', '.join(need_caps)}" if need_caps
                     else f"model {model!r}" if model else "an image model")
-            return {"ok": False, "headroom": hr_r,
-                    "error": f"no {what} fits the headroom under profile {profile!r}"}
+            return {"ok": False, "headroom": hr_r, "host_ram_headroom_gib": round(host_ram_avail, 1),
+                    "error": f"no {what} fits the headroom under profile {profile!r} "
+                             f"(device VRAM and/or real host-RAM budget)"}
 
         dev, backend, ld = pick
         note = None
@@ -323,6 +407,19 @@ class Reconciler:
                 self._teardown_image(state, now, why="no image tier configured")
             return
 
+        pr = self.cfg.profiles.get(profile)
+        if pr is not None and pr.image == ImageSupport.none:
+            # A user-pinned slot survives `image: none` -- this policy means
+            # "don't AUTO-fill the tier here", not "actively fight a deliberate
+            # manual load". Without this carve-out, `bench-image` (the profile
+            # THIS policy exists for) tore down its own bench's model on every
+            # ~20s reconciler tick, a few seconds after `stackctl image bench`
+            # spawned it for measurement -- a self-inflicted thrash loop
+            # discovered 2026-09-04 trying to bench flux2-dev-turbo on it.
+            if state.image is not None and state.image.pinned_by != "user":
+                self._teardown_image(state, now, why=f"image: none under {profile}")
+            return
+
         slot = state.image
         healthy = bool(slot and slot.handle
                        and slot.state in (EngineState.warming, EngineState.ready))
@@ -335,7 +432,8 @@ class Reconciler:
             slot, healthy = None, False
 
         hr = headroom(self.cfg, profile, self.catalog, reserve_gib=tier.margin_gib)
-        pick = self._pick_image(tier, hr)
+        host_ram_avail = self._real_host_ram_avail(tier, profile)
+        pick = self._pick_image(tier, hr, host_ram_avail=host_ram_avail)
         if pick is None:
             if slot is not None:
                 self._teardown_image(state, now, why="no headroom under the active profile")
@@ -385,6 +483,7 @@ class Reconciler:
     def converge(self, state: RuntimeState, target: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
         self.events.clear()
+        state.warmed_for = None   # every entry re-arms the `image: warm` trigger
         pl = self._solve(target)
         want = pl.placed
         target_models = set(self.cfg.profiles[target].models)
@@ -534,8 +633,65 @@ class Reconciler:
         # never placed (e.g. boot_reset dropped it). No repick — sticky.
         self._image_tick(state, now)
         self._reconcile_image(state, state.active_profile, now=now, repick=False)
+        self._maybe_warm_image(state, now)
 
         return list(self.events)
+
+    def _maybe_warm_image(self, state: RuntimeState, now: float) -> None:
+        """`image: warm` profiles force one throwaway generation as soon as both
+        this profile's own LLM stacks and the image tier are ready, so the first
+        real request doesn't pay ComfyUI's model-load latency. Fire-and-forget:
+        the generation itself runs in ComfyUI's own queue, so we only need the
+        submit call (a fast POST) off the tick thread, not the full render.
+
+        Keyed on (profile, resident active_model) — not just the profile — so a
+        manual `/image/model` swap (dashboard "Load" button, not a real
+        generation request) re-arms this too: the newly-picked model gets
+        warmed the same way a fresh profile activation does, instead of only
+        the very first image model a profile ever lands on."""
+        pr = self.cfg.profiles.get(state.active_profile)
+        if pr is None or pr.image != ImageSupport.warm:
+            return
+        slot = state.image
+        if slot is None or slot.state != EngineState.ready or not slot.endpoint:
+            return
+        warm_key = f"{state.active_profile}:{slot.active_model}"
+        if state.warmed_for == warm_key:
+            return
+        if not all(state.stacks.get(n) and state.stacks[n].state == EngineState.ready
+                   for n in pr.models):
+            return
+        state.warmed_for = warm_key   # arm before firing — never resubmit mid-flight
+        model, endpoint = slot.active_model, slot.endpoint
+        self._emit(f"image:{model}", "warm-fire", f"forcing a generation under {state.active_profile}")
+        threading.Thread(target=self._fire_warm_generation, args=(model, endpoint),
+                         daemon=True).start()
+
+    @staticmethod
+    def _fire_warm_generation(model: str, endpoint: str) -> None:
+        # Everything -- imports included -- lives inside the try/except: this
+        # runs on a daemon thread with nothing watching it, so an unhandled
+        # exception here (e.g. the optional stackd[imagegen] extra isn't
+        # installed) would otherwise just spew a raw traceback to stderr
+        # instead of the same best-effort "never crash" swallow as the rest
+        # of this best-effort warm-up.
+        try:
+            import asyncio
+
+            from stackd.imagegen import workflows
+            from stackd.imagegen.bench import DEFAULT_PROMPT
+            from stackd.imagegen.comfyui_client import submit_workflow
+
+            async def _go() -> None:
+                _name, graph, nodes, _entry = workflows.load_model("generate", model)
+                nid = nodes.get("positive") or nodes.get("prompt")
+                if nid:
+                    workflows.set_node(graph, nid, "positive", DEFAULT_PROMPT)
+                await submit_workflow(graph, endpoint)
+
+            asyncio.run(_go())
+        except Exception:  # noqa: BLE001 — best-effort warm-up, never crash the tick loop
+            pass
 
     # ----------------------------------------------------------------- restart ---
     def _backoff(self, restarts: int) -> float:

@@ -1,0 +1,51 @@
+# Audit-only manifest for Docker-Tools/compose-version-audit.
+#
+# NOT a real compose file -- never `docker compose up` this. stackd creates
+# every one of these containers itself, straight through the Docker Engine
+# API (stackd/builder.py + stackd/runner.py via ai-socket-proxy), driven by
+# the image refs/build recipes in config/models/*.yaml, config/runtime.yaml,
+# and config/media/image.yaml (which resolve ${VAR} placeholders from
+# AI-STACK/.env). None of that appears in AI-STACK/docker-compose.yml, so
+# compose-version-audit has nothing to scan there -- this file just restates
+# the same five images in plain compose `image:`/`build:` syntax so the audit
+# tool (which only reads a compose file's `services:` block) can see them too.
+#
+#   python3 Docker-Tools/compose-version-audit/compose_audit.py audit stackd-images.audit.yml
+#
+# Keep this in sync by hand whenever an image/build recipe changes in
+# config/models/*.yaml, config/runtime.yaml, config/media/image.yaml, or the
+# *_IMAGE values in AI-STACK/.env -- there's no automation tying these
+# together, and compose-version-audit parses this file with plain PyYAML (no
+# `docker compose config` env-var substitution), so the `image:` values below
+# must be the literal current tags, not `${VAR}` placeholders.
+
+services:
+  # config/models/chat.yaml container.image + container.build -- moved in-repo
+  # 2026-09-05 from LLM-Tools/llama-priority-proxy (now dead) to break stackd's
+  # dependency on that repo. `docker exec stackd stackctl build chat` produces it.
+  llamacpp-cuda:
+    build:
+      context: stackd/llamacpp_image
+      dockerfile: Dockerfile.cuda
+
+  # config/runtime.yaml images.llamacpp-vulkan -- plain vendor pull, no local
+  # build. Current value: AI-STACK/.env LLAMACPP_VULKAN_IMAGE
+  llamacpp-vulkan:
+    image: ghcr.io/ggml-org/llama.cpp:server-vulkan
+
+  # config/models/coding-flash.yaml container.image -- plain vendor pull.
+  # Current value: AI-STACK/.env VLLM_IMAGE
+  vllm-cuda:
+    image: vllm/vllm-openai:qwen38-flash-next
+
+  # config/media/image.yaml containers.cuda.image -- plain vendor pull.
+  # Current value: AI-STACK/.env COMFYUI_CUDA_IMAGE
+  comfyui-cuda:
+    image: yanwk/comfyui-boot:cu130-megapak-pt211-20260826
+
+  # config/media/image.yaml containers.vulkan -- local build, produced by
+  # `docker exec stackd stackctl build image:vulkan`
+  comfyui-rocm:
+    build:
+      context: stackd/imagegen/comfyui_image
+      dockerfile: Dockerfile.igpu

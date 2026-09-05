@@ -99,12 +99,6 @@ def validate_profile(cfg: Config, profile: str, catalog: "Catalog | None" = None
                 f"(peak != sum of budgets)"
             )
 
-    if not cfg.profiles[profile].default and any(
-        cfg.devices[p.device].backend.value == "cuda" for p in pl.placed.values()
-    ):
-        flags.append("entry/exit tears down cuda0 models — apply R1 discipline "
-                     "(container kill, nvidia-smi probe, backoff)")
-
     if pl.unplaced:
         flags.append(f"won't fit, unavailable in this profile: {', '.join(pl.unplaced)}")
 

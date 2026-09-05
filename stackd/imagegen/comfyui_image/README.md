@@ -11,7 +11,7 @@ run the same graphs (`../workflow_graphs/`) and the same custom node:
 
 `stackd/imagegen/tools.py` runs each request against whichever ComfyUI is resident —
 read from `Manager.capabilities()["image"]` (`active_model` + the `capabilities` verb
-list). No "coding"/"everyday" mode: the tool uses the resident model, and if it
+list). No "coding"/"chat" mode: the tool uses the resident model, and if it
 doesn't declare the requested verb it asks the tier to swap to one that does.
 
 ## Files

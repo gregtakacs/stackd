@@ -1,4 +1,4 @@
-model: everyday-chat
+model: chat
 engine:
   template: llamacpp-cuda
   model: Qwen3.8-27B-UD-Q4_K_XL
@@ -13,7 +13,10 @@ engine:
                  "-n", "32768",
                  "--mmproj", "/models/Qwen3.8-27B-UD-Q4_K_XL.mmproj-BF16.gguf"]
   container:
-    entrypoint: ["llama-server"]   # the reused proxy image's own entrypoint is the python proxy
+    image: ${LLAMACPP_CUDA_IMAGE}
+    build:
+      context: /app/stackd/llamacpp_image   # shipped inside the stackd image
+      dockerfile: Dockerfile.cuda           # `docker exec stackd stackctl build chat` produces it
 budget: { vram_gib: 30, ram_gib: 2 }     # fallback if catalog/ has no curve
 placement: { devices: [cuda0] }
 # `reasoning:` is stackd's engine-agnostic knob — the front translates it to the

@@ -78,6 +78,8 @@ class EngineAdapter(ABC):
             network=ctx.network,
             ipc_host=c.ipc_host or d.ipc_host,
             shm_size=c.shm_size or d.shm_size,
+            ulimits=dict(c.ulimits),
+            mem_limit_gib=c.mem_limit_gib,
             labels=dict(c.labels),
             stop_grace_s=c.stop_grace_s,
         )
