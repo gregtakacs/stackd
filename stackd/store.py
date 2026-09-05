@@ -14,8 +14,8 @@ import sqlite3
 import time
 from dataclasses import dataclass
 
-SCHEMA_VERSION = 1
-RETAIN_DAYS = 7
+SCHEMA_VERSION = 3
+RETAIN_DAYS = 40
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS user_keys (
@@ -33,7 +33,8 @@ CREATE TABLE IF NOT EXISTS usage (
     day TEXT NOT NULL,
     user_email TEXT,
     requested_model TEXT,
-    served_stack TEXT,
+    served_stack TEXT,           -- the stackd stack/unit (e.g. 'coding')
+    served_model TEXT,           -- the checkpoint on disk (e.g. 'Qwen3.8-Flash-Next-NVFP4')
     served_profile TEXT,
     off_home INTEGER DEFAULT 0,
     prompt_tokens INTEGER DEFAULT 0,
@@ -45,11 +46,13 @@ CREATE INDEX IF NOT EXISTS ix_usage_day ON usage(day);
 
 CREATE TABLE IF NOT EXISTS usage_daily (
     day TEXT, user_email TEXT, requested_model TEXT, served_profile TEXT,
+    served_stack TEXT NOT NULL DEFAULT '?',
+    served_model TEXT NOT NULL DEFAULT '?',
     reqs INTEGER DEFAULT 0,
     prompt_tokens INTEGER DEFAULT 0,
     completion_tokens INTEGER DEFAULT 0,
     cached_tokens INTEGER DEFAULT 0,
-    PRIMARY KEY (day, user_email, requested_model, served_profile)
+    PRIMARY KEY (day, user_email, requested_model, served_profile, served_stack, served_model)
 );
 
 CREATE TABLE IF NOT EXISTS price_points (
@@ -85,9 +88,53 @@ class Store:
         conn.executescript("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
         conn.executescript(_SCHEMA)
         s = cls(conn)
-        if s.get_meta("schema_version") is None:
-            s.set_meta("schema_version", str(SCHEMA_VERSION))
+        s._migrate()
         return s
+
+    def _migrate(self) -> None:
+        """Idempotent schema catch-ups for DBs created before SCHEMA_VERSION.
+        Keyed off the actual table shape, not the stored version, so a DB that
+        predates the version stamp is handled too.
+
+        The ledger distinguishes two things that used to be conflated:
+          * served_stack  — the stackd unit / yaml stack (e.g. 'coding')
+          * served_model  — the checkpoint on disk (e.g. 'Qwen3.8-Flash-Next-NVFP4')
+        v2 stored the stack in a column it called `served_model`; v3 renames that
+        to `served_stack` and adds a real `served_model` (seeded '?', backfilled
+        out of band). `usage` (raw) gains a `served_model` column too."""
+        ucols = {r["name"] for r in self.conn.execute("PRAGMA table_info(usage)")}
+        if "served_model" not in ucols:
+            self.conn.execute("ALTER TABLE usage ADD COLUMN served_model TEXT")
+
+        dcols = {r["name"] for r in self.conn.execute("PRAGMA table_info(usage_daily)")}
+        if "served_stack" not in dcols:
+            # v1 (neither col) or v2 (a `served_model` that actually holds the
+            # stack id) -> v3. Copy that column into served_stack; new
+            # served_model starts as '?'.
+            stack_src = "served_model" if "served_model" in dcols else "'?'"
+            self.conn.executescript(f"""
+                BEGIN;
+                CREATE TABLE usage_daily_v3 (
+                    day TEXT, user_email TEXT, requested_model TEXT, served_profile TEXT,
+                    served_stack TEXT NOT NULL DEFAULT '?',
+                    served_model TEXT NOT NULL DEFAULT '?',
+                    reqs INTEGER DEFAULT 0,
+                    prompt_tokens INTEGER DEFAULT 0,
+                    completion_tokens INTEGER DEFAULT 0,
+                    cached_tokens INTEGER DEFAULT 0,
+                    PRIMARY KEY (day, user_email, requested_model, served_profile,
+                                 served_stack, served_model)
+                );
+                INSERT INTO usage_daily_v3
+                    (day,user_email,requested_model,served_profile,served_stack,served_model,
+                     reqs,prompt_tokens,completion_tokens,cached_tokens)
+                SELECT day,user_email,requested_model,served_profile,{stack_src},'?',
+                       reqs,prompt_tokens,completion_tokens,cached_tokens FROM usage_daily;
+                DROP TABLE usage_daily;
+                ALTER TABLE usage_daily_v3 RENAME TO usage_daily;
+                COMMIT;
+            """)
+        self.set_meta("schema_version", str(SCHEMA_VERSION))
 
     def close(self) -> None:
         self.conn.close()
@@ -202,9 +249,11 @@ class Store:
                 pass
             for (day, u, m, p), (reqs, pt, ct, cc) in agg.items():
                 self.conn.execute(
-                    "INSERT INTO usage_daily(day,user_email,requested_model,served_profile,reqs,"
-                    "prompt_tokens,completion_tokens,cached_tokens) VALUES(?,?,?,?,?,?,?,?) "
-                    "ON CONFLICT(day,user_email,requested_model,served_profile) DO UPDATE SET "
+                    "INSERT INTO usage_daily(day,user_email,requested_model,served_profile,"
+                    "served_stack,served_model,reqs,prompt_tokens,completion_tokens,cached_tokens) "
+                    "VALUES(?,?,?,?,'?','?',?,?,?,?) "
+                    "ON CONFLICT(day,user_email,requested_model,served_profile,served_stack,served_model) "
+                    "DO UPDATE SET "
                     "reqs=reqs+excluded.reqs, prompt_tokens=prompt_tokens+excluded.prompt_tokens, "
                     "completion_tokens=completion_tokens+excluded.completion_tokens, "
                     "cached_tokens=cached_tokens+excluded.cached_tokens",
@@ -243,16 +292,18 @@ class Store:
     # -- usage ledger ------------------------------------------------------------------
     def record_usage(self, *, user_email: str | None, requested_model: str | None,
                      served_stack: str | None, served_profile: str | None,
+                     served_model: str | None = None,
                      prompt_tokens: int = 0, completion_tokens: int = 0,
                      cached_tokens: int = 0, off_home: bool = False, ok: bool = True,
                      now: float | None = None) -> None:
         now = time.time() if now is None else now
         self.conn.execute(
-            "INSERT INTO usage(ts,day,user_email,requested_model,served_stack,served_profile,"
-            "off_home,prompt_tokens,completion_tokens,cached_tokens,ok) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO usage(ts,day,user_email,requested_model,served_stack,served_model,"
+            "served_profile,off_home,prompt_tokens,completion_tokens,cached_tokens,ok) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
             (now, _utc_day(now), (user_email or "direct"), requested_model, served_stack,
-             served_profile, int(off_home), prompt_tokens, completion_tokens, cached_tokens, int(ok)),
+             served_model, served_profile, int(off_home),
+             prompt_tokens, completion_tokens, cached_tokens, int(ok)),
         )
 
     def rollup(self, *, retain_days: int = RETAIN_DAYS, now: float | None = None) -> int:
@@ -260,19 +311,24 @@ class Store:
         cutoff = _utc_day(now - retain_days * 86400)
         rows = self.conn.execute(
             "SELECT day, COALESCE(user_email,'direct') u, COALESCE(requested_model,'?') m, "
-            "COALESCE(served_profile,'?') p, COUNT(*) reqs, SUM(prompt_tokens) pt, "
+            "COALESCE(served_profile,'?') p, COALESCE(served_stack,'?') sk, "
+            "COALESCE(served_model,'?') sm, "
+            "COUNT(*) reqs, SUM(prompt_tokens) pt, "
             "SUM(completion_tokens) ct, SUM(cached_tokens) cc "
-            "FROM usage WHERE day < ? GROUP BY day,u,m,p", (cutoff,)
+            "FROM usage WHERE day < ? GROUP BY day,u,m,p,sk,sm", (cutoff,)
         ).fetchall()
         for r in rows:
             self.conn.execute(
-                "INSERT INTO usage_daily(day,user_email,requested_model,served_profile,reqs,"
-                "prompt_tokens,completion_tokens,cached_tokens) VALUES(?,?,?,?,?,?,?,?) "
-                "ON CONFLICT(day,user_email,requested_model,served_profile) DO UPDATE SET "
+                "INSERT INTO usage_daily(day,user_email,requested_model,served_profile,"
+                "served_stack,served_model,reqs,prompt_tokens,completion_tokens,cached_tokens) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(day,user_email,requested_model,served_profile,served_stack,served_model) "
+                "DO UPDATE SET "
                 "reqs=reqs+excluded.reqs, prompt_tokens=prompt_tokens+excluded.prompt_tokens, "
                 "completion_tokens=completion_tokens+excluded.completion_tokens, "
                 "cached_tokens=cached_tokens+excluded.cached_tokens",
-                (r["day"], r["u"], r["m"], r["p"], r["reqs"], r["pt"], r["ct"], r["cc"]),
+                (r["day"], r["u"], r["m"], r["p"], r["sk"], r["sm"],
+                 r["reqs"], r["pt"], r["ct"], r["cc"]),
             )
         cur = self.conn.execute("DELETE FROM usage WHERE day < ?", (cutoff,))
         return cur.rowcount
@@ -288,13 +344,14 @@ class Store:
         raw = self.conn.execute(
             "SELECT day, COALESCE(user_email,'direct') user_email, "
             "COALESCE(requested_model,'?') requested_model, COALESCE(served_profile,'?') served_profile, "
+            "COALESCE(served_stack,'?') served_stack, COALESCE(served_model,'?') served_model, "
             "COUNT(*) reqs, SUM(prompt_tokens) prompt_tokens, SUM(completion_tokens) completion_tokens, "
             "SUM(cached_tokens) cached_tokens FROM usage" + where +
-            " GROUP BY day,user_email,requested_model,served_profile", args
+            " GROUP BY day,user_email,requested_model,served_profile,served_stack,served_model", args
         ).fetchall()
         folded = self.conn.execute(
-            "SELECT day,user_email,requested_model,served_profile,reqs,prompt_tokens,"
-            "completion_tokens,cached_tokens FROM usage_daily" + where, args
+            "SELECT day,user_email,requested_model,served_profile,served_stack,served_model,reqs,"
+            "prompt_tokens,completion_tokens,cached_tokens FROM usage_daily" + where, args
         ).fetchall()
         return [dict(r) for r in list(raw) + list(folded)]
 

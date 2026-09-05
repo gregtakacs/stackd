@@ -169,6 +169,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send_json(401, {"error": {"message": "unauthorized"}})
         if self.path.split("?")[0] == "/savings":
             return self._savings()
+        if self.path.split("?")[0] == "/savings/facts":
+            return self._savings_facts()
         if self.path.split("?")[0] == "/events":
             return self._events()
         if self.path == "/gpu":
@@ -319,6 +321,24 @@ class _Handler(BaseHTTPRequestHandler):
                           from_day=(q.get("from") or [None])[0], to_day=(q.get("to") or [None])[0])
         return self._send_json(200, out)
 
+    def _savings_facts(self):
+        """Finest-grain priced fact table for the dashboard's drill-down explorer.
+        `?from=YYYY-MM-DD&to=YYYY-MM-DD` — same range params as `/savings`.
+
+        Each fact carries both `served_stack` (the stackd unit, e.g. `coding`) and
+        `served_model` (the checkpoint on disk, e.g. `Qwen3.8-Flash-Next-NVFP4`),
+        straight from the ledger — no config-time remap."""
+        if self.store is None:
+            return self._send_json(503, {"error": {"message": "no datastore"}})
+        from urllib.parse import parse_qs, urlparse
+        from stackd.pricing import load_pricing, savings_facts
+        q = parse_qs(urlparse(self.path).query)
+        with self.lock:
+            out = savings_facts(self.store, load_pricing(self.pricing_path),
+                                from_day=(q.get("from") or [None])[0],
+                                to_day=(q.get("to") or [None])[0])
+        return self._send_json(200, out)
+
     def _savings_refresh(self):
         """Pull current tier-ref prices from OpenRouter (writes a new effective-
         dated point only on change). Mirrors `stackctl prices`."""
@@ -428,6 +448,7 @@ class _Handler(BaseHTTPRequestHandler):
                         would_evict = []
                 out.append({
                     "name": name, "priority": pr.priority, "default": pr.default,
+                    "manual_only": pr.manual_only,
                     "idle_evict": pr.idle_evict, "active": name == active,
                     "pinned": pinned and name == active, "models": list(pr.models),
                     "fits": rep.ok, "unplaced": rep.unplaced, "flags": rep.flags,
@@ -665,7 +686,7 @@ class _Handler(BaseHTTPRequestHandler):
             with self.lock:
                 self.store.record_usage(
                     user_email=email, requested_model=requested_model,
-                    served_stack=rr.stack, served_profile=rr.profile,
+                    served_stack=rr.stack, served_model=rr.artifact, served_profile=rr.profile,
                     prompt_tokens=usage.get("prompt_tokens", 0),
                     completion_tokens=usage.get("completion_tokens", 0),
                     cached_tokens=(usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0),

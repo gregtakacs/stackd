@@ -65,7 +65,8 @@ def main() -> int:
     store = Store.open(str(tmp / "web.db"))
     day = _utc_day()
     store.record_usage(user_email="u@x.com", requested_model="assistant",
-                       served_stack="chat", served_profile="chat",
+                       served_stack="chat", served_model="Qwen3.8-27B-UD-Q4_K_XL",
+                       served_profile="chat",
                        prompt_tokens=2000, completion_tokens=800, cached_tokens=200)
     store.add_energy(day, gpu_wh=120, host_wh=90)
 
@@ -106,15 +107,15 @@ def main() -> int:
         check("activate produced new events", code == 200 and len(j["events"]) >= 1)
         check("new events carry a source", all(e.get("source") for e in j["events"]))
 
-        # --- /slots + /engine (coding is active -> coding-flash resident) ---
+        # --- /slots + /engine (coding is active -> coding resident) ---
         code, j = _json_req(f"{base}/slots/does-not-exist", token="admin")
         check("/slots on an unknown stack -> 404", code == 404)
-        code, j = _json_req(f"{base}/slots/coding-flash", token="admin")
+        code, j = _json_req(f"{base}/slots/coding", token="admin")
         check("/slots on a vLLM stack -> unsupported (not an error)",
               code == 200 and j.get("unsupported") is True)
         code, j = _json_req(f"{base}/engine/does-not-exist", token="admin")
         check("/engine on an unknown stack -> 404", code == 404)
-        code, j = _json_req(f"{base}/engine/coding-flash", token="admin")
+        code, j = _json_req(f"{base}/engine/coding", token="admin")
         check("/engine returns a normalised (all-None on an unreachable engine) block",
               code == 200 and j.get("template", "").startswith("vllm")
               and "gen_tok_s" in j and "mtp_accept_pct" in j)
@@ -150,6 +151,23 @@ def main() -> int:
         check("/history honours an explicit from/to range",
               code == 200 and j["days"] == ["2026-08-20", "2026-08-21", "2026-08-22",
                                             "2026-08-23", "2026-08-24"])
+
+        # --- /savings/facts (cost explorer feed) ------------------------
+        code, j = _json_req(f"{base}/savings/facts", token="admin")
+        check("/savings/facts -> 200 with a facts[] + tiers[]", code == 200
+              and isinstance(j.get("facts"), list) and isinstance(j.get("tiers"), list)
+              and "energy_cost" in j)
+        f0 = next((f for f in j["facts"] if f["reqs"]), None)
+        # both dims come straight from the ledger now — no config-time remap
+        check("/savings/facts carries served_stack + served_model + requested_model",
+              f0 is not None and f0["served_stack"] == "chat"
+              and f0["served_model"] == "Qwen3.8-27B-UD-Q4_K_XL"
+              and f0["requested_model"] == "assistant")
+        check("/savings/facts prices each fact per tier label",
+              f0 is not None and set(f0["gross"]) == {t["label"] for t in j["tiers"]})
+        check("/savings/facts fact gross sums to the tier total",
+              all(abs(round(sum(f["gross"][t["label"]] for f in j["facts"]), 4)
+                      - t["total_gross"]) < 1e-6 for t in j["tiers"]))
 
         # --- /profiles ---------------------------------------------------
         code, j = _json_req(f"{base}/profiles", token="admin")

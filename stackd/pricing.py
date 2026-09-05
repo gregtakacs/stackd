@@ -152,6 +152,55 @@ def savings(store: Store, cfg: dict, *, from_day: str | None = None,
     }
 
 
+def savings_facts(store: Store, cfg: dict, *, from_day: str | None = None,
+                  to_day: str | None = None) -> dict:
+    """Priced fact table at finest grain, for the dashboard's interactive
+    drill-down. One entry per distinct
+    ``(day, user_email, requested_model, served_stack, served_model, served_profile)``
+    in range, with per-tier gross. ``served_stack`` is the stackd unit (``coding``);
+    ``served_model`` is the checkpoint on disk (``Qwen3.8-Flash-Next-NVFP4``). Net is
+    left to the caller and apportioned exactly as ``savings()`` does::
+
+        net(subset) = gross(subset) - energy_cost * gross(subset) / tier.total_gross
+    """
+    excl = set(cfg.get("exclude_models", []))
+    rows = [r for r in store.usage_rows(from_day, to_day)
+            if r["requested_model"] not in excl]
+    days = sorted({r["day"] for r in rows})
+    energy = (store.energy_between(days[0], days[-1]) if days
+              else {"gpu_kwh": 0.0, "host_kwh": 0.0})
+    energy_cost = round((energy["gpu_kwh"] + energy["host_kwh"])
+                        * cfg["electricity_price_per_kwh"], 4)
+
+    tiers = cfg.get("tiers", [])
+    tier_meta = [{"label": t["label"], "ref": t["ref"],
+                  "total_gross": _gross_for(_tier_rows(rows, t), store, t["ref"])}
+                 for t in tiers]
+
+    keys = ("day", "user_email", "requested_model",
+            "served_stack", "served_model", "served_profile")
+    groups: dict[tuple, list[dict]] = {}
+    for r in rows:
+        groups.setdefault(tuple(r[k] for k in keys), []).append(r)
+
+    facts = []
+    for key, g in groups.items():
+        rec = dict(zip(keys, key))
+        for col in ("reqs", "prompt_tokens", "completion_tokens", "cached_tokens"):
+            rec[col] = sum(x[col] for x in g)
+        rec["gross"] = {t["label"]: _gross_for(_tier_rows(g, t), store, t["ref"])
+                        for t in tiers}
+        facts.append(rec)
+
+    return {
+        "from": days[0] if days else None, "to": days[-1] if days else None,
+        "currency": cfg.get("currency", "USD"),
+        "energy_cost": energy_cost,
+        "tiers": tier_meta,
+        "facts": facts,
+    }
+
+
 # -- OpenRouter price pull (manual; called by `stackctl prices --refresh`) --------
 
 

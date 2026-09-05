@@ -111,10 +111,10 @@ def main() -> int:
     old = time.time() - 30 * 86400
     for i in range(3):
         st.record_usage(user_email="u@x.com", requested_model="assistant",
-                        served_stack="chat", served_profile="chat",
+                        served_stack="chat", served_model="Qwen3.8-27B", served_profile="chat",
                         prompt_tokens=1000, completion_tokens=500, cached_tokens=200, now=old)
     st.record_usage(user_email="u@x.com", requested_model="assistant",
-                    served_stack="chat", served_profile="chat",
+                    served_stack="chat", served_model="Qwen3.8-27B", served_profile="chat",
                     prompt_tokens=2000, completion_tokens=800)  # today
     moved = st.rollup(retain_days=7)
     check("rollup folds old rows", moved == 3)
@@ -122,6 +122,50 @@ def main() -> int:
     check("usage_rows spans raw + folded", len(rows) == 2)
     check("folded totals preserved",
           sum(r["prompt_tokens"] for r in rows) == 1000 * 3 + 2000)
+    check("usage_rows carry stack + checkpoint through the rollup",
+          all(r["served_stack"] == "chat" and r["served_model"] == "Qwen3.8-27B" for r in rows))
+
+    # --- v2 -> v3 migration: split the conflated column into stack + checkpoint --
+    import sqlite3 as _sqm
+    v2p = tmp / "v2.db"
+    v2 = _sqm.connect(str(v2p))
+    v2.executescript(
+        # v2 usage_daily: a `served_model` column that actually held the stack id
+        "CREATE TABLE usage_daily (day TEXT, user_email TEXT, requested_model TEXT,"
+        " served_profile TEXT, served_model TEXT NOT NULL DEFAULT '?', reqs INTEGER,"
+        " prompt_tokens INTEGER, completion_tokens INTEGER, cached_tokens INTEGER,"
+        " PRIMARY KEY (day,user_email,requested_model,served_profile,served_model));"
+        "INSERT INTO usage_daily VALUES ('2026-05-01','a@x.com','assistant','chat','coding',4,400,200,10);"
+        # v2 usage: served_stack, no served_model
+        "CREATE TABLE usage (id INTEGER PRIMARY KEY, ts REAL, day TEXT, user_email TEXT,"
+        " requested_model TEXT, served_stack TEXT, served_profile TEXT, off_home INT,"
+        " prompt_tokens INT, completion_tokens INT, cached_tokens INT, ok INT);"
+        "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);"
+        "INSERT INTO meta VALUES ('schema_version','2');")
+    v2.commit(); v2.close()
+    mg = Store.open(str(v2p))
+    ucols = {r["name"] for r in mg.conn.execute("PRAGMA table_info(usage)")}
+    dcols = {r["name"] for r in mg.conn.execute("PRAGMA table_info(usage_daily)")}
+    check("v3 migration: usage gains served_model", "served_model" in ucols)
+    check("v3 migration: usage_daily has both served_stack + served_model",
+          {"served_stack", "served_model"} <= dcols)
+    mr = mg.conn.execute("SELECT * FROM usage_daily").fetchone()
+    check("v3 migration: old stack id moved to served_stack, checkpoint seeded '?'",
+          mr["served_stack"] == "coding" and mr["served_model"] == "?"
+          and mr["reqs"] == 4 and mr["prompt_tokens"] == 400)
+    check("v3 migration stamps schema_version=3", mg.get_meta("schema_version") == "3")
+    t_old = time.time() - 30 * 86400
+    for sk, art in (("coding", "Flash-Next"), ("coding", "Flash-Next"),
+                    ("uncensored-big", "Flash-Next-heretic")):
+        mg.record_usage(user_email="a@x.com", requested_model="assistant", served_stack=sk,
+                        served_model=art, served_profile="coding",
+                        prompt_tokens=100, completion_tokens=50, now=t_old)
+    mg.rollup(retain_days=7)
+    folded = {(r["served_stack"], r["served_model"]): r["reqs"] for r in mg.usage_rows()
+              if r["day"] == _utc_day(t_old)}
+    check("rollup groups folded rows by (stack, checkpoint)",
+          folded.get(("coding", "Flash-Next")) == 2
+          and folded.get(("uncensored-big", "Flash-Next-heretic")) == 1)
 
     # --- backfill from a llama-priority-proxy usage.sqlite ------------------------
     import sqlite3 as _sq
