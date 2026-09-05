@@ -78,17 +78,24 @@
   .seg { border-top:1px solid rgba(0,0,0,.3); min-height:1px; }
   .seg.elastic { background-image:repeating-linear-gradient(45deg,transparent,transparent 5px,rgba(255,255,255,.1) 5px,rgba(255,255,255,.1) 10px); }
   .seg.resv { background:#2a2f3d !important; }
+  .seg.warming { animation:pulse 1.4s infinite; }
+  .seg.crashed { outline:2px solid var(--red); outline-offset:-2px; }
+  .seg-row .sw.warming { animation:pulse 1.4s infinite; }
+  .seg-row .sw.crashed { outline:1px solid var(--red); }
   .bar .free { flex:1; }
   .marker { position:absolute; left:-4px; right:-4px; border-top:2px dashed var(--accent); z-index:5; transition:bottom .4s ease; }
   .marker span { position:absolute; right:0; top:-14px; font-size:.62rem; color:var(--accent); background:var(--bg); padding:0 2px; }
   .ghost { font-size:.76rem; color:var(--dim); border:1px dashed var(--border); border-radius:6px; padding:4px 8px; margin-top:6px; display:inline-block; }
 
   /* profiles */
-  .prof { border:1px solid var(--border); border-radius:9px; padding:11px 13px; margin-bottom:10px; background:var(--bg); }
+  .prof { border:1px solid var(--border); border-left-width:3px; border-radius:9px;
+    padding:11px 13px; margin-bottom:10px; background:var(--bg); }
   .prof.active { border-color:var(--accent); background:#161a2b; }
   .prof.pending { border-color:var(--yellow); border-style:dashed; animation:pulse 1.4s infinite; }
   .prof .chips { display:flex; flex-wrap:wrap; gap:5px; margin:7px 0; }
   .chip { font-size:.73rem; padding:2px 8px; border-radius:6px; background:var(--surface2); border:1px solid var(--border); }
+  .chip-sw { display:inline-block; width:8px; height:8px; border-radius:2px; margin-right:5px;
+    vertical-align:middle; text-decoration:none; }
   .chip.res { color:var(--green); border-color:#2c5138; }
   .chip.load { color:var(--yellow); border-color:#5c5222; animation:pulse 1.4s infinite; }
   .chip.plan { color:var(--dim); }
@@ -124,6 +131,36 @@
   td { padding:6px 10px; border-bottom:1px solid var(--surface2); }
   td.num, th.num { text-align:right; font-variant-numeric:tabular-nums; }
   tr:last-child td { border-bottom:none; }
+
+  /* cost explorer (usage view) */
+  #viewUsage [data-days].on { background:var(--accent-dim); border-color:var(--accent); }
+  .xp-chips { display:flex; flex-wrap:wrap; gap:7px; }
+  .xp-chip { display:inline-flex; align-items:center; gap:6px; font-size:.78rem;
+    padding:4px 9px; border-radius:7px; background:var(--surface2); border:1px solid var(--border);
+    user-select:none; }
+  .xp-chip.on { border-color:var(--accent); background:#161a2b; }
+  .xp-chip.drag { opacity:.45; outline:1px dashed var(--accent); }
+  .xp-grip { cursor:grab; color:var(--dim); font-size:.82rem; line-height:1; touch-action:none; letter-spacing:-2px; }
+  .xp-grip:active { cursor:grabbing; }
+  .xp-chip .xp-lvl { font-size:.64rem; font-weight:700; color:var(--accent);
+    background:var(--bg); border:1px solid var(--accent-dim); border-radius:4px; padding:0 4px; }
+  .xp-chip .xp-lbl { cursor:pointer; }
+  .xp-chip .xp-flt { color:var(--dim); cursor:pointer; font-size:.72rem; }
+  .xp-hint { font-size:.72rem; margin:8px 0 4px; }
+  table.xp-table { table-layout:auto; }
+  table.xp-table td:first-child { white-space:nowrap; overflow-wrap:normal; }
+  .xp-chev { display:inline-block; width:14px; color:var(--dim); cursor:pointer; font-size:.7rem; }
+  .xp-chev.bare { cursor:default; }
+  tr.xp-total td { font-weight:700; border-top:1px solid var(--border); border-bottom:none; }
+  tr.xp-row:hover td { background:var(--surface2); }
+  th.xp-sorth { cursor:pointer; }
+  .xp-pop { position:absolute; z-index:50; background:var(--surface); border:1px solid var(--border);
+    border-radius:8px; padding:8px; box-shadow:0 8px 24px #0008; min-width:180px; max-width:340px; }
+  .xp-pop-bar { display:flex; gap:6px; margin-bottom:6px; }
+  .xp-pop-list { max-height:260px; overflow-y:auto; display:flex; flex-direction:column; gap:2px; }
+  .xp-pop-item { display:flex; align-items:center; gap:6px; font-size:.8rem; padding:2px 3px;
+    white-space:nowrap; cursor:pointer; }
+  .xp-pop button.sm.primary { margin-top:7px; width:100%; }
 
   /* live gauges */
   #gauges { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:10px 22px; }
@@ -295,14 +332,7 @@
       </div>
     </div>
 
-    <div class="grid g2" style="margin-bottom:16px;">
-      <div class="card"><h2>By user</h2><div class="tblwrap" id="usgByUser"></div></div>
-      <div class="card"><h2>By model</h2><div class="tblwrap" id="usgByModel"></div></div>
-    </div>
-    <div class="grid g2">
-      <div class="card"><h2>By profile</h2><div class="tblwrap" id="usgByProfile"></div></div>
-      <div class="card"><h2>By day</h2><div class="tblwrap" id="usgByDay"></div></div>
-    </div>
+    <div class="card" id="usgExplorer"></div>
   </div>
 
   <div class="card hidden" id="usersCard" style="margin-top:16px;">
@@ -408,6 +438,10 @@ function renderGauges(gpu, host) {
 // ---- placement map --------------------------------------------------------
 const RESV_KEYS = /reserve|slack|headroom|budget|gtt|overhead/i;
 function hue(str){ let h=0; for(const c of str) h=(h*31+c.charCodeAt(0))>>>0; return h%360; }
+// one stable colour per model, shared by its placement-map segment and its
+// profile chip so a profile's memory is visually traceable to its models.
+const modelColor = n => `hsl(${hue(n)} 62% 60%)`;
+const profileColor = n => `hsl(${hue("profile∷" + n)} 50% 52%)`;
 
 function segColor(s) {
   return s.color || (s.cls === "resv" ? "#2a2f3d" : `hsl(${hue(s.label)} 55% 62%)`);
@@ -446,9 +480,10 @@ function laneEl(o) {
   for (const s of (o.segs || [])) {
     if (!s.gib || s.gib <= 0.02) continue;
     const row = el("div", "seg-row");
-    const sw = el("span", "sw" + (s.cls === "elastic" ? " elastic" : "")); sw.style.background = segColor(s);
+    const sw = el("span", "sw" + (s.cls ? " " + s.cls : "")); sw.style.background = segColor(s);
     row.append(sw, el("span", "nm", s.label), el("span", "gb", fmtGib(s.gib)));
     if (s.tag) row.append(el("span", "tg", s.tag));
+    else if (s.cls === "warming" || s.cls === "crashed") row.append(el("span", "tg", s.cls));
     sl.append(row);
   }
   const fr = el("div", "seg-row free-row");
@@ -482,17 +517,20 @@ function renderMap(st, eng, img, gpu, host) {
   const engState = {};
   (eng.engines || []).forEach(e => engState[e.stack] = e.state);
   const stackState = n => (st.stacks[n] && st.stacks[n].state) || engState[n] || engState["image:" + n];
-  const RESV_LBL = { host_reserve: "host reserve (non-stackd est.)", load_slack: "page-cache load slack",
-    "vram:igpu0 (≤90)": "iGPU VRAM charge", "vram:cuda0": null, "ram:cuda0": "cuda0 engine RAM spill" };
+  const RESV_LBL = { host_reserve: "host + other containers (reserve)",
+    load_slack: "page-cache load slack", "vram:cuda0": null };
   const srcTag = m => (st.sources || {})[m] || "";
   const segFor = (label, gib) => {
     const resv = RESV_KEYS.test(label);
     const s = stackState(label);
-    let color = "";
-    if (s === "ready") color = "var(--green)";
-    else if (s === "warming") color = "var(--yellow)";
-    else if (s === "crashed" || s === "error") color = "var(--red)";
-    return { label: RESV_LBL[label] || label, gib, cls: resv ? "resv" : "", color,
+    // fill = the model's own stable colour (traceable to its profile chip);
+    // engine state shows as a class (warming pulse / crashed outline), not by
+    // recolouring the segment.
+    const cls = resv ? "resv"
+      : s === "warming" ? "warming"
+      : (s === "crashed" || s === "error") ? "crashed" : "";
+    return { label: RESV_LBL[label] || label, gib, cls,
+             color: resv ? "#2a2f3d" : modelColor(label),
              tag: resv ? "reservation" : srcTag(label) };
   };
   const imgSeg = () => ({ label: "image · " + img.resident.active_model, gib: imgFootprint(img),
@@ -501,13 +539,22 @@ function renderMap(st, eng, img, gpu, host) {
   const dev = n => (st.devices || []).find(d => d.device === n);
   const resKey = img && img.resident ? [img.resident.active_model, img.resident.device, img.resident.pinned_by] : null;
 
-  if (!unchanged("map", [st.pools, st.devices, st.flags, st.unplaced, st.sources, resKey,
+  if (!unchanged("map", [st.pools, st.devices, st.flags, st.unplaced, st.sources,
+      st.placement, st.model_vram, st.model_ram, resKey,
       (eng.engines||[]).map(e => [e.stack, e.state])])) {
     const lanes = $("#mapLanes"); lanes.innerHTML = "";
+    const modelsOn = d => Object.keys(st.model_vram || {})
+      .filter(m => (st.placement || {})[m] === d);
 
     const cv = pool("cuda_vram");
     if (cv) {
-      const segs = Object.entries(cv.breakdown || {}).map(([k, v]) => segFor(k, v));
+      // one segment per model on cuda0 (labelled by model name), not a single
+      // opaque "vram:cuda0" block. Fall back to the pool breakdown if the
+      // backend didn't send model_vram.
+      const on = modelsOn("cuda0");
+      const segs = on.length
+        ? on.map(m => segFor(m, (st.model_vram || {})[m]))
+        : Object.entries(cv.breakdown || {}).map(([k, v]) => segFor(k, v));
       if (resKey && img.resident.device === "cuda0") segs.push(imgSeg());
       const budgeted = segs.reduce((a, s) => a + (s.gib || 0), 0);
       lanes.append(laneEl({
@@ -532,13 +579,29 @@ function renderMap(st, eng, img, gpu, host) {
     }
     const hu = pool("host_unified");
     if (hu) {
-      const segs = Object.entries(hu.breakdown || {}).map(([k, v]) => segFor(k, v));
-      // GTT (the iGPU's VRAM) is carved from this same unified pool -- unlike
-      // cuda0, whose VRAM is a separate dedicated pool the image tier never
-      // touches here. The backend's own "vram:igpu0 (≤90)" breakdown entry is
-      // LLM-stack-only (the image tier isn't a profile member the solver knows
-      // about; see solver.py headroom()), so without this the resident image
-      // model's real host-RAM cost never shows up here at all, on ANY swap.
+      const mr = st.model_ram || {};
+      const cudaRamModels = modelsOn("cuda0").filter(m => mr[m]);
+      const segs = [];
+      for (const [k, v] of Object.entries(hu.breakdown || {})) {
+        if (k === "ram:cuda0" && cudaRamModels.length) {
+          // the cuda0 engines' host-RAM demand, named per model: weights kept in
+          // host RAM (vLLM PLE / CPU-offload) + engine RSS + KV staging. Coloured
+          // to match that model's cuda0 VRAM segment and its profile chip.
+          for (const m of cudaRamModels)
+            segs.push({ label: m + " · host RAM (offload + engine)", gib: mr[m],
+                        cls: "", color: modelColor(m), tag: srcTag(m) || "engine RAM" });
+        } else if (k.startsWith("vram:igpu0")) {
+          // the iGPU has no dedicated VRAM — its budget is GTT carved straight
+          // out of this unified pool. A reservation, not measured demand.
+          segs.push({ label: "igpu0 GTT · iGPU VRAM lives in unified RAM", gib: v,
+                      cls: "resv", color: "#2a2f3d", tag: "reservation" });
+        } else {
+          segs.push(segFor(k, v));
+        }
+      }
+      // The image tier's host-RAM cost isn't in the backend breakdown (it isn't a
+      // profile member the solver budgets; see solver.py headroom()), so add it
+      // here on any swap where the resident image engine is on the iGPU.
       if (resKey && img.resident.device === "igpu0") segs.push(imgSeg());
       const huBudgeted = segs.reduce((a, s) => a + (s.gib || 0), 0) || hu.used;
       lanes.append(laneEl({
@@ -609,6 +672,7 @@ function renderProfiles(data) {
   const box = $("#profiles"); box.innerHTML = "";
   for (const pr of data.profiles) {
     const d = el("div", "prof" + (pr.active ? " active" : ""));
+    d.style.borderLeftColor = profileColor(pr.name);   // profile's own colour on the thick edge
     const r = el("div", "row");
     r.append(el("b", null, pr.name));
     r.append(el("span", "pill info", "pri " + pr.priority));
@@ -644,7 +708,9 @@ function renderProfiles(data) {
         : s === "warming" ? "load"
         : (s === "ready" || (pr.resident || []).includes(m)) ? "res"
         : (s === "crashed" || s === "error") ? "unplaced" : "plan";
-      const c = el("span", "chip " + cls, m + (cls === "load" ? " ⏳" : ""));
+      const c = el("span", "chip " + cls);
+      const sw = el("span", "chip-sw"); sw.style.background = modelColor(m);
+      c.append(sw, document.createTextNode(m + (cls === "load" ? " ⏳" : "")));
       c.title = (pr.placement && pr.placement[m] ? "→ " + pr.placement[m] : "") + (s ? "  (" + s + ")" : "");
       chips.append(c);
     }
@@ -974,7 +1040,7 @@ function renderLive(engineNames) {
   ensureLiveGrid(engineNames);
   const line = (name, label, i, scale) => ({ _n: name, label, stroke: PAL[i % PAL.length],
     width: 2.5, spanGaps: true, points: { show: false }, paths: SPLINE, ...(scale ? { scale } : {}) });
-  const avgLine = name => ({ _n: name, label: "avg (active only)", stroke: "#e1e4ed", width: 1.75,
+  const avgLine = name => ({ _n: name, label: "avg (active only)", stroke: "#e1e4ed", width: 1.25,
     dash: [6, 4], spanGaps: true, points: { show: false }, paths: SPLINE });
 
   // rolling avg lines from the per-request points only (10-min trailing window)
@@ -1007,10 +1073,13 @@ function renderLive(engineNames) {
       : `${rnd(l) ?? "–"}${suf} · avg ${a == null ? "–" : rnd(a) + suf}${a == null ? "" : ` (${n} pts)`}`;
   };
   const e0 = engineNames[0];
-  { const gu = last("gu_cuda0"), cp = last("h_cpu"), e = $(".lv-gpuutil");
-    if (e) e.textContent = `GPU ${rnd(gu) ?? "–"}% · CPU ${rnd(cp) ?? "–"}%`; }
-  cap("gpupow", last("gp_cuda0"), " W");
-  cap("vram", last("gv_cuda0"), " GiB");
+  const dash = v => rnd(v) ?? "–";
+  { const e = $(".lv-gpuutil");
+    if (e) e.textContent = `cuda0 ${dash(last("gu_cuda0"))}% · igpu0 ${dash(last("gu_igpu0"))}% · CPU ${dash(last("h_cpu"))}%`; }
+  { const e = $(".lv-gpupow");
+    if (e) e.textContent = `cuda0 ${dash(last("gp_cuda0"))} W · igpu0 ${dash(last("gp_igpu0"))} W`; }
+  { const e = $(".lv-vram");
+    if (e) e.textContent = `cuda0 ${dash(last("gv_cuda0"))} GiB · igpu0 ${dash(last("gv_igpu0"))} GiB`; }
   { const e = $(".lv-kv"), pct = e0 ? last("kv_" + e0) : null, ct = e0 ? last("ctxt_" + e0) : null;
     if (e) e.textContent = pct == null ? ""
       : (ct != null ? fmtSI(ct) + " tok · " : "") + rnd(pct) + "%"; }
@@ -1084,44 +1153,257 @@ function renderHistoryCharts(h) {
 }
 
 // ---- usage view ---------------------------------------------
-let LAST_SV = null;
-function tierAgg(sv, dim) {
-  // dim -> [{key,reqs,tin,tout,byTier:{label:{gross,net}}}], sorted by first tier's net desc
-  const tiers = sv.tiers || [];
-  const keys = new Set();
-  tiers.forEach(t => Object.keys((t.by || {})[dim] || {}).forEach(k => keys.add(k)));
-  const rows = [...keys].map(k => {
-    const c = (((tiers[0] || {}).by || {})[dim] || {})[k] || {};
-    const byTier = {};
-    tiers.forEach(t => { const e = (((t.by || {})[dim] || {})[k]) || {}; byTier[t.label] = { gross: e.gross || 0, net: e.net || 0 }; });
-    return { key: k, reqs: c.reqs || 0, tin: c.prompt_tokens || 0, tout: c.completion_tokens || 0, byTier };
-  });
-  rows.sort((a, b) => ((Object.values(b.byTier)[0] || {}).net || 0) - ((Object.values(a.byTier)[0] || {}).net || 0));
-  return rows;
-}
-function renderBreakTable(elId, sv, dim, keyHdr) {
-  const rows = tierAgg(sv, dim);
-  const tiers = (sv.tiers || []).map(t => t.label);
-  const box = $(elId); box.innerHTML = "";
-  if (!rows.length) { box.append(el("p", "muted", "no usage in range")); return; }
-  const t = el("table");
-  t.innerHTML = `<thead><tr><th>${keyHdr}</th><th class=num>reqs</th><th class=num>tok in</th><th class=num>tok out</th>` +
-    tiers.map(l => `<th class=num>${l}<br><span style="font-weight:400;font-size:.9em">net $</span></th>`).join("") + "</tr></thead>";
-  const tb = el("tbody");
-  for (const r of rows) {
-    const tr = el("tr");
-    tr.append(el("td", null, r.key));
-    tr.append(el("td", "num", fmtNum(r.reqs)));
-    tr.append(el("td", "num", fmtSI(r.tin)));
-    tr.append(el("td", "num", fmtSI(r.tout)));
-    for (const l of tiers) {
-      const td = el("td", "num", fmtUsd(r.byTier[l].net));
-      td.title = `gross ${fmtUsd(r.byTier[l].gross)}`;
-      tr.append(td);
+let LAST_SV = null, LAST_FACTS = null;
+
+// ---- cost explorer: dynamic multi-layer drill-down ---------
+const XP_DIMS = [
+  { k: "served_stack",    label: "Stack" },       // the stackd unit (coding, chat, uncensored-big)
+  { k: "served_model",    label: "Model" },       // the checkpoint on disk (Qwen3.8-Flash-Next-NVFP4)
+  { k: "requested_model", label: "API name" },
+  { k: "served_profile",  label: "Profile" },
+  { k: "user_email",      label: "User" },
+  { k: "day",             label: "Day" },
+];
+const XP_DEF = { order: ["served_stack", "served_model", "requested_model", "served_profile", "user_email", "day"],
+                 active: ["served_model", "user_email", "day"], filters: {} };
+function loadXP() {
+  try {
+    const s = JSON.parse(localStorage.getItem("stackd_explorer") || "null");
+    if (s && Array.isArray(s.order) && Array.isArray(s.active)) {
+      const valid = new Set(XP_DIMS.map(d => d.k));
+      s.order = s.order.filter(k => valid.has(k));
+      for (const d of XP_DIMS) if (!s.order.includes(d.k)) s.order.push(d.k);
+      s.active = s.order.filter(k => s.active.includes(k));
+      s.filters = s.filters || {};
+      return s;
     }
-    tb.append(tr);
+  } catch (e) {}
+  return JSON.parse(JSON.stringify(XP_DEF));
+}
+let XP = loadXP();
+function saveXP() { try { localStorage.setItem("stackd_explorer", JSON.stringify(XP)); } catch (e) {} }
+const xpExpanded = new Set();           // tree paths currently expanded (collapsed by default)
+let xpSort = null;                      // {tier,dir} column-sort override; null = first tier, desc
+
+function xpAllFacts() { return (LAST_FACTS && LAST_FACTS.facts) || []; }
+function xpTiers() { return (LAST_FACTS && LAST_FACTS.tiers) || []; }
+function xpDistinct(dim) {
+  return [...new Set(xpAllFacts().map(r => String(r[dim])))].sort();
+}
+function xpFacts() {
+  // filters[dim]: null/undefined = all values; [] = none; [..] = just those
+  return xpAllFacts().filter(r => XP_DIMS.every(d => {
+    const sel = XP.filters[d.k];
+    return sel == null || sel.includes(String(r[d.k]));
+  }));
+}
+function xpNet(gross, tier) {
+  const tot = tier.total_gross || 0, ec = (LAST_FACTS && LAST_FACTS.energy_cost) || 0;
+  return gross - ec * (tot ? gross / tot : 0);
+}
+function xpAcc(node, r, tiers) {
+  node.reqs += r.reqs || 0;
+  node.tin += r.prompt_tokens || 0;
+  node.tout += r.completion_tokens || 0;
+  for (const t of tiers) node.gross[t.label] += (r.gross && r.gross[t.label]) || 0;
+}
+function xpBuild() {
+  const dims = XP.order.filter(k => XP.active.includes(k));
+  const tiers = xpTiers();
+  const mk = () => ({ reqs: 0, tin: 0, tout: 0,
+                      gross: Object.fromEntries(tiers.map(t => [t.label, 0])), kids: new Map() });
+  const root = mk();
+  for (const r of xpFacts()) {
+    xpAcc(root, r, tiers);
+    let node = root;
+    for (const dk of dims) {
+      const key = String(r[dk] == null ? "?" : r[dk]);
+      if (!node.kids.has(key)) node.kids.set(key, mk());
+      node = node.kids.get(key);
+      xpAcc(node, r, tiers);
+    }
   }
-  t.append(tb); box.append(t);
+  return { root, dims };
+}
+
+let xpPop = null, xpPopOff = null;
+function xpClosePop() {
+  if (xpPopOff) { document.removeEventListener("mousedown", xpPopOff, true); xpPopOff = null; }
+  if (xpPop) { xpPop.remove(); xpPop = null; }
+}
+function xpOpenFilter(dim, anchor) {
+  xpClosePop();
+  const vals = xpDistinct(dim);
+  const f = XP.filters[dim];
+  const cur = new Set(f == null ? vals : f);          // null = all checked; [] = none
+  const pop = el("div", "xp-pop");
+  const r = anchor.getBoundingClientRect();
+  pop.style.left = (r.left + window.scrollX) + "px";
+  pop.style.top = (r.bottom + window.scrollY + 4) + "px";
+  const bar = el("div", "xp-pop-bar");
+  const bAll = el("button", "sm", "all"), bNone = el("button", "sm", "none");
+  bar.append(bAll, bNone); pop.append(bar);
+  const list = el("div", "xp-pop-list");
+  const boxes = vals.map(v => {
+    const lab = el("label", "xp-pop-item");
+    const cb = el("input"); cb.type = "checkbox"; cb.checked = cur.has(v); cb.value = String(v);
+    lab.append(cb, document.createTextNode(" " + v)); list.append(lab);
+    return cb;
+  });
+  pop.append(list);
+  bAll.onclick = () => boxes.forEach(b => b.checked = true);
+  bNone.onclick = () => boxes.forEach(b => b.checked = false);
+  const done = el("button", "sm primary", "apply");
+  done.onclick = () => {
+    const picked = boxes.filter(b => b.checked).map(b => b.value);
+    XP.filters[dim] = (picked.length === vals.length) ? null : picked;   // all -> no filter
+    saveXP(); xpClosePop(); renderExplorer();
+  };
+  pop.append(done);
+  document.body.append(pop); xpPop = pop;
+  // close only on a pointer press outside the popover (and not on the caret that opened it)
+  xpPopOff = ev => { if (xpPop && !xpPop.contains(ev.target) && ev.target !== anchor) xpClosePop(); };
+  document.addEventListener("mousedown", xpPopOff, true);
+}
+
+function renderExplorer() {
+  const card = $("#usgExplorer"); if (!card) return;
+  card.innerHTML = "";
+  const head = el("div", "row"); head.style.marginBottom = "10px";
+  head.append(el("h2", null, "Cost explorer"));
+  card.append(head);
+  if (!xpAllFacts().length) { card.append(el("p", "muted", "no usage in range")); return; }
+
+  // -- dimension chips: drag the ⠿ handle to reorder, click the name to toggle, ▾ to filter --
+  const chips = el("div", "xp-chips");
+  let dragK = null;
+  const commitOrder = () => {
+    const ord = [...chips.querySelectorAll(".xp-chip")].map(c => c.dataset.k);
+    XP.order = ord;
+    XP.active = ord.filter(k => XP.active.includes(k));
+    saveXP(); renderExplorer();
+  };
+  XP.order.forEach((dk, i) => {
+    const d = XP_DIMS.find(x => x.k === dk);
+    const on = XP.active.includes(dk);
+    const chip = el("div", "xp-chip" + (on ? " on" : ""));
+    chip.dataset.k = dk;
+    const grip = el("span", "xp-grip", "⠿");
+    chip.append(grip);
+    if (on) {
+      const lvl = XP.order.filter((k, j) => j <= i && XP.active.includes(k)).length;
+      chip.append(el("span", "xp-lvl", String(lvl)));
+    }
+    const lbl = el("span", "xp-lbl", d.label);
+    lbl.style.cursor = "pointer";
+    lbl.onclick = () => {
+      const s = new Set(XP.active);
+      s.has(dk) ? s.delete(dk) : s.add(dk);
+      XP.active = XP.order.filter(k => s.has(k));
+      saveXP(); renderExplorer();
+    };
+    chip.append(lbl);
+    const sel = XP.filters[dk];
+    const flt = el("span", "xp-flt", sel == null ? "all ▾" : (sel.length + " ▾"));
+    flt.onclick = e => { e.stopPropagation(); xpOpenFilter(dk, flt); };
+    chip.append(flt);
+
+    // pointer-based reorder (works on mouse + touch; HTML5 DnD was unreliable here)
+    grip.addEventListener("pointerdown", e => {
+      e.preventDefault();
+      dragK = dk; chip.classList.add("drag");
+      try { grip.setPointerCapture(e.pointerId); } catch (x) {}
+    });
+    grip.addEventListener("pointermove", e => {
+      if (dragK !== dk) return;
+      let placed = false;
+      for (const c of chips.querySelectorAll(".xp-chip")) {
+        if (c === chip) continue;
+        const rc = c.getBoundingClientRect();
+        if (e.clientX < rc.left + rc.width / 2) { chips.insertBefore(chip, c); placed = true; break; }
+      }
+      if (!placed) chips.appendChild(chip);
+    });
+    const endDrag = e => {
+      if (dragK !== dk) return;
+      dragK = null; chip.classList.remove("drag");
+      try { grip.releasePointerCapture(e.pointerId); } catch (x) {}
+      commitOrder();
+    };
+    grip.addEventListener("pointerup", endDrag);
+    grip.addEventListener("pointercancel", endDrag);
+    chips.append(chip);
+  });
+  card.append(chips);
+  card.append(el("div", "xp-hint muted",
+    "drag the ⠿ handle to reorder layers · click a name to add/remove a layer · ▾ to pick values"));
+
+  // -- tree table --
+  const { root, dims } = xpBuild();
+  const tiers = xpTiers();
+  const sortT = (xpSort && xpSort.tier) || (tiers[0] && tiers[0].label);
+  const wrap = el("div", "tblwrap");
+  const t = el("table", "xp-table");
+  t.innerHTML = "<thead><tr><th>" +
+    (dims.length ? dims.map(k => XP_DIMS.find(x => x.k === k).label).join(" › ") : "total") +
+    "</th><th class=num>reqs</th><th class=num>tok in</th><th class=num>tok out</th>" +
+    tiers.map(t2 => `<th class="num xp-sorth" data-tier="${t2.label}">${t2.label}` +
+      `<br><span style="font-weight:400;font-size:.9em">net $</span></th>`).join("") +
+    "</tr></thead>";
+  const tb = el("tbody");
+
+  const totR = el("tr", "xp-row xp-total");
+  const tc0 = el("td"); tc0.style.paddingLeft = "10px";
+  tc0.append(el("span", "xp-chev bare", ""), document.createTextNode("all"));
+  totR.append(tc0);
+  totR.append(el("td", "num", fmtNum(root.reqs)));
+  totR.append(el("td", "num", fmtSI(root.tin)));
+  totR.append(el("td", "num", fmtSI(root.tout)));
+  for (const t2 of tiers) {
+    const td = el("td", "num", fmtUsd(xpNet(root.gross[t2.label], t2)));
+    td.title = `gross ${fmtUsd(root.gross[t2.label])}`;
+    totR.append(td);
+  }
+  tb.append(totR);
+
+  function rows(node, depth, path) {
+    const kids = [...node.kids.entries()].sort((a, b) => {
+      const ga = a[1].gross[sortT] || 0, gb = b[1].gross[sortT] || 0;
+      return (xpSort && xpSort.dir === "asc") ? ga - gb : gb - ga;
+    });
+    for (const [key, kn] of kids) {
+      const p = path + "/" + key;
+      const hasKids = kn.kids.size > 0;
+      const open = xpExpanded.has(p);
+      const tr = el("tr", "xp-row");
+      const c0 = el("td");
+      c0.style.paddingLeft = (10 + depth * 16) + "px";
+      const chev = el("span", "xp-chev" + (hasKids ? "" : " bare"), hasKids ? (open ? "▾" : "▸") : "");
+      if (hasKids) chev.onclick = () => { open ? xpExpanded.delete(p) : xpExpanded.add(p); renderExplorer(); };
+      c0.append(chev, document.createTextNode(key));
+      tr.append(c0);
+      tr.append(el("td", "num", fmtNum(kn.reqs)));
+      tr.append(el("td", "num", fmtSI(kn.tin)));
+      tr.append(el("td", "num", fmtSI(kn.tout)));
+      for (const t2 of tiers) {
+        const td = el("td", "num", fmtUsd(xpNet(kn.gross[t2.label], t2)));
+        td.title = `gross ${fmtUsd(kn.gross[t2.label])}`;
+        tr.append(td);
+      }
+      tb.append(tr);
+      if (hasKids && open) rows(kn, depth + 1, p);
+    }
+  }
+  if (dims.length) rows(root, 0, "");
+
+  t.append(tb);
+  t.querySelectorAll(".xp-sorth").forEach(th => th.onclick = () => {
+    const tk = th.dataset.tier;
+    xpSort = (xpSort && xpSort.tier === tk && xpSort.dir === "desc")
+      ? { tier: tk, dir: "asc" } : { tier: tk, dir: "desc" };
+    renderExplorer();
+  });
+  wrap.append(t); card.append(wrap);
 }
 function pricePerMtok(p) { return p ? `$${p.input_mtok}/$${p.output_mtok} per Mtok` : "no price"; }
 function tiny(txt) { const d = el("div", "muted", txt); d.style.fontSize = ".72rem"; return d; }
@@ -1166,6 +1448,8 @@ async function loadUsage() {
   try { sv = await api("/savings" + (qs.toString() ? "?" + qs : "")); }
   catch (e) { toast("savings: " + e.message, true); return; }
   LAST_SV = sv;
+  try { LAST_FACTS = await api("/savings/facts" + (qs.toString() ? "?" + qs : "")); }
+  catch (e) { LAST_FACTS = null; toast("facts: " + e.message, true); }
   const hq = new URLSearchParams();
   if (from || to) { if (from) hq.set("from", from); if (to) hq.set("to", to); }
   else if (sv.from) { hq.set("from", sv.from); hq.set("to", sv.to); }
@@ -1180,23 +1464,37 @@ async function loadUsage() {
   if (sv.energy) box.append(stat(fmtUsd(sv.energy.cost), `energy · ${(sv.energy.kwh||0).toFixed(1)} kWh @ $${sv.energy.price_per_kwh}`));
   renderTierCards(sv);
   if (h && h.days) renderHistoryCharts(h);
-  renderBreakTable("#usgByUser", sv, "user_email", "user");
-  renderBreakTable("#usgByModel", sv, "requested_model", "model");
-  renderBreakTable("#usgByProfile", sv, "served_profile", "profile");
-  renderBreakTable("#usgByDay", sv, "day", "day");
+  renderExplorer();
+  markPreset();
+}
+function markPreset() {
+  const f = $("#usgFrom").value, to = $("#usgTo").value;
+  let match = (!f && !to) ? "all" : null;
+  if (f && to === isoNDaysAgo(0)) {
+    for (const d of [7, 14, 30, 90]) if (f === isoNDaysAgo(d - 1)) { match = String(d); break; }
+  }
+  document.querySelectorAll("#viewUsage [data-days]").forEach(b =>
+    b.classList.toggle("on", b.dataset.days === match));
 }
 function stat(b, s) { const d = el("div", "stat"); d.append(el("b", null, b)); d.append(el("span", null, s)); return d; }
 function exportCsv() {
-  const sv = LAST_SV; if (!sv) return;
-  const tiers = (sv.tiers || []).map(t => t.label);
-  const lines = [["dimension", "key", "reqs", "tok_in", "tok_out",
-    ...tiers.flatMap(l => [l + "_gross", l + "_net"])].join(",")];
-  for (const dim of ["user_email", "requested_model", "served_profile", "day"]) {
-    for (const r of tierAgg(sv, dim)) {
-      lines.push([dim, r.key, r.reqs, r.tin, r.tout,
-        ...tiers.flatMap(l => [r.byTier[l].gross, r.byTier[l].net])].join(","));
-    }
-  }
+  if (!xpAllFacts().length) return;
+  const sv = LAST_SV || {};
+  const { root } = xpBuild();
+  const tiers = xpTiers();
+  const r4 = v => Math.round(v * 1e4) / 1e4;
+  const csv = s => /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  const lines = [["path", "depth", "reqs", "tok_in", "tok_out",
+    ...tiers.flatMap(t => [t.label + "_gross", t.label + "_net"])].join(",")];
+  const walk = (node, depth, path) => {
+    lines.push([csv(path.join(" / ")), depth, node.reqs, node.tin, node.tout,
+      ...tiers.flatMap(t => [r4(node.gross[t.label]), r4(xpNet(node.gross[t.label], t))])].join(","));
+    const sortT = (tiers[0] || {}).label;
+    for (const [k, kn] of [...node.kids.entries()]
+        .sort((a, b) => (b[1].gross[sortT] || 0) - (a[1].gross[sortT] || 0)))
+      walk(kn, depth + 1, path.concat(k));
+  };
+  walk(root, 0, ["all"]);
   const blob = new Blob([lines.join("\n")], { type: "text/csv" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
