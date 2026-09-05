@@ -1,4 +1,4 @@
-model: chat-autocomplete
+name: code-autocomplete
 engine:
   template: llamacpp-vulkan          # stackd-created on the iGPU, image ghcr.io/ggml-org/llama.cpp:server-vulkan
   model: Qwen2.5-Coder-1.5B.Q8_0

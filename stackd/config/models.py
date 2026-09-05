@@ -159,9 +159,13 @@ class ServedEntry:
 @dataclass
 class ModelSpec:
     """One entry in the models/ catalog — a servable model + how to run it. The
-    *device* is chosen by the solver, not pinned here."""
+    *device* is chosen by the solver, not pinned here.
 
-    model: str
+    ``name`` is the stackd stack identity (the yaml file's unit, e.g. ``coding``);
+    the checkpoint on disk is ``engine.model`` (e.g. ``Qwen3.8-Flash-Next-NVFP4``).
+    """
+
+    name: str
     engine: EngineSpec
     budget: Budget = field(default_factory=Budget)
     placement: Placement = field(default_factory=Placement)
@@ -174,6 +178,10 @@ class ProfileSpec:
     priority: int
     default: bool = False
     idle_evict: str | None = None
+    # Never entered by the router on its own — not by priority, not reactively by a
+    # served api_name. Only an explicit `stackctl use` / POST /profiles/<p>/activate
+    # loads it. For hand-loaded stand-ins and maintenance profiles (bench-image).
+    manual_only: bool = False
     # Models to keep loaded while this profile is active — LIST ORDER IS PRIORITY.
     # The solver places each on the first fitting device; ones that fit nowhere
     # are reported unplaced (a request for them can still trigger reactive entry).
@@ -259,7 +267,7 @@ def _check_comfyui_capabilities(m: ModelSpec) -> None:
     missing = _missing_graphs(active_model, caps)
     if missing:
         raise ConfigError(
-            f"model {m.model!r}: capabilities {missing} have no workflow graph for "
+            f"model {m.name!r}: capabilities {missing} have no workflow graph for "
             f"active_model {active_model!r}"
         )
 
@@ -308,16 +316,16 @@ class Config:
         for m in self.models.values():
             if m.engine.template not in TEMPLATES:
                 raise ConfigError(
-                    f"model {m.model!r}: unknown engine template {m.engine.template!r} "
+                    f"model {m.name!r}: unknown engine template {m.engine.template!r} "
                     f"(known: {', '.join(sorted(TEMPLATES))})"
                 )
             for dev in m.placement.devices:
                 if dev not in self.devices:
-                    raise ConfigError(f"model {m.model!r}: placement names unknown device {dev!r}")
+                    raise ConfigError(f"model {m.name!r}: placement names unknown device {dev!r}")
             try:
                 TEMPLATES[m.engine.template].validate_params(m.engine.params)
             except ConfigError as e:
-                raise ConfigError(f"model {m.model!r}: {e}") from None
+                raise ConfigError(f"model {m.name!r}: {e}") from None
 
             if m.engine.template == "comfyui":
                 _check_comfyui_capabilities(m)

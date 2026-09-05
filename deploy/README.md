@@ -124,7 +124,7 @@ Keep `config.local/` in its own private git repo (`docker-compose.yml` + `.env` 
 `config.local/` = your whole deployment); pull this repo for code only.
 
 - **vLLM**: `template: vllm-cuda`, put the full server args in `container.cmd_extra`,
-  bind-mount the weights in `container.mounts` (see `models/coding-flash.yaml`).
+  bind-mount the weights in `container.mounts` (see `models/coding.yaml`).
 - **Image gen** is not a model file — it's `config/media/image.yaml`: a `containers:`
   block per GPU backend (`cuda` stock, `vulkan` a local build via
   `docker compose exec stackd stackctl build image:vulkan`) and an ordered `prefer:`

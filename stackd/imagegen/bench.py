@@ -238,7 +238,7 @@ async def bench_image(model: str, sizes: list[int], prompt: str, base: str,
     added_host = max((p["added_host_gib"] for p in ok_pts), default=0.0)
     if backend == "vulkan":
         # igpu0 shares VRAM/GTT with system RAM, and whatever else is placed
-        # there (e.g. chat-autocomplete) can be co-resident during a bench.
+        # there (e.g. code-autocomplete) can be co-resident during a bench.
         # _pick_image() already subtracts THAT separately (via the LLM-placement
         # headroom check), so using the device's raw total here double-counts
         # it on top -- delta-vs-baseline isolates just this pipeline's own

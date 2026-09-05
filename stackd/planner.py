@@ -23,8 +23,8 @@ def plan_transition(cfg: Config, frm: str, to: str, catalog=None) -> ReconcilePl
     for n in (frm, to):
         if n not in cfg.profiles:
             raise KeyError(n)
-    before = {p.model: p.identity for p in solve(cfg, frm, catalog).placed.values()}
-    after = {p.model: p.identity for p in solve(cfg, to, catalog).placed.values()}
+    before = {p.name: p.identity for p in solve(cfg, frm, catalog).placed.values()}
+    after = {p.name: p.identity for p in solve(cfg, to, catalog).placed.values()}
 
     plan = ReconcilePlan(frm, to)
     for n, ident in after.items():

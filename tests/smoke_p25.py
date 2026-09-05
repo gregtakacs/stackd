@@ -116,15 +116,15 @@ def main() -> int:
         check("reactive entry switched active profile to coding",
               mgr.state.active_profile == "coding")
 
-        # bring coding-flash up, point it at the echo upstream, retry as stand-in
+        # bring coding up, point it at the echo upstream, retry as stand-in
         for i in range(4):
             mgr.tick(now=100 + (i + 1) * 5)
-        mgr.state.stacks["coding-flash"].endpoint = up_url
+        mgr.state.stacks["coding"].endpoint = up_url
         code, res = _req(f"{base}/v1/chat/completions", token="secret",
                          body={"model": "assistant", "messages": []})
         check("stand-in serves chat name while coding active", code == 200)
-        check("vllm stand-in: model rewritten to served_model_name",
-              res.get("echo", {}).get("model") == "assistant-coder-flash")
+        check("vllm stand-in: body model rewritten to the stack's served name (stack name by default)",
+              res.get("echo", {}).get("model") == "coding")
 
         code, st = _req(f"{base}/profiles/chat/activate", token="secret", body={})
         check("control: /profiles/chat/activate -> 200", code == 200)

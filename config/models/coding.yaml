@@ -1,9 +1,8 @@
-model: coding-flash
+name: coding
 engine:
   template: vllm-cuda
   model: Qwen3.8-Flash-Next-NVFP4
   params:
-    served_model_name: assistant-coder-flash
     port: 8000
     gpu_memory_utilization: 0.94
     max_model_len: 262144
@@ -26,11 +25,9 @@ engine:
       - { host_path: ${DOCKERDIR}/appdata/llm-models/flash-next-ple/worker_image_quant.py, container_path: /usr/local/lib/python3.12/dist-packages/vllm/v1/ple_offload/worker.py, ro: true }
       - { host_path: ${DOCKERDIR}/appdata/llm-models/flash-next-ple/ple_layer_quant.py, container_path: /usr/local/lib/python3.12/dist-packages/vllm/models/qwen3_8_flash_next/nvidia/ple_layer.py, ro: true }
       - { host_path: ${DOCKERDIR}/appdata/vllm-flash-cache, container_path: /root/.cache/vllm, ro: false }
-    cmd_extra:
+    cmd_extra:                     # stackd injects --served-model-name (== stack name)
       - --model
       - /model
-      - --served-model-name
-      - assistant-coder-flash
       - --host
       - 0.0.0.0
       - --port

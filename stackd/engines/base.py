@@ -54,7 +54,7 @@ class EngineAdapter(ABC):
 
     # -- shared LaunchSpec plumbing --------------------------------------------------
     def container_name(self) -> str:
-        return self.spec.engine.container.name or f"stackd-{self.spec.model}"
+        return self.spec.engine.container.name or f"stackd-{self.spec.name}"
 
     def _base_spec(self, ctx: LaunchContext) -> LaunchSpec:
         c = self.spec.engine.container

@@ -158,7 +158,7 @@ def load_config(root: str | pathlib.Path, *, env_file: str | None = None,
     devices = {
         k: build(Device, {"name": k, **v}, f"devices.yaml/{k}") for k, v in devices_raw.items()
     }
-    models = _load_named(base, ovp, "models", ModelSpec, "model", env)
+    models = _load_named(base, ovp, "models", ModelSpec, "name", env)
     profiles = _load_named(base, ovp, "profiles", ProfileSpec, "profile", env)
 
     # Optional: config/media/<kind>.yaml -> the elastic image/video/audio tiers.

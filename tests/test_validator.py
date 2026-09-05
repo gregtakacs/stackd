@@ -39,8 +39,8 @@ def test_chat_flags_image_llm_contention(cfg):
 def test_coding_fits_and_keeps_autocomplete(cfg):
     r = validate_profile(cfg, "coding")
     assert r.ok
-    assert "coding-flash" in r.resident
-    assert "chat-autocomplete" in r.resident  # kept via mask: keep@igpu0
+    assert "coding" in r.resident
+    assert "code-autocomplete" in r.resident  # kept via mask: keep@igpu0
     assert "chat" not in r.resident
     cuda = next(p for p in r.pools if p.pool == "cuda_vram")
     assert cuda.used_gib == pytest.approx(88.0, abs=0.5)
@@ -56,5 +56,5 @@ def test_coding_fits_on_its_own(cfg):
 def test_plan_chat_to_coding_is_a_delta(cfg):
     p = plan_transition(cfg, "chat", "coding")
     assert p.teardown == ["chat"]
-    assert sorted(p.spawn) == ["coding-flash"]
-    assert p.keep == ["chat-autocomplete"]  # untouched by the switch
+    assert sorted(p.spawn) == ["coding"]
+    assert p.keep == ["code-autocomplete"]  # untouched by the switch

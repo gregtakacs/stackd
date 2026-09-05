@@ -76,19 +76,19 @@ class Reconciler:
 
     # ---------------------------------------------------------------- start/stop ---
     def _start(self, state: RuntimeState, p: Placed, owner: str, now: float) -> None:
-        m = self.cfg.models[p.model]
+        m = self.cfg.models[p.name]
         adapter = adapter_for(m, self.cfg.devices[p.device])
         spec = adapter.launch_spec(self._lc(p.device, p.port))
         handle = self.runner.spawn(spec)
-        state.stacks[p.model] = StackRuntime(
-            name=p.model, owner_profile=owner, kind="container", device=p.device,
+        state.stacks[p.name] = StackRuntime(
+            name=p.name, owner_profile=owner, kind="container", device=p.device,
             identity=p.identity, state=EngineState.warming, handle=handle,
             container=spec.name, port=p.port, health_url=spec.health_url,
             endpoint=adapter.endpoint(p.port), started_at=now,
             ready_timeout=spec.ready_timeout_s,
             stop_grace=spec.stop_grace_s,
         )
-        self._emit(p.model, "spawn", f"{spec.name} on {p.device}")
+        self._emit(p.name, "spawn", f"{spec.name} on {p.device}")
 
     def _stop(self, state: RuntimeState, name: str, now: float, *, remove: bool = False) -> None:
         rt = state.stacks.get(name)
@@ -152,7 +152,7 @@ class Reconciler:
         the same way it does for any container — the checkpoint is chosen at
         runtime, not declared."""
         return ModelSpec(
-            model=f"image:{active_model}",
+            name=f"image:{active_model}",
             engine=EngineSpec(
                 template="comfyui",
                 model=active_model,

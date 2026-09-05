@@ -32,14 +32,14 @@ def model_identity(cfg: Config, model_name: str, device: str, port: int | None =
     unchanged identity, keeps the OLD container running on its OLD port, and
     stackd's own health_url points at the NEW port forever after — permanent
     "warming", never crashing, never healing on its own (found 2026-09-04,
-    chat-autocomplete stuck this way across a `bench-image` -> `chat` switch)."""
+    code-autocomplete stuck this way across a `bench-image` -> `chat` switch)."""
     e = cfg.models[model_name].engine
     p = e.params
     return [
         model_name, e.template, device, e.model,
         p.get("ctx"), p.get("parallel"), p.get("kv_dtype"),
         list(p.get("extra_args", []) or []),
-        p.get("served_model_name"), p.get("active_model"), p.get("gpu_memory_utilization"),
+        p.get("served_model_name") or model_name, p.get("active_model"), p.get("gpu_memory_utilization"),
         e.container.name, e.container.adopt,
         asdict(e.container),
         port,
@@ -48,7 +48,7 @@ def model_identity(cfg: Config, model_name: str, device: str, port: int | None =
 
 @dataclass
 class Placed:
-    model: str
+    name: str
     device: str
     template: str
     port: int | None

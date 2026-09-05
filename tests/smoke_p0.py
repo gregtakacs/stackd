@@ -72,7 +72,7 @@ def main() -> int:
     check("delta vs declared recorded (40 curve - 30 declared)",
           withcat.deltas["chat"][0] == 10.0)
     check("models with no curve flagged unmeasured",
-          "chat-autocomplete" in withcat.unmeasured)
+          "code-autocomplete" in withcat.unmeasured)
     check("no-catalog: sources all 'declared'",
           set(base.sources.values()) == {"declared"})
     check("no-catalog: nothing flagged unmeasured", base.unmeasured == [])
@@ -87,7 +87,7 @@ def main() -> int:
     rep = validate_profile(cfg, "chat", catalog=icat2)
     check("ingested curve is 'measured'", rep.sources["chat"] == "measured")
     check("chat no longer unmeasured", "chat" not in rep.unmeasured)
-    check("a model with no curve is still unmeasured", "chat-autocomplete" in rep.unmeasured)
+    check("a model with no curve is still unmeasured", "code-autocomplete" in rep.unmeasured)
     check("measured value used (41 vram)",
           approx(next(p for p in rep.pools if p.pool == "cuda_vram").used_gib, 41.0, 0.5))
 

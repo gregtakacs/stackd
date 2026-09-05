@@ -19,8 +19,8 @@ Numbers are seeded from a prior proxy's
 
 ```
 stackctl bench chat              --points 131072,262144,393216
-stackctl bench chat-autocomplete --points 8192,16384,32768
-stackctl bench coding-flash       --ingest coding-flash.measured.json   # vLLM: 1 point
+stackctl bench code-autocomplete --points 8192,16384,32768
+stackctl bench coding       --ingest coding.measured.json   # vLLM: 1 point
 stackctl bench <image-model>      --ingest <image-model>.measured.json  # ComfyUI: 1 point
 ```
 
