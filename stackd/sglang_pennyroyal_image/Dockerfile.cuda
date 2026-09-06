@@ -10,10 +10,10 @@
 # (stackd/builder.py). Tag: ${SGLANG_PENNYROYAL_IMAGE} (AI-STACK/.env).
 #
 # HIGH-RISK BUILD. The fork's own BUILD.md / RUN.md at ref
-# `pennyroyal-main-sm120-final` is the source of truth for exact versions and
-# flags; the steps below are transcribed from it and its two serve-*.sh scripts
-# and are expected to need a round or two of build-fix iteration. Rollback lever:
-# SGLANG_FORK_REF below.
+# `pennyroyal-v2.3.1` is the source of truth for exact versions and flags; the
+# steps below are transcribed from it and its launchers and are expected to need
+# a round or two of build-fix iteration. Rollback lever: SGLANG_FORK_REF below
+# (previous known-good: 38a5ecbabe957b77f66f6d4ecf91f7f8c36531ab).
 #
 # compose-version-audit (Docker-Tools/compose-version-audit) tracks the pins here
 # against upstream like the other stackd-built images — see
@@ -28,11 +28,21 @@
 FROM nvidia/cuda:13.3.1-devel-ubuntu24.04@sha256:4ff859525f99de5782aa73607ce24219b07dddd48d12b97c1c301d7e1cfb0a87
 
 ARG SGLANG_FORK_REPO=https://github.com/jpezzulli/sglang-rtxpro6000.git
-# Branch tip. Built + verified on the box 2026-09-06 at commit
-# 38a5ecbabe957b77f66f6d4ecf91f7f8c36531ab — pin SGLANG_FORK_REF to that exact
-# SHA on the next from-scratch rebuild (kept as the branch for now so an
-# incremental rebuild — ffmpeg / toml — reuses the ~20 min sm120 build cache).
-ARG SGLANG_FORK_REF=pennyroyal-main-sm120-final
+# Pinned to release tag pennyroyal-v2.3.1 (commit
+# 21eb654ac08cfe9d2f0d7bea913a98c9e541f8ab, released 2026-09-06 — also the
+# current tip of pennyroyal-main-sm120-final). Bumped 2026-09-06 from the
+# earlier box build at 38a5ecb (pre-v2.3.0).
+#   v2.3   — Flash-Next FR-Spec: 65,536-token draft map + launcher/map-builder.
+#            Decode-throughput win for the Flash-Next profile, but ONLY if the
+#            launch config switches to the FR-Spec launcher (coding-long.yaml
+#            still uses --speculative-algorithm NEXTN — not yet updated).
+#   v2.3.1 — GDN gate-rounding correctness fix on the Triton verify path used by
+#            27B FP8/DFlash2. Flash-Next's FlashInfer/WY path is UNCHANGED.
+# BUILD.md @ v2.3.1 qualifies the same toolchain this Dockerfile already uses
+# (Python 3.12.13, CUDA 13.3, GCC 15.3.1, PyTorch 2.13.0+cu130) and the same
+# NIXL_REF below — no dependency changes. The git-checkout layer changes, so a
+# from-scratch ~20 min sm120 rebuild.
+ARG SGLANG_FORK_REF=pennyroyal-v2.3.1
 # NIXL commit from the fork's BUILD.md (POSIX FILE plugin for the HiCache
 # storage backend). Only needed once phase-2 NIXL persistence is turned on, but
 # built now so the image is complete.
