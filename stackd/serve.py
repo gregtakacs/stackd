@@ -397,7 +397,10 @@ class _Handler(BaseHTTPRequestHandler):
         days = len(span)
         out = {"days": span, "requests": {}, "tokens_in": {}, "tokens_out": {},
                "tokens_cached": {}, "energy": {"gpu_kwh": [0.0] * days, "host_kwh": [0.0] * days},
-               "savings": {"net_usd": [0.0] * days}}
+               "savings": {"net_usd": [0.0] * days},
+               # per-day token-weighted throughput + context size
+               "throughput": {"decode_tps": [0.0] * days, "prefill_tps": [0.0] * days,
+                              "ctx_avg": [0] * days, "ctx_max": [0] * days}}
         if self.store is None:
             return self._send_json(200, out)
         idx = {d: i for i, d in enumerate(span)}
@@ -407,6 +410,7 @@ class _Handler(BaseHTTPRequestHandler):
             from stackd.pricing import load_pricing, savings
             pricing = load_pricing(self.pricing_path)
             per_day = {d: savings(self.store, pricing, from_day=d, to_day=d) for d in span}
+        acc = [dict(pfm=0, pft=0, dcm=0, dct=0, cxs=0, cxm=0, cxn=0) for _ in span]
         for r in rows:
             i = idx.get(r["day"])
             if i is None:
@@ -416,15 +420,32 @@ class _Handler(BaseHTTPRequestHandler):
                              ("completion_tokens", "tokens_out"), ("cached_tokens", "tokens_cached")):
                 series = out[col].setdefault(prof, [0] * days)
                 series[i] += r.get(key) or 0
+            a = acc[i]
+            a["pfm"] += r.get("prefill_ms") or 0;  a["pft"] += r.get("prefill_tok") or 0
+            a["dcm"] += r.get("decode_ms") or 0;   a["dct"] += r.get("decode_tok") or 0
+            a["cxs"] += r.get("ctx_tokens_sum") or 0
+            a["cxm"] = max(a["cxm"], r.get("ctx_tokens_max") or 0)
+            a["cxn"] += r.get("ctx_n") or 0
+        tp = out["throughput"]
+        for i, a in enumerate(acc):
+            tp["decode_tps"][i] = round(a["dct"] * 1000 / a["dcm"], 1) if a["dcm"] else 0.0
+            tp["prefill_tps"][i] = round(a["pft"] * 1000 / a["pfm"], 1) if a["pfm"] else 0.0
+            tp["ctx_avg"][i] = round(a["cxs"] / a["cxn"]) if a["cxn"] else 0
+            tp["ctx_max"][i] = a["cxm"]
         for r in erows:
             i = idx.get(r["day"])
             if i is not None:
                 out["energy"]["gpu_kwh"][i] = round((r["gpu_wh"] or 0) / 1000.0, 4)
                 out["energy"]["host_kwh"][i] = round((r["host_wh"] or 0) / 1000.0, 4)
+        # cumulative-savings line = the `payback_tier` from pricing.json (the tier
+        # the payback % is measured against), else the last-configured tier.
+        sample = per_day.get(span[-1]) or per_day.get(span[0]) or {}
+        pay_label = sample.get("payback_tier")
+        out["savings_tier"] = pay_label or ((sample.get("tiers") or [{}])[-1].get("label", ""))
         for d, i in idx.items():
             tiers = per_day[d].get("tiers") or []
-            # headline tier = the last one configured (frontier), matching /savings' UI
-            out["savings"]["net_usd"][i] = round((tiers[-1]["net"] if tiers else 0.0), 4)
+            blk = next((x for x in tiers if x["label"] == pay_label), None) or (tiers[-1] if tiers else None)
+            out["savings"]["net_usd"][i] = round((blk["net"] if blk else 0.0), 4)
         return self._send_json(200, out)
 
     def _profiles_list(self):
@@ -693,8 +714,9 @@ class _Handler(BaseHTTPRequestHandler):
 
         is_embeddings = self.path.endswith("embeddings")
 
-        def _on_body(buf: bytes, status: int) -> None:
-            self._record_usage(model, rr, buf, status, embeddings=is_embeddings, req_body=body)
+        def _on_body(buf: bytes, status: int, meta: dict | None = None) -> None:
+            self._record_usage(model, rr, buf, status, embeddings=is_embeddings,
+                               req_body=body, meta=meta)
             _capture_gen(rr.stack, buf)
 
         self._relay(rr.endpoint.rstrip("/") + self.path, "POST",
@@ -703,13 +725,25 @@ class _Handler(BaseHTTPRequestHandler):
 
     # -- ledger ------------------------------------------------------------------------
     def _record_usage(self, requested_model, rr, buf: bytes, status: int, *,
-                      embeddings: bool, req_body: dict | None = None):
+                      embeddings: bool, req_body: dict | None = None,
+                      meta: dict | None = None):
         if self.store is None or embeddings:
             return
         usage = _extract_usage(buf)
         email = (self.headers.get("X-OpenWebUI-User-Email")
                  or self.headers.get("X-OpenWebUI-User-Id") or "direct")
         prompt = usage.get("prompt_tokens", 0)
+        completion = usage.get("completion_tokens", 0)
+        # prompt-processing / generation time: prefer the engine's own numbers
+        # (llama.cpp `timings`, ms), else the proxy's wall-clock split (meta).
+        tim = _extract_timings(buf)
+        if tim and (tim.get("prompt_ms") or tim.get("predicted_ms")):
+            prefill_ms = round(tim.get("prompt_ms") or 0)
+            decode_ms = round(tim.get("predicted_ms") or 0)
+        else:
+            m = meta or {}
+            prefill_ms = round((m.get("prefill_s") or 0) * 1000)
+            decode_ms = round((m.get("decode_s") or 0) * 1000)
         try:
             with self.lock:
                 # cached_tokens = a synthetic *commercial* prefix-cache estimate
@@ -720,9 +754,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self.store.record_usage(
                     user_email=email, requested_model=requested_model,
                     served_stack=rr.stack, served_model=rr.artifact, served_profile=rr.profile,
-                    prompt_tokens=prompt,
-                    completion_tokens=usage.get("completion_tokens", 0),
-                    cached_tokens=cached,
+                    prompt_tokens=prompt, completion_tokens=completion, cached_tokens=cached,
+                    prefill_ms=prefill_ms, decode_ms=decode_ms, ctx_tokens=prompt + completion,
                     off_home=(rr.route_kind != "native"),
                     ok=(200 <= status < 300),
                 )
@@ -785,7 +818,11 @@ class _Handler(BaseHTTPRequestHandler):
         `inject_timings` (chat/completions only): if the upstream response carries a
         `usage` block but no llama.cpp-style `timings` (i.e. vLLM / SGLang), add
         Ollama-style `eval_count`/`eval_duration`/`total_duration` (proxy-measured
-        wall clock, nanoseconds) so Open WebUI can show a tokens/sec rate."""
+        wall clock, nanoseconds) so Open WebUI can show a tokens/sec rate.
+
+        `on_body` is also handed a small `meta` dict: {prefill_s, decode_s} —
+        the proxy wall-clock split (first upstream byte ~= prefill done), for the
+        ledger's tok/s when the engine reports no timings of its own."""
         fwd_ct = self.headers.get("content-type", "application/json")
         req = urllib.request.Request(
             url, data=body, method=method,
@@ -802,7 +839,7 @@ class _Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
             if on_body:
-                on_body(payload, e.code)
+                on_body(payload, e.code, {})
             return
         except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
             return self._send_json(502, {"error": {"message": f"upstream unreachable: {e}"}})
@@ -828,10 +865,10 @@ class _Handler(BaseHTTPRequestHandler):
             clen = up.headers.get("content-length")
             self.send_response(up.status)
             self.send_header("content-type", ctype)
+            t_first = None
             if streaming and not clen:
                 self.send_header("transfer-encoding", "chunked")
                 self.end_headers()
-                t_first = None
                 lb = b""            # line buffer — relay whole SSE events (\n\n-delimited)
                 while True:
                     chunk = up.read(8192)
@@ -860,8 +897,11 @@ class _Handler(BaseHTTPRequestHandler):
                 self.send_header("content-length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
+        t_end = time.monotonic()
         if on_body:
-            on_body(bytes(keep), up.status)
+            prefill_s = (t_first - t0) if t_first else 0.0
+            decode_s = (t_end - t_first) if t_first else (t_end - t0)
+            on_body(bytes(keep), up.status, {"prefill_s": prefill_s, "decode_s": decode_s})
 
 
 # One long-lived prompt-cache estimator per pricing.json path (it holds a rolling

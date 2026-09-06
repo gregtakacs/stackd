@@ -141,7 +141,10 @@ def main() -> int:
         check("/history day span", code == 200 and len(j["days"]) == 7)
         check("/history aligns every series to the day span",
               all(len(v) == 7 for v in j["energy"].values())
-              and all(len(v) == 7 for v in j["savings"].values()))
+              and all(len(v) == 7 for v in j["savings"].values())
+              and all(len(v) == 7 for v in j["throughput"].values()))
+        check("/history throughput has the four token-weighted series",
+              set(j["throughput"]) == {"decode_tps", "prefill_tps", "ctx_avg", "ctx_max"})
         check("/history buckets requests under the serving profile",
               sum(j["requests"].get("chat", [])) == 1)
         check("/history picks up energy", sum(j["energy"]["gpu_kwh"]) > 0)

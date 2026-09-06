@@ -137,6 +137,11 @@ def savings(store: Store, cfg: dict, *, from_day: str | None = None,
     pay = next((b for b in blocks if b["label"] == pay_label), blocks[-1] if blocks else None)
     payback_pct = round(max(0.0, pay["net"]) / hw * 100, 2) if (hw > 0 and pay) else None
 
+    _pfm = sum(r.get("prefill_ms") or 0 for r in rows)
+    _pft = sum(r.get("prefill_tok") or 0 for r in rows)
+    _dcm = sum(r.get("decode_ms") or 0 for r in rows)
+    _dct = sum(r.get("decode_tok") or 0 for r in rows)
+    _cxn = sum(r.get("ctx_n") or 0 for r in rows)
     return {
         "from": days[0] if days else None, "to": days[-1] if days else None,
         "span_days": span_days,
@@ -144,6 +149,13 @@ def savings(store: Store, cfg: dict, *, from_day: str | None = None,
         "reqs": sum(r["reqs"] for r in rows),
         "prompt_tokens": sum(r["prompt_tokens"] for r in rows),
         "completion_tokens": sum(r["completion_tokens"] for r in rows),
+        # token-weighted throughput + context size over the range (timed rows only)
+        "throughput": {
+            "decode_tps": round(_dct * 1000 / _dcm, 1) if _dcm else 0.0,
+            "prefill_tps": round(_pft * 1000 / _pfm, 1) if _pfm else 0.0,
+            "ctx_avg": round(sum(r.get("ctx_tokens_sum") or 0 for r in rows) / _cxn) if _cxn else 0,
+            "ctx_max": max((r.get("ctx_tokens_max") or 0 for r in rows), default=0),
+        },
         "energy": {**energy, "kwh": round(kwh, 4), "cost": energy_cost,
                    "price_per_kwh": cfg["electricity_price_per_kwh"]},
         "tiers": blocks,
@@ -190,8 +202,11 @@ def savings_facts(store: Store, cfg: dict, *, from_day: str | None = None,
     facts = []
     for key, g in groups.items():
         rec = dict(zip(keys, key))
-        for col in ("reqs", "prompt_tokens", "completion_tokens", "cached_tokens"):
-            rec[col] = sum(x[col] for x in g)
+        for col in ("reqs", "prompt_tokens", "completion_tokens", "cached_tokens",
+                    "prefill_ms", "prefill_tok", "decode_ms", "decode_tok",
+                    "ctx_tokens_sum", "ctx_n"):
+            rec[col] = sum(x.get(col) or 0 for x in g)
+        rec["ctx_tokens_max"] = max((x.get("ctx_tokens_max") or 0 for x in g), default=0)
         rec["gross"] = {t["label"]: _gross_for(_tier_rows(g, t), store, t["ref"])
                         for t in tiers}
         facts.append(rec)

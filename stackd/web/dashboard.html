@@ -214,14 +214,36 @@
   .collapse-h { cursor:pointer; user-select:none; }
   .collapse-h::before { content:"▸ "; color:var(--dim); }
   .collapse-h.open::before { content:"▾ "; }
+
+  /* usage & savings — responsive */
+  .usg-charts { grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:18px; }
+  #viewUsage input[type=date] { max-width:150px; min-width:0; }
+  .xp-grip { padding:2px 4px; margin:-2px -2px -2px -4px; }   /* bigger drag target */
+  /* while dragging: the chip floats (position:fixed, set inline) and a
+     same-size placeholder holds the slot it will drop into. */
+  .xp-chip.drag { opacity:.92; outline:2px solid var(--accent); background:var(--surface2);
+    box-shadow:0 8px 24px rgba(0,0,0,.45); cursor:grabbing; }
+  .xp-ph { border:1px dashed var(--accent); background:transparent; border-radius:7px; }
+  .xp-pop { max-width:min(340px, calc(100vw - 24px)); }
+  @media (max-width:640px) {
+    body { padding:12px; }
+    h1 { font-size:1.12rem; }
+    .card { padding:13px 12px; }
+    .row { gap:7px; }
+    .statrow { grid-template-columns:repeat(auto-fit,minmax(90px,1fr)); gap:10px; }
+    .stat b { font-size:1rem; }
+    .xp-table th, .xp-table td { padding:5px 6px; font-size:.8rem; }
+    .xp-chip { font-size:.82rem; padding:6px 10px; }   /* easier to tap */
+    #usgChartGrid { gap:14px; }
+  }
 </style>
 </head>
 <body>
 
-<div id="gate">
+<div id="gate" class="hidden">
   <div class="card">
     <h1>🗄 <span>stackd</span></h1>
-    <p class="muted" style="margin:10px 0 14px; font-size:.86rem;">Enter the API token</p>
+    <p class="muted" style="margin:10px 0 14px; font-size:.86rem;">Enter the API token <span class="muted" style="font-size:.9em">(remembered on this device)</span></p>
     <div class="row" style="justify-content:center;">
       <input type="password" id="gateKey" placeholder="Bearer token" autocomplete="current-password">
       <button class="primary" id="gateGo">Unlock</button>
@@ -325,10 +347,11 @@
     </div>
 
     <div class="card" style="margin-bottom:16px;">
-      <div class="grid" style="grid-template-columns:1fr 1fr 1fr; gap:18px;" id="usgChartGrid">
+      <div class="grid usg-charts" id="usgChartGrid">
         <div><div class="muted" style="font-size:.78rem; margin-bottom:4px;">Requests / day (by profile)</div><div id="chReq" class="chartwrap"></div></div>
         <div><div class="muted" style="font-size:.78rem; margin-bottom:4px;">Tokens / day</div><div id="chTok" class="chartwrap"></div></div>
         <div><div class="muted" style="font-size:.78rem; margin-bottom:4px;">Energy (kWh) &amp; cumulative net savings ($)</div><div id="chEng" class="chartwrap"></div></div>
+        <div><div class="muted" style="font-size:.78rem; margin-bottom:4px;">Throughput tok/s &amp; context size (weighted /day)</div><div id="chTps" class="chartwrap"></div></div>
       </div>
     </div>
 
@@ -346,8 +369,9 @@
 "use strict";
 const $ = s => document.querySelector(s);
 const el = (t, c, txt) => { const e = document.createElement(t); if (c) e.className = c; if (txt != null) e.textContent = txt; return e; };
-const KEY = () => sessionStorage.getItem("stackd_key") || "";
+const KEY = () => localStorage.getItem("stackd_key") || "";
 const fmtGib = v => (v == null ? "–" : (Math.round(v * 10) / 10).toLocaleString() + " GiB");
+const rnd1 = v => (v == null ? "–" : (Math.round(v * 10) / 10).toLocaleString());
 const fmtNum = v => (v == null ? "–" : Number(v).toLocaleString());
 const fmtUsd = v => (v == null ? "–" : "$" + Number(v).toLocaleString(undefined, {maximumFractionDigits:2}));
 function fmtSI(n){ n = +n; const a = Math.abs(n);
@@ -1109,19 +1133,22 @@ function sampleLive(now, gpu, host, engTel) {
 function mkHist(id, series, data, opts = {}) {
   const box = $(id); if (!box) return;
   if (H[id]) { H[id].destroy(); delete H[id]; }
+  const valFmt = opts.valFmt || ((v, ser) => (ser && ser.scale === "usd" ? "$" : "") + fmtSI(v));
+  const axis1fmt = opts.axis1fmt || fmtSI;
+  const axis2fmt = opts.axis2fmt || fmtSI;
   const o = {
     width: box.clientWidth || 360, height: 210,
     legend: { show: true, live: false },
-    plugins: [hoverTip(mdDate, (v, ser) => (ser.scale === "usd" ? "$" : "") + fmtSI(v))],
+    plugins: [hoverTip(mdDate, valFmt)],
     scales: { x: { time: true }, ...(opts.scales || {}) },
     series: [{ value: (u, v) => v == null ? "" : mdDate(v) }, ...series],
     axes: [
       { stroke: "#8b8fa3", grid: { stroke: "#23283a" }, ticks: { stroke: "#23283a" }, space: 46,
         values: (u, sp) => sp.map(mdDate) },
       { stroke: "#8b8fa3", grid: { stroke: "#23283a" }, ticks: { stroke: "#23283a" }, size: 58,
-        values: (u, sp) => sp.map(fmtSI) },
+        values: (u, sp) => sp.map(axis1fmt) },
       ...(opts.axis2 ? [{ stroke: "#8b8fa3", side: 1, scale: opts.axis2, size: 60, grid: { show: false },
-        values: (u, sp) => sp.map(v => "$" + fmtSI(v)) }] : []),
+        values: (u, sp) => sp.map(axis2fmt) }] : []),
     ],
   };
   H[id] = new uPlot(o, data, box);
@@ -1139,17 +1166,41 @@ function renderHistoryCharts(h) {
   mkHist("#chReq",
     profs.map((p, i) => ({ label: p, stroke: PAL[i % PAL.length], width: 2.5, points: { show: false } })),
     [xs, ...profs.map(p => h.requests[p])]);
+  // completion is ~10x smaller than prompt — put it on its own right-hand axis
+  // so it isn't flattened against the x-axis.
   mkHist("#chTok",
     [{ label: "prompt", stroke: PAL[0], width: 2.5, points: { show: false } },
-     { label: "completion", stroke: PAL[1], width: 2.5, points: { show: false } },
-     { label: "cached", stroke: PAL[2], width: 2.5, points: { show: false } }],
-    [xs, sumSeries(h.tokens_in), sumSeries(h.tokens_out), sumSeries(h.tokens_cached)]);
+     { label: "cached", stroke: PAL[2], width: 2.5, points: { show: false } },
+     { label: "completion (right)", stroke: PAL[1], width: 2.5, points: { show: false }, scale: "out" }],
+    [xs, sumSeries(h.tokens_in), sumSeries(h.tokens_cached), sumSeries(h.tokens_out)],
+    { axis2: "out", scales: { out: {} } });
   const kwh = h.days.map((_, i) => (h.energy.gpu_kwh[i] || 0) + (h.energy.host_kwh[i] || 0));
   let cum = 0; const sav = h.savings.net_usd.map(v => (cum += (v || 0)));
+  const savTier = (h.savings_tier || "").trim();
   mkHist("#chEng",
     [{ label: "kWh/day", stroke: PAL[4], fill: "rgba(250,204,21,.15)", width: 2.5, points: { show: false } },
-     { label: "cum. savings $", stroke: PAL[2], width: 2.5, points: { show: false }, scale: "usd" }],
-    [xs, kwh, sav], { axis2: "usd", scales: { usd: {} } });
+     { label: "cum. saved" + (savTier ? " vs " + savTier : "") + " $", stroke: PAL[2],
+       width: 2.5, points: { show: false }, scale: "usd" }],
+    [xs, kwh, sav], { axis2: "usd", scales: { usd: {} },
+      axis2fmt: v => "$" + fmtSI(v),
+      // kWh/day is small (single digits) — show 2 decimals on hover, not fmtSI's
+      // integer rounding; keep the $ line as-is
+      valFmt: (v, ser) => ser && ser.scale === "usd" ? "$" + fmtSI(v)
+        : (Math.round(v * 100) / 100).toLocaleString(),
+      axis1fmt: v => (Math.round(v * 100) / 100).toLocaleString() });
+  // token-weighted tok/s (left) + context size (right — much larger numbers)
+  const tp = h.throughput || {};
+  const nz = a => (a || []).some(v => v);   // skip the chart if there's no timing yet
+  if (nz(tp.decode_tps) || nz(tp.prefill_tps)) {
+    mkHist("#chTps",
+      [{ label: "generation t/s", stroke: PAL[1], width: 2.5, points: { show: false } },
+       { label: "prefill t/s", stroke: PAL[0], width: 2.5, points: { show: false } },
+       { label: "ctx avg (right)", stroke: PAL[3], width: 2, dash: [4, 3], points: { show: false }, scale: "ctx" },
+       { label: "ctx peak (right)", stroke: PAL[5], width: 1.5, dash: [2, 3], points: { show: false }, scale: "ctx" }],
+      [xs, tp.decode_tps, tp.prefill_tps, tp.ctx_avg, tp.ctx_max],
+      { axis2: "ctx", scales: { ctx: {} },
+        valFmt: (v, ser) => ser && ser.scale === "ctx" ? fmtSI(v) + " tok" : (Math.round(v * 10) / 10) + " t/s" });
+  }
 }
 
 // ---- usage view ---------------------------------------------
@@ -1165,7 +1216,7 @@ const XP_DIMS = [
   { k: "day",             label: "Day" },
 ];
 const XP_DEF = { order: ["served_stack", "served_model", "requested_model", "served_profile", "user_email", "day"],
-                 active: ["served_model", "user_email", "day"], filters: {} };
+                 active: ["served_model", "user_email", "day"], filters: {}, daySort: "date" };
 function loadXP() {
   try {
     const s = JSON.parse(localStorage.getItem("stackd_explorer") || "null");
@@ -1175,6 +1226,7 @@ function loadXP() {
       for (const d of XP_DIMS) if (!s.order.includes(d.k)) s.order.push(d.k);
       s.active = s.order.filter(k => s.active.includes(k));
       s.filters = s.filters || {};
+      s.daySort = s.daySort === "usage" ? "usage" : "date";
       return s;
     }
   } catch (e) {}
@@ -1201,16 +1253,37 @@ function xpNet(gross, tier) {
   const tot = tier.total_gross || 0, ec = (LAST_FACTS && LAST_FACTS.energy_cost) || 0;
   return gross - ec * (tot ? gross / tot : 0);
 }
+// token-weighted throughput + context for an explorer node (0 where untimed)
+function xpDerive(n) {
+  return {
+    gen: n.decode_ms ? n.decode_tok * 1000 / n.decode_ms : 0,
+    pre: n.prefill_ms ? n.prefill_tok * 1000 / n.prefill_ms : 0,
+    ctx: n.ctx_n ? Math.round(n.ctx_tokens_sum / n.ctx_n) : 0,
+    ctxMax: n.ctx_max || 0,
+  };
+}
+function xpTpCells(node) {
+  const d = xpDerive(node);
+  const g = el("td", "num", d.gen ? rnd1(d.gen) : "–");
+  const p = el("td", "num", d.pre ? rnd1(d.pre) : "–");
+  const c = el("td", "num", d.ctx ? fmtSI(d.ctx) : "–");
+  if (d.ctxMax) c.title = "peak " + fmtNum(d.ctxMax) + " tok";
+  return [g, p, c];
+}
+const XP_TIMING = ["prefill_ms", "prefill_tok", "decode_ms", "decode_tok", "ctx_tokens_sum", "ctx_n"];
 function xpAcc(node, r, tiers) {
   node.reqs += r.reqs || 0;
   node.tin += r.prompt_tokens || 0;
   node.tout += r.completion_tokens || 0;
+  for (const k of XP_TIMING) node[k] += r[k] || 0;
+  node.ctx_max = Math.max(node.ctx_max, r.ctx_tokens_max || 0);
   for (const t of tiers) node.gross[t.label] += (r.gross && r.gross[t.label]) || 0;
 }
 function xpBuild() {
   const dims = XP.order.filter(k => XP.active.includes(k));
   const tiers = xpTiers();
-  const mk = () => ({ reqs: 0, tin: 0, tout: 0,
+  const mk = () => ({ reqs: 0, tin: 0, tout: 0, ctx_max: 0,
+                      ...Object.fromEntries(XP_TIMING.map(k => [k, 0])),
                       gross: Object.fromEntries(tiers.map(t => [t.label, 0])), kids: new Map() });
   const root = mk();
   for (const r of xpFacts()) {
@@ -1261,6 +1334,14 @@ function xpOpenFilter(dim, anchor) {
   };
   pop.append(done);
   document.body.append(pop); xpPop = pop;
+  // keep it on-screen (mobile: an anchor near the right edge would overflow)
+  const pw = pop.offsetWidth, ph = pop.offsetHeight;
+  let px = r.left + window.scrollX, py = r.bottom + window.scrollY + 4;
+  px = Math.max(window.scrollX + 8, Math.min(px, window.scrollX + document.documentElement.clientWidth - pw - 8));
+  if (r.bottom + ph + 8 > window.innerHeight && r.top - ph - 4 > 0)
+    py = r.top + window.scrollY - ph - 4;               // flip above if it'd fall off the bottom
+  pop.style.left = px + "px";
+  pop.style.top = py + "px";
   // close only on a pointer press outside the popover (and not on the caret that opened it)
   xpPopOff = ev => { if (xpPop && !xpPop.contains(ev.target) && ev.target !== anchor) xpClosePop(); };
   document.addEventListener("mousedown", xpPopOff, true);
@@ -1276,12 +1357,58 @@ function renderExplorer() {
 
   // -- dimension chips: drag the ⠿ handle to reorder, click the name to toggle, ▾ to filter --
   const chips = el("div", "xp-chips");
-  let dragK = null;
-  const commitOrder = () => {
-    const ord = [...chips.querySelectorAll(".xp-chip")].map(c => c.dataset.k);
-    XP.order = ord;
-    XP.active = ord.filter(k => XP.active.includes(k));
-    saveXP(); renderExplorer();
+  // Drag model: the dragged chip is lifted OUT of flow (position:fixed, tracks
+  // the pointer) and a same-size placeholder holds its slot. Only the light
+  // placeholder ever moves in the layout, and only when the drop slot actually
+  // changes — so the other chips don't reflow/flicker, and where you release is
+  // exactly where the placeholder sits.
+  let dragChip = null, dragPh = null, lastXY = null, rafId = 0;
+  const grab = { x: 0, y: 0 };
+  const slotBefore = (x, y) => {
+    // only reslot when the pointer is genuinely OVER another chip's body (4px
+    // inset) — the inter-chip gaps and the placeholder are a dead zone, so
+    // jitter near a slot boundary can't flip the placeholder back and forth.
+    for (const c of chips.children) {
+      if (c === dragChip || c === dragPh) continue;
+      const r = c.getBoundingClientRect();
+      if (x >= r.left + 4 && x <= r.right - 4 && y >= r.top && y <= r.bottom)
+        return (x < r.left + r.width / 2) ? c : c.nextSibling;
+    }
+    return undefined;                       // undefined -> leave the placeholder put
+  };
+  const applyMove = () => {
+    rafId = 0;
+    if (!dragChip || !lastXY) return;
+    const [x, y] = lastXY;
+    dragChip.style.left = (x - grab.x) + "px";
+    dragChip.style.top = (y - grab.y) + "px";
+    const ref = slotBefore(x, y);
+    if (ref !== undefined && ref !== dragPh && ref !== dragPh.nextSibling)
+      chips.insertBefore(dragPh, ref);
+  };
+  const onDragMove = e => {               // coalesce to one layout write per frame
+    if (!dragChip) return;
+    e.preventDefault();
+    lastXY = [e.clientX, e.clientY];
+    if (!rafId) rafId = requestAnimationFrame(applyMove);
+  };
+  const onDragEnd = () => {
+    if (!dragChip) return;
+    if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
+    document.removeEventListener("pointermove", onDragMove);
+    document.removeEventListener("pointerup", onDragEnd);
+    document.removeEventListener("pointercancel", onDragEnd);
+    chips.insertBefore(dragChip, dragPh);
+    dragPh.remove();
+    dragChip.removeAttribute("style");
+    dragChip.classList.remove("drag");
+    dragChip = dragPh = null;
+    const ord = [...chips.children].map(c => c.dataset.k).filter(Boolean);
+    if (ord.join() !== XP.order.join()) {            // only re-render on a real move
+      XP.order = ord;
+      XP.active = ord.filter(k => XP.active.includes(k));
+      saveXP(); renderExplorer();
+    }
   };
   XP.order.forEach((dk, i) => {
     const d = XP_DIMS.find(x => x.k === dk);
@@ -1308,35 +1435,46 @@ function renderExplorer() {
     flt.onclick = e => { e.stopPropagation(); xpOpenFilter(dk, flt); };
     chip.append(flt);
 
-    // pointer-based reorder (works on mouse + touch; HTML5 DnD was unreliable here)
+    // pointer-based reorder (mouse + touch; grip has touch-action:none so a
+    // touch-drag doesn't scroll the page)
     grip.addEventListener("pointerdown", e => {
       e.preventDefault();
-      dragK = dk; chip.classList.add("drag");
-      try { grip.setPointerCapture(e.pointerId); } catch (x) {}
+      const r = chip.getBoundingClientRect();
+      grab.x = e.clientX - r.left;
+      grab.y = e.clientY - r.top;
+      dragPh = el("div", "xp-chip xp-ph");
+      dragPh.style.width = r.width + "px";
+      dragPh.style.height = r.height + "px";
+      chip.after(dragPh);
+      dragChip = chip;
+      chip.classList.add("drag");
+      Object.assign(chip.style, { position: "fixed", margin: "0", zIndex: "60",
+        pointerEvents: "none", width: r.width + "px", height: r.height + "px",
+        left: r.left + "px", top: r.top + "px" });
+      document.addEventListener("pointermove", onDragMove, { passive: false });
+      document.addEventListener("pointerup", onDragEnd);
+      document.addEventListener("pointercancel", onDragEnd);
     });
-    grip.addEventListener("pointermove", e => {
-      if (dragK !== dk) return;
-      let placed = false;
-      for (const c of chips.querySelectorAll(".xp-chip")) {
-        if (c === chip) continue;
-        const rc = c.getBoundingClientRect();
-        if (e.clientX < rc.left + rc.width / 2) { chips.insertBefore(chip, c); placed = true; break; }
-      }
-      if (!placed) chips.appendChild(chip);
-    });
-    const endDrag = e => {
-      if (dragK !== dk) return;
-      dragK = null; chip.classList.remove("drag");
-      try { grip.releasePointerCapture(e.pointerId); } catch (x) {}
-      commitOrder();
-    };
-    grip.addEventListener("pointerup", endDrag);
-    grip.addEventListener("pointercancel", endDrag);
     chips.append(chip);
   });
   card.append(chips);
-  card.append(el("div", "xp-hint muted",
+  const hint = el("div", "xp-hint muted");
+  hint.append(document.createTextNode(
     "drag the ⠿ handle to reorder layers · click a name to add/remove a layer · ▾ to pick values"));
+  if (XP.active.includes("day")) {          // Day rows: chronological, or by size like the rest
+    hint.append(document.createTextNode(" · Day rows: "));
+    const now = XP.daySort || "date";
+    for (const [val, txt] of [["date", "by date"], ["usage", "by usage"]]) {
+      const a = el("a", null, txt);
+      a.href = "#";
+      a.style.cssText = "text-decoration:none;font-weight:600;color:" +
+        (now === val ? "var(--accent)" : "var(--dim)");
+      a.onclick = e => { e.preventDefault(); XP.daySort = val; saveXP(); renderExplorer(); };
+      hint.append(a);
+      if (val === "date") hint.append(document.createTextNode(" / "));
+    }
+  }
+  card.append(hint);
 
   // -- tree table --
   const { root, dims } = xpBuild();
@@ -1347,6 +1485,9 @@ function renderExplorer() {
   t.innerHTML = "<thead><tr><th>" +
     (dims.length ? dims.map(k => XP_DIMS.find(x => x.k === k).label).join(" › ") : "total") +
     "</th><th class=num>reqs</th><th class=num>tok in</th><th class=num>tok out</th>" +
+    "<th class=num title='token-weighted generation tok/s'>gen t/s</th>" +
+    "<th class=num title='token-weighted prompt/prefill tok/s'>pre t/s</th>" +
+    "<th class=num title='mean context size (hover a row for peak)'>ctx</th>" +
     tiers.map(t2 => `<th class="num xp-sorth" data-tier="${t2.label}">${t2.label}` +
       `<br><span style="font-weight:400;font-size:.9em">net $</span></th>`).join("") +
     "</tr></thead>";
@@ -1359,6 +1500,7 @@ function renderExplorer() {
   totR.append(el("td", "num", fmtNum(root.reqs)));
   totR.append(el("td", "num", fmtSI(root.tin)));
   totR.append(el("td", "num", fmtSI(root.tout)));
+  totR.append(...xpTpCells(root));
   for (const t2 of tiers) {
     const td = el("td", "num", fmtUsd(xpNet(root.gross[t2.label], t2)));
     td.title = `gross ${fmtUsd(root.gross[t2.label])}`;
@@ -1367,7 +1509,9 @@ function renderExplorer() {
   tb.append(totR);
 
   function rows(node, depth, path) {
+    const byDate = dims[depth] === "day" && (XP.daySort || "date") === "date";
     const kids = [...node.kids.entries()].sort((a, b) => {
+      if (byDate) return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0;   // ISO day -> chronological
       const ga = a[1].gross[sortT] || 0, gb = b[1].gross[sortT] || 0;
       return (xpSort && xpSort.dir === "asc") ? ga - gb : gb - ga;
     });
@@ -1385,6 +1529,7 @@ function renderExplorer() {
       tr.append(el("td", "num", fmtNum(kn.reqs)));
       tr.append(el("td", "num", fmtSI(kn.tin)));
       tr.append(el("td", "num", fmtSI(kn.tout)));
+      tr.append(...xpTpCells(kn));
       for (const t2 of tiers) {
         const td = el("td", "num", fmtUsd(xpNet(kn.gross[t2.label], t2)));
         td.title = `gross ${fmtUsd(kn.gross[t2.label])}`;
@@ -1460,6 +1605,11 @@ async function loadUsage() {
   const pay = (sv.tiers || []).find(t => t.label === sv.payback_tier) || (sv.tiers || [])[sv.tiers.length - 1];
   box.append(stat(fmtNum(sv.reqs), "requests"));
   box.append(stat(fmtSI((sv.prompt_tokens || 0) + (sv.completion_tokens || 0)), "tokens"));
+  const tp = sv.throughput || {};
+  if (tp.decode_tps) box.append(stat(rnd1(tp.decode_tps) + " tok/s", "generation (weighted)"));
+  if (tp.prefill_tps) box.append(stat(rnd1(tp.prefill_tps) + " tok/s", "prompt / prefill (weighted)"));
+  if (tp.ctx_avg) box.append(stat(fmtSI(tp.ctx_avg) + (tp.ctx_max ? " / " + fmtSI(tp.ctx_max) : ""),
+                                  "context avg / peak"));
   if (pay) { box.append(stat(fmtUsd(pay.gross), `would cost · ${pay.label}`)); box.append(stat(fmtUsd(pay.net), "net of energy")); }
   if (sv.energy) box.append(stat(fmtUsd(sv.energy.cost), `energy · ${(sv.energy.kwh||0).toFixed(1)} kWh @ $${sv.energy.price_per_kwh}`));
   renderTierCards(sv);
@@ -1485,9 +1635,12 @@ function exportCsv() {
   const r4 = v => Math.round(v * 1e4) / 1e4;
   const csv = s => /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
   const lines = [["path", "depth", "reqs", "tok_in", "tok_out",
+    "gen_tok_s", "prefill_tok_s", "ctx_avg", "ctx_peak",
     ...tiers.flatMap(t => [t.label + "_gross", t.label + "_net"])].join(",")];
   const walk = (node, depth, path) => {
+    const d = xpDerive(node);
     lines.push([csv(path.join(" / ")), depth, node.reqs, node.tin, node.tout,
+      r4(d.gen), r4(d.pre), d.ctx, d.ctxMax,
       ...tiers.flatMap(t => [r4(node.gross[t.label]), r4(xpNet(node.gross[t.label], t))])].join(","));
     const sortT = (tiers[0] || {}).label;
     for (const [k, kn] of [...node.kids.entries()]
@@ -1593,20 +1746,32 @@ function setView(v) {
 
 // ---- boot -----------------------------------------------
 async function start() {
-  try { await api("/status"); } catch (e) { return; }
   $("#gate").classList.add("hidden"); $("#app").classList.remove("hidden");
+  // Auth is a stateless bearer token (no server-side session) — a server restart
+  // never invalidates it. So ride out a restart / transient outage here: retry
+  // with backoff and only fall back to the gate on a real 401.
+  for (let wait = 800; ; wait = Math.min(wait * 1.6, 8000)) {
+    try { await api("/status"); break; }
+    catch (e) {
+      if (e.message === "401") return;      // bad token — api() already showed the gate
+      $("#topErr").textContent = "connecting to stackd… (server unreachable, retrying)";
+      $("#topErr").classList.remove("hidden");
+      await new Promise(r => setTimeout(r, wait));
+    }
+  }
+  $("#topErr").classList.add("hidden");
   await tick();
-  renderEvents(await api("/events"), true);
+  try { renderEvents(await api("/events"), true); } catch (e) {}
   loadProfiles(); loadUsers();
   schedule();
   setInterval(loadProfiles, 15000);
   setInterval(paintIdle, 1000);
 }
 
-$("#gateGo").onclick = () => { sessionStorage.setItem("stackd_key", $("#gateKey").value.trim());
+$("#gateGo").onclick = () => { localStorage.setItem("stackd_key", $("#gateKey").value.trim());
   $("#gateErr").classList.add("hidden"); start(); };
 $("#gateKey").addEventListener("keydown", e => { if (e.key === "Enter") $("#gateGo").click(); });
-$("#btnLogout").onclick = () => { sessionStorage.removeItem("stackd_key"); showGate(); };
+$("#btnLogout").onclick = () => { localStorage.removeItem("stackd_key"); showGate(); };
 $("#refreshRate").onchange = schedule;
 $("#navMain").onclick = () => setView("main");
 $("#navUsage").onclick = () => setView("usage");

@@ -14,7 +14,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 RETAIN_DAYS = 40
 
 _SCHEMA = """
@@ -40,7 +40,10 @@ CREATE TABLE IF NOT EXISTS usage (
     prompt_tokens INTEGER DEFAULT 0,
     completion_tokens INTEGER DEFAULT 0,
     cached_tokens INTEGER DEFAULT 0,
-    ok INTEGER DEFAULT 1
+    ok INTEGER DEFAULT 1,
+    prefill_ms INTEGER DEFAULT 0,   -- proxy/engine-measured prompt-processing time
+    decode_ms INTEGER DEFAULT 0,    -- ... and generation time (for token-weighted tok/s)
+    ctx_tokens INTEGER DEFAULT 0    -- context size this request occupied (prompt + completion)
 );
 CREATE INDEX IF NOT EXISTS ix_usage_day ON usage(day);
 
@@ -52,6 +55,16 @@ CREATE TABLE IF NOT EXISTS usage_daily (
     prompt_tokens INTEGER DEFAULT 0,
     completion_tokens INTEGER DEFAULT 0,
     cached_tokens INTEGER DEFAULT 0,
+    -- running sums for token-weighted throughput. *_tok is summed only over rows
+    -- that actually carry timing, so Σtok/Σms stays correct when some rows are
+    -- untimed (pre-v4 rows, failed requests): tps = decode_tok / decode_ms * 1000.
+    prefill_ms INTEGER DEFAULT 0,
+    prefill_tok INTEGER DEFAULT 0,     -- Σ (prompt-cached) over rows with prefill_ms>0
+    decode_ms INTEGER DEFAULT 0,
+    decode_tok INTEGER DEFAULT 0,      -- Σ completion over rows with decode_ms>0
+    ctx_tokens_sum INTEGER DEFAULT 0,  -- Σ ctx_tokens over rows with ctx_tokens>0
+    ctx_tokens_max INTEGER DEFAULT 0,
+    ctx_n INTEGER DEFAULT 0,           -- count of those rows -> mean = sum / ctx_n
     PRIMARY KEY (day, user_email, requested_model, served_profile, served_stack, served_model)
 );
 
@@ -105,6 +118,11 @@ class Store:
         ucols = {r["name"] for r in self.conn.execute("PRAGMA table_info(usage)")}
         if "served_model" not in ucols:
             self.conn.execute("ALTER TABLE usage ADD COLUMN served_model TEXT")
+        # v4: per-request timing + context size (for token-weighted tok/s in the
+        # daily rollup). Plain ADD COLUMN — cheap, back-fills 0 on existing rows.
+        for col in ("prefill_ms", "decode_ms", "ctx_tokens"):
+            if col not in ucols:
+                self.conn.execute(f"ALTER TABLE usage ADD COLUMN {col} INTEGER DEFAULT 0")
 
         dcols = {r["name"] for r in self.conn.execute("PRAGMA table_info(usage_daily)")}
         if "served_stack" not in dcols:
@@ -134,6 +152,12 @@ class Store:
                 ALTER TABLE usage_daily_v3 RENAME TO usage_daily;
                 COMMIT;
             """)
+            dcols = {r["name"] for r in self.conn.execute("PRAGMA table_info(usage_daily)")}
+        # v4: matching timing/context running-sums on the folded table.
+        for col in ("prefill_ms", "prefill_tok", "decode_ms", "decode_tok",
+                    "ctx_tokens_sum", "ctx_tokens_max", "ctx_n"):
+            if col not in dcols:
+                self.conn.execute(f"ALTER TABLE usage_daily ADD COLUMN {col} INTEGER DEFAULT 0")
         self.set_meta("schema_version", str(SCHEMA_VERSION))
 
     def close(self) -> None:
@@ -295,15 +319,20 @@ class Store:
                      served_model: str | None = None,
                      prompt_tokens: int = 0, completion_tokens: int = 0,
                      cached_tokens: int = 0, off_home: bool = False, ok: bool = True,
+                     prefill_ms: int = 0, decode_ms: int = 0, ctx_tokens: int | None = None,
                      now: float | None = None) -> None:
         now = time.time() if now is None else now
+        if ctx_tokens is None:
+            ctx_tokens = (prompt_tokens or 0) + (completion_tokens or 0)
         self.conn.execute(
             "INSERT INTO usage(ts,day,user_email,requested_model,served_stack,served_model,"
-            "served_profile,off_home,prompt_tokens,completion_tokens,cached_tokens,ok) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            "served_profile,off_home,prompt_tokens,completion_tokens,cached_tokens,ok,"
+            "prefill_ms,decode_ms,ctx_tokens) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (now, _utc_day(now), (user_email or "direct"), requested_model, served_stack,
              served_model, served_profile, int(off_home),
-             prompt_tokens, completion_tokens, cached_tokens, int(ok)),
+             prompt_tokens, completion_tokens, cached_tokens, int(ok),
+             int(prefill_ms or 0), int(decode_ms or 0), int(ctx_tokens or 0)),
         )
 
     def rollup(self, *, retain_days: int = RETAIN_DAYS, now: float | None = None) -> int:
@@ -314,21 +343,36 @@ class Store:
             "COALESCE(served_profile,'?') p, COALESCE(served_stack,'?') sk, "
             "COALESCE(served_model,'?') sm, "
             "COUNT(*) reqs, SUM(prompt_tokens) pt, "
-            "SUM(completion_tokens) ct, SUM(cached_tokens) cc "
+            "SUM(completion_tokens) ct, SUM(cached_tokens) cc, "
+            "SUM(prefill_ms) pfm, "
+            "SUM(CASE WHEN prefill_ms>0 THEN MAX(prompt_tokens-cached_tokens,0) ELSE 0 END) pft, "
+            "SUM(decode_ms) dcm, "
+            "SUM(CASE WHEN decode_ms>0 THEN completion_tokens ELSE 0 END) dct, "
+            "SUM(CASE WHEN ctx_tokens>0 THEN ctx_tokens ELSE 0 END) cxs, "
+            "MAX(ctx_tokens) cxm, "
+            "SUM(CASE WHEN ctx_tokens>0 THEN 1 ELSE 0 END) cxn "
             "FROM usage WHERE day < ? GROUP BY day,u,m,p,sk,sm", (cutoff,)
         ).fetchall()
         for r in rows:
             self.conn.execute(
                 "INSERT INTO usage_daily(day,user_email,requested_model,served_profile,"
-                "served_stack,served_model,reqs,prompt_tokens,completion_tokens,cached_tokens) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?) "
+                "served_stack,served_model,reqs,prompt_tokens,completion_tokens,cached_tokens,"
+                "prefill_ms,prefill_tok,decode_ms,decode_tok,ctx_tokens_sum,ctx_tokens_max,ctx_n) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(day,user_email,requested_model,served_profile,served_stack,served_model) "
                 "DO UPDATE SET "
                 "reqs=reqs+excluded.reqs, prompt_tokens=prompt_tokens+excluded.prompt_tokens, "
                 "completion_tokens=completion_tokens+excluded.completion_tokens, "
-                "cached_tokens=cached_tokens+excluded.cached_tokens",
+                "cached_tokens=cached_tokens+excluded.cached_tokens, "
+                "prefill_ms=prefill_ms+excluded.prefill_ms, prefill_tok=prefill_tok+excluded.prefill_tok, "
+                "decode_ms=decode_ms+excluded.decode_ms, decode_tok=decode_tok+excluded.decode_tok, "
+                "ctx_tokens_sum=ctx_tokens_sum+excluded.ctx_tokens_sum, "
+                "ctx_tokens_max=MAX(ctx_tokens_max, excluded.ctx_tokens_max), "
+                "ctx_n=ctx_n+excluded.ctx_n",
                 (r["day"], r["u"], r["m"], r["p"], r["sk"], r["sm"],
-                 r["reqs"], r["pt"], r["ct"], r["cc"]),
+                 r["reqs"], r["pt"], r["ct"], r["cc"],
+                 r["pfm"] or 0, r["pft"] or 0, r["dcm"] or 0, r["dct"] or 0,
+                 r["cxs"] or 0, r["cxm"] or 0, r["cxn"] or 0),
             )
         cur = self.conn.execute("DELETE FROM usage WHERE day < ?", (cutoff,))
         return cur.rowcount
@@ -346,12 +390,20 @@ class Store:
             "COALESCE(requested_model,'?') requested_model, COALESCE(served_profile,'?') served_profile, "
             "COALESCE(served_stack,'?') served_stack, COALESCE(served_model,'?') served_model, "
             "COUNT(*) reqs, SUM(prompt_tokens) prompt_tokens, SUM(completion_tokens) completion_tokens, "
-            "SUM(cached_tokens) cached_tokens FROM usage" + where +
+            "SUM(cached_tokens) cached_tokens, "
+            "SUM(prefill_ms) prefill_ms, "
+            "SUM(CASE WHEN prefill_ms>0 THEN MAX(prompt_tokens-cached_tokens,0) ELSE 0 END) prefill_tok, "
+            "SUM(decode_ms) decode_ms, "
+            "SUM(CASE WHEN decode_ms>0 THEN completion_tokens ELSE 0 END) decode_tok, "
+            "SUM(CASE WHEN ctx_tokens>0 THEN ctx_tokens ELSE 0 END) ctx_tokens_sum, "
+            "MAX(ctx_tokens) ctx_tokens_max, "
+            "SUM(CASE WHEN ctx_tokens>0 THEN 1 ELSE 0 END) ctx_n FROM usage" + where +
             " GROUP BY day,user_email,requested_model,served_profile,served_stack,served_model", args
         ).fetchall()
         folded = self.conn.execute(
             "SELECT day,user_email,requested_model,served_profile,served_stack,served_model,reqs,"
-            "prompt_tokens,completion_tokens,cached_tokens FROM usage_daily" + where, args
+            "prompt_tokens,completion_tokens,cached_tokens,prefill_ms,prefill_tok,decode_ms,decode_tok,"
+            "ctx_tokens_sum,ctx_tokens_max,ctx_n FROM usage_daily" + where, args
         ).fetchall()
         return [dict(r) for r in list(raw) + list(folded)]
 

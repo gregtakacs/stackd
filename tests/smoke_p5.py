@@ -112,10 +112,12 @@ def main() -> int:
     for i in range(3):
         st.record_usage(user_email="u@x.com", requested_model="assistant",
                         served_stack="chat", served_model="Qwen3.8-27B", served_profile="chat",
-                        prompt_tokens=1000, completion_tokens=500, cached_tokens=200, now=old)
+                        prompt_tokens=1000, completion_tokens=500, cached_tokens=200,
+                        prefill_ms=400, decode_ms=2000, now=old)   # ctx=1500
     st.record_usage(user_email="u@x.com", requested_model="assistant",
                     served_stack="chat", served_model="Qwen3.8-27B", served_profile="chat",
-                    prompt_tokens=2000, completion_tokens=800)  # today
+                    prompt_tokens=2000, completion_tokens=800,
+                    prefill_ms=500, decode_ms=4000)  # today, ctx=2800
     moved = st.rollup(retain_days=7)
     check("rollup folds old rows", moved == 3)
     rows = st.usage_rows()
@@ -124,6 +126,13 @@ def main() -> int:
           sum(r["prompt_tokens"] for r in rows) == 1000 * 3 + 2000)
     check("usage_rows carry stack + checkpoint through the rollup",
           all(r["served_stack"] == "chat" and r["served_model"] == "Qwen3.8-27B" for r in rows))
+    # timing + context survive record -> rollup -> usage_rows
+    check("timing sums fold through the rollup",
+          sum(r["decode_ms"] for r in rows) == 3 * 2000 + 4000
+          and sum(r["prefill_ms"] for r in rows) == 3 * 400 + 500)
+    check("ctx_tokens_sum + ctx_tokens_max fold through",
+          sum(r["ctx_tokens_sum"] for r in rows) == 3 * 1500 + 2800
+          and max(r["ctx_tokens_max"] for r in rows) == 2800)
 
     # --- v2 -> v3 migration: split the conflated column into stack + checkpoint --
     import sqlite3 as _sqm
@@ -153,7 +162,11 @@ def main() -> int:
     check("v3 migration: old stack id moved to served_stack, checkpoint seeded '?'",
           mr["served_stack"] == "coding" and mr["served_model"] == "?"
           and mr["reqs"] == 4 and mr["prompt_tokens"] == 400)
-    check("v3 migration stamps schema_version=3", mg.get_meta("schema_version") == "3")
+    check("v4 migration adds timing/context columns",
+          {"prefill_ms", "decode_ms", "ctx_tokens"} <= ucols
+          and {"prefill_ms", "decode_ms", "ctx_tokens_sum", "ctx_tokens_max"} <= dcols)
+    check("migration stamps the current schema_version",
+          mg.get_meta("schema_version") == str(__import__("stackd.store", fromlist=["SCHEMA_VERSION"]).SCHEMA_VERSION))
     t_old = time.time() - 30 * 86400
     for sk, art in (("coding", "Flash-Next"), ("coding", "Flash-Next"),
                     ("uncensored-big", "Flash-Next-heretic")):
@@ -220,6 +233,16 @@ def main() -> int:
     check("tier carries its resolved price + annualized",
           front["price"] and "input_mtok" in front["price"] and "annualized" in front)
     check("savings exposes pricing status", "pricing_stale" in sv and "last_openrouter_fetch" in sv)
+    # token-weighted: decode_tok 2300 over decode_ms 10000 -> 230 tok/s
+    tpv = sv["throughput"]
+    check("savings.throughput is token-weighted",
+          abs(tpv["decode_tps"] - 230) < 1 and tpv["ctx_max"] == 2800 and tpv["prefill_tps"] > 0)
+    # an UNTIMED row (decode_ms=0) with a big completion must not blow up the mean
+    st.record_usage(user_email="u@x.com", requested_model="assistant", served_stack="chat",
+                    served_model="Qwen3.8-27B", served_profile="chat",
+                    prompt_tokens=9999, completion_tokens=9999)  # no timing
+    check("untimed rows don't poison the weighted tok/s",
+          abs(savings(st, pcfg)["throughput"]["decode_tps"] - 230) < 1)
     pcfg2 = {**pcfg, "hardware_cost": 1000, "payback_tier": "frontier"}
     check("payback_pct computed when hardware_cost set",
           savings(st, pcfg2)["payback_pct"] is not None)
