@@ -39,6 +39,20 @@ class _Echo(BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("content-length") or 0)
         body = json.loads(self.rfile.read(n) or b"{}")
+        if body.get("stream"):
+            # minimal OpenAI SSE with a final include_usage chunk, no llama.cpp `timings`
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.end_headers()
+            for ln in (
+                b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n',
+                b'data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":21,"total_tokens":28}}\n\n',
+                b"data: [DONE]\n\n",
+            ):
+                self.wfile.write(ln)
+                self.wfile.flush()
+                time.sleep(0.05)
+            return
         payload = json.dumps({"echo": body, "path": self.path}).encode()
         self.send_response(200)
         self.send_header("content-type", "application/json")
@@ -125,6 +139,30 @@ def main() -> int:
         check("stand-in serves chat name while coding active", code == 200)
         check("vllm stand-in: body model rewritten to the stack's served name (stack name by default)",
               res.get("echo", {}).get("model") == "coding")
+
+        # --- Ollama timing injection for an OpenAI-shaped (vLLM/SGLang) stream ---
+        # coding still points at the echo upstream; stream a request and confirm
+        # the proxy adds a `stackd-timing` chunk with eval_count/eval_duration so
+        # Open WebUI can show a tok/s rate.
+        raw = b""
+        r = urllib.request.Request(
+            f"{base}/v1/chat/completions",
+            data=json.dumps({"model": "assistant", "messages": [], "stream": True,
+                             "stream_options": {"include_usage": True}}).encode(),
+            headers={"content-type": "application/json", "authorization": "Bearer secret"},
+            method="POST")
+        with urllib.request.urlopen(r, timeout=10) as resp:
+            raw = resp.read()
+        tline = next((l for l in raw.split(b"\n\n") if b"stackd-timing" in l), b"")
+        tj = json.loads(tline[len(b"data: "):]) if tline else {}
+        tu = tj.get("usage", {})
+        check("timing chunk injected before [DONE]",
+              b"stackd-timing" in raw and raw.rfind(b"stackd-timing") < raw.rfind(b"[DONE]"))
+        check("timing chunk carries eval_count == completion_tokens", tu.get("eval_count") == 21)
+        check("timing chunk carries a positive eval_duration (ns)",
+              isinstance(tu.get("eval_duration"), int) and tu["eval_duration"] > 0)
+        check("real usage chunk preserved untouched",
+              b'"completion_tokens":21' in raw and b'"prompt_tokens":7' in raw)
 
         code, st = _req(f"{base}/profiles/chat/activate", token="secret", body={})
         check("control: /profiles/chat/activate -> 200", code == 200)

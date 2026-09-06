@@ -1,0 +1,20 @@
+# NIXL POSIX-FILE backend for SGLang HiCache L3 (prefix-page persistence to NVMe).
+# Referenced by the model YAML: --hicache-storage-backend-extra-config @<this>.
+#
+# Based on the fork's configs/pennyroyal/nixl-posix.toml. Differences for this box:
+#  * /nixl lives on the SHARED WD_BLACK SN850X 4 TB (the ${DOCKERDIR} ext4 fs),
+#    not a dedicated volume — l3_cleaner watermarks raised to 60/57 (whole-fs %):
+#    start evicting the disposable NIXL cache only past ~60% full, down to ~57%.
+#  * use_uring = "false": Docker 29's default seccomp blocks io_uring_setup
+#    (io_uring_setup -> EPERM in-container), which fails the NIXL POSIX backend
+#    outright. The plugin falls back to pread/pwrite — fine for the L3 tier's
+#    background prefix-page I/O. To restore io_uring, add a seccomp profile that
+#    allowlists syscalls 425/426/427 to the cuda device_profile in runtime.yaml.
+use_direct_io = true
+l3_cleaner_enabled = true
+l3_cleaner_high_watermark = 60.0
+l3_cleaner_low_watermark = 57.0
+
+[plugin.posix]
+active = true
+use_uring = "false"

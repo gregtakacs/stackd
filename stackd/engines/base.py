@@ -74,7 +74,7 @@ class EngineAdapter(ABC):
             gpus=d.gpus,
             device_paths=[*d.devices, *c.devices],
             group_add=list(d.group_add),
-            security_opt=list(d.security_opt),
+            security_opt=[*d.security_opt, *c.security_opt],
             network=ctx.network,
             ipc_host=c.ipc_host or d.ipc_host,
             shm_size=c.shm_size or d.shm_size,

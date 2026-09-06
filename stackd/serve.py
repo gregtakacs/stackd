@@ -23,6 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from stackd import events
 from stackd.engines.base import EngineState
 from stackd.manager import Manager
+from stackd.promptcache import PromptCacheModel, pc_units
 from stackd.store import Store, _utc_day
 
 _WEB_DIR = pathlib.Path(__file__).resolve().parent / "web"
@@ -467,7 +468,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _engine(self, stack: str):
         """Normalised live telemetry for one running engine (llama.cpp /slots +
-        /metrics, vLLM /metrics) — tok/s, KV %, in-flight, MTP acceptance."""
+        /metrics, vLLM + SGLang /metrics) — tok/s, KV %, in-flight, MTP acceptance."""
         with self.lock:
             rt = self.mgr.state.stacks.get(stack)
             endpoint = rt.endpoint if rt else None
@@ -487,11 +488,13 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send_json(503, {"error": {"message": "no endpoint yet"}})
         from stackd.telemetry import engine_telemetry
         tel = engine_telemetry(endpoint, tmpl)
-        if tel.get("slots") is None:   # vLLM has no /slots — take the configured seq cap
-            cap = params.get("max_num_seqs") or params.get("parallel") or _cli_val("--max-num-seqs")
+        if tel.get("slots") is None:   # vLLM/SGLang have no /slots — take the configured seq cap
+            cap = (params.get("max_num_seqs") or params.get("parallel")
+                   or _cli_val("--max-num-seqs") or _cli_val("--max-running-requests"))
             tel["slots"] = int(cap) if cap else None
-        if tel.get("ctx_max") is None:  # vLLM /metrics has no ctx ceiling — use the configured one
-            ml = params.get("max_model_len") or params.get("ctx") or _cli_val("--max-model-len")
+        if tel.get("ctx_max") is None:  # no ctx ceiling in /metrics — use the configured one
+            ml = (params.get("max_model_len") or params.get("ctx")
+                  or _cli_val("--max-model-len") or _cli_val("--context-length"))
             tel["ctx_max"] = int(ml) if ml else None
         hint = _LAST_GEN.get(stack)
         if hint:
@@ -688,28 +691,38 @@ class _Handler(BaseHTTPRequestHandler):
         if rr.served_model_name:
             body["model"] = rr.served_model_name
 
+        is_embeddings = self.path.endswith("embeddings")
+
         def _on_body(buf: bytes, status: int) -> None:
-            self._record_usage(model, rr, buf, status, embeddings=self.path.endswith("embeddings"))
+            self._record_usage(model, rr, buf, status, embeddings=is_embeddings, req_body=body)
             _capture_gen(rr.stack, buf)
 
         self._relay(rr.endpoint.rstrip("/") + self.path, "POST",
-                    json.dumps(body).encode(), streaming=streaming, on_body=_on_body)
+                    json.dumps(body).encode(), streaming=streaming, on_body=_on_body,
+                    inject_timings=_INJECT_TIMINGS and not is_embeddings)
 
     # -- ledger ------------------------------------------------------------------------
-    def _record_usage(self, requested_model, rr, buf: bytes, status: int, *, embeddings: bool):
+    def _record_usage(self, requested_model, rr, buf: bytes, status: int, *,
+                      embeddings: bool, req_body: dict | None = None):
         if self.store is None or embeddings:
             return
         usage = _extract_usage(buf)
         email = (self.headers.get("X-OpenWebUI-User-Email")
                  or self.headers.get("X-OpenWebUI-User-Id") or "direct")
+        prompt = usage.get("prompt_tokens", 0)
         try:
             with self.lock:
+                # cached_tokens = a synthetic *commercial* prefix-cache estimate
+                # (what a frontier API would have discounted for this prefix
+                # pattern), NOT the local backend's own reuse — see promptcache.py.
+                pcm = _prompt_cache_model(self.pricing_path)
+                cached = pcm.measure(f"{email}\x00{rr.stack}", pc_units(req_body or {}), prompt)
                 self.store.record_usage(
                     user_email=email, requested_model=requested_model,
                     served_stack=rr.stack, served_model=rr.artifact, served_profile=rr.profile,
-                    prompt_tokens=usage.get("prompt_tokens", 0),
+                    prompt_tokens=prompt,
                     completion_tokens=usage.get("completion_tokens", 0),
-                    cached_tokens=(usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0),
+                    cached_tokens=cached,
                     off_home=(rr.route_kind != "native"),
                     ok=(200 <= status < 300),
                 )
@@ -763,16 +776,22 @@ class _Handler(BaseHTTPRequestHandler):
 
     # -- reverse proxy ----------------------------------------------------------------
     def _relay(self, url: str, method: str, body: bytes | None, *, streaming: bool,
-               on_body=None):
+               on_body=None, inject_timings: bool = False):
         """Forward one request upstream and relay the response. `streaming` chunk-
         relays a response with no content-length (SSE); otherwise buffers and sends
         with a real content-length. `on_body(bytes, status)` gets the full response
-        for the ledger (bounded — only the first 256 KiB is kept)."""
+        for the ledger (bounded — only the first 256 KiB is kept).
+
+        `inject_timings` (chat/completions only): if the upstream response carries a
+        `usage` block but no llama.cpp-style `timings` (i.e. vLLM / SGLang), add
+        Ollama-style `eval_count`/`eval_duration`/`total_duration` (proxy-measured
+        wall clock, nanoseconds) so Open WebUI can show a tokens/sec rate."""
         fwd_ct = self.headers.get("content-type", "application/json")
         req = urllib.request.Request(
             url, data=body, method=method,
             headers={"content-type": fwd_ct, "accept": self.headers.get("accept", "*/*")},
         )
+        t0 = time.monotonic()
         try:
             up = urllib.request.urlopen(req, timeout=_PROXY_READ_TIMEOUT_S)
         except urllib.error.HTTPError as e:
@@ -789,10 +808,20 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send_json(502, {"error": {"message": f"upstream unreachable: {e}"}})
 
         keep = bytearray()
+        tail = bytearray()          # rolling last ~8 KiB — finds the usage line even
+        _TAILCAP = 8192             # on a stream far past the 256 KiB `keep` cap
 
         def _tee(chunk: bytes) -> None:
             if on_body and len(keep) < 262144:
                 keep.extend(chunk[: 262144 - len(keep)])
+            if inject_timings:
+                tail.extend(chunk)
+                if len(tail) > _TAILCAP:
+                    del tail[: len(tail) - _TAILCAP]
+
+        def _wc(b: bytes) -> None:   # one chunked-transfer frame + flush
+            self.wfile.write(f"{len(b):x}\r\n".encode() + b + b"\r\n")
+            self.wfile.flush()
 
         with up:
             ctype = up.headers.get("content-type", "application/octet-stream")
@@ -802,22 +831,50 @@ class _Handler(BaseHTTPRequestHandler):
             if streaming and not clen:
                 self.send_header("transfer-encoding", "chunked")
                 self.end_headers()
+                t_first = None
+                lb = b""            # line buffer — relay whole SSE events (\n\n-delimited)
                 while True:
                     chunk = up.read(8192)
                     if not chunk:
-                        self.wfile.write(b"0\r\n\r\n")
                         break
+                    if t_first is None:
+                        t_first = time.monotonic()
                     _tee(chunk)
-                    self.wfile.write(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
-                    self.wfile.flush()
+                    lb += chunk
+                    while b"\n\n" in lb:
+                        evt, lb = lb.split(b"\n\n", 1)
+                        evt += b"\n\n"
+                        if inject_timings and evt.strip() == b"data: [DONE]":
+                            extra = _timing_sse_line(bytes(tail), t0, t_first, time.monotonic())
+                            if extra:
+                                _wc(extra)
+                        _wc(evt)
+                if lb:
+                    _wc(lb)
+                self.wfile.write(b"0\r\n\r\n")
             else:
                 data = up.read()
                 _tee(data)
+                if inject_timings:
+                    data = _inject_body_timings(data, t0, time.monotonic()) or data
                 self.send_header("content-length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
         if on_body:
             on_body(bytes(keep), up.status)
+
+
+# One long-lived prompt-cache estimator per pricing.json path (it holds a rolling
+# per-(user, stack) request history). Rebuilt only if the path changes.
+_PCM: list = [object(), None]  # [pricing_path sentinel, PromptCacheModel|None]
+
+
+def _prompt_cache_model(pricing_path) -> PromptCacheModel:
+    if _PCM[0] != pricing_path or _PCM[1] is None:
+        from stackd.pricing import load_pricing
+        cfg = (load_pricing(pricing_path) or {}).get("prompt_cache")
+        _PCM[0], _PCM[1] = pricing_path, PromptCacheModel(cfg)
+    return _PCM[1]
 
 
 def _extract_usage(buf: bytes) -> dict:
@@ -889,6 +946,65 @@ def _capture_gen(stack: str | None, buf: bytes) -> None:
     _GEN_SEQ[0] += 1
     _LAST_GEN[stack] = {"gen_tok_s": g, "prompt_tok_s": p, "mtp_accept_pct": mtp,
                         "ctx_tokens": ctx or None, "at": time.time(), "seq": _GEN_SEQ[0]}
+
+
+# --- Ollama-style timing injection for OpenAI-shaped backends (vLLM / SGLang) --
+# Open WebUI (0.11.x, utils/response.py) derives `response_token/s` ONLY from
+# `eval_count / eval_duration` (Ollama) or a llama.cpp `timings` block — OpenAI's
+# `usage` has token counts but no duration. vLLM / SGLang stream OpenAI usage, so
+# OWU shows counts and no rate. Here the proxy measures wall clock and attaches
+# the Ollama fields it's missing. Opt out with STACKD_INJECT_TIMINGS=0.
+_INJECT_TIMINGS = os.getenv("STACKD_INJECT_TIMINGS", "1").lower() not in ("0", "false", "no", "")
+
+
+def _ollama_timings(usage: dict, prefill_s, decode_s: float, total_s: float) -> dict:
+    """Ollama-shaped timing fields (durations in nanoseconds) from proxy timing."""
+    tm = {
+        "eval_count": int(usage.get("completion_tokens") or 0),
+        "eval_duration": max(int(decode_s * 1e9), 1),
+        "total_duration": max(int(total_s * 1e9), 1),
+    }
+    if usage.get("prompt_tokens") and prefill_s and prefill_s > 0:
+        tm["prompt_eval_count"] = int(usage["prompt_tokens"])
+        tm["prompt_eval_duration"] = int(prefill_s * 1e9)
+    return tm
+
+
+def _timing_sse_line(tail: bytes, t0: float, t_first, t_end: float) -> bytes | None:
+    """A synthetic `data:` chunk carrying only the Ollama timing fields, to emit
+    just before `data: [DONE]`. None if there's nothing to add."""
+    if _extract_timings(tail):                       # llama.cpp already has real timings
+        return None
+    usage = _extract_usage(tail)                     # needs stream_options.include_usage
+    if not usage or not usage.get("completion_tokens"):
+        return None
+    ct = int(usage.get("completion_tokens") or 0)
+    prefill_s = (t_first - t0) if t_first else None
+    decode_s = (t_end - t_first) if t_first else (t_end - t0)
+    # Degenerate split: a small/cached response can arrive in one read, so
+    # t_first ~= t_end and decode_s collapses to ~0 -> an absurd tok/s. If the
+    # implied rate is impossible for a single stream (>3000 tok/s), just put all
+    # the elapsed time on decode and drop the prefill split.
+    if ct > 4 and decode_s > 0 and ct / decode_s > 3000:
+        decode_s, prefill_s = (t_end - t0), None
+    tm = _ollama_timings(usage, prefill_s, decode_s, t_end - t0)
+    chunk = {"id": "stackd-timing", "object": "chat.completion.chunk",
+             "created": int(time.time()), "choices": [], "usage": tm}
+    return b"data: " + json.dumps(chunk).encode() + b"\n\n"
+
+
+def _inject_body_timings(data: bytes, t0: float, t_end: float) -> bytes | None:
+    """Non-streamed chat/completions: fold Ollama timing fields into `usage`.
+    None if not a JSON object with a `usage` and no existing `timings`."""
+    try:
+        doc = json.loads(data)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return None
+    if not isinstance(doc, dict) or doc.get("timings") or not isinstance(doc.get("usage"), dict):
+        return None
+    # non-streamed: can't separate prefill from decode — attribute it all to decode
+    doc["usage"] = {**doc["usage"], **_ollama_timings(doc["usage"], None, t_end - t0, t_end - t0)}
+    return json.dumps(doc).encode()
 
 
 def make_server(mgr: Manager, host: str, port: int, api_key: str | None,

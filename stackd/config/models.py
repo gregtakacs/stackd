@@ -108,6 +108,10 @@ class ContainerSpec:
     devices: list[str] = field(default_factory=list)
     shm_size: str | None = None        # per-container override of the device_profile's
     ulimits: dict[str, int] = field(default_factory=dict)   # e.g. {nofile: 65536} -- soft==hard
+    # Docker --security-opt entries ADDED to the resolved device_profile's (e.g.
+    # "seccomp:unconfined" for a model whose engine needs syscalls the default
+    # profile blocks — NIXL's io_uring on Docker 29).
+    security_opt: list[str] = field(default_factory=list)
     # Hard cgroup memory ceiling (docker run --memory / --memory-swap, both set
     # to this so the container can't spill into swap past it). A backstop, not
     # the primary safety mechanism (see solver.py::host_ram_headroom for that):

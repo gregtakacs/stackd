@@ -211,7 +211,7 @@ def host_stats() -> dict:
     return out
 
 
-# --- normalised per-engine telemetry (llama.cpp /slots+/metrics, vLLM /metrics) ---
+# --- normalised per-engine telemetry (llama.cpp /slots+/metrics, vLLM + SGLang /metrics) ---
 def _prom(text: str) -> dict:
     """Prometheus exposition -> {metric_name: last_value}. Labels ignored."""
     out: dict = {}
@@ -469,6 +469,75 @@ def engine_telemetry(endpoint: str, template: str) -> dict:
                 d["gen_tok_s"] = ls.get("gen_tok_s")
                 d["prompt_tok_s"] = ls.get("prompt_tok_s")
                 d["mtp_accept_pct"] = ls.get("mtp_accept_pct") or life_mtp
+
+        elif template.startswith("sglang"):
+            # SGLang (--enable-metrics) exposes live gauges (sglang:gen_throughput
+            # tok/s, sglang:token_usage 0..1 KV fill, sglang:spec_accept_rate)
+            # AND monotonic token counters. Prefer the gauges while a request
+            # runs; hold the last session's numbers when idle (same as vLLM).
+            m = _prom(_http_text(ep + "/metrics"))
+            running = int(m.get("sglang:num_running_reqs") or 0)
+            d["running"] = running
+            d["waiting"] = int(m.get("sglang:num_queue_reqs") or 0)
+            active = running > 0
+            d["active"] = active
+
+            pool = m.get("sglang:max_total_num_tokens")
+            d["kv_pool_tokens"] = int(pool) if pool else None
+            d["ctx_max"] = (int(m["sglang:context_len"]) if m.get("sglang:context_len")
+                            else d["kv_pool_tokens"])
+            frac = m.get("sglang:token_usage")          # 0..1 fill of the KV pool
+            if frac is not None:
+                d["kv_pct"] = round(100.0 * frac, 1)
+                if d["kv_pool_tokens"]:
+                    d["ctx_tokens"] = round(frac * d["kv_pool_tokens"])
+            used = m.get("sglang:kv_used_tokens")
+            if used:
+                d["ctx_tokens"] = int(used)
+
+            gauge_tps = m.get("sglang:gen_throughput")   # tok/s, live gauge
+            acc_rate = m.get("sglang:spec_accept_rate")  # 0..1 while spec active
+            acc_len = m.get("sglang:spec_accept_length") # avg accepted draft tok / step
+
+            cur = {"ts": now, "running": running,
+                   "gen_tok": m.get("sglang:generation_tokens_total"),
+                   "prompt_tok": m.get("sglang:prompt_tokens_total")}
+            hist = st.setdefault("hist", [])
+            hist.append(cur)
+            st["hist"] = [h for h in hist if now - h["ts"] <= 20.0][-60:]
+            prev = st["hist"][-2] if len(st["hist"]) > 1 else None
+            base = next((h for h in reversed(st["hist"][:-1]) if now - h["ts"] >= 1.8), prev)
+
+            was_active = bool(st.get("was_active"))
+            st["was_active"] = active
+            if active and st["sess_start"] is None:
+                st["sess_start"] = dict(cur)
+            mtp_pct = (round(100.0 * acc_rate, 1) if acc_rate
+                       else round(25.0 * acc_len, 1) if acc_len else None)  # /4 draft tok
+            if mtp_pct:
+                st["last_acc_pct"] = mtp_pct
+            if not active and was_active and st["sess_start"]:
+                ss = st["sess_start"]
+                st["last_sess"] = {
+                    "gen_tok_s": _wall_rate(ss, cur, "gen_tok"),
+                    "prompt_tok_s": _wall_rate(ss, cur, "prompt_tok"),
+                    "mtp_accept_pct": st.get("last_acc_pct"),
+                }
+                st["sess_start"] = None
+            ls = st["last_sess"]
+            d["gen_tok_s_session"] = ls.get("gen_tok_s")
+            d["prompt_tok_s_session"] = ls.get("prompt_tok_s")
+            d["mtp_accept_pct_session"] = ls.get("mtp_accept_pct")
+            if active:
+                b = base if (base and base.get("running", 0) > 0) else st["sess_start"]
+                d["gen_tok_s"] = ((gauge_tps if gauge_tps and gauge_tps > 0 else None)
+                                  or _wall_rate(b, cur, "gen_tok") or ls.get("gen_tok_s"))
+                d["prompt_tok_s"] = _wall_rate(b, cur, "prompt_tok") or ls.get("prompt_tok_s")
+                d["mtp_accept_pct"] = mtp_pct or ls.get("mtp_accept_pct")
+            else:
+                d["gen_tok_s"] = ls.get("gen_tok_s")
+                d["prompt_tok_s"] = ls.get("prompt_tok_s")
+                d["mtp_accept_pct"] = ls.get("mtp_accept_pct") or st.get("last_acc_pct")
     except Exception as e:  # noqa: BLE001 — telemetry is best-effort
         d["error"] = str(e)
     return d

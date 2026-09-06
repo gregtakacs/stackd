@@ -220,6 +220,51 @@ def t_preset_translation() -> None:
     check("vllm off merges into existing chat_template_kwargs",
           _translate_preset({"reasoning": "off", "chat_template_kwargs": {"foo": 1}}, "vllm-cuda")
           == {"chat_template_kwargs": {"foo": 1, "enable_thinking": False}})
+    # sglang-pennyroyal shares vLLM's Qwen3 request dialect
+    check("sglang reasoning:off -> enable_thinking:false",
+          _translate_preset({"reasoning": "off"}, "sglang-pennyroyal")
+          == {"chat_template_kwargs": {"enable_thinking": False}})
+    check("sglang effort kept, per-request budget dropped",
+          _translate_preset({"reasoning": {"effort": "medium", "budget": 8192}}, "sglang-pennyroyal")
+          == {"reasoning_effort": "medium"})
+
+
+def t_sglang_pennyroyal_adapter() -> None:
+    """The sglang-pennyroyal adapter is vLLM-shaped: cmd_extra is the whole
+    command, stackd only injects --served-model-name and the health URL."""
+    from stackd.config._build import build
+    from stackd.config.models import ModelSpec
+    from stackd.runner import LaunchContext
+
+    spec = build(ModelSpec, {
+        "name": "coding-next",
+        "engine": {
+            "template": "sglang-pennyroyal",
+            "model": "Qwen3.8-Flash-Next-NVFP4-hf",
+            "params": {"port": 8001},
+            "container": {
+                "image": "sglang-pennyroyal:local",
+                "security_opt": ["seccomp:unconfined"],   # NIXL io_uring on Docker 29
+                "cmd_extra": ["--model-path", "/models/x",
+                              "--served-model-name", "pennyroyal",  # stackd must drop this copy
+                              "--port", "8001"],
+            },
+        },
+        "budget": {"vram_gib": 93.8, "ram_gib": 40},
+        "placement": {"devices": ["cuda0"]},
+        "serves": [{"api_name": "TakacsAI-Coding-Next-med"}],
+    })
+    cfg = load_config(CFG)
+    ls = adapter_for(spec, cfg.devices["cuda0"]).launch_spec(LaunchContext(port=8001))
+    check("sglang: image passthrough", ls.image == "sglang-pennyroyal:local")
+    check("sglang: stackd owns one --served-model-name == the stack name",
+          ls.cmd.count("--served-model-name") == 1
+          and ls.cmd[ls.cmd.index("--served-model-name") + 1] == "coding-next")
+    check("sglang: cmd_extra flags preserved", "--model-path" in ls.cmd and "/models/x" in ls.cmd)
+    check("sglang: health on :8001/health", (ls.health_url or "").endswith(":8001/health"))
+    check("sglang: long cold-boot ready timeout", ls.ready_timeout_s >= 1800.0)
+    check("container.security_opt merges into the LaunchSpec",
+          "seccomp:unconfined" in ls.security_opt)
 
 
 def t_cuda_drain_barrier() -> None:
@@ -613,6 +658,25 @@ def t_reactive_entry_refused_when_not_outranking() -> None:
         check("reactive downgrade refused", True)
 
 
+def t_route_fastfails_when_active_is_pinned() -> None:
+    """A request for a name only a higher-priority profile serves, while the
+    active (lower) profile is pinned, must return 'outranked' immediately — not
+    'warming' (which makes the HTTP front poll a stack that never comes)."""
+    m = mgr(FakeRunner(ready_after=1))
+    m.use("chat", now=0)
+    ready_all(m)
+    m.pin()  # chat is now pinned; coding (higher priority) can't reactively enter
+    rr = m.route("assistant-coder", now=50)  # a name only the `coding` profile serves
+    check("pinned + outranked name -> status 'outranked' (fast fail, no warming poll)",
+          rr.status == "outranked")
+    check("outranked note explains the pin",
+          "pinned" in (rr.note or "").lower())
+    check("active profile unchanged (no switch attempted)", m.state.active_profile == "chat")
+    m.unpin()
+    rr2 = m.route("assistant-coder", now=60)  # now the switch is allowed
+    check("unpinned -> reactive entry proceeds (warming)", rr2.status == "warming")
+
+
 def main() -> int:
     for fn in [
         t_converge_chat,
@@ -626,6 +690,7 @@ def main() -> int:
         t_shutdown_engines_tears_down_everything,
         t_reactive_entry_and_standin,
         t_preset_translation,
+        t_sglang_pennyroyal_adapter,
         t_cuda_drain_barrier,
         t_tick_sweeps_stray_stacks,
         t_image_tier_is_stackd_created,
@@ -638,6 +703,7 @@ def main() -> int:
         t_image_none_survives_pin,
         t_reload_config,
         t_reactive_entry_refused_when_not_outranking,
+        t_route_fastfails_when_active_is_pinned,
     ]:
         try:
             fn()

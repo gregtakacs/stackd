@@ -3,6 +3,7 @@ from __future__ import annotations
 from stackd.engines.base import EngineAdapter
 from stackd.engines.comfyui import ComfyuiAdapter
 from stackd.engines.llamacpp import LlamacppCudaAdapter, LlamacppVulkanAdapter
+from stackd.engines.sglang_pennyroyal import SglangPennyroyalAdapter
 from stackd.engines.vllm import VllmCudaAdapter
 
 TEMPLATES: dict[str, type[EngineAdapter]] = {
@@ -11,6 +12,7 @@ TEMPLATES: dict[str, type[EngineAdapter]] = {
         LlamacppCudaAdapter,
         LlamacppVulkanAdapter,
         VllmCudaAdapter,
+        SglangPennyroyalAdapter,
         ComfyuiAdapter,
     )
 }

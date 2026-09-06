@@ -10,8 +10,13 @@ from stackd.solver import solve
 if TYPE_CHECKING:
     from stackd.catalog import Catalog
 
-THIN_ABS_GIB = 5.0
-THIN_FRAC = 0.05
+# Soft "thin margin" advisory flags (NOT a fit failure — `check()` still hard-fails
+# on real overflow). Lowered from 5.0 / 0.05 (2026-09-06): the sglang-pennyroyal
+# whole-GPU profiles deliberately run the card near-full (--mem-fraction-static
+# 0.981 leaves ~1.8 GiB on a 96 GiB card, ~1.9%), which is fine and intentional.
+# 1.5 GiB / 1.5% still flags a genuinely about-to-not-fit placement.
+THIN_ABS_GIB = 1.5
+THIN_FRAC = 0.015
 
 
 @dataclass

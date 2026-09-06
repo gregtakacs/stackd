@@ -42,10 +42,14 @@ Then point any OpenAI client at `http://localhost:11444/v1`, or open
 ## Concepts
 
 **Model** (`config/models/<name>.yaml`) — a servable model + how to run it: an engine
-`template` (`llamacpp-cuda` | `llamacpp-vulkan` | `vllm-cuda` | `comfyui`), a `budget:`
-(VRAM/RAM footprint — a starting estimate you refine with `stackctl bench`), a
-`placement:` device-preference list, and the API `serves:` names clients ask for. The
-*device* is chosen by the solver, not pinned.
+`template` (`llamacpp-cuda` | `llamacpp-vulkan` | `vllm-cuda` | `sglang-pennyroyal` |
+`comfyui`), a `budget:` (VRAM/RAM footprint — a starting estimate you refine with
+`stackctl bench`), a `placement:` device-preference list, and the API `serves:` names
+clients ask for. The *device* is chosen by the solver, not pinned.
+(`sglang-pennyroyal` is the RTX PRO 6000 / sm120 SGLang fork
+[`jpezzulli/sglang-rtxpro6000`](https://github.com/jpezzulli/sglang-rtxpro6000) —
+`stackctl build`s its own image; **not** vanilla SGLang. The adapter is generic
+cmd_extra passthrough, so a `sglang-cuda` on a vendor image is a one-line add.)
 
 **Profile** (`config/profiles/<name>.yaml`) — a priority-ordered list of model names.
 The solver places each on the first device it fits; the highest-priority profile that

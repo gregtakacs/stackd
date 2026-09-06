@@ -1,0 +1,170 @@
+# =============================================================================
+# SGLang "Pennyroyal" runtime — jpezzulli/sglang-rtxpro6000, built for NVIDIA
+# Blackwell (sm_120 / RTX PRO 6000). NOT vanilla SGLang: this fork carries the
+# DFLASH speculative path, mamba-radix HiCache, gdn-mtp-cache-mode, the
+# FlashInfer linear-attn backends, ple-offload-embedding and the page_first
+# HiCache layout that the config/models/*-next.yaml cmd_extra depends on.
+#
+# Produced by `docker exec stackd stackctl build coding-next` (or chat-next) —
+# stackd tars this directory and streams it to the Docker Engine /build API
+# (stackd/builder.py). Tag: ${SGLANG_PENNYROYAL_IMAGE} (AI-STACK/.env).
+#
+# HIGH-RISK BUILD. The fork's own BUILD.md / RUN.md at ref
+# `pennyroyal-main-sm120-final` is the source of truth for exact versions and
+# flags; the steps below are transcribed from it and its two serve-*.sh scripts
+# and are expected to need a round or two of build-fix iteration. Rollback lever:
+# SGLANG_FORK_REF below.
+#
+# compose-version-audit (Docker-Tools/compose-version-audit) tracks the pins here
+# against upstream like the other stackd-built images — see
+# LLM-Tools/stackd/stackd-images.audit.yml.
+# ---------------------------------------------------------------------------
+# Single-stage on the CUDA 13.3 devel base: the runtime is a Python venv full of
+# compiled CUDA extensions + NIXL's meson-installed libs, which do not survive a
+# naive COPY into a slim stage. Slimming to two stages is a later optimisation.
+# Pinned by digest — nvidia/cuda:*-devel tags are mutable (see the llama.cpp
+# Dockerfile's note on why the digest matters). 13.3.1-devel-ubuntu24.04 as of
+# 2026-09-06.
+FROM nvidia/cuda:13.3.1-devel-ubuntu24.04@sha256:4ff859525f99de5782aa73607ce24219b07dddd48d12b97c1c301d7e1cfb0a87
+
+ARG SGLANG_FORK_REPO=https://github.com/jpezzulli/sglang-rtxpro6000.git
+# Branch tip. Built + verified on the box 2026-09-06 at commit
+# 38a5ecbabe957b77f66f6d4ecf91f7f8c36531ab — pin SGLANG_FORK_REF to that exact
+# SHA on the next from-scratch rebuild (kept as the branch for now so an
+# incremental rebuild — ffmpeg / toml — reuses the ~20 min sm120 build cache).
+ARG SGLANG_FORK_REF=pennyroyal-main-sm120-final
+# NIXL commit from the fork's BUILD.md (POSIX FILE plugin for the HiCache
+# storage backend). Only needed once phase-2 NIXL persistence is turned on, but
+# built now so the image is complete.
+ARG NIXL_REF=aecbc3846d92c34c7507a58d776e1fda50ff4fba
+# Fork validated on 3.12.13; `uv` only ships python-build-standalone for the patch
+# levels its own release knows, so pin the MINOR and let uv pick the newest 3.12
+# patch — any 3.12.x is fine for the runtime venv.
+ARG PYTHON_VERSION=3.12
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# --- toolchain: GCC 15 (fork validated on 15.3.1), git, meson/ninja for NIXL ---
+# The ubuntu-toolchain-r/test PPA carries gcc-15 for noble. Added by hand (apt
+# source line + keyserver-fetched signing key) rather than `add-apt-repository`,
+# whose launchpadlib API call is a flaky single point of failure (observed:
+# Launchpad HTTP 504 mid-build). Key 0x...BA9EF27F is the well-known
+# ubuntu-toolchain-r archive-signing key.
+ARG TOOLCHAIN_PPA_KEY=60C317803A41BA51845E371A1E9377A2BA9EF27F
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl git gnupg \
+        build-essential ninja-build meson pkg-config \
+        libnuma-dev libibverbs-dev librdmacm-dev \
+    && for i in 1 2 3 4 5; do \
+         curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&options=mr&search=0x${TOOLCHAIN_PPA_KEY}" \
+           | gpg --dearmor -o /usr/share/keyrings/ubuntu-toolchain-r.gpg && break || sleep 15; \
+       done \
+    && test -s /usr/share/keyrings/ubuntu-toolchain-r.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/ubuntu-toolchain-r.gpg] https://ppa.launchpadcontent.net/ubuntu-toolchain-r/test/ubuntu noble main" \
+       > /etc/apt/sources.list.d/ubuntu-toolchain-r.list \
+    && apt-get update && apt-get install -y --no-install-recommends g++-15 gcc-15 \
+    && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-15 150 \
+       --slave /usr/bin/g++ g++ /usr/bin/g++-15 \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- uv (pinned) ------------------------------------------------------------
+ARG UV_VERSION=0.9.2
+RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
+ENV PATH=/root/.local/bin:${PATH}
+
+# --- compiler / build-parallelism env (from the fork's serve-*.sh) ---------
+ENV CUDA_HOME=/usr/local/cuda \
+    CUDACXX=/usr/local/cuda/bin/nvcc \
+    CC=/usr/bin/gcc-15 CXX=/usr/bin/g++-15 CUDAHOSTCXX=/usr/bin/g++-15 \
+    TORCH_CUDA_ARCH_LIST=12.0 \
+    CMAKE_CUDA_ARCHITECTURES=120a \
+    MAX_JOBS=24 CMAKE_BUILD_PARALLEL_LEVEL=24 \
+    FLASHINFER_NINJA_JOBS=24 FLASHINFER_NVCC_THREADS=4 \
+    TORCHINDUCTOR_COMPILE_THREADS=24 \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64
+
+WORKDIR /opt/pennyroyal
+
+# --- the fork + its venv --------------------------------------------------
+RUN git clone --recursive ${SGLANG_FORK_REPO} . \
+    && git checkout ${SGLANG_FORK_REF} \
+    && git submodule update --init --recursive
+
+RUN uv python install ${PYTHON_VERSION} \
+    && uv venv --python ${PYTHON_VERSION} .venv
+ENV VIRTUAL_ENV=/opt/pennyroyal/.venv PATH=/opt/pennyroyal/.venv/bin:${PATH}
+
+# `--no-build-isolation` means every build backend must already live in the venv —
+# a fresh `uv venv` has none. setuptools/wheel/packaging for the editable sglang
+# build; `wheel-stub` is the PEP 517 backend NVIDIA's stub wheels (cuda-tile, …)
+# use to redirect to the real platform wheel at build time.
+RUN uv pip install setuptools wheel packaging pip wheel-stub
+
+# SGLang + FlashInfer 0.6.17 + PyTorch 2.13.0+cu130 from the fork's cu130 index.
+RUN uv pip install --prerelease=allow --index-strategy unsafe-best-match \
+        --extra-index-url https://docs.sglang.ai/whl/cu130/ \
+        --no-build-isolation -e python
+
+# --- NIXL 1.4.0 (POSIX FILE plugin) — HiCache L3 persistence backend ------
+# `ninja install` (-Dprefix=/usr/local) lays down libnixl*.so, the POSIX plugin
+# (/usr/local/lib/x86_64-linux-gnu/plugins/libplugin_POSIX.so) and the CUDA-13
+# bindings package `nixl_cu13` into the *system* site-packages — which the venv
+# doesn't see. SGLang's storage/nixl/hicache_nixl.py does `from nixl._api import
+# ...`, so the next RUN bridges /usr/local site-packages onto the venv path and
+# installs the thin `nixl` meta wheel (it re-exports nixl_cu13 by CUDA version).
+RUN git clone https://github.com/ai-dynamo/nixl.git /opt/nixl \
+    && cd /opt/nixl && git checkout ${NIXL_REF} \
+    && uv pip install meson-python pybind11 \
+    && meson setup build --buildtype=release -Dprefix=/usr/local -Denable_plugins=POSIX \
+    && ninja -C build && ninja -C build install
+ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/local/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}
+ENV NIXL_PLUGIN_DIR=/usr/local/lib/x86_64-linux-gnu/plugins
+# Make `nixl` importable from the venv (ninja put nixl_cu13 in the system
+# site-packages, and libnixl.so under /usr/local/lib*). ldconfig registers the
+# libs, a .pth bridges the system site-packages onto the venv, then the thin
+# `nixl` meta wheel goes in; assert it actually loads.
+RUN ldconfig \
+    && echo "/usr/local/lib/python3.12/site-packages" \
+      > /opt/pennyroyal/.venv/lib/python3.12/site-packages/_nixl_system.pth \
+    && uv pip install --no-deps /opt/nixl/build/src/bindings/python/nixl-meta/nixl-*-py3-none-any.whl \
+    && /opt/pennyroyal/.venv/bin/python -c "from nixl._api import nixl_agent, nixl_agent_config; print('nixl venv import OK')"
+
+# Late runtime deps kept out of the ~20 min sm120 build cache above:
+#  * ffmpeg    — torchcodec dlopen's libavutil.so.* at import; without it every
+#                startup spews OSError tracebacks (harmless for text, just noise)
+#  * libssl-dev — SGLang JIT-builds `hicache_hash_cpp` (#include <openssl/sha.h>)
+#                the first time an L3 storage backend (NIXL) is active
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- stable runtime env (from the fork's serve-*.sh; box-specific vars stay
+#     in the model YAML's container.env). Cache dirs point at /cache, a bind
+#     mount (AI-STACK: ${DOCKERDIR}/appdata/sglang-cache) so torch.compile /
+#     FlashInfer JIT / triton output survives a container recreate. ----------
+ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    SGLANG_NUMA_BIND_V2=false \
+    SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 \
+    OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 TOKENIZERS_PARALLELISM=false \
+    CACHE_BASE=/cache \
+    HF_HOME=/cache/huggingface XDG_CACHE_HOME=/cache \
+    TORCH_HOME=/cache/torch TORCHINDUCTOR_CACHE_DIR=/cache/torchinductor \
+    TRITON_CACHE_DIR=/cache/triton CUDA_CACHE_PATH=/cache/cuda \
+    FLASHINFER_WORKSPACE_BASE=/cache/flashinfer \
+    SGLANG_CACHE_DIR=/cache/sglang SGLANG_JIT_CACHE_DIR=/cache/sglang/jit \
+    TORCH_EXTENSIONS_DIR=/cache/torch_extensions
+
+# NIXL POSIX-FILE backend config for phase-2 HiCache persistence. Baked in (vs a
+# host mount) since it changes rarely; the model YAML references it with
+# `--hicache-storage-backend-extra-config @/etc/pennyroyal/nixl-posix.toml`. The
+# l3_cleaner watermarks are WHOLE-FILESYSTEM occupancy % — tuned here for the
+# WD_BLACK 4 TB (${DOCKERDIR} fs) that holds /nixl; recalculate if that changes.
+COPY nixl-posix.toml /etc/pennyroyal/nixl-posix.toml
+
+COPY entrypoint.sh /usr/local/bin/pennyroyal-entrypoint
+RUN chmod +x /usr/local/bin/pennyroyal-entrypoint
+
+EXPOSE 8001
+# stackd's SglangPennyroyalAdapter passes the whole arg list as the container
+# command (== `container.cmd_extra` + the injected --served-model-name), so the
+# entrypoint just prepares cache dirs and exec's `sglang serve "$@"`.
+ENTRYPOINT ["/usr/local/bin/pennyroyal-entrypoint"]

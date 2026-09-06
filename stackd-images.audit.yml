@@ -38,6 +38,17 @@ services:
   vllm-cuda:
     image: vllm/vllm-openai:qwen38-flash-next
 
+  # AI-STACK/config.local/models/{chat,coding}-next.yaml container.image +
+  # container.build -- the jpezzulli/sglang-rtxpro6000 "Pennyroyal" SGLang fork,
+  # built for the RTX PRO 6000 (sm120). NOT vanilla SGLang. Local build produced
+  # by `docker exec stackd stackctl build coding-next` (or chat-next); recipe in
+  # stackd/sglang_pennyroyal_image/Dockerfile.cuda. Current tag: AI-STACK/.env
+  # SGLANG_PENNYROYAL_IMAGE.
+  sglang-pennyroyal:
+    build:
+      context: stackd/sglang_pennyroyal_image
+      dockerfile: Dockerfile.cuda
+
   # config/media/image.yaml containers.cuda.image -- plain vendor pull.
   # Current value: AI-STACK/.env COMFYUI_CUDA_IMAGE
   comfyui-cuda:

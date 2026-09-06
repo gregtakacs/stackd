@@ -61,17 +61,21 @@ def _translate_preset(raw: dict, template: str) -> dict:
     presets still work.
 
       reasoning: off                        -> llamacpp: reasoning_effort=none, reasoning_budget=0
-                                               vllm:     chat_template_kwargs.enable_thinking=false
-      reasoning: low | {effort: low}        -> both:     reasoning_effort=low
-      reasoning: {effort: low, budget: N}   -> llamacpp: + reasoning_budget=N   (vllm has no per-request budget)
+                                               vllm/sglang: chat_template_kwargs.enable_thinking=false
+      reasoning: low | {effort: low}        -> all:      reasoning_effort=low
+      reasoning: {effort: low, budget: N}   -> llamacpp: + reasoning_budget=N   (vllm/sglang have no per-request budget)
+
+    vLLM (Qwen3 reasoning parser) and the sglang-pennyroyal fork (also launched
+    with --reasoning-parser qwen3 + --default-chat-template-kwargs) share the same
+    Qwen3 request dialect, so they're translated identically.
     """
     if "reasoning" not in raw:
         return dict(raw)
     out = {k: v for k, v in raw.items() if k != "reasoning"}
     spec = raw["reasoning"]
-    is_vllm = template.startswith("vllm")
+    is_qwen3_dialect = template.startswith(("vllm", "sglang"))
     if spec in ("off", False, None):
-        if is_vllm:
+        if is_qwen3_dialect:
             ctk = dict(out.get("chat_template_kwargs") or {})
             ctk["enable_thinking"] = False
             out["chat_template_kwargs"] = ctk
@@ -84,7 +88,7 @@ def _translate_preset(raw: dict, template: str) -> dict:
     if isinstance(spec, dict):
         if spec.get("effort"):
             out["reasoning_effort"] = spec["effort"]
-        if spec.get("budget") is not None and not is_vllm:
+        if spec.get("budget") is not None and not is_qwen3_dialect:
             out["reasoning_budget"] = spec["budget"]
     return out
 
@@ -298,9 +302,23 @@ class Manager:
             return RouteResult("unknown", api_name, note="no model serves this name")
         top = owners[0]
         if self.cfg.profiles[top].priority > pr.priority:
+            # `top` outranks the active profile — normally we'd auto-switch. But if
+            # the active profile is PINNED the switch will never happen, so fail
+            # fast with a clear reason instead of letting the caller poll a
+            # warming stack that never comes (a manual profile like `chat-next`
+            # that scopes its serves stays pinned and would otherwise hang any
+            # request for a name only a higher-priority profile serves).
+            if self.state.pinned:
+                return RouteResult(
+                    "outranked", api_name, profile=top,
+                    note=(f"{api_name!r} is served by profile {top!r}, but the active "
+                          f"profile {pr.profile!r} is pinned — unpin it or switch by hand"),
+                )
             try:
                 self.use(top, manual=False, now=now)
             except Outranked as e:
+                # transient refusal (e.g. min-residency window) — the caller's
+                # readiness poll re-routes each second and recovers on its own.
                 return RouteResult("warming", api_name, profile=top, note=str(e))
             return RouteResult("warming", api_name, profile=top, note=f"entered {top}; warming")
         return RouteResult("outranked", api_name, profile=top,
