@@ -241,6 +241,27 @@ def main() -> int:
     sse = b'data: {"choices":[]}\n\ndata: {"usage":{"prompt_tokens":9,"completion_tokens":3}}\n\ndata: [DONE]\n\n'
     check("_extract_usage from SSE tail", _extract_usage(sse)["completion_tokens"] == 3)
 
+    # --- prompt-cache estimator (frontier ROI proxy, not backend reuse) ------------
+    from stackd.promptcache import PromptCacheModel, pc_units
+    pcm = PromptCacheModel({"ttl_s": 300, "min_prefix_tokens": 100, "history_per_model": 8})
+    sysmsg = {"role": "system", "content": "x" * 4000}
+    b1 = {"messages": [sysmsg, {"role": "user", "content": "hello"}]}
+    b2 = {"messages": [sysmsg, {"role": "user", "content": "hello"},
+                       {"role": "assistant", "content": "hi"}, {"role": "user", "content": "again"}]}
+    check("first request under a key has no prefix to match",
+          pcm.measure("u\x00coding", pc_units(b1), 1100, now=1000) == 0)
+    c2 = pcm.measure("u\x00coding", pc_units(b2), 1200, now=1001)
+    check("follow-up matches the shared leading prefix", 0 < c2 < 1200)
+    check("a different key shares no history",
+          pcm.measure("v\x00coding", pc_units(b2), 1200, now=1002) == 0)
+    check("match expires past the TTL window",
+          pcm.measure("u\x00coding", pc_units(b2), 1200, now=1001 + 400) == 0)
+    check("disabled model (no config block) always returns 0",
+          PromptCacheModel(None).measure("k", pc_units(b2), 5000) == 0)
+    check("below min_prefix_tokens -> 0",
+          PromptCacheModel({"min_prefix_tokens": 999999}).measure(
+              "k", pc_units(b1), 10) == 0)
+
     # --- HTTP wiring --------------------------------------------------------------------
     fake = ThreadingHTTPServer(("127.0.0.1", 0), _Fake)
     threading.Thread(target=fake.serve_forever, daemon=True).start()

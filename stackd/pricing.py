@@ -27,6 +27,10 @@ _DEFAULTS = {
     ],
     "manual_prices": [],
     "exclude_models": [],
+    # frontier prefix-cache estimate for the ledger's cached_tokens — models what
+    # an Anthropic/OpenAI cache would discount (ttl_s = Anthropic's 5-min default,
+    # min_prefix_tokens = OpenAI's threshold). See promptcache.py.
+    "prompt_cache": {"ttl_s": 300, "min_prefix_tokens": 1024, "history_per_model": 24},
 }
 
 
