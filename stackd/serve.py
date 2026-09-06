@@ -820,9 +820,11 @@ class _Handler(BaseHTTPRequestHandler):
         for the ledger (bounded — only the first 256 KiB is kept).
 
         `inject_timings` (chat/completions only): if the upstream response carries a
-        `usage` block but no llama.cpp-style `timings` (i.e. vLLM / SGLang), add
+        `usage` block but no llama.cpp-style `timings` (i.e. vLLM / SGLang), fold
         Ollama-style `eval_count`/`eval_duration`/`total_duration` (proxy-measured
-        wall clock, nanoseconds) so Open WebUI can show a tokens/sec rate.
+        wall clock, nanoseconds) INTO the usage chunk itself — never as a second
+        `usage` object on the stream, which would clobber the counts for
+        last-usage-wins clients (see _merge_usage_evt).
 
         `on_body` is also handed a small `meta` dict: {prefill_s, decode_s} —
         the proxy wall-clock split (first upstream byte ~= prefill done), for the
@@ -874,6 +876,7 @@ class _Handler(BaseHTTPRequestHandler):
                 self.send_header("transfer-encoding", "chunked")
                 self.end_headers()
                 lb = b""            # line buffer — relay whole SSE events (\n\n-delimited)
+                usage_merged = False
                 while True:
                     chunk = up.read(8192)
                     if not chunk:
@@ -885,10 +888,15 @@ class _Handler(BaseHTTPRequestHandler):
                     while b"\n\n" in lb:
                         evt, lb = lb.split(b"\n\n", 1)
                         evt += b"\n\n"
-                        if inject_timings and evt.strip() == b"data: [DONE]":
-                            extra = _timing_sse_line(bytes(tail), t0, t_first, time.monotonic())
-                            if extra:
-                                _wc(extra)
+                        if inject_timings:
+                            if not usage_merged and b'"usage"' in evt:
+                                merged = _merge_usage_evt(evt, t0, t_first, time.monotonic())
+                                if merged:
+                                    evt, usage_merged = merged, True
+                            if evt.strip() == b"data: [DONE]" and not usage_merged:
+                                extra = _timing_sse_line(bytes(tail), t0, t_first, time.monotonic())
+                                if extra:
+                                    _wc(extra)
                         _wc(evt)
                 if lb:
                     _wc(lb)
@@ -1014,14 +1022,9 @@ def _ollama_timings(usage: dict, prefill_s, decode_s: float, total_s: float) -> 
     return tm
 
 
-def _timing_sse_line(tail: bytes, t0: float, t_first, t_end: float) -> bytes | None:
-    """A synthetic `data:` chunk carrying only the Ollama timing fields, to emit
-    just before `data: [DONE]`. None if there's nothing to add."""
-    if _extract_timings(tail):                       # llama.cpp already has real timings
-        return None
-    usage = _extract_usage(tail)                     # needs stream_options.include_usage
-    if not usage or not usage.get("completion_tokens"):
-        return None
+def _wall_timings(usage: dict, t0: float, t_first, t_end: float) -> dict:
+    """Proxy wall-clock split (first upstream byte ~= prefill done) as Ollama
+    timing fields, with the degenerate-rate guard shared by both injection paths."""
     ct = int(usage.get("completion_tokens") or 0)
     prefill_s = (t_first - t0) if t_first else None
     decode_s = (t_end - t_first) if t_first else (t_end - t0)
@@ -1031,10 +1034,53 @@ def _timing_sse_line(tail: bytes, t0: float, t_first, t_end: float) -> bytes | N
     # the elapsed time on decode and drop the prefill split.
     if ct > 4 and decode_s > 0 and ct / decode_s > 3000:
         decode_s, prefill_s = (t_end - t0), None
-    tm = _ollama_timings(usage, prefill_s, decode_s, t_end - t0)
-    chunk = {"id": "stackd-timing", "object": "chat.completion.chunk",
-             "created": int(time.time()), "choices": [], "usage": tm}
-    return b"data: " + json.dumps(chunk).encode() + b"\n\n"
+    return _ollama_timings(usage, prefill_s, decode_s, t_end - t0)
+
+
+def _merge_usage_evt(evt: bytes, t0: float, t_first, t_end: float) -> bytes | None:
+    """Fold the Ollama eval_* timing fields INTO an OpenAI SSE `usage` chunk,
+    in place — so one object carries both token counts and rate.
+
+    Emitting a SECOND, timing-only `usage` chunk after the real one (the old
+    shape) silently zeroes the counts for any client that keeps the LAST usage
+    object it sees on a stream (the documented stream_options.include_usage
+    pattern — e.g. Cline): the eval_* object has no prompt_tokens/completion_
+    tokens. None if this event is not a mergeable usage chunk (llama.cpp chunks
+    carry real `timings` already; already-merged chunks must not double up)."""
+    stripped = evt.strip()
+    if not stripped.startswith(b"data:") or stripped == b"data: [DONE]" or b'"usage"' not in stripped:
+        return None
+    try:
+        doc = json.loads(stripped[len(b"data:"):].strip())
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    u = doc.get("usage")
+    # a `timings` key (even empty) means the engine claims the timing channel;
+    # an already-merged usage (eval_count present) must not double up
+    if (not isinstance(u, dict) or not u.get("completion_tokens")
+            or "timings" in doc or u.get("eval_count") is not None):
+        return None
+    doc["usage"] = {**u, **_wall_timings(u, t0, t_first, t_end)}
+    return b"data: " + json.dumps(doc).encode() + b"\n\n"
+
+
+def _timing_sse_line(tail: bytes, t0: float, t_first, t_end: float) -> bytes | None:
+    """A synthetic `data:` chunk carrying only the Ollama timing fields, to emit
+    just before `data: [DONE]` — FALLBACK ONLY, for streams where
+    _merge_usage_evt couldn't rewrite the usage chunk in place. None if there's
+    nothing to add (no usage block — or llama.cpp already ships real timings)."""
+    if _extract_timings(tail):                       # llama.cpp already has real timings
+        return None
+    usage = _extract_usage(tail)                     # needs stream_options.include_usage
+    if not usage or not usage.get("completion_tokens"):
+        return None
+    return (b"data: " + json.dumps({
+        "id": "stackd-timing", "object": "chat.completion.chunk",
+        "created": int(time.time()), "choices": [],
+        "usage": _wall_timings(usage, t0, t_first, t_end),
+    }).encode() + b"\n\n")
 
 
 def _inject_body_timings(data: bytes, t0: float, t_end: float) -> bytes | None:

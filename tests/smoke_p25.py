@@ -157,8 +157,10 @@ def main() -> int:
 
         # --- Ollama timing injection for an OpenAI-shaped (vLLM/SGLang) stream ---
         # coding still points at the echo upstream; stream a request and confirm
-        # the proxy adds a `stackd-timing` chunk with eval_count/eval_duration so
-        # Open WebUI can show a tok/s rate.
+        # the proxy MERGES eval_count/eval_duration INTO the real usage chunk —
+        # exactly one usage object on the stream, counts intact (a second,
+        # timing-only usage chunk zeroes the counts for last-usage-wins clients
+        # like Cline).
         raw = b""
         r = urllib.request.Request(
             f"{base}/v1/chat/completions",
@@ -168,16 +170,25 @@ def main() -> int:
             method="POST")
         with urllib.request.urlopen(r, timeout=10) as resp:
             raw = resp.read()
-        tline = next((l for l in raw.split(b"\n\n") if b"stackd-timing" in l), b"")
-        tj = json.loads(tline[len(b"data: "):]) if tline else {}
-        tu = tj.get("usage", {})
-        check("timing chunk injected before [DONE]",
-              b"stackd-timing" in raw and raw.rfind(b"stackd-timing") < raw.rfind(b"[DONE]"))
-        check("timing chunk carries eval_count == completion_tokens", tu.get("eval_count") == 21)
-        check("timing chunk carries a positive eval_duration (ns)",
-              isinstance(tu.get("eval_duration"), int) and tu["eval_duration"] > 0)
-        check("real usage chunk preserved untouched",
-              b'"completion_tokens":21' in raw and b'"prompt_tokens":7' in raw)
+        usage_chunks = [l for l in raw.split(b"\n\n") if b'"usage"' in l]
+        check("exactly one usage-bearing chunk (no shadow stackd-timing chunk)",
+              len(usage_chunks) == 1 and b"stackd-timing" not in raw)
+        u = json.loads(usage_chunks[0][len(b"data: "):]).get("usage") if usage_chunks else {}
+        check("usage chunk still carries the real token counts",
+              u.get("prompt_tokens") == 7 and u.get("completion_tokens") == 21
+              and u.get("total_tokens") == 28)
+        check("timing fields merged into that same usage chunk",
+              u.get("eval_count") == 21 and isinstance(u.get("eval_duration"), int)
+              and u["eval_duration"] > 0)
+        check("[DONE] still terminates the stream", raw.rstrip().endswith(b"data: [DONE]"))
+        # merge guards: llama.cpp chunks (real timings) and already-merged chunks
+        from stackd.serve import _merge_usage_evt
+        check("merge skips llama.cpp timings chunks",
+              _merge_usage_evt(b'data: {"usage":{"completion_tokens":5},"timings":{}}',
+                               0.0, 0.5, 1.0) is None)
+        check("merge skips already-merged chunks",
+              _merge_usage_evt(b'data: {"usage":{"completion_tokens":5,"eval_count":5}}',
+                               0.0, 0.5, 1.0) is None)
 
         code, st = _req(f"{base}/profiles/chat/activate", token="secret", body={})
         check("control: /profiles/chat/activate -> 200", code == 200)
