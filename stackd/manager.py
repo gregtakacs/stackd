@@ -54,6 +54,46 @@ def _serves(cfg: Config, model_name: str, api_name: str) -> tuple[bool, bool]:
     return matches, exact
 
 
+_CTX_FLAGS = ("--ctx-size", "-c", "--max-model-len", "--context-length")
+
+
+def _ctx_from_args(args: list) -> int | None:
+    """The LAST context-size value in a raw engine arg list. Engines take
+    last-wins for repeated flags, so scanning in launch order and returning
+    the final hit is what the server will actually run with."""
+    val: int | None = None
+    args = list(args or [])
+    for i, a in enumerate(args):
+        if str(a) in _CTX_FLAGS and i + 1 < len(args):
+            try:
+                val = int(str(args[i + 1]))
+            except ValueError:
+                pass
+    return val
+
+
+def model_context_length(cfg: Config, model_name: str) -> int | None:
+    """The context length the engine behind this stack ACTUALLY serves with.
+
+    Resolution mirrors the launch command — later sources override earlier:
+      1. typed params (llama.cpp `ctx`, vLLM `max_model_len`, SGLang
+         `context_length`) — rendered first by the adapters;
+      2. llama.cpp `params.extra_args` (appended after the rendered --ctx-size);
+      3. `engine.container.cmd_extra` (where vLLM/SGLang's real args live).
+    """
+    e = cfg.models[model_name].engine
+    p = e.params
+    ctx = p.get("ctx") or p.get("max_model_len") or p.get("context_length")
+    for src in (p.get("extra_args") or [], e.container.cmd_extra or []):
+        v = _ctx_from_args(src)
+        if v is not None:
+            ctx = v
+    try:
+        return int(ctx) if ctx else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _translate_preset(raw: dict, template: str) -> dict:
     """Expand stackd's engine-agnostic ``reasoning:`` preset key into the request
     dialect of the engine that will actually serve the call. Everything else
@@ -450,7 +490,6 @@ class Manager:
         for pr in sorted(self.cfg.profiles.values(), key=lambda p: -p.priority):
             for mn in pr.models:
                 m = self.cfg.models[mn]
-                ctx = m.engine.params.get("ctx") or m.engine.params.get("max_model_len")
                 for se in m.serves:
                     if se.api_name in seen or "*" in se.api_name:
                         continue
@@ -463,8 +502,24 @@ class Manager:
                     glob_here = any(_serves(self.cfg, x, se.api_name)[0] for x in pr_active.models)
                     up = any(x in running for x in pr_active.models
                              if _serves(self.cfg, x, se.api_name)[0])
+                    # Who ANSWERS this name right now: the active profile's first
+                    # (priority-order) match — a stand-in counts — else the home
+                    # model that defines it. The advertised context is THAT
+                    # stack's real window, not the covered model's: a stand-in
+                    # with a smaller ctx would otherwise overpromise, and one
+                    # with a bigger ctx would hide room the client could use.
+                    provider = mn
+                    if glob_here:
+                        provider = next(x for x in pr_active.models
+                                        if _serves(self.cfg, x, se.api_name)[0])
                     seen[se.api_name] = {
-                        "id": se.api_name, "context_length": ctx,
+                        "id": se.api_name,
+                        "context_length": model_context_length(self.cfg, provider),
+                        # the home model's own window, kept for reference — the
+                        # value clients see once the name is natively served.
+                        "native_context_length": model_context_length(self.cfg, mn),
+                        # stack whose engine the advertised context_length came from
+                        "context_provider": provider,
                         # who actually answers this right now: the active profile
                         # if it serves the name, else its highest-priority home.
                         "owner_profile": self.state.active_profile if glob_here else pr.profile,

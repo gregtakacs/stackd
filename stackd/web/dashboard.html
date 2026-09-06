@@ -843,6 +843,7 @@ function renderCatalog(models, activeProfile) {
   const rows = (models.data || []).map(m => {
     const s = m.stackd || {};
     return [m.id, s.owner_profile || "", !!s.ready, m.context_length,
+            s.native_context_length, s.context_provider || "",
             s.native !== false, !!s.standin];
   });
   if (unchanged("catalog", [rows, activeProfile])) return;
@@ -850,13 +851,18 @@ function renderCatalog(models, activeProfile) {
   const t = el("table");
   t.innerHTML = "<thead><tr><th>model</th><th>owner profile</th><th class=num>ctx</th><th>state</th></tr></thead>";
   const tb = el("tbody");
-  for (const [id, owner, ready, ctx, native, standin] of rows) {
+  for (const [id, owner, ready, ctx, nctx, provider, native, standin] of rows) {
     const tr = el("tr");
     tr.append(el("td", null, id));
     const oc = el("td");
     oc.append(el("span", null, owner || "–"));
     tr.append(oc);
-    tr.append(el("td", "num", ctx ? fmtNum(ctx) : "–"));
+    // ctx is the ANSWERING stack's real window — flag when a stand-in's differs
+    // from the home model's own context.
+    const cc = el("td", "num", ctx ? fmtNum(ctx) : "–");
+    if (ctx && nctx && nctx !== ctx)
+      cc.title = `home model ctx ${fmtNum(nctx)} — currently answered by ${provider}`;
+    tr.append(cc);
     const stc = el("td");
     const lbl = native ? (ready ? " native · ready" : " native · loading")
               : standin ? (ready ? " served by stand-in" : " stand-in not loaded")

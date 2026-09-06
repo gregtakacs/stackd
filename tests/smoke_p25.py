@@ -140,6 +140,21 @@ def main() -> int:
         check("vllm stand-in: body model rewritten to the stack's served name (stack name by default)",
               res.get("echo", {}).get("model") == "coding")
 
+        # --- /v1/models while a stand-in answers: advertise the ANSWERING
+        #     stack's real ctx (coding's), not the covered model's (chat's). ---
+        ce = mgr.cfg.models["coding"].engine
+        ce.container.cmd_extra[ce.container.cmd_extra.index("--max-model-len") + 1] = "131072"
+        code, models2 = _req(f"{base}/v1/models", token="secret")
+        ids2 = {mm["id"]: mm for mm in models2.get("data", [])}
+        a = ids2.get("assistant", {})
+        check("covered name advertises the stand-in's context_length",
+              code == 200 and a.get("context_length") == 131072)
+        check("home window kept as stackd.native_context_length",
+              a.get("stackd", {}).get("native_context_length") == 262144)
+        check("stackd.context_provider names the answering stack",
+              a.get("stackd", {}).get("context_provider") == "coding"
+              and a.get("stackd", {}).get("standin") is True)
+
         # --- Ollama timing injection for an OpenAI-shaped (vLLM/SGLang) stream ---
         # coding still points at the echo upstream; stream a request and confirm
         # the proxy adds a `stackd-timing` chunk with eval_count/eval_duration so

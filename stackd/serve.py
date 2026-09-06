@@ -204,7 +204,11 @@ class _Handler(BaseHTTPRequestHandler):
                         "context_length": m["context_length"],
                         "stackd": {"owner_profile": m["owner_profile"], "ready": m["ready"],
                                    "native": m.get("native", True),
-                                   "standin": m.get("standin", False)},
+                                   "standin": m.get("standin", False),
+                                   # the covered model's own window + which stack
+                                   # the advertised context_length really comes from
+                                   "native_context_length": m.get("native_context_length"),
+                                   "context_provider": m.get("context_provider")},
                     }
                     for m in cat
                 ],

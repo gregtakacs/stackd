@@ -195,6 +195,66 @@ def t_reactive_entry_and_standin() -> None:
           r_lo.preset.get("reasoning_effort") == "low" and "reasoning_budget" not in r_lo.preset)
 
 
+def t_catalog_advertises_answering_ctx() -> None:
+    """The context advertised for a covered name must be the ANSWERING stack's
+    real window — not the covered model's (a stand-in with a smaller ctx would
+    overpromise, one with a bigger ctx would hide usable room)."""
+    import copy
+
+    from stackd.manager import model_context_length
+
+    m = mgr(FakeRunner(ready_after=1), switch_cooldown_s=0)
+    m.use("chat", now=0)
+    ready_all(m)
+    cat = {e["id"]: e for e in m.models_catalog()}
+    check("native: assistant advertises its own ctx",
+          cat["assistant"]["context_length"] == 262144
+          and cat["assistant"]["context_provider"] == "chat"
+          and cat["assistant"]["native_context_length"] == 262144)
+
+    # enter coding (assistant* now stands in) and give it a SMALLER window
+    m.route("assistant-coder", now=100)
+    ready_all(m, now_start=100)
+    ce = m.cfg.models["coding"].engine
+    ce.container.cmd_extra[ce.container.cmd_extra.index("--max-model-len") + 1] = "131072"
+    cat = {e["id"]: e for e in m.models_catalog()}
+    check("covered name advertises the stand-in's ctx, not its own",
+          cat["assistant"]["context_length"] == 131072
+          and cat["assistant"]["context_provider"] == "coding"
+          and cat["assistant"]["native_context_length"] == 262144
+          and cat["assistant"]["standin"] is True)
+    check("stand-in's own names advertise its ctx",
+          cat["assistant-coder"]["context_length"] == 131072
+          and cat["assistant-coder"]["context_provider"] == "coding")
+
+    # back home -> the native window returns
+    m.use("chat", now=200)
+    cat = {e["id"]: e for e in m.models_catalog()}
+    check("back on the home profile, ctx reverts to the native model's",
+          cat["assistant"]["context_length"] == 262144
+          and cat["assistant"]["context_provider"] == "chat")
+
+    # model_context_length resolution: params, then extra_args, then cmd_extra
+    check("helper: llama.cpp params ctx",
+          model_context_length(m.cfg, "chat") == 262144)
+    c = copy.deepcopy(m.cfg.models["chat"])
+    c.engine.params["extra_args"] = ["-c", "4096"]
+    check("helper: llama.cpp extra_args -c overrides params ctx",
+          model_context_length(_cfg_with(m, "chat", c), "chat") == 4096)
+    c.engine.container.cmd_extra.extend(["--ctx-size", "8192"])
+    check("helper: cmd_extra ctx-size wins over everything",
+          model_context_length(_cfg_with(m, "chat", c), "chat") == 8192)
+    check("helper: vllm max_model_len via params OR cmd_extra",
+          model_context_length(m.cfg, "coding") == 131072)
+
+
+def _cfg_with(m, name, model_spec):
+    """A shallow clone of m.cfg with one model swapped in (for helper tests)."""
+    import dataclasses
+
+    return dataclasses.replace(m.cfg, models={**m.cfg.models, name: model_spec})
+
+
 def t_preset_translation() -> None:
     from stackd.manager import _translate_preset
     check("llamacpp reasoning:off",
@@ -689,6 +749,7 @@ def main() -> int:
         t_no_timer_profile_autopins_on_entry,
         t_shutdown_engines_tears_down_everything,
         t_reactive_entry_and_standin,
+        t_catalog_advertises_answering_ctx,
         t_preset_translation,
         t_sglang_pennyroyal_adapter,
         t_cuda_drain_barrier,
