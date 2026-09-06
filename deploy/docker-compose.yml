@@ -5,6 +5,9 @@
 #   docker compose up -d                 # stackd + the scoped docker API  (LLM proxy + MCP)
 #   docker compose --profile full up -d  # ^ + Open WebUI (chat UI, image round-trip)
 #
+#   docker compose exec stackd stackctl down   # tear down every engine stackd
+#   docker compose down                        # spawned, THEN remove stackd itself
+#
 #   OpenAI endpoint : http://localhost:11444/v1     (Authorization: Bearer $STACKD_API_KEY)
 #   image MCP       : http://localhost:8000/mcp     (Authorization: Bearer $MCP_API_KEY)
 #   Open WebUI      : http://localhost:3000         (--profile full)
@@ -29,6 +32,10 @@ services:
       dockerfile: Dockerfile
     image: stackd:local
     restart: unless-stopped
+    # A SIGTERM (compose down / restart) is handled gracefully; with
+    # STACKD_TEARDOWN_ON_SIGTERM it also stops every engine (vLLM gets 60s), so
+    # give the daemon room before Docker's SIGKILL.
+    stop_grace_period: 120s
     runtime: nvidia                        # for nvidia-smi (drain barrier + probes). Drop on a non-NVIDIA host.
     # Uncomment on a host with an AMD integrated GPU to get its live stats in the
     # dashboard (GET /gpu -> igpu0). Read-only telemetry — no compute.
@@ -52,6 +59,12 @@ services:
       - STACKD_STATE=/data/state.json
       - STACKD_ENV_FILE=/run/stackd-env/.env       # this dir is bind-mounted -> `stackctl reload` sees edits
       - STACKD_CONFIG_OVERLAY=${STACKD_CONFIG_OVERLAY:-}   # private per-file config overlay (see below)
+      # 1 -> a plain `docker compose down` also tears down every engine stackd
+      # spawned (nothing left holding VRAM). Leave unset if you use
+      # `docker compose restart stackd` / rebuilds — those also SIGTERM, and you
+      # want the engines kept (boot_reset re-adopts them). `stackctl down` always
+      # tears down regardless.
+      - STACKD_TEARDOWN_ON_SIGTERM=${STACKD_TEARDOWN_ON_SIGTERM:-}
       # image MCP + Open WebUI wiring
       - MCP_PORT=8000
       - MCP_API_KEY=${MCP_API_KEY}

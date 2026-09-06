@@ -196,6 +196,11 @@ def _build_parser() -> argparse.ArgumentParser:
     rl.add_argument("--port", type=int, default=int(os.environ.get("STACKD_PORT", "11444")))
     rl.add_argument("--api-key", default=_env_or_file("STACKD_API_KEY"))
 
+    dn = sub.add_parser("down", help="tear down every engine the running daemon spawned, then stop it")
+    dn.add_argument("--host", default=os.environ.get("STACKD_HOST", "127.0.0.1"))
+    dn.add_argument("--port", type=int, default=int(os.environ.get("STACKD_PORT", "11444")))
+    dn.add_argument("--api-key", default=_env_or_file("STACKD_API_KEY"))
+
     im = sub.add_parser("image", help="inspect / swap / bench the elastic image tier (talks to the daemon)")
     im.add_argument("--sizes", default="1024", help="bench: comma-separated square px (e.g. 1024,1536)")
     im.add_argument("--prompt", default=None, help="bench: generation prompt override")
@@ -333,6 +338,35 @@ def _cmd_reload(args) -> int:
     for ev in body.get("events", []):
         d = f" — {ev['detail']}" if ev.get("detail") else ""
         print(f"  {ev['action']:<10} {ev['stack']}{d}")
+    return 0
+
+
+def _cmd_down(args) -> int:
+    """POST /shutdown to the RUNNING daemon: it tears down every engine it
+    spawned (through the Docker socket) and then exits. Follow with
+    `docker compose down` to remove stackd + the socket proxy themselves."""
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    url = f"http://{args.host}:{args.port}/shutdown"
+    headers = {"content-type": "application/json"}
+    if args.api_key:
+        headers["authorization"] = f"Bearer {args.api_key}"
+    req = urllib.request.Request(url, data=b"{}", method="POST", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=300) as r:
+            body = _json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        print(f"down failed (HTTP {e.code})", file=sys.stderr)
+        return 1
+    except urllib.error.URLError as e:
+        print(f"down failed: {e} — is `stackctl serve` running on {args.host}:{args.port}?",
+              file=sys.stderr)
+        return 1
+    stopped = body.get("stopped", [])
+    print(f"tore down {len(stopped)} engine(s): {', '.join(stopped) or 'none'}")
+    print("daemon exiting — run `docker compose down` to remove stackd + the socket proxy")
     return 0
 
 
@@ -539,6 +573,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "reload":
         return _cmd_reload(args)
+    if args.cmd == "down":
+        return _cmd_down(args)
 
     if args.cmd == "image":
         return _cmd_image(args)

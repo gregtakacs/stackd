@@ -86,6 +86,7 @@ stackctl image show | use <m> | capability <v>   # inspect / swap the elastic im
 stackctl bench <model> [--verify <prof>]   # measure a model's real VRAM/RAM footprint
 stackctl build <target>                    # build a local image — a model, or "image:vulkan"
 stackctl serve                             # the daemon: OpenAI front + MCP + supervisor
+stackctl down                              # tear down every engine the daemon spawned, then stop it
 stackctl --fake use|tick|route|status      # dry-run the control loop with no GPUs/docker
 ```
 

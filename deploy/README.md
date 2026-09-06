@@ -146,7 +146,24 @@ docker compose exec stackd stackctl use <profile>   # NOTE: only when the daemon
 curl -X POST http://localhost:11444/profiles/<profile>/activate -H "Authorization: Bearer $STACKD_API_KEY"
 docker compose exec stackd stackctl bench <model>   # measure a model's real VRAM/RAM footprint
 docker compose exec stackd stackctl build image:vulkan   # build a local image (a model name, or "<kind>:<backend>")
+docker compose exec stackd stackctl down            # tear down every engine, then stop the daemon
 ```
+
+### Bringing it down
+
+The LLM / image engines are containers **stackd** creates through the socket
+proxy — they are not in this compose file, so a plain `docker compose down`
+stops `stackd` but leaves them orphaned and holding VRAM. Either:
+
+```bash
+docker compose exec stackd stackctl down   # stops every engine, then the daemon exits
+docker compose down                         # now removes stackd + the socket proxy
+```
+
+or set `STACKD_TEARDOWN_ON_SIGTERM=1` in `.env` so a plain `docker compose down`
+does the teardown itself. Leave it unset if you use `docker compose restart
+stackd` or rebuilds — those SIGTERM too, and there you *want* the engines kept
+(stackd re-adopts the healthy ones on the next boot).
 
 ---
 

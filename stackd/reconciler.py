@@ -106,6 +106,29 @@ class Reconciler:
             self._emit(name, "degraded", "nvidia-smi did not respond after teardown")
         state.stacks.pop(name, None)
 
+    def teardown_all(self, state: RuntimeState, now: float, *, why: str = "shutdown") -> list[str]:
+        """Stop + remove every engine this reconciler manages — the elastic image
+        tier and all LLM stacks — via the runner (i.e. through the Docker socket).
+        For a deliberate whole-stack stop so nothing stackd spawned is left
+        orphaned holding VRAM after the daemon exits. Best-effort: one engine that
+        won't die doesn't abort the rest. Returns the names it removed."""
+        removed: list[str] = []
+        if state.image is not None:
+            removed.append(f"image:{state.image.active_model}")
+            try:
+                self._teardown_image(state, now, why=why)
+            except Exception as e:  # noqa: BLE001
+                self._emit("image", "teardown-error", repr(e))
+                state.image = None
+        for n in list(state.stacks):
+            try:
+                self._stop(state, n, now, remove=True)
+            except Exception as e:  # noqa: BLE001
+                self._emit(n, "teardown-error", repr(e))
+                state.stacks.pop(n, None)
+            removed.append(n)
+        return list(dict.fromkeys(removed))
+
     def _drain_cuda(self, freed: list[str]) -> bool:
         """Poll free VRAM after a cuda0 teardown until it has settled (stopped
         climbing), then allow the spawn. Returns False — abort the spawn — if

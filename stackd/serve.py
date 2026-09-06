@@ -11,7 +11,9 @@ from __future__ import annotations
 import datetime
 import functools
 import json
+import os
 import pathlib
+import signal
 import threading
 import time
 import urllib.error
@@ -235,6 +237,9 @@ class _Handler(BaseHTTPRequestHandler):
 
         if self.path == "/reload":
             return self._reload()
+
+        if self.path == "/shutdown":
+            return self._shutdown()
 
         if self.path == "/savings/refresh":
             return self._savings_refresh()
@@ -603,6 +608,21 @@ class _Handler(BaseHTTPRequestHandler):
             "status": self.mgr.status(),
         })
 
+    def _shutdown(self):
+        """POST /shutdown — tear down every engine stackd spawned (LLM stacks +
+        the elastic image tier) through the Docker socket, then stop the daemon.
+        For a clean whole-stack stop: nothing stackd created is left orphaned
+        holding VRAM. `stackctl down` is the CLI for this."""
+        with self.lock:
+            removed = self.mgr.shutdown_engines()
+        for n in removed:
+            print(f"[{time.strftime('%H:%M:%S')}] teardown {n} (shutdown)")
+        events.record("shutdown", "", f"removed {', '.join(removed) or 'nothing'}", source="shutdown")
+        self._send_json(200, {"stopped": removed, "note": "daemon exiting"})
+        # serve_forever() only returns from another thread; do it after the
+        # response has flushed so `stackctl down` gets its 200.
+        threading.Thread(target=self.httpd.shutdown, daemon=True).start()
+
     def _image_swap(self):
         """POST /image/model {name} | /image/capability {need} — bring a different
         image model resident. 200 with the swap result (incl. `note` on a
@@ -880,7 +900,9 @@ def make_server(mgr: Manager, host: str, port: int, api_key: str | None,
         "store": store, "owu_base_url": owu_base_url, "pricing_path": pricing_path,
         "cleaner": cleaner,
     })
-    return ThreadingHTTPServer((host, port), handler)
+    srv = ThreadingHTTPServer((host, port), handler)
+    handler.httpd = srv          # so POST /shutdown can stop serve_forever()
+    return srv
 
 
 def serve(mgr: Manager, host: str, port: int, api_key: str | None,
@@ -898,6 +920,33 @@ def serve(mgr: Manager, host: str, port: int, api_key: str | None,
     lock = httpd.RequestHandlerClass.lock  # type: ignore[attr-defined]
     stop = threading.Event()
     last_energy = [time.time()]
+
+    # SIGTERM (docker stop / compose down) -> graceful exit: run the `finally`
+    # below (save state, stop the server). Engine containers are LEFT RUNNING by
+    # default so a `compose restart` / rebuild keeps them (boot_reset re-adopts
+    # the healthy ones). Set STACKD_TEARDOWN_ON_SIGTERM=1 to also tear every
+    # engine down here — for a host where `compose down` should leave nothing
+    # holding VRAM and an in-place restart isn't used. Explicit `stackctl down`
+    # always tears down regardless of the env var.
+    _term_teardown = os.environ.get("STACKD_TEARDOWN_ON_SIGTERM", "").lower() in ("1", "true", "yes")
+
+    def _on_sigterm(signum, _frame):
+        name = signal.Signals(signum).name
+        print(f"\n[{time.strftime('%H:%M:%S')}] {name} — shutting down"
+              + (" (tearing down engines)" if _term_teardown else ""))
+        def _do():
+            if _term_teardown:
+                try:
+                    with lock:
+                        for n in mgr.shutdown_engines():
+                            print(f"[{time.strftime('%H:%M:%S')}] teardown {n} (shutdown)")
+                except Exception as e:  # noqa: BLE001
+                    print(f"[shutdown] engine teardown error: {e}")
+            stop.set()
+            httpd.shutdown()
+        threading.Thread(target=_do, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
 
     def _resident_comfy() -> str | None:
         with lock:

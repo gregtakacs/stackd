@@ -231,6 +231,16 @@ class Manager:
         self._save()
         return list(self.rec.events)
 
+    def shutdown_engines(self, *, now: float | None = None) -> list[str]:
+        """Tear down every engine container stackd spawned (all LLM stacks + the
+        elastic image tier) through the Docker socket, then persist. For a clean
+        whole-stack stop: `stackctl down`, or a SIGTERM when
+        STACKD_TEARDOWN_ON_SIGTERM is set. Returns the names removed."""
+        now = time.time() if now is None else now
+        removed = self.rec.teardown_all(self.state, now)
+        self._save()
+        return removed
+
     def pin(self) -> None:
         self.state.pinned = True
         self._save()

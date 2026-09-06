@@ -248,6 +248,26 @@ def t_cuda_drain_barrier() -> None:
     check("wedge -> coding NOT spawned on the stuck card", "coding" not in m2.state.stacks)
 
 
+def t_shutdown_engines_tears_down_everything() -> None:
+    fake = FakeRunner(ready_after=1)
+    m = mgr(fake)
+    m.use("chat", now=0)
+    ready_all(m)
+    had = set(m.state.stacks)
+    check("engines + image up before shutdown", len(had) >= 1 and m.state.image is not None)
+    cns = [rt.handle or rt.container for rt in m.state.stacks.values()]
+    cns.append(m.state.image.handle or m.state.image.container)
+    removed = m.shutdown_engines(now=500)
+    check("shutdown_engines reports every stack + the image tier",
+          set(n for n in removed if not n.startswith("image:")) == had
+          and any(n.startswith("image:") for n in removed))
+    check("state is empty afterwards", not m.state.stacks and m.state.image is None)
+    check("containers were actually removed via the runner",
+          all(cn in fake.removed for cn in cns))
+    # idempotent — a second call on an already-clean state is a no-op
+    check("second shutdown_engines is a no-op", m.shutdown_engines(now=600) == [])
+
+
 def t_tick_sweeps_stray_stacks() -> None:
     """A stack left in state that the active profile doesn't want (e.g. a switch
     whose converge threw mid-teardown) is stopped by the next tick, not
@@ -603,6 +623,7 @@ def main() -> int:
         t_pin_blocks_self_evict,
         t_idle_evict_counts_from_load_not_activation,
         t_no_timer_profile_autopins_on_entry,
+        t_shutdown_engines_tears_down_everything,
         t_reactive_entry_and_standin,
         t_preset_translation,
         t_cuda_drain_barrier,
