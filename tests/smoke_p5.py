@@ -129,6 +129,12 @@ def main() -> int:
     check("ctx_tokens_sum + ctx_tokens_max fold through",
           sum(r["ctx_tokens_sum"] for r in rows) == 3 * 1500 + 2800
           and max(r["ctx_tokens_max"] for r in rows) == 2800)
+    check("ctx_tokens_sq_sum folds through (raw + rolled) for the token-weighted mean",
+          sum(r["ctx_tokens_sq_sum"] for r in rows) == 3 * 1500 ** 2 + 2800 ** 2)
+    _sqs = sum(r["ctx_tokens_sq_sum"] for r in rows)   # 3·1500² + 2800² = 14_590_000
+    _sms = sum(r["ctx_tokens_sum"] for r in rows)      # 3·1500  + 2800  =      7_300
+    check("token-weighted mean = Σctx² / Σctx (pulled toward the 2800 row vs. arith. 1825)",
+          round(_sqs / _sms) == 1999)
 
     # --- v2 -> v3 migration: split the conflated column into stack + checkpoint --
     import sqlite3 as _sqm
@@ -158,8 +164,9 @@ def main() -> int:
     check("v3 migration: old stack id moved to served_stack, checkpoint seeded '?'",
           mr["served_stack"] == "coding" and mr["served_model"] == "?"
           and mr["reqs"] == 4 and mr["prompt_tokens"] == 400)
-    check("v4 migration adds the context columns",
-          "ctx_tokens" in ucols and {"ctx_tokens_sum", "ctx_tokens_max", "ctx_n"} <= dcols)
+    check("v4/v7 migration adds the context columns",
+          "ctx_tokens" in ucols
+          and {"ctx_tokens_sum", "ctx_tokens_sq_sum", "ctx_tokens_max", "ctx_n"} <= dcols)
     check("v6 migration: dead per-request timing columns are gone",
           not ({"prefill_ms", "decode_ms"} & ucols)
           and not ({"prefill_ms", "prefill_tok", "decode_ms", "decode_tok"} & dcols))
@@ -194,6 +201,9 @@ def main() -> int:
     check("v6: timing columns dropped from an existing DB",
           not ({"prefill_ms", "decode_ms"} & u6)
           and not ({"prefill_ms", "prefill_tok", "decode_ms", "decode_tok"} & d6))
+    check("v7: ctx_tokens_sq_sum added to an existing DB, back-filled 0",
+          "ctx_tokens_sq_sum" in d6
+          and m6.conn.execute("SELECT ctx_tokens_sq_sum FROM usage_daily").fetchone()[0] == 0)
     d6row = m6.conn.execute("SELECT prompt_tokens, ctx_tokens_sum FROM usage_daily").fetchone()
     check("v6: token + context data survives the column drop",
           m6.conn.execute("SELECT completion_tokens FROM usage").fetchone()[0] == 50
@@ -274,6 +284,8 @@ def main() -> int:
     check("savings.throughput is engine-measured + token-weighted",
           abs(tpv["decode_tps"] - 230) < 1 and tpv["ctx_max"] == 2800
           and abs(tpv["prefill_tps"] - 700) < 1)
+    check("savings.throughput ctx_avg is the token-weighted mean (Σctx²/Σctx), not arith.",
+          tpv["ctx_avg"] == 1999)
     # a big new ledger row must NOT move the engine tok/s (they only track engine_daily)
     st.record_usage(user_email="u@x.com", requested_model="assistant", served_stack="chat",
                     served_model="Qwen3.8-27B", served_profile="chat",

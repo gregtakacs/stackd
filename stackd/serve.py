@@ -473,8 +473,9 @@ class _Handler(BaseHTTPRequestHandler):
             pricing = load_pricing(self.pricing_path)
             per_day = {d: savings(self.store, pricing, from_day=d, to_day=d) for d in span}
         # tok/s + peak context come from the engines' own /metrics counters
-        # (engine_daily); ctx_avg (per-request mean) still comes from the ledger.
-        acc = [dict(cxs=0, cxn=0) for _ in span]
+        # (engine_daily); ctx_avg (token-weighted mean = Σctx² / Σctx) still
+        # comes from the ledger.
+        acc = [dict(cxs=0, cxsq=0) for _ in span]
         eng = [dict(pfm=0, pft=0, dcm=0, dct=0, cxm=0) for _ in span]
         for r in rows:
             i = idx.get(r["day"])
@@ -487,7 +488,7 @@ class _Handler(BaseHTTPRequestHandler):
                 series[i] += r.get(key) or 0
             a = acc[i]
             a["cxs"] += r.get("ctx_tokens_sum") or 0
-            a["cxn"] += r.get("ctx_n") or 0
+            a["cxsq"] += r.get("ctx_tokens_sq_sum") or 0
         for r in engrows:
             i = idx.get(r["day"])
             if i is None:
@@ -500,7 +501,7 @@ class _Handler(BaseHTTPRequestHandler):
         for i, (a, e) in enumerate(zip(acc, eng)):
             tp["decode_tps"][i] = round(e["dct"] * 1000 / e["dcm"], 1) if e["dcm"] else 0.0
             tp["prefill_tps"][i] = round(e["pft"] * 1000 / e["pfm"], 1) if e["pfm"] else 0.0
-            tp["ctx_avg"][i] = round(a["cxs"] / a["cxn"]) if a["cxn"] else 0
+            tp["ctx_avg"][i] = round(a["cxsq"] / a["cxs"]) if a["cxs"] else 0
             tp["ctx_max"][i] = e["cxm"]
         for r in erows:
             i = idx.get(r["day"])
@@ -599,19 +600,27 @@ class _Handler(BaseHTTPRequestHandler):
         hint = _LAST_GEN.get(stack)
         if hint:
             tel["last_request"] = hint
-            if not tel.get("active"):
-                # idle -> the last request's own llama.cpp `timings` are the
-                # authoritative "last session" numbers (the poll-based tracking
-                # is only a fallback, e.g. for vLLM).
+        if not tel.get("active"):
+            # idle -> the last request's own llama.cpp `timings` are the
+            # authoritative "last session" numbers (the poll-based tracking
+            # is only a fallback, e.g. for vLLM).
+            if hint:
                 for k in ("gen_tok_s", "prompt_tok_s", "mtp_accept_pct"):
                     if hint.get(k) is not None:
                         tel[k] = hint[k]
                         tel[k + "_session"] = hint[k]
-                hc = hint.get("ctx_tokens") or 0
-                if hc and hc > (tel.get("ctx_tokens") or 0):
-                    tel["ctx_tokens"] = hc
-                    if tel.get("ctx_max"):
-                        tel["kv_pct"] = round(100.0 * hc / tel["ctx_max"], 1)
+            # exact context-window position from the last completed request's
+            # token counts — llama.cpp `timings` (_LAST_GEN) or the OpenAI
+            # `usage` block (_LAST_CTX, vLLM/SGLang). Beats the live KV gauge
+            # while idle: SGLang's pool-wide `kv_used_tokens` lingers on
+            # retained prefix pages, and its % was pool-relative not window-
+            # relative. Recompute kv_pct window-relative to match the caption.
+            hc = ((hint or {}).get("ctx_tokens")
+                  or _LAST_CTX.get(stack, {}).get("ctx_tokens") or 0)
+            if hc and hc > (tel.get("ctx_tokens") or 0):
+                tel["ctx_tokens"] = hc
+                if tel.get("ctx_max"):
+                    tel["kv_pct"] = round(min(100.0, 100.0 * hc / tel["ctx_max"]), 1)
         return self._send_json(200, tel)
 
     def _slots(self, stack: str):
@@ -1044,6 +1053,15 @@ def _extract_usage(buf: bytes) -> dict:
 _LAST_GEN: dict = {}
 _GEN_SEQ = [0]
 
+# exact context-window position for engines with no llama.cpp `timings` channel
+# (vLLM / SGLang): {stack: {"ctx_tokens": int, "at": float}} from the last
+# completed request's OpenAI `usage`. prompt_tokens already carries the whole
+# resent conversation, so prompt+completion == that conversation's size in the
+# window — no cross-request summing. Kept OUT of _LAST_GEN (which the throughput
+# chart treats as a rate datapoint); only serve._engine's idle ctx fallback
+# reads this.
+_LAST_CTX: dict = {}
+
 
 def _extract_timings(buf: bytes) -> dict:
     """llama.cpp `timings` block — JSON body or the final SSE `data:` line."""
@@ -1073,6 +1091,17 @@ def _capture_gen(stack: str | None, buf: bytes) -> None:
         return
     tm = _extract_timings(buf)
     if not tm:
+        # vLLM / SGLang have no `timings` channel. Still record the exact
+        # window position from the OpenAI `usage` block for serve._engine's
+        # idle ctx fallback. `completion_tokens` gates out embeddings responses
+        # (prompt-only usage). Rates for these engines come from the /metrics
+        # sampler + the /engine live poll, not from here.
+        u = _extract_usage(buf)
+        if u.get("completion_tokens"):
+            _LAST_CTX[stack] = {
+                "ctx_tokens": int((u.get("prompt_tokens") or 0) + u["completion_tokens"]),
+                "at": time.time(),
+            }
         return
     g = round(tm.get("predicted_per_second") or 0, 1) or None
     p = round(tm.get("prompt_per_second") or 0, 1) or None

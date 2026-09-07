@@ -138,13 +138,14 @@ def savings(store: Store, cfg: dict, *, from_day: str | None = None,
     payback_pct = round(max(0.0, pay["net"]) / hw * 100, 2) if (hw > 0 and pay) else None
 
     # tok/s + peak context: the engines' own /metrics counters (engine_daily).
-    # ctx_avg (per-request mean) still comes from the ledger.
+    # ctx_avg (token-weighted mean = Σctx² / Σctx) still comes from the ledger.
     erows = store.engine_rows(days[0], days[-1]) if days else []
     _pfm = sum(r.get("prefill_ms") or 0 for r in erows)
     _pft = sum(r.get("prefill_tok") or 0 for r in erows)
     _dcm = sum(r.get("decode_ms") or 0 for r in erows)
     _dct = sum(r.get("decode_tok") or 0 for r in erows)
-    _cxn = sum(r.get("ctx_n") or 0 for r in rows)
+    _cxs = sum(r.get("ctx_tokens_sum") or 0 for r in rows)
+    _cxsq = sum(r.get("ctx_tokens_sq_sum") or 0 for r in rows)
     return {
         "from": days[0] if days else None, "to": days[-1] if days else None,
         "span_days": span_days,
@@ -156,7 +157,7 @@ def savings(store: Store, cfg: dict, *, from_day: str | None = None,
         "throughput": {
             "decode_tps": round(_dct * 1000 / _dcm, 1) if _dcm else 0.0,
             "prefill_tps": round(_pft * 1000 / _pfm, 1) if _pfm else 0.0,
-            "ctx_avg": round(sum(r.get("ctx_tokens_sum") or 0 for r in rows) / _cxn) if _cxn else 0,
+            "ctx_avg": round(_cxsq / _cxs) if _cxs else 0,
             "ctx_max": max((r.get("ctx_tokens_max") or 0 for r in erows), default=0),
         },
         "energy": {**energy, "kwh": round(kwh, 4), "cost": energy_cost,
@@ -214,7 +215,7 @@ def _join_engine_throughput(facts: list[dict], erows: list[dict], keys) -> None:
         if not grp:
             f = {k: v for k, v in zip(keys, (day, "(engine)", "(engine)", stack, "(engine)", "(engine)"))}
             f.update(reqs=0, prompt_tokens=0, completion_tokens=0, cached_tokens=0,
-                     ctx_tokens_sum=0, ctx_n=0, ctx_tokens_max=0,
+                     ctx_tokens_sum=0, ctx_tokens_sq_sum=0, ctx_n=0, ctx_tokens_max=0,
                      prefill_ms=0, prefill_tok=0, decode_ms=0, decode_tok=0,
                      engine_ctx_max=0, gross={})
             facts.append(f)
@@ -264,7 +265,7 @@ def savings_facts(store: Store, cfg: dict, *, from_day: str | None = None,
     for key, g in groups.items():
         rec = dict(zip(keys, key))
         for col in ("reqs", "prompt_tokens", "completion_tokens", "cached_tokens",
-                    "ctx_tokens_sum", "ctx_n"):
+                    "ctx_tokens_sum", "ctx_tokens_sq_sum", "ctx_n"):
             rec[col] = sum(x.get(col) or 0 for x in g)
         rec["ctx_tokens_max"] = max((x.get("ctx_tokens_max") or 0 for x in g), default=0)
         # timing is filled below from engine_daily, pro-rated by token share

@@ -14,7 +14,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 RETAIN_DAYS = 40
 
 _SCHEMA = """
@@ -53,11 +53,15 @@ CREATE TABLE IF NOT EXISTS usage_daily (
     prompt_tokens INTEGER DEFAULT 0,
     completion_tokens INTEGER DEFAULT 0,
     cached_tokens INTEGER DEFAULT 0,
-    -- context size: per-request mean = ctx_tokens_sum / ctx_n, peak = ctx_tokens_max.
+    -- context size (over rows with ctx_tokens>0): peak = ctx_tokens_max;
+    -- token-weighted mean = ctx_tokens_sq_sum / ctx_tokens_sum (weights each
+    -- request by its own size, so a flood of tiny agent calls can't drag it
+    -- down); plain arithmetic mean = ctx_tokens_sum / ctx_n is still available.
     -- (tok/s used to fold here too — v6 moved it to engine_daily, the /metrics sampler.)
-    ctx_tokens_sum INTEGER DEFAULT 0,  -- Σ ctx_tokens over rows with ctx_tokens>0
+    ctx_tokens_sum INTEGER DEFAULT 0,     -- Σ ctx_tokens
+    ctx_tokens_sq_sum INTEGER DEFAULT 0,  -- Σ ctx_tokens² (for the token-weighted mean)
     ctx_tokens_max INTEGER DEFAULT 0,
-    ctx_n INTEGER DEFAULT 0,           -- count of those rows -> mean = sum / ctx_n
+    ctx_n INTEGER DEFAULT 0,              -- count of those rows -> arith. mean = sum / ctx_n
     PRIMARY KEY (day, user_email, requested_model, served_profile, served_stack, served_model)
 );
 
@@ -169,7 +173,11 @@ class Store:
             """)
             dcols = {r["name"] for r in self.conn.execute("PRAGMA table_info(usage_daily)")}
         # v4: matching context running-sums on the folded table.
-        for col in ("ctx_tokens_sum", "ctx_tokens_max", "ctx_n"):
+        # v7: + ctx_tokens_sq_sum (Σ ctx²) for the token-weighted mean. Plain
+        # ADD COLUMN -> already-folded rows back-fill 0, so days older than
+        # RETAIN_DAYS show no weighted mean until new traffic; raw `usage` (the
+        # last 40 days, i.e. every default explorer range) is recomputed exactly.
+        for col in ("ctx_tokens_sum", "ctx_tokens_sq_sum", "ctx_tokens_max", "ctx_n"):
             if col not in dcols:
                 self.conn.execute(f"ALTER TABLE usage_daily ADD COLUMN {col} INTEGER DEFAULT 0")
 
@@ -373,6 +381,7 @@ class Store:
             "COUNT(*) reqs, SUM(prompt_tokens) pt, "
             "SUM(completion_tokens) ct, SUM(cached_tokens) cc, "
             "SUM(CASE WHEN ctx_tokens>0 THEN ctx_tokens ELSE 0 END) cxs, "
+            "SUM(CASE WHEN ctx_tokens>0 THEN ctx_tokens*ctx_tokens ELSE 0 END) cxsq, "
             "MAX(ctx_tokens) cxm, "
             "SUM(CASE WHEN ctx_tokens>0 THEN 1 ELSE 0 END) cxn "
             "FROM usage WHERE day < ? GROUP BY day,u,m,p,sk,sm", (cutoff,)
@@ -381,19 +390,20 @@ class Store:
             self.conn.execute(
                 "INSERT INTO usage_daily(day,user_email,requested_model,served_profile,"
                 "served_stack,served_model,reqs,prompt_tokens,completion_tokens,cached_tokens,"
-                "ctx_tokens_sum,ctx_tokens_max,ctx_n) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ctx_tokens_sum,ctx_tokens_sq_sum,ctx_tokens_max,ctx_n) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(day,user_email,requested_model,served_profile,served_stack,served_model) "
                 "DO UPDATE SET "
                 "reqs=reqs+excluded.reqs, prompt_tokens=prompt_tokens+excluded.prompt_tokens, "
                 "completion_tokens=completion_tokens+excluded.completion_tokens, "
                 "cached_tokens=cached_tokens+excluded.cached_tokens, "
                 "ctx_tokens_sum=ctx_tokens_sum+excluded.ctx_tokens_sum, "
+                "ctx_tokens_sq_sum=ctx_tokens_sq_sum+excluded.ctx_tokens_sq_sum, "
                 "ctx_tokens_max=MAX(ctx_tokens_max, excluded.ctx_tokens_max), "
                 "ctx_n=ctx_n+excluded.ctx_n",
                 (r["day"], r["u"], r["m"], r["p"], r["sk"], r["sm"],
                  r["reqs"], r["pt"], r["ct"], r["cc"],
-                 r["cxs"] or 0, r["cxm"] or 0, r["cxn"] or 0),
+                 r["cxs"] or 0, r["cxsq"] or 0, r["cxm"] or 0, r["cxn"] or 0),
             )
         cur = self.conn.execute("DELETE FROM usage WHERE day < ?", (cutoff,))
         return cur.rowcount
@@ -413,14 +423,21 @@ class Store:
             "COUNT(*) reqs, SUM(prompt_tokens) prompt_tokens, SUM(completion_tokens) completion_tokens, "
             "SUM(cached_tokens) cached_tokens, "
             "SUM(CASE WHEN ctx_tokens>0 THEN ctx_tokens ELSE 0 END) ctx_tokens_sum, "
+            "SUM(CASE WHEN ctx_tokens>0 THEN ctx_tokens*ctx_tokens ELSE 0 END) ctx_tokens_sq_sum, "
             "MAX(ctx_tokens) ctx_tokens_max, "
             "SUM(CASE WHEN ctx_tokens>0 THEN 1 ELSE 0 END) ctx_n FROM usage" + where +
             " GROUP BY day,user_email,requested_model,served_profile,served_stack,served_model", args
         ).fetchall()
         folded = self.conn.execute(
             "SELECT day,user_email,requested_model,served_profile,served_stack,served_model,reqs,"
-            "prompt_tokens,completion_tokens,cached_tokens,"
-            "ctx_tokens_sum,ctx_tokens_max,ctx_n FROM usage_daily" + where, args
+            "prompt_tokens,completion_tokens,cached_tokens,ctx_tokens_sum,ctx_tokens_max,ctx_n,"
+            # rows folded before v7 have no Σctx² -> fall back to n·mean²
+            # (= ctx_tokens_sum²/ctx_n), i.e. assume weighted == arithmetic for
+            # that row rather than let a 0 pull the pooled weighted mean down.
+            "CASE WHEN ctx_tokens_sq_sum>0 THEN ctx_tokens_sq_sum "
+            "     WHEN ctx_n>0 THEN ctx_tokens_sum*ctx_tokens_sum/ctx_n "
+            "     ELSE 0 END ctx_tokens_sq_sum "
+            "FROM usage_daily" + where, args
         ).fetchall()
         return [dict(r) for r in list(raw) + list(folded)]
 
