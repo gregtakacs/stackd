@@ -220,6 +220,26 @@ def main() -> int:
         check("alias: no-op on a body with no choices",
               _alias_response_token_ids(b'{"usage":{"completion_tokens":3}}') is None)
 
+        # SGLang reads reasoning_effort only from chat_template_kwargs; the front
+        # folds the top-level field in for sglang-template stacks.
+        from stackd.serve import _fold_reasoning_effort_into_ctk
+        b1 = {"reasoning_effort": "xhigh"}
+        _fold_reasoning_effort_into_ctk(b1)
+        check("fold: effort mirrored into chat_template_kwargs",
+              b1["chat_template_kwargs"] == {"reasoning_effort": "xhigh"})
+        b2 = {"reasoning_effort": "low", "chat_template_kwargs": {"enable_thinking": True}}
+        _fold_reasoning_effort_into_ctk(b2)
+        check("fold: keeps existing chat_template_kwargs keys",
+              b2["chat_template_kwargs"] == {"enable_thinking": True, "reasoning_effort": "low"})
+        b3 = {"reasoning_effort": "low", "chat_template_kwargs": {"reasoning_effort": "medium"}}
+        _fold_reasoning_effort_into_ctk(b3)
+        check("fold: caller's chat_template_kwargs.reasoning_effort wins",
+              b3["chat_template_kwargs"]["reasoning_effort"] == "medium")
+        b4 = {"messages": []}
+        _fold_reasoning_effort_into_ctk(b4)
+        check("fold: no-op when the request carries no reasoning_effort",
+              "chat_template_kwargs" not in b4)
+
         code, st = _req(f"{base}/profiles/chat/activate", token="secret", body={})
         check("control: /profiles/chat/activate -> 200", code == 200)
         check("control: active profile is chat", mgr.state.active_profile == "chat")

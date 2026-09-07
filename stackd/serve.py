@@ -114,6 +114,24 @@ def _map_reasoning_effort(body: dict, effort_map: dict | None) -> None:
         body["reasoning_effort"] = effort_map[eff]
 
 
+def _fold_reasoning_effort_into_ctk(body: dict) -> None:
+    """SGLang reads `reasoning_effort` ONLY from `chat_template_kwargs` — its
+    template-feature detector reported `effort_kwarg=None` for the Qwen3.8
+    Flash-Next chat template, so the top-level OpenAI field is dropped before the
+    jinja render (verified on coding-long: top-level effort has no effect, the
+    same value under chat_template_kwargs does). Mirror `body["reasoning_effort"]`
+    into `body["chat_template_kwargs"]["reasoning_effort"]` unless the caller
+    already set it there. Called only for sglang-template stacks, after
+    `_map_reasoning_effort`. No-op when there is no effort to fold."""
+    eff = body.get("reasoning_effort")
+    if not isinstance(eff, str):
+        return
+    ctk = body.get("chat_template_kwargs")
+    ctk = dict(ctk) if isinstance(ctk, dict) else {}
+    ctk.setdefault("reasoning_effort", eff)
+    body["chat_template_kwargs"] = ctk
+
+
 class _Handler(BaseHTTPRequestHandler):
     server_version = "stackd/0.2"
     protocol_version = "HTTP/1.1"
@@ -758,6 +776,7 @@ class _Handler(BaseHTTPRequestHandler):
             rr = self.mgr.route(model)
             _m = self.mgr.cfg.models.get(rr.stack) if rr.stack else None
             eff_map = _m.engine.params.get("reasoning_effort_map") if _m else None
+            serving_tmpl = _m.engine.template if _m else ""
 
         if rr.status == "unknown":
             return self._send_json(404, {"error": {"message": f"unknown model {model!r}"}})
@@ -778,6 +797,8 @@ class _Handler(BaseHTTPRequestHandler):
 
         _apply_preset(body, rr.preset)
         _map_reasoning_effort(body, eff_map)
+        if serving_tmpl.startswith("sglang"):
+            _fold_reasoning_effort_into_ctk(body)
         if rr.served_model_name:
             body["model"] = rr.served_model_name
 
