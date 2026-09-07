@@ -94,7 +94,12 @@
   .lane .bar-budget { width:26px; opacity:.9; }
   .bar-budget.over { border-color:var(--red); box-shadow:inset 0 0 0 1px var(--red); }
   .marker { position:absolute; left:-4px; right:-4px; border-top:2px dashed var(--accent); z-index:5; transition:bottom .4s ease; }
-  .marker span { position:absolute; right:0; top:-14px; font-size:.62rem; color:var(--accent); background:var(--bg); padding:0 2px; }
+  /* label sits just ABOVE the dashed line by default, LEFT-anchored inside the bar,
+     never wrapping. When the marker is near the top it flips to just BELOW the line
+     (via .marker.label-below, set in laneLive) so the bar's overflow:hidden can't clip it. */
+  .marker span { position:absolute; left:2px; top:-13px; font-size:.62rem; line-height:1.1;
+    color:var(--accent); background:var(--bg); padding:0 3px; white-space:nowrap; border-radius:3px; }
+  .marker.label-below span { top:3px; }
   .ghost { font-size:.76rem; color:var(--dim); border:1px dashed var(--border); border-radius:6px; padding:4px 8px; margin-top:6px; display:inline-block; }
 
   /* profiles */
@@ -538,7 +543,10 @@ function laneLive(lane, val) {   // per-tick: real-usage marker + the "real" hea
   const lim = m ? +m.dataset.limit : 0;
   if (m) {
     if (val == null || val <= 0 || val >= lim) m.hidden = true;
-    else { m.hidden = false; m.style.bottom = (val / lim) * 100 + "%";
+    else { m.hidden = false;
+           const pct = (val / lim) * 100;
+           m.style.bottom = pct + "%";
+           m.classList.toggle("label-below", pct > 80);   // flip label under the line near the top
            m.innerHTML = ""; m.append(el("span", null, "real " + fmtGib(val))); }
   }
   const r = lane.querySelector(".lane-real");
