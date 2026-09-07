@@ -97,6 +97,23 @@ def _apply_preset(body: dict, preset: dict) -> None:
             body[key] = val
 
 
+def _map_reasoning_effort(body: dict, effort_map: dict | None) -> None:
+    """Rewrite `body["reasoning_effort"]` through the serving engine's
+    `engine.params.reasoning_effort_map` ({caller_effort: engine_effort}), in
+    place. A value that is not a key in the map is left untouched; no map (the
+    usual case) is a no-op. Lets a client speak the OpenAI vocabulary
+    (none/minimal/low/medium/high) at an engine whose accepted set differs — e.g.
+    the vllm-flash Qwen3.8 build, which 400s on anything but none/low/medium/
+    xhigh, so `coding` maps high->xhigh and the suite's `max`->xhigh. Runs after
+    `_apply_preset`, so a pinned `-xhigh`/`-med` variant's effort is mapped too
+    (harmless: those land on values the map passes through)."""
+    if not effort_map:
+        return
+    eff = body.get("reasoning_effort")
+    if isinstance(eff, str) and eff in effort_map:
+        body["reasoning_effort"] = effort_map[eff]
+
+
 class _Handler(BaseHTTPRequestHandler):
     server_version = "stackd/0.2"
     protocol_version = "HTTP/1.1"
@@ -739,6 +756,8 @@ class _Handler(BaseHTTPRequestHandler):
 
         with self.lock:
             rr = self.mgr.route(model)
+            _m = self.mgr.cfg.models.get(rr.stack) if rr.stack else None
+            eff_map = _m.engine.params.get("reasoning_effort_map") if _m else None
 
         if rr.status == "unknown":
             return self._send_json(404, {"error": {"message": f"unknown model {model!r}"}})
@@ -758,6 +777,7 @@ class _Handler(BaseHTTPRequestHandler):
             )
 
         _apply_preset(body, rr.preset)
+        _map_reasoning_effort(body, eff_map)
         if rr.served_model_name:
             body["model"] = rr.served_model_name
 
@@ -770,7 +790,8 @@ class _Handler(BaseHTTPRequestHandler):
 
         self._relay(rr.endpoint.rstrip("/") + self.path, "POST",
                     json.dumps(body).encode(), streaming=streaming, on_body=_on_body,
-                    inject_timings=_INJECT_TIMINGS and not is_embeddings)
+                    inject_timings=_INJECT_TIMINGS and not is_embeddings,
+                    alias_token_ids=not is_embeddings)
 
     # -- ledger ------------------------------------------------------------------------
     def _record_usage(self, requested_model, rr, buf: bytes, status: int, *,
@@ -850,7 +871,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     # -- reverse proxy ----------------------------------------------------------------
     def _relay(self, url: str, method: str, body: bytes | None, *, streaming: bool,
-               on_body=None, inject_timings: bool = False):
+               on_body=None, inject_timings: bool = False, alias_token_ids: bool = False):
         """Forward one request upstream and relay the response. `streaming` chunk-
         relays a response with no content-length (SSE); otherwise buffers and sends
         with a real content-length. `on_body(bytes, status)` gets the full response
@@ -862,6 +883,11 @@ class _Handler(BaseHTTPRequestHandler):
         wall clock, nanoseconds) INTO the usage chunk itself — never as a second
         `usage` object on the stream, which would clobber the counts for
         last-usage-wins clients (see _merge_usage_evt).
+
+        `alias_token_ids` (non-streamed chat/completions): mirror SGLang's
+        per-choice `response_token_ids` onto `token_ids` so `return_token_ids`
+        clients that expect the vLLM/OpenAI spelling still see them
+        (see _alias_response_token_ids). Streamed responses are not rewritten.
 
         `on_body` is also handed a small `meta` dict: {prefill_s, decode_s} —
         the proxy wall-clock split (first upstream byte ~= prefill done), for the
@@ -943,6 +969,8 @@ class _Handler(BaseHTTPRequestHandler):
                 _tee(data)
                 if inject_timings:
                     data = _inject_body_timings(data, t0, time.monotonic()) or data
+                if alias_token_ids:
+                    data = _alias_response_token_ids(data) or data
                 self.send_header("content-length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
@@ -1132,6 +1160,30 @@ def _inject_body_timings(data: bytes, t0: float, t_end: float) -> bytes | None:
     # non-streamed: can't separate prefill from decode — attribute it all to decode
     doc["usage"] = {**doc["usage"], **_ollama_timings(doc["usage"], None, t_end - t0, t_end - t0)}
     return json.dumps(doc).encode()
+
+
+def _alias_response_token_ids(data: bytes) -> bytes | None:
+    """Non-streamed chat/completions: the sglang-pennyroyal fork returns per-choice
+    generated token IDs as `response_token_ids` (and prompt IDs as
+    `prompt_token_ids`); vLLM and OpenAI-ecosystem `return_token_ids` clients —
+    including the pennyroyal-validation collector — read `token_ids`. Mirror the
+    SGLang spelling onto `token_ids` when it is the only one present, so the
+    response carries the field the client expects. None if nothing changed
+    (vLLM responses already have `token_ids`; most responses have neither)."""
+    try:
+        doc = json.loads(data)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return None
+    choices = doc.get("choices") if isinstance(doc, dict) else None
+    if not isinstance(choices, list):
+        return None
+    changed = False
+    for ch in choices:
+        if (isinstance(ch, dict) and ch.get("token_ids") is None
+                and isinstance(ch.get("response_token_ids"), list)):
+            ch["token_ids"] = ch["response_token_ids"]
+            changed = True
+    return json.dumps(doc).encode() if changed else None
 
 
 def make_server(mgr: Manager, host: str, port: int, api_key: str | None,

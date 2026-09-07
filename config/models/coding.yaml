@@ -6,6 +6,18 @@ engine:
     port: 8000
     gpu_memory_utilization: 0.94
     max_model_len: 262144
+    # The vllm-flash build validates reasoning_effort and 400s on anything but
+    # none/low/medium/xhigh. Translate the OpenAI vocabulary (and the
+    # pennyroyal-validation suite's `max`) onto what it accepts; the HTTP front
+    # rewrites the request before forwarding. `xhigh` is absent on purpose -> it
+    # passes through, so the pinned assistant-coder-xhigh variant is unaffected.
+    reasoning_effort_map:
+      none: none
+      minimal: low
+      low: low
+      medium: medium
+      high: xhigh
+      max: xhigh
   # Full recipe — stackd creates this container. Swap the image / cmd_extra to
   # change how the big model is served (or switch `template` to llamacpp-cuda for
   # a GGUF). PLE quant table + the two site-packages overlays are bind-mounted.

@@ -17,6 +17,11 @@ class SglangParams:
     backend_url: str | None = None       # override; default http://<container>:<port>
     context_length: int | None = None    # informational — the real value is in cmd_extra
     mem_fraction_static: float | None = None   # informational — real value is in cmd_extra
+    # {caller_effort: engine_effort} request-time rewrite for `reasoning_effort`
+    # — same contract as VllmParams.reasoning_effort_map. The fork's Qwen3 parser
+    # already accepts any value, so this is usually left unset; provided for
+    # symmetry / an explicit identity map. See serve._map_reasoning_effort.
+    reasoning_effort_map: dict[str, str] | None = None
 
 
 class SglangPennyroyalAdapter(EngineAdapter):

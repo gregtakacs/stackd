@@ -118,6 +118,14 @@ def main() -> int:
         check("proxied to the right upstream path",
               res.get("path") == "/v1/chat/completions")
 
+        # chat is llama.cpp and its config carries no reasoning_effort_map, so a
+        # client-sent effort passes straight through.
+        _, res = _req(f"{base}/v1/chat/completions", token="secret",
+                      body={"model": "assistant", "messages": [{"role": "user", "content": "hi"}],
+                            "reasoning_effort": "max"})
+        check("no effort map: reasoning_effort passes through untouched",
+              res.get("echo", {}).get("reasoning_effort") == "max")
+
         code, res = _req(f"{base}/v1/chat/completions", token="secret",
                          body={"model": "no-such-model", "messages": []})
         check("unknown model -> 404", code == 404)
@@ -139,6 +147,16 @@ def main() -> int:
         check("stand-in serves chat name while coding active", code == 200)
         check("vllm stand-in: body model rewritten to the stack's served name (stack name by default)",
               res.get("echo", {}).get("model") == "coding")
+
+        # coding.yaml carries a reasoning_effort_map: the front rewrites a
+        # client's effort onto what the vllm-flash build accepts. Values absent
+        # from the map (here: xhigh) pass through unchanged.
+        for sent, want in (("max", "xhigh"), ("high", "xhigh"), ("low", "low"), ("xhigh", "xhigh")):
+            _, res = _req(f"{base}/v1/chat/completions", token="secret",
+                          body={"model": "assistant", "messages": [],
+                                "reasoning_effort": sent})
+            check(f"vllm effort map: {sent!r} -> {want!r}",
+                  res.get("echo", {}).get("reasoning_effort") == want)
 
         # --- /v1/models while a stand-in answers: advertise the ANSWERING
         #     stack's real ctx (coding's), not the covered model's (chat's). ---
@@ -189,6 +207,18 @@ def main() -> int:
         check("merge skips already-merged chunks",
               _merge_usage_evt(b'data: {"usage":{"completion_tokens":5,"eval_count":5}}',
                                0.0, 0.5, 1.0) is None)
+
+        # SGLang `response_token_ids` -> `token_ids` alias for non-streamed bodies
+        from stackd.serve import _alias_response_token_ids
+        aliased = _alias_response_token_ids(
+            b'{"choices":[{"index":0,"response_token_ids":[5,6,7],"message":{"content":"x"}}]}')
+        check("alias: response_token_ids mirrored onto token_ids",
+              aliased is not None
+              and json.loads(aliased)["choices"][0]["token_ids"] == [5, 6, 7])
+        check("alias: no-op when token_ids already present",
+              _alias_response_token_ids(b'{"choices":[{"token_ids":[1]}]}') is None)
+        check("alias: no-op on a body with no choices",
+              _alias_response_token_ids(b'{"usage":{"completion_tokens":3}}') is None)
 
         code, st = _req(f"{base}/profiles/chat/activate", token="secret", body={})
         check("control: /profiles/chat/activate -> 200", code == 200)

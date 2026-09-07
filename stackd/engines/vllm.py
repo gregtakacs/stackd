@@ -17,6 +17,12 @@ class VllmParams:
     backend_url: str | None = None       # override; default http://<container>:<port>
     gpu_memory_utilization: float = 0.9
     max_model_len: int | None = None
+    # {caller_effort: engine_effort} — the HTTP front rewrites a request's
+    # `reasoning_effort` through this before forwarding, so a client using the
+    # OpenAI vocabulary (none/minimal/low/medium/high) lands on whatever this
+    # build actually accepts. A value not listed here passes through untouched;
+    # omit the whole key to disable rewriting. See serve._map_reasoning_effort.
+    reasoning_effort_map: dict[str, str] | None = None
 
 
 class VllmCudaAdapter(EngineAdapter):
