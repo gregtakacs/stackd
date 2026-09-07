@@ -570,35 +570,41 @@ function hostRamSegs(host, st) {
   const bd = (hu && hu.breakdown) || {};
   const reserveBudget = (bd.host_reserve || 0) + (bd.load_slack || 0);
 
-  // ---- measured: solid segments summing to "OS used" + a cache band on top --
-  const segs = [];
+  // ---- measured: solid segments summing to "OS used" + a cache band on top.
+  // Stacked bottom->top in the SAME order as the reserved bar: OS / host stuff
+  // at the base, then engines, then the image tier, then the cache band.
+  const engSegs = [];
   let engAnon = 0;
   for (const [name, s] of Object.entries(st.stacks || {})) {
     const c = s && s.container && cont[s.container];
     if (!c || !c.anon_gib) continue;
     engAnon += c.anon_gib;
-    segs.push({ label: name + " · engine RSS", gib: c.anon_gib, color: modelColor(name),
-                cls: s.state === "warming" ? "warming" : "", tag: "measured",
-                budget: mr[name] });
+    engSegs.push({ label: name + " · engine RSS", gib: c.anon_gib, color: modelColor(name),
+                   cls: s.state === "warming" ? "warming" : "", tag: "measured",
+                   budget: mr[name] });
   }
   const im = st.image;
+  let imgSeg = null;
   if (im && im.container && cont[im.container] && cont[im.container].anon_gib) {
     engAnon += cont[im.container].anon_gib;
-    segs.push({ label: "image · " + im.active_model + " · engine RSS",
-                gib: cont[im.container].anon_gib, cls: "elastic", tag: "measured",
-                color: modelColor("image:" + im.active_model),
-                budget: st.image_ram_budget && st.image_ram_budget.gib });
+    imgSeg = { label: "image · " + im.active_model + " · engine RSS",
+               gib: cont[im.container].anon_gib, cls: "elastic", tag: "measured",
+               color: modelColor("image:" + im.active_model),
+               budget: st.image_ram_budget && st.image_ram_budget.gib };
   }
+  // residual committed memory, forced so the solid stack height == "OS used".
+  const otherCommitted = Math.max(0, osUsed - engAnon - shmem - slabU);
+  const segs = [];
+  if (otherCommitted > 0.05)
+    segs.push({ label: "host + other containers", gib: otherCommitted, color: MUTED_SEG,
+                tag: "measured", budget: reserveBudget });
   if (shmem > 0.3)
     segs.push({ label: "tmpfs / shmem", gib: shmem, cls: "resv", tag: "needs swap" });
   if (slabU > 0.3)
     segs.push({ label: "kernel slab (unreclaimable)", gib: slabU, cls: "resv",
                tag: "unreclaimable" });
-  // residual committed memory, forced so the solid stack height == "OS used".
-  const otherCommitted = Math.max(0, osUsed - engAnon - shmem - slabU);
-  if (otherCommitted > 0.05)
-    segs.push({ label: "host + other containers", gib: otherCommitted, color: MUTED_SEG,
-                tag: "measured", budget: reserveBudget });
+  segs.push(...engSegs);
+  if (imgSeg) segs.push(imgSeg);
   const committed = segs.reduce((a, s) => a + (s.gib || 0), 0);   // ≈ osUsed
   const cache = Math.max(0, physUsed - committed);
   if (cache > 0.05)
