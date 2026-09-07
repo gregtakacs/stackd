@@ -223,7 +223,7 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path == "/gpu":
             return self._send_json(200, _gpu_stats())
         if self.path == "/host":
-            return self._send_json(200, _host_stats())
+            return self._send_json(200, self._host_payload())
         if self.path.split("?")[0] == "/history":
             return self._history()
         if self.path == "/profiles":
@@ -421,6 +421,24 @@ class _Handler(BaseHTTPRequestHandler):
         return self._send_json(200, {"updated": n, "last_openrouter_fetch": today})
 
     # -- web UI data endpoints -----------------------------------------------------
+    def _host_payload(self) -> dict:
+        """`GET /host` — host meminfo decomposition, plus per-container anon RSS
+        for every engine stackd has resident so the dashboard's host-RAM lane can
+        name the tenants instead of showing one opaque 'over budget' gap."""
+        out = _host_stats()
+        try:
+            mgr = self.mgr
+            names = [rt.container for rt in mgr.state.stacks.values() if rt.container]
+            if mgr.state.image is not None and mgr.state.image.container:
+                names.append(mgr.state.image.container)
+            base = getattr(mgr.runner, "base", None)  # DockerApiRunner only
+            if base and names:
+                from stackd.telemetry import container_mem
+                out["containers"] = container_mem(base, names)
+        except Exception as e:  # noqa: BLE001 — enrichment is best-effort
+            out["containers_error"] = str(e)
+        return out
+
     def _events(self):
         from urllib.parse import parse_qs, urlparse
         q = parse_qs(urlparse(self.path).query)

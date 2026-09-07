@@ -16,6 +16,9 @@ import os
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 _TTL_S = 2.0
 _lock = threading.Lock()
@@ -202,13 +205,98 @@ def host_stats() -> dict:
                 k, _, v = line.partition(":")
                 mi[k] = float(v.strip().split()[0]) / (1024 * 1024)  # kB -> GiB
         if "MemTotal" in mi:
-            out["mem_total_gib"] = round(mi["MemTotal"], 2)
-            avail = mi.get("MemAvailable", mi.get("MemFree", 0.0))
-            out["mem_used_gib"] = round(mi["MemTotal"] - avail, 2)
+            mt = mi["MemTotal"]
+            mf = mi.get("MemFree", 0.0)
+            avail = mi.get("MemAvailable", mf)
+            shmem = mi.get("Shmem", 0.0)
+            sunreclaim = mi.get("SUnreclaim", 0.0)
+            # file-backed page cache that drops without swap under pressure. Cached
+            # already folds in Shmem/tmpfs (which needs swap, not reclaim) so back
+            # it out. This is the "would just get evicted" pool.
+            cache_reclaimable = max(
+                0.0, mi.get("Buffers", 0.0) + mi.get("Cached", 0.0)
+                + mi.get("SReclaimable", 0.0) - shmem)
+            phys_used = mt - mf                       # everything not on the freelist
+            # what's left once the reclaimable pools are removed: process anon +
+            # mlocked + page tables + kernel stacks etc. — the genuinely committed
+            # slice that a new allocation can't get back cheaply.
+            anon = max(0.0, phys_used - cache_reclaimable - shmem - sunreclaim)
+            out["mem_total_gib"] = round(mt, 2)
+            out["mem_free_gib"] = round(mf, 2)
             out["mem_available_gib"] = round(avail, 2)
+            out["mem_used_gib"] = round(mt - avail, 2)          # unchanged: the marker
+            out["mem_phys_used_gib"] = round(phys_used, 2)      # bar total (MemTotal-MemFree)
+            out["mem_cache_reclaimable_gib"] = round(cache_reclaimable, 2)
+            out["mem_shmem_gib"] = round(shmem, 2)
+            out["mem_slab_unreclaim_gib"] = round(sunreclaim, 2)
+            out["mem_anon_gib"] = round(anon, 2)
     except (OSError, ValueError):
         pass
     return out
+
+
+# --- per-container memory (dashboard host-RAM lane: name the anon tenants) ----
+_cmem_lock = threading.Lock()
+_cmem_cache: dict = {"at": 0.0, "key": None, "data": {}, "refreshing": False}
+_CMEM_TTL_S = 8.0
+
+
+def _one_container_mem(base: str, name: str, timeout: float) -> tuple[str, dict] | None:
+    """cgroup memory for one container via the Docker Engine API. `one-shot=true`
+    skips the 1s CPU sample `stream=false` otherwise takes — we only want memory."""
+    url = f"{base}/containers/{name}/stats?stream=false&one-shot=true"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            if r.status != 200:
+                return None
+            m = (json.loads(r.read()) or {}).get("memory_stats") or {}
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+        return None
+    st = m.get("stats") or {}
+    g = 1024 ** 3
+    # cgroup v2: `anon` is the non-reclaimable working set; `file` is this
+    # container's slice of the global page cache (already in meminfo — don't
+    # re-add it to the lane). cgroup v1 fallback: `rss` / `cache`.
+    anon = st.get("anon", st.get("rss", 0.0)) or 0.0
+    fileb = st.get("file", st.get("cache", 0.0)) or 0.0
+    usage = m.get("usage", 0.0) or 0.0
+    return name, {"anon_gib": round(anon / g, 2),
+                  "file_gib": round(fileb / g, 2),
+                  "usage_gib": round(usage / g, 2)}
+
+
+def _cmem_refresh(base: str, names: list[str], key, timeout: float) -> None:
+    out: dict = {}
+    try:
+        with ThreadPoolExecutor(max_workers=min(8, len(names))) as ex:
+            for res in ex.map(lambda n: _one_container_mem(base, n, timeout), names):
+                if res:
+                    out[res[0]] = res[1]
+    finally:
+        with _cmem_lock:
+            _cmem_cache.update(at=time.time(), key=key, data=out, refreshing=False)
+
+
+def container_mem(base_url: str | None, names, *, timeout: float = 3.5) -> dict:
+    """{container_name: {anon_gib, file_gib, usage_gib}} for the given containers,
+    from cgroup memory.stat via the Docker Engine API. NON-BLOCKING: returns the
+    last cached sample immediately (an empty dict on the very first call) and
+    refreshes in the background when the cache is stale, so a hung Docker API
+    can't stall the `/host` poll. Best-effort — a gone/unreachable container just
+    drops out of the map."""
+    names = sorted({n for n in (names or []) if n})
+    if not base_url or not names:
+        return {}
+    key = (base_url, tuple(names))
+    now = time.time()
+    with _cmem_lock:
+        fresh = _cmem_cache["key"] == key and now - _cmem_cache["at"] < _CMEM_TTL_S
+        data = dict(_cmem_cache["data"]) if _cmem_cache["key"] == key else {}
+        if not fresh and not _cmem_cache["refreshing"]:
+            _cmem_cache["refreshing"] = True
+            threading.Thread(target=_cmem_refresh, daemon=True,
+                             args=(base_url.rstrip("/"), names, key, timeout)).start()
+    return data
 
 
 # --- normalised per-engine telemetry (llama.cpp /slots+/metrics, vLLM + SGLang /metrics) ---
@@ -511,14 +599,23 @@ def engine_telemetry(endpoint: str, template: str) -> dict:
             d["kv_pool_tokens"] = int(pool) if pool else None
             d["ctx_max"] = (int(m["sglang:context_len"]) if m.get("sglang:context_len")
                             else d["kv_pool_tokens"])
+            # sglang:token_usage / kv_used_tokens are fills of the *whole KV pool*
+            # (max_total_num_tokens ~= 1.6x the context window here, shared across
+            # --max-running-requests and inclusive of retained radix/HiCache prefix
+            # pages) -- NOT a single request's position in its window. Derive the
+            # live fill in tokens, then express the "context" meter window-relative
+            # (matches the ctx_tokens/ctx_max caption + serve._engine's idle path).
             frac = m.get("sglang:token_usage")          # 0..1 fill of the KV pool
-            if frac is not None:
-                d["kv_pct"] = round(100.0 * frac, 1)
-                if d["kv_pool_tokens"]:
-                    d["ctx_tokens"] = round(frac * d["kv_pool_tokens"])
             used = m.get("sglang:kv_used_tokens")
             if used:
                 d["ctx_tokens"] = int(used)
+            elif frac is not None and d["kv_pool_tokens"]:
+                d["ctx_tokens"] = round(frac * d["kv_pool_tokens"])
+            d["kv_pool_pct"] = round(100.0 * frac, 1) if frac is not None else None
+            if d.get("ctx_tokens") is not None and d.get("ctx_max"):
+                d["kv_pct"] = round(min(100.0, 100.0 * d["ctx_tokens"] / d["ctx_max"]), 1)
+            elif frac is not None:
+                d["kv_pct"] = round(100.0 * frac, 1)
 
             gauge_tps = m.get("sglang:gen_throughput")   # tok/s, live gauge
             acc_rate = m.get("sglang:spec_accept_rate")  # 0..1 while spec active
@@ -629,9 +726,17 @@ def engine_counters(endpoint: str, template: str) -> dict | None:
             out["gen_tok"] = (_prom_sum(t, "sglang:generation_tokens_total", is_streaming="true")
                               or _prom_sum(t, "sglang:generation_tokens_total"))
             out["gen_s"] = _prom_sum(t, "sglang:inter_token_latency_seconds_sum")
-            # prefill: prefer the compute-only stage timer + compute-only token
-            # counter (excludes queue wait + cache hits); else TTFT + prompt total.
-            out["prompt_tok"] = (_prom_sum(t, "sglang:realtime_tokens_total", mode="prefill_compute")
+            # prefill: the `prefill_forward` stage wall time is the cost to turn
+            # the WHOLE prompt into a decode-ready state — it includes restoring
+            # KV pages from the radix/HiCache/NIXL tiers, not just fresh compute.
+            # So the numerator must be every token that stage made ready
+            # (compute + cache), else a prefix hit craters the rate (a few
+            # thousand computed tokens over compute+restore seconds). This is
+            # "effective" prefill throughput — how fast the prompt is ingested,
+            # cache included — and it matches the live card's basis.
+            _pf_c = _prom_sum(t, "sglang:realtime_tokens_total", mode="prefill_compute")
+            _pf_h = _prom_sum(t, "sglang:realtime_tokens_total", mode="prefill_cache")
+            out["prompt_tok"] = (((_pf_c or 0) + (_pf_h or 0))
                                  or _prom_sum(t, "sglang:prompt_tokens_total"))
             out["prefill_s"] = (_prom_sum(t, "sglang:per_stage_req_latency_seconds_sum",
                                           stage="prefill_forward")

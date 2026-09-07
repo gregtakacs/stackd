@@ -80,10 +80,15 @@
   .seg { border-top:1px solid rgba(0,0,0,.3); min-height:1px; }
   .seg.elastic { background-image:repeating-linear-gradient(45deg,transparent,transparent 5px,rgba(255,255,255,.1) 5px,rgba(255,255,255,.1) 10px); }
   .seg.resv { background:#2a2f3d !important; }
+  /* reclaimable page cache — physically resident but evicts under pressure. */
+  .seg.cache { background:var(--surface2) !important;
+    background-image:repeating-linear-gradient(45deg,transparent,transparent 5px,rgba(255,255,255,.07) 5px,rgba(255,255,255,.07) 10px) !important;
+    opacity:.7; }
   .seg.warming { animation:pulse 1.4s infinite; }
   .seg.crashed { outline:2px solid var(--red); outline-offset:-2px; }
   .seg-row .sw.warming { animation:pulse 1.4s infinite; }
   .seg-row .sw.crashed { outline:1px solid var(--red); }
+  .seg-row .sw.cache { background-image:repeating-linear-gradient(45deg,#0000,#0000 3px,#ffffff40 3px,#ffffff40 6px); }
   .bar .free { flex:1; }
   .marker { position:absolute; left:-4px; right:-4px; border-top:2px dashed var(--accent); z-index:5; transition:bottom .4s ease; }
   .marker span { position:absolute; right:0; top:-14px; font-size:.62rem; color:var(--accent); background:var(--bg); padding:0 2px; }
@@ -476,6 +481,7 @@ function segColor(s) {
 function laneEl(o) {
   const lane = el("div", "lane"); lane.dataset.name = o.name;
   lane.dataset.budgeted = o.budgeted ?? 0;
+  lane.dataset.limit = o.limit;               // shared by hostRamRepaint()'s per-tick rescale
   lane.dataset.realLabel = o.realLabel || "actual";
   const bar = el("div", "bar");
   let used = 0;
@@ -498,9 +504,10 @@ function laneEl(o) {
   if (o.sub) body.append(el("div", "sub", o.sub));
   const bud = o.budgeted ?? used;
   lane.dataset.budgeted = bud;
-  const st1 = el("div", "lane-stat");
-  st1.innerHTML = `budgeted <b>${fmtGib(bud)}</b> / ${fmtGib(o.limit)}`;
+  const st1 = el("div", "lane-stat lane-bud");
+  st1.innerHTML = `${o.budLabel || "budgeted"} <b>${fmtGib(o.budShown ?? bud)}</b> / ${fmtGib(o.limit)}`;
   body.append(st1);
+  if (o.altStat) { const a = el("div", "lane-stat lane-alt muted"); a.innerHTML = o.altStat; body.append(a); }
   // .lane-real is refreshed every tick by laneLive() — always render the slot
   body.append(el("div", "lane-real muted"));
   const sl = el("div", "seglist");
@@ -540,6 +547,99 @@ function laneLive(lane, val) {   // per-tick: real-usage marker + the "real" hea
   }
 }
 
+// ---- host RAM lane: a MEASURED decomposition of physical RAM ---------------
+// Every tenant of system RAM as a stacked bar summing to MemTotal-MemFree, so
+// the "OS used" marker (MemTotal-MemAvailable) lands exactly where reclaimable
+// page cache begins: below the line is committed, above it evicts on demand.
+// Per-engine anon RSS comes from `GET /host` -> containers{} (cgroup memory.stat
+// via the Docker API). Returns null when that enrichment isn't available (e.g.
+// the socket-proxy blocks /stats) so the caller can fall back to the budget bar.
+const MUTED_SEG = "#3a4152";
+function hostRamSegs(host, st) {
+  if (!host || host.mem_anon_gib == null) return null;
+  const cont = host.containers || {};
+  const segs = [];
+  let engAnon = 0;
+  // one segment per resident engine, coloured to its profile chip / VRAM segment
+  for (const [name, s] of Object.entries(st.stacks || {})) {
+    const c = s && s.container && cont[s.container];
+    if (!c || !c.anon_gib) continue;
+    engAnon += c.anon_gib;
+    segs.push({ label: name + " · engine RSS", gib: c.anon_gib,
+                color: modelColor(name),
+                cls: s.state === "warming" ? "warming" : "",
+                tag: "measured" });
+  }
+  const im = st.image;
+  if (im && im.container && cont[im.container] && cont[im.container].anon_gib) {
+    engAnon += cont[im.container].anon_gib;
+    segs.push({ label: "image · " + im.active_model + " · engine RSS",
+                gib: cont[im.container].anon_gib, cls: "elastic", tag: "measured" });
+  }
+  // everything else anonymous: the host itself + containers stackd doesn't own
+  const otherAnon = Math.max(0, (host.mem_anon_gib || 0) - engAnon);
+  if (otherAnon > 0.05)
+    segs.push({ label: "host + other containers · anon", gib: otherAnon,
+                color: MUTED_SEG, tag: "measured" });
+  if ((host.mem_shmem_gib || 0) > 0.3)
+    segs.push({ label: "tmpfs / shmem", gib: host.mem_shmem_gib,
+                cls: "resv", tag: "needs swap" });
+  if ((host.mem_slab_unreclaim_gib || 0) > 0.3)
+    segs.push({ label: "kernel slab (unreclaimable)", gib: host.mem_slab_unreclaim_gib,
+                cls: "resv", tag: "unreclaimable" });
+  const committed = segs.reduce((a, s) => a + (s.gib || 0), 0);
+  if ((host.mem_cache_reclaimable_gib || 0) > 0.05)
+    segs.push({ label: "page cache · reclaimable", gib: host.mem_cache_reclaimable_gib,
+                cls: "cache", color: "#2a3040", tag: "evictable" });
+  const physUsed = host.mem_phys_used_gib
+    ?? segs.reduce((a, s) => a + (s.gib || 0), 0);
+  return { segs, committed, physUsed };
+}
+
+// in-place per-tick repaint of the host RAM lane's bar + legend (its segments
+// move every tick, unlike the other lanes which only rebuild on a map change).
+function hostRamRepaint(lane, host, st) {
+  const r = hostRamSegs(host, st);
+  if (!r || !lane) return false;
+  const limit = +lane.dataset.limit || r.physUsed || 1;
+  const bar = lane.querySelector(".bar");
+  const free = bar.querySelector(".free");
+  bar.querySelectorAll(".seg").forEach(n => n.remove());
+  const sl = lane.querySelector(".seglist");
+  const frow = sl.querySelector(".free-row");
+  sl.querySelectorAll(".seg-row:not(.free-row)").forEach(n => n.remove());
+  let used = 0;
+  for (const s of r.segs) {
+    if (!s.gib || s.gib <= 0.02) continue;
+    used += s.gib;
+    const d = el("div", "seg" + (s.cls ? " " + s.cls : ""));
+    d.style.height = Math.max(0.4, (s.gib / limit) * 100) + "%";
+    d.style.background = segColor(s);
+    d.title = `${s.label} — ${fmtGib(s.gib)}${s.tag ? " (" + s.tag + ")" : ""}`;
+    bar.insertBefore(d, free);
+    const row = el("div", "seg-row");
+    const sw = el("span", "sw" + (s.cls ? " " + s.cls : "")); sw.style.background = segColor(s);
+    row.append(sw, el("span", "nm", s.label), el("span", "gb", fmtGib(s.gib)));
+    if (s.tag) row.append(el("span", "tg", s.tag));
+    sl.insertBefore(row, frow);
+  }
+  frow.querySelector(".gb").textContent = fmtGib(Math.max(0, limit - used));
+  // over-delta on the "OS used" line is now measured vs the committed (non-
+  // reclaimable) stack — a small positive number = the slice of page cache the
+  // kernel won't promise back. Near zero => the decomposition adds up.
+  lane.dataset.budgeted = r.committed;
+  const bs = lane.querySelector(".lane-bud");
+  if (bs) bs.innerHTML = `in RAM now <b>${fmtGib(used)}</b> / ${fmtGib(limit)}`;
+  const as = lane.querySelector(".lane-alt");
+  const hu = (st.pools || []).find(p => p.pool === "host_unified");
+  if (as && hu) {
+    const d = used - hu.used;
+    as.innerHTML = `solver budget <b>${fmtGib(hu.used)}</b>`
+      + (Math.abs(d) >= 1 ? ` · ${d > 0 ? "+" : ""}${fmtGib(d)} vs in-RAM` : "");
+  }
+  return true;
+}
+
 function renderMap(st, eng, img, gpu, host) {
   const engState = {};
   (eng.engines || []).forEach(e => engState[e.stack] = e.state);
@@ -568,6 +668,7 @@ function renderMap(st, eng, img, gpu, host) {
 
   if (!unchanged("map", [st.pools, st.devices, st.flags, st.unplaced, st.sources,
       st.placement, st.model_vram, st.model_ram, resKey,
+      (host && host.mem_anon_gib != null),   // measured host-RAM lane available?
       (eng.engines||[]).map(e => [e.stack, e.state])])) {
     const lanes = $("#mapLanes"); lanes.innerHTML = "";
     const modelsOn = d => Object.keys(st.model_vram || {})
@@ -606,39 +707,53 @@ function renderMap(st, eng, img, gpu, host) {
     }
     const hu = pool("host_unified");
     if (hu) {
-      const mr = st.model_ram || {};
-      const cudaRamModels = modelsOn("cuda0").filter(m => mr[m]);
-      const segs = [];
-      for (const [k, v] of Object.entries(hu.breakdown || {})) {
-        if (k === "ram:cuda0" && cudaRamModels.length) {
-          // the cuda0 engines' host-RAM demand, named per model: weights kept in
-          // host RAM (vLLM PLE / CPU-offload) + engine RSS + KV staging. Coloured
-          // to match that model's cuda0 VRAM segment and its profile chip.
-          for (const m of cudaRamModels)
-            segs.push({ label: m + " · host RAM (offload + engine)", gib: mr[m],
-                        cls: "", color: modelColor(m), tag: srcTag(m) || "engine RAM" });
-        } else if (k.startsWith("vram:igpu0")) {
-          // the iGPU has no dedicated VRAM — its budget is GTT carved straight
-          // out of this unified pool. A reservation, not measured demand.
-          segs.push({ label: "igpu0 GTT · iGPU VRAM lives in unified RAM", gib: v,
-                      cls: "resv", color: "#2a2f3d", tag: "reservation" });
-        } else {
-          segs.push(segFor(k, v));
+      // MEASURED mode: /host gave us per-container anon RSS -> decompose real
+      // physical RAM (bar sums to MemTotal-MemFree; the "OS used" marker lands
+      // where reclaimable page cache begins). hostRamRepaint() then refreshes
+      // this lane's bar every tick.
+      const measured = hostRamSegs(host, st);
+      if (measured) {
+        lanes.append(laneEl({
+          name: "host RAM", sub: "unified LPDDR5X — what's physically resident",
+          limit: host.mem_phys_used_gib != null
+            ? Math.max(host.mem_total_gib || hu.limit, measured.physUsed) : hu.limit,
+          segs: measured.segs, budgeted: measured.committed,
+          budLabel: "in RAM now", budShown: measured.physUsed,
+          altStat: `solver budget <b>${fmtGib(hu.used)}</b>`,
+          real: host && host.mem_used_gib, realLabel: "OS used",
+          note: "Measured, not budgeted. Everything below the 'OS used' line is "
+            + "committed (engine RSS + host anon + tmpfs); the hatched band above "
+            + "it is reclaimable page cache — mmap'd model files the kernel drops "
+            + "on demand. The solver budget is a separate planning number.",
+        }));
+      } else {
+        // FALLBACK (no container stats): the old budget bar.
+        const mr = st.model_ram || {};
+        const cudaRamModels = modelsOn("cuda0").filter(m => mr[m]);
+        const segs = [];
+        for (const [k, v] of Object.entries(hu.breakdown || {})) {
+          if (k === "ram:cuda0" && cudaRamModels.length) {
+            for (const m of cudaRamModels)
+              segs.push({ label: m + " · host RAM (offload + engine)", gib: mr[m],
+                          cls: "", color: modelColor(m), tag: srcTag(m) || "engine RAM" });
+          } else if (k.startsWith("vram:igpu0")) {
+            segs.push({ label: "igpu0 GTT · iGPU VRAM lives in unified RAM", gib: v,
+                        cls: "resv", color: "#2a2f3d", tag: "reservation" });
+          } else {
+            segs.push(segFor(k, v));
+          }
         }
+        if (resKey && img.resident.device === "igpu0") segs.push(imgSeg());
+        const huBudgeted = segs.reduce((a, s) => a + (s.gib || 0), 0) || hu.used;
+        lanes.append(laneEl({
+          name: "host RAM", sub: "unified LPDDR5X — the solver's placement budget",
+          limit: hu.limit, segs, budgeted: huBudgeted,
+          real: host && host.mem_used_gib, realLabel: "OS used",
+          note: "The lane is stackd's budget for placing engines. The OS number is real "
+            + "memory pressure — ComfyUI/engine RSS and multi-GiB model-file page cache "
+            + "aren't in the budget (only 'load slack' gestures at it).",
+        }));
       }
-      // The image tier's host-RAM cost isn't in the backend breakdown (it isn't a
-      // profile member the solver budgets; see solver.py headroom()), so add it
-      // here on any swap where the resident image engine is on the iGPU.
-      if (resKey && img.resident.device === "igpu0") segs.push(imgSeg());
-      const huBudgeted = segs.reduce((a, s) => a + (s.gib || 0), 0) || hu.used;
-      lanes.append(laneEl({
-        name: "host RAM", sub: "unified LPDDR5X — the solver's placement budget",
-        limit: hu.limit, segs, budgeted: huBudgeted,
-        real: host && host.mem_used_gib, realLabel: "OS used",
-        note: "The lane is stackd's budget for placing engines. The OS number is real "
-          + "memory pressure — ComfyUI/engine RSS and multi-GiB model-file page cache "
-          + "aren't in the budget (only 'load slack' gestures at it).",
-      }));
     }
     const fl = $("#mapFlags"); fl.innerHTML = "";
     (st.flags || []).forEach(f => fl.append(el("div", "flag", "⚠ " + f)));
@@ -650,7 +765,7 @@ function renderMap(st, eng, img, gpu, host) {
     const nm = lane.dataset.name;
     if (nm === "cuda0") laneLive(lane, gpu && gpu.cuda0 && gpu.cuda0.vram_used_gib);
     else if (nm === "igpu0") laneLive(lane, gpu && gpu.igpu0 && gpu.igpu0.vram_used_gib);
-    else if (nm === "host RAM") laneLive(lane, host && host.mem_used_gib);
+    else if (nm === "host RAM") { hostRamRepaint(lane, host, st); laneLive(lane, host && host.mem_used_gib); }
   }
 }
 function imgFootprint(img) {
@@ -1235,7 +1350,7 @@ function renderHistoryCharts(h) {
     mkHist("#chTps",
       [{ label: "generation t/s", stroke: PAL[1], width: 2.5, points: { show: false } },
        { label: "prefill t/s", stroke: PAL[0], width: 2.5, points: { show: false } },
-       { label: "ctx avg (right)", stroke: PAL[3], width: 2, dash: [4, 3], points: { show: false }, scale: "ctx" },
+       { label: "ctx tok-wtd (right)", stroke: PAL[3], width: 2, dash: [4, 3], points: { show: false }, scale: "ctx" },
        { label: "ctx peak (right)", stroke: PAL[5], width: 1.5, dash: [2, 3], points: { show: false }, scale: "ctx" }],
       [xs, tp.decode_tps, tp.prefill_tps, tp.ctx_avg, tp.ctx_max],
       { axis2: "ctx", scales: { ctx: {} },
@@ -1296,12 +1411,15 @@ function xpNet(gross, tier) {
 // engine-measured throughput + context for an explorer node. tok/s comes from
 // each engine's own /metrics counters (engine_daily), pro-rated onto these rows
 // by token share — so the rate holds up under a user / API-name filter. ctx is
-// the per-request mean from the ledger; engine_ctx_max is the engine-wide peak.
+// the token-weighted mean from the ledger (Σctx² / Σctx — weights each request
+// by its own size); engine_ctx_max is the engine-wide peak.
 function xpDerive(n) {
   return {
     gen: n.decode_ms ? n.decode_tok * 1000 / n.decode_ms : 0,
     pre: n.prefill_ms ? n.prefill_tok * 1000 / n.prefill_ms : 0,
-    ctx: n.ctx_n ? Math.round(n.ctx_tokens_sum / n.ctx_n) : 0,
+    ctx: n.ctx_tokens_sum ? Math.round(n.ctx_tokens_sq_sum / n.ctx_tokens_sum) : 0,
+    ctxArith: n.ctx_n ? Math.round(n.ctx_tokens_sum / n.ctx_n) : 0,
+    ctxN: n.ctx_n || 0,
     ctxMax: n.ctx_max || 0,
     engCtx: n.engine_ctx_max || 0,
   };
@@ -1312,12 +1430,14 @@ function xpTpCells(node) {
   const p = el("td", "num", d.pre ? rnd1(d.pre) : "–");
   const c = el("td", "num", d.ctx ? fmtSI(d.ctx) : "–");
   const tip = [];
+  if (d.ctxArith) tip.push("arith. mean " + fmtNum(d.ctxArith) + " tok over " + fmtNum(d.ctxN) + " req");
   if (d.ctxMax) tip.push("biggest request " + fmtNum(d.ctxMax) + " tok");
-  if (d.engCtx) tip.push("engine peak " + fmtNum(d.engCtx) + " tok (all traffic)");
+  if (d.engCtx) tip.push("engine sampled peak " + fmtNum(d.engCtx) + " tok (understated — 3–10s poll)");
   if (tip.length) c.title = tip.join(" · ");
   return [g, p, c];
 }
-const XP_TIMING = ["prefill_ms", "prefill_tok", "decode_ms", "decode_tok", "ctx_tokens_sum", "ctx_n"];
+const XP_TIMING = ["prefill_ms", "prefill_tok", "decode_ms", "decode_tok",
+                   "ctx_tokens_sum", "ctx_tokens_sq_sum", "ctx_n"];
 function xpAcc(node, r, tiers) {
   node.reqs += r.reqs || 0;
   node.tin += r.prompt_tokens || 0;
@@ -1535,7 +1655,7 @@ function renderExplorer() {
     "</th><th class=num>reqs</th><th class=num>tok in</th><th class=num>tok out</th>" +
     "<th class=num title='engine-measured generation tok/s (from /metrics counters, pro-rated by token share)'>gen t/s</th>" +
     "<th class=num title='engine-measured prompt/prefill tok/s (from /metrics counters, pro-rated by token share)'>pre t/s</th>" +
-    "<th class=num title='mean context size per request (hover a row for the biggest request + engine-wide peak)'>ctx</th>" +
+    "<th class=num title='token-weighted mean context per request (Σctx² / Σctx — weights each request by its own size, so tiny agent calls do not swamp it; hover for arith. mean, biggest request, engine peak)'>ctx</th>" +
     tiers.map(t2 => `<th class="num xp-sorth" data-tier="${t2.label}">${t2.label}` +
       `<br><span style="font-weight:400;font-size:.9em">net $</span></th>`).join("") +
     "</tr></thead>";
@@ -1657,7 +1777,7 @@ async function loadUsage() {
   if (tp.decode_tps) box.append(stat(rnd1(tp.decode_tps) + " tok/s", "generation (engine)"));
   if (tp.prefill_tps) box.append(stat(rnd1(tp.prefill_tps) + " tok/s", "prompt / prefill (engine)"));
   if (tp.ctx_avg) box.append(stat(fmtSI(tp.ctx_avg) + (tp.ctx_max ? " / " + fmtSI(tp.ctx_max) : ""),
-                                  "context avg / peak"));
+                                  "context tok-wtd / peak"));
   if (pay) { box.append(stat(fmtUsd(pay.gross), `would cost · ${pay.label}`)); box.append(stat(fmtUsd(pay.net), "net of energy")); }
   if (sv.energy) box.append(stat(fmtUsd(sv.energy.cost), `energy · ${(sv.energy.kwh||0).toFixed(1)} kWh @ $${sv.energy.price_per_kwh}`));
   renderTierCards(sv);

@@ -126,6 +126,14 @@ def main() -> int:
         code, j = _json_req(f"{base}/host", token="admin")
         check("/host returns cpu/load/mem keys", code == 200
               and {"loadavg", "cpu_pct", "mem_used_gib", "mem_total_gib"} <= set(j))
+        check("/host carries the physical-RAM decomposition (dashboard host-RAM lane)",
+              {"mem_phys_used_gib", "mem_cache_reclaimable_gib", "mem_anon_gib",
+               "mem_shmem_gib", "mem_slab_unreclaim_gib", "mem_free_gib"} <= set(j))
+        check("/host decomposition sums to physical use",
+              abs((j["mem_anon_gib"] + j["mem_cache_reclaimable_gib"] + j["mem_shmem_gib"]
+                   + j["mem_slab_unreclaim_gib"]) - j["mem_phys_used_gib"]) <= 0.6)
+        check("/host container_mem is a no-op under FakeRunner (no .base), not an error",
+              "containers" not in j and "containers_error" not in j)
 
         # --- /gpu ------------------------------------------------------------
         telemetry._cache.update(at=0.0, data=None)

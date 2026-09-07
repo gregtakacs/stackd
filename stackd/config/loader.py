@@ -110,6 +110,16 @@ def _load_named(base: pathlib.Path, overlay: pathlib.Path | None, key: str,
     return out
 
 
+def _gpu_autodetect_enabled() -> bool:
+    """Off when STACKD_DISABLE_GPU_AUTODETECT is set (1/true/yes). The smoke
+    suite sets it so `load_config()` uses the fixed `IGPU_RENDER_NODE` from
+    tests/_env.py instead of whatever DRM render node this particular host
+    assigned the AMD card (which is machine-specific — on a box where an
+    NVIDIA card sorts first on PCI address, the iGPU is renderD129, not
+    renderD128, and a hard-coded test expectation would fail there only)."""
+    return os.environ.get("STACKD_DISABLE_GPU_AUTODETECT", "").lower() not in ("1", "true", "yes")
+
+
 def _apply_dynamic_gpu_env(env: dict[str, str]) -> None:
     """Override IGPU_RENDER_NODE with a freshly-detected value from sysfs
     (see gpu_discovery.py) — render node NUMBERS drift across reboots/PCI
@@ -146,7 +156,8 @@ def load_config(root: str | pathlib.Path, *, env_file: str | None = None,
 
     env_file = env_file if env_file is not None else os.environ.get("STACKD_ENV_FILE")
     env: dict[str, str] = {**os.environ, **_parse_env_file(env_file)} if env_file else dict(os.environ)
-    _apply_dynamic_gpu_env(env)
+    if _gpu_autodetect_enabled():
+        _apply_dynamic_gpu_env(env)
 
     ov = overlay if overlay is not None else os.environ.get("STACKD_CONFIG_OVERLAY")
     ovp = pathlib.Path(ov) if ov and pathlib.Path(ov).is_dir() else None

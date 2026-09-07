@@ -25,6 +25,9 @@ _FALLBACK = {
     "HOST_RESERVE_GIB": "28",
     "IGPU_VRAM_BUDGET_GIB": "90",
     "IGPU_RENDER_NODE": "/dev/dri/renderD128",
+    # keep load_config() deterministic — don't let this host's real DRM topology
+    # (which card got renderD128) override the fixed value above (see loader.py).
+    "STACKD_DISABLE_GPU_AUTODETECT": "1",
     "VIDEO_GID": "44",
     "RENDER_GID": "990",
     "HSA_GFX_VERSION": "11.5.1",
