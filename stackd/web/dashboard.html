@@ -547,7 +547,10 @@ function laneLive(lane, val) {   // per-tick: real-usage marker + the "real" hea
            const pct = (val / lim) * 100;
            m.style.bottom = pct + "%";
            m.classList.toggle("label-below", pct > 80);   // flip label under the line near the top
-           m.innerHTML = ""; m.append(el("span", null, "real " + fmtGib(val))); }
+           // bare number only — it must fit inside the 56px bar (overflow:hidden);
+           // the unit + full "OS used" readout is on the lane-real line in the body.
+           m.innerHTML = "";
+           m.append(el("span", null, (Math.round(val * 10) / 10).toLocaleString())); }
   }
   const r = lane.querySelector(".lane-real");
   if (r && val != null) {
@@ -674,11 +677,16 @@ function hostRamRepaint(lane, host, st) {
     const sw = el("span", "sw" + (s.cls ? " " + s.cls : "")); sw.style.background = segColor(s);
     row.append(sw, el("span", "nm", s.label), el("span", "gb", fmtGib(s.gib)));
     if (s.budget != null && s.budget > 0.05) {
-      // compare the tenant's whole measured footprint (anon + its shmem) to its
-      // single budget, not just the anon sub-segment.
+      // compare the tenant's WHOLE measured footprint (anon + its shmem) to its
+      // single budget. When they differ (shmem present) spell out the total so
+      // "over 3" on a row that shows 5.8 isn't baffling.
       const measured = s.groupGib != null ? s.groupGib : s.gib;
       const over = measured - s.budget;
-      const t = el("span", "tg", over > 0.5 ? `over ${fmtGib(over)}` : `budget ${fmtGib(s.budget)}`);
+      const grp = s.groupGib != null && Math.abs(s.groupGib - s.gib) > 0.5
+        ? `${fmtGib(measured)} vs ` : "";
+      const t = el("span", "tg", over > 0.5
+        ? `${grp}budget ${fmtGib(s.budget)} · over ${fmtGib(over)}`
+        : `${grp}budget ${fmtGib(s.budget)}`);
       if (over > 0.5) t.style.color = "var(--orange)";
       row.append(t);
     } else if (s.tag) row.append(el("span", "tg", s.tag));
