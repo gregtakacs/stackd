@@ -573,38 +573,51 @@ function hostRamSegs(host, st) {
   // ---- measured: solid segments summing to "OS used" + a cache band on top.
   // Stacked bottom->top in the SAME order as the reserved bar: OS / host stuff
   // at the base, then engines, then the image tier, then the cache band.
+  // Each engine contributes anon RSS + its own shmem (SGLang's PLE table /
+  // HiCache host pool live in /dev/shm and are just as un-reclaimable as anon —
+  // conceptually part of that model's footprint). Both sub-segments carry the
+  // model colour; the budget tag compares anon+shmem against model_ram.
   const engSegs = [];
-  let engAnon = 0;
+  let engAnon = 0, engShmem = 0;
+  const pushEngine = (label, c, extra) => {
+    const grp = (c.anon_gib || 0) + (c.shmem_gib || 0);
+    engAnon += c.anon_gib || 0;
+    engShmem += c.shmem_gib || 0;
+    engSegs.push({ label: label + " · engine RSS", gib: c.anon_gib || 0, tag: "measured",
+                   groupGib: grp, budget: extra.budget, color: extra.color, cls: extra.cls || "" });
+    if ((c.shmem_gib || 0) > 0.3)
+      engSegs.push({ label: label + " · KV / PLE cache (shmem)", gib: c.shmem_gib,
+                     color: extra.color, cls: extra.cls || "",
+                     tag: "shmem · not reclaimable" });
+  };
   for (const [name, s] of Object.entries(st.stacks || {})) {
     const c = s && s.container && cont[s.container];
-    if (!c || !c.anon_gib) continue;
-    engAnon += c.anon_gib;
-    engSegs.push({ label: name + " · engine RSS", gib: c.anon_gib, color: modelColor(name),
-                   cls: s.state === "warming" ? "warming" : "", tag: "measured",
-                   budget: mr[name] });
+    if (!c || (!c.anon_gib && !c.shmem_gib)) continue;
+    pushEngine(name, c, { budget: mr[name], color: modelColor(name),
+                          cls: s.state === "warming" ? "warming" : "" });
   }
   const im = st.image;
-  let imgSeg = null;
-  if (im && im.container && cont[im.container] && cont[im.container].anon_gib) {
-    engAnon += cont[im.container].anon_gib;
-    imgSeg = { label: "image · " + im.active_model + " · engine RSS",
-               gib: cont[im.container].anon_gib, cls: "elastic", tag: "measured",
-               color: modelColor("image:" + im.active_model),
-               budget: st.image_ram_budget && st.image_ram_budget.gib };
+  if (im && im.container && cont[im.container]
+      && (cont[im.container].anon_gib || cont[im.container].shmem_gib)) {
+    pushEngine("image · " + im.active_model, cont[im.container],
+               { budget: st.image_ram_budget && st.image_ram_budget.gib,
+                 color: modelColor("image:" + im.active_model), cls: "elastic" });
   }
   // residual committed memory, forced so the solid stack height == "OS used".
+  // (engAnon + engShmem + leftover shmem + slab + residual == osUsed)
   const otherCommitted = Math.max(0, osUsed - engAnon - shmem - slabU);
+  const leftoverShmem = Math.max(0, shmem - engShmem);
   const segs = [];
   if (otherCommitted > 0.05)
     segs.push({ label: "host + other containers", gib: otherCommitted, color: MUTED_SEG,
                 tag: "measured", budget: reserveBudget });
-  if (shmem > 0.3)
-    segs.push({ label: "tmpfs / shmem", gib: shmem, cls: "resv", tag: "needs swap" });
+  if (leftoverShmem > 0.3)
+    segs.push({ label: "tmpfs / shmem (host)", gib: leftoverShmem, cls: "resv",
+               tag: "needs swap" });
   if (slabU > 0.3)
     segs.push({ label: "kernel slab (unreclaimable)", gib: slabU, cls: "resv",
                tag: "unreclaimable" });
   segs.push(...engSegs);
-  if (imgSeg) segs.push(imgSeg);
   const committed = segs.reduce((a, s) => a + (s.gib || 0), 0);   // ≈ osUsed
   const cache = Math.max(0, physUsed - committed);
   if (cache > 0.05)
@@ -653,7 +666,10 @@ function hostRamRepaint(lane, host, st) {
     const sw = el("span", "sw" + (s.cls ? " " + s.cls : "")); sw.style.background = segColor(s);
     row.append(sw, el("span", "nm", s.label), el("span", "gb", fmtGib(s.gib)));
     if (s.budget != null && s.budget > 0.05) {
-      const over = s.gib - s.budget;
+      // compare the tenant's whole measured footprint (anon + its shmem) to its
+      // single budget, not just the anon sub-segment.
+      const measured = s.groupGib != null ? s.groupGib : s.gib;
+      const over = measured - s.budget;
       const t = el("span", "tg", over > 0.5 ? `over ${fmtGib(over)}` : `budget ${fmtGib(s.budget)}`);
       if (over > 0.5) t.style.color = "var(--orange)";
       row.append(t);

@@ -256,11 +256,17 @@ def _one_container_mem(base: str, name: str, timeout: float) -> tuple[str, dict]
     g = 1024 ** 3
     # cgroup v2: `anon` is the non-reclaimable working set; `file` is this
     # container's slice of the global page cache (already in meminfo — don't
-    # re-add it to the lane). cgroup v1 fallback: `rss` / `cache`.
+    # re-add it to the lane). `shmem` is tmpfs / SysV / POSIX shared memory
+    # charged to this cgroup — for an engine that offloads a big structure to
+    # /dev/shm (SGLang's FP8 n-gram PLE table, HiCache host pool) it dwarfs
+    # anon and is just as un-reclaimable, so attribute it to the engine too.
+    # cgroup v1 fallback: `rss` / `cache`.
     anon = st.get("anon", st.get("rss", 0.0)) or 0.0
     fileb = st.get("file", st.get("cache", 0.0)) or 0.0
+    shmem = st.get("shmem", 0.0) or 0.0
     usage = m.get("usage", 0.0) or 0.0
     return name, {"anon_gib": round(anon / g, 2),
+                  "shmem_gib": round(shmem / g, 2),
                   "file_gib": round(fileb / g, 2),
                   "usage_gib": round(usage / g, 2)}
 
