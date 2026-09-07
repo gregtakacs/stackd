@@ -18,7 +18,7 @@ import _env  # noqa: F401,E402  — reference ${VAR} env for config interpolatio
 
 from stackd.engines.base import EngineState  # noqa: E402
 from stackd.manager import Manager  # noqa: E402
-from stackd.pricing import load_pricing, savings, sync_manual_prices  # noqa: E402
+from stackd.pricing import load_pricing, savings, savings_facts, sync_manual_prices  # noqa: E402
 from stackd.runner import FakeRunner  # noqa: E402
 from stackd.serve import _extract_usage, make_server  # noqa: E402
 from stackd.store import Store, _utc_day  # noqa: E402
@@ -113,11 +113,10 @@ def main() -> int:
         st.record_usage(user_email="u@x.com", requested_model="assistant",
                         served_stack="chat", served_model="Qwen3.8-27B", served_profile="chat",
                         prompt_tokens=1000, completion_tokens=500, cached_tokens=200,
-                        prefill_ms=400, decode_ms=2000, now=old)   # ctx=1500
+                        now=old)   # ctx=1500
     st.record_usage(user_email="u@x.com", requested_model="assistant",
                     served_stack="chat", served_model="Qwen3.8-27B", served_profile="chat",
-                    prompt_tokens=2000, completion_tokens=800,
-                    prefill_ms=500, decode_ms=4000)  # today, ctx=2800
+                    prompt_tokens=2000, completion_tokens=800)  # today, ctx=2800
     moved = st.rollup(retain_days=7)
     check("rollup folds old rows", moved == 3)
     rows = st.usage_rows()
@@ -126,10 +125,7 @@ def main() -> int:
           sum(r["prompt_tokens"] for r in rows) == 1000 * 3 + 2000)
     check("usage_rows carry stack + checkpoint through the rollup",
           all(r["served_stack"] == "chat" and r["served_model"] == "Qwen3.8-27B" for r in rows))
-    # timing + context survive record -> rollup -> usage_rows
-    check("timing sums fold through the rollup",
-          sum(r["decode_ms"] for r in rows) == 3 * 2000 + 4000
-          and sum(r["prefill_ms"] for r in rows) == 3 * 400 + 500)
+    # context survives record -> rollup -> usage_rows (tok/s no longer folded here)
     check("ctx_tokens_sum + ctx_tokens_max fold through",
           sum(r["ctx_tokens_sum"] for r in rows) == 3 * 1500 + 2800
           and max(r["ctx_tokens_max"] for r in rows) == 2800)
@@ -162,11 +158,47 @@ def main() -> int:
     check("v3 migration: old stack id moved to served_stack, checkpoint seeded '?'",
           mr["served_stack"] == "coding" and mr["served_model"] == "?"
           and mr["reqs"] == 4 and mr["prompt_tokens"] == 400)
-    check("v4 migration adds timing/context columns",
-          {"prefill_ms", "decode_ms", "ctx_tokens"} <= ucols
-          and {"prefill_ms", "decode_ms", "ctx_tokens_sum", "ctx_tokens_max"} <= dcols)
+    check("v4 migration adds the context columns",
+          "ctx_tokens" in ucols and {"ctx_tokens_sum", "ctx_tokens_max", "ctx_n"} <= dcols)
+    check("v6 migration: dead per-request timing columns are gone",
+          not ({"prefill_ms", "decode_ms"} & ucols)
+          and not ({"prefill_ms", "prefill_tok", "decode_ms", "decode_tok"} & dcols))
     check("migration stamps the current schema_version",
           mg.get_meta("schema_version") == str(__import__("stackd.store", fromlist=["SCHEMA_VERSION"]).SCHEMA_VERSION))
+
+    # v5 -> v6: a DB that still HAS the timing columns (+ data) gets them dropped,
+    # everything else intact.
+    v5p = tmp / "v5.db"
+    v5 = _sqm.connect(str(v5p))
+    v5.executescript(
+        "CREATE TABLE usage (id INTEGER PRIMARY KEY, ts REAL, day TEXT, user_email TEXT,"
+        " requested_model TEXT, served_stack TEXT, served_model TEXT, served_profile TEXT,"
+        " off_home INT, prompt_tokens INT, completion_tokens INT, cached_tokens INT, ok INT,"
+        " prefill_ms INT DEFAULT 0, decode_ms INT DEFAULT 0, ctx_tokens INT DEFAULT 0);"
+        "INSERT INTO usage (ts,day,user_email,prompt_tokens,completion_tokens,prefill_ms,decode_ms,ctx_tokens)"
+        " VALUES (1e9,'2026-09-01','a@x.com',100,50,999,999,150);"
+        "CREATE TABLE usage_daily (day TEXT, user_email TEXT, requested_model TEXT, served_profile TEXT,"
+        " served_stack TEXT NOT NULL DEFAULT '?', served_model TEXT NOT NULL DEFAULT '?', reqs INT,"
+        " prompt_tokens INT, completion_tokens INT, cached_tokens INT,"
+        " prefill_ms INT DEFAULT 0, prefill_tok INT DEFAULT 0, decode_ms INT DEFAULT 0, decode_tok INT DEFAULT 0,"
+        " ctx_tokens_sum INT DEFAULT 0, ctx_tokens_max INT DEFAULT 0, ctx_n INT DEFAULT 0,"
+        " PRIMARY KEY (day,user_email,requested_model,served_profile,served_stack,served_model));"
+        "INSERT INTO usage_daily VALUES ('2026-08-01','a@x.com','assistant','chat','chat','M',7,700,300,10,"
+        " 40,4,80,8,900,450,7);"
+        "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);"
+        "INSERT INTO meta VALUES ('schema_version','5');")
+    v5.commit(); v5.close()
+    m6 = Store.open(str(v5p))
+    u6 = {r["name"] for r in m6.conn.execute("PRAGMA table_info(usage)")}
+    d6 = {r["name"] for r in m6.conn.execute("PRAGMA table_info(usage_daily)")}
+    check("v6: timing columns dropped from an existing DB",
+          not ({"prefill_ms", "decode_ms"} & u6)
+          and not ({"prefill_ms", "prefill_tok", "decode_ms", "decode_tok"} & d6))
+    d6row = m6.conn.execute("SELECT prompt_tokens, ctx_tokens_sum FROM usage_daily").fetchone()
+    check("v6: token + context data survives the column drop",
+          m6.conn.execute("SELECT completion_tokens FROM usage").fetchone()[0] == 50
+          and m6.conn.execute("SELECT ctx_tokens FROM usage").fetchone()[0] == 150
+          and (d6row[0], d6row[1]) == (700, 900))
     t_old = time.time() - 30 * 86400
     for sk, art in (("coding", "Flash-Next"), ("coding", "Flash-Next"),
                     ("uncensored-big", "Flash-Next-heretic")):
@@ -233,16 +265,51 @@ def main() -> int:
     check("tier carries its resolved price + annualized",
           front["price"] and "input_mtok" in front["price"] and "annualized" in front)
     check("savings exposes pricing status", "pricing_stale" in sv and "last_openrouter_fetch" in sv)
-    # token-weighted: decode_tok 2300 over decode_ms 10000 -> 230 tok/s
-    tpv = sv["throughput"]
-    check("savings.throughput is token-weighted",
-          abs(tpv["decode_tps"] - 230) < 1 and tpv["ctx_max"] == 2800 and tpv["prefill_tps"] > 0)
-    # an UNTIMED row (decode_ms=0) with a big completion must not blow up the mean
+    # tok/s + peak ctx now come from engine_daily (the telemetry sampler), not
+    # the per-request ledger split. Seed a day's engine counters for `chat`.
+    st.add_engine_sample(served_stack="chat", served_model="Qwen3.8-27B",
+                         served_profile="chat", decode_tok=2300, decode_ms=10000,
+                         prefill_tok=1400, prefill_ms=2000, ctx_tokens_max=2800)
+    tpv = savings(st, pcfg)["throughput"]
+    check("savings.throughput is engine-measured + token-weighted",
+          abs(tpv["decode_tps"] - 230) < 1 and tpv["ctx_max"] == 2800
+          and abs(tpv["prefill_tps"] - 700) < 1)
+    # a big new ledger row must NOT move the engine tok/s (they only track engine_daily)
     st.record_usage(user_email="u@x.com", requested_model="assistant", served_stack="chat",
                     served_model="Qwen3.8-27B", served_profile="chat",
-                    prompt_tokens=9999, completion_tokens=9999)  # no timing
-    check("untimed rows don't poison the weighted tok/s",
+                    prompt_tokens=9999, completion_tokens=9999)
+    check("ledger rows never feed the engine tok/s",
           abs(savings(st, pcfg)["throughput"]["decode_tps"] - 230) < 1)
+    # add_engine_sample accumulates additively; ctx peak takes the MAX
+    st.add_engine_sample(served_stack="chat", served_model="Qwen3.8-27B",
+                         served_profile="chat", decode_tok=700, decode_ms=2000,
+                         ctx_tokens_max=1500)
+    er = {(r["served_stack"], r["served_model"]): r
+          for r in st.engine_rows(_utc_day(), _utc_day())}
+    ec = er[("chat", "Qwen3.8-27B")]
+    check("add_engine_sample folds additively + MAXes the ctx peak",
+          ec["decode_tok"] == 3000 and ec["decode_ms"] == 12000 and ec["ctx_tokens_max"] == 2800)
+    check("engine_rows honours the day range", st.engine_rows("2000-01-01", "2000-01-02") == [])
+
+    # savings_facts pro-rates engine timing onto the priced rows by token share:
+    # tps is identical on every sub-row, so a user filter still reads right.
+    fdb = Store.open(str(tmp / "facts.db"))
+    for u, comp in (("a@x.com", 800), ("b@x.com", 200)):
+        fdb.record_usage(user_email=u, requested_model="assistant", served_stack="coding",
+                         served_model="Flash", served_profile="coding",
+                         prompt_tokens=comp * 2, completion_tokens=comp)
+    fdb.add_engine_sample(served_stack="coding", served_model="Flash", served_profile="coding",
+                          decode_tok=5000, decode_ms=25000, prefill_tok=4000, prefill_ms=8000,
+                          ctx_tokens_max=40000)
+    ff = savings_facts(fdb, pcfg)["facts"]
+    byu = {f["user_email"]: f for f in ff}
+    check("engine decode_tok split by completion share (800:200)",
+          byu["a@x.com"]["decode_tok"] == 4000 and byu["b@x.com"]["decode_tok"] == 1000)
+    check("engine decode_ms split the same way -> equal tps per row",
+          byu["a@x.com"]["decode_ms"] == 20000 and byu["b@x.com"]["decode_ms"] == 5000)
+    check("every sub-row shows the engine's real rate + engine-wide peak ctx",
+          all(abs(f["decode_tok"] * 1000 / f["decode_ms"] - 200) < 1
+              and f["engine_ctx_max"] == 40000 for f in byu.values()))
     pcfg2 = {**pcfg, "hardware_cost": 1000, "payback_tier": "frontier"}
     check("payback_pct computed when hardware_cost set",
           savings(st, pcfg2)["payback_pct"] is not None)

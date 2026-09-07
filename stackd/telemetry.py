@@ -240,6 +240,31 @@ def _prom_label(text: str, metric: str, label: str):
     return None
 
 
+def _prom_sum(text: str, metric: str, **match) -> float | None:
+    """Sum every series of `metric` whose label set contains all of `match`
+    (label=value). No `match` -> sum across every series of that name. `_prom`
+    keys by bare name so it silently keeps only the last of a multi-series
+    counter (e.g. SGLang's `generation_tokens_total{is_streaming=...}`); this
+    adds them up instead. None if no series matched."""
+    total, seen = 0.0, False
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line[0] == "#" or not line.startswith(metric):
+            continue
+        head, _, val = line.rpartition(" ")
+        if head.split("{", 1)[0].strip() != metric:
+            continue
+        if match:
+            labels = head[len(metric):]
+            if not all(f'{k}="{v}"' in labels for k, v in match.items()):
+                continue
+        try:
+            total += float(val); seen = True
+        except ValueError:
+            pass
+    return total if seen else None
+
+
 def _http_json(url: str, timeout: float = 4.0):
     import urllib.request
     with urllib.request.urlopen(url, timeout=timeout) as r:
@@ -541,3 +566,86 @@ def engine_telemetry(endpoint: str, template: str) -> dict:
     except Exception as e:  # noqa: BLE001 — telemetry is best-effort
         d["error"] = str(e)
     return d
+
+
+def engine_counters(endpoint: str, template: str) -> dict | None:
+    """Raw cumulative counters for the throughput sampler (serve._engine_sampler).
+
+    Unlike `engine_telemetry` (which smooths into live rates) this returns the
+    monotonic totals straight off `/metrics`, so the sampler can take honest
+    poll-to-poll deltas and fold them token-weighted into `engine_daily`:
+
+      gen_tok / gen_s     - generation tokens / decode seconds. gen_s is
+                            counter-based for llama.cpp (`*_seconds_total`) and
+                            SGLang (`inter_token_latency_seconds_sum`, streaming);
+                            vanilla vLLM has no such counter, so there the sampler
+                            falls back to wall-clock while a request is in flight.
+      prompt_tok / prefill_s - prompt tokens prefilled / prefill seconds
+                            (counter-based for all three engines).
+      ctx_tokens          - current KV fill in tokens (for a running peak).
+      running             - in-flight request count (0 => idle).
+
+    None if the endpoint is unreachable / the template is unknown. Individual
+    keys are None when that engine doesn't expose them."""
+    ep = endpoint.rstrip("/")
+    out: dict = {"gen_tok": None, "gen_s": None, "prompt_tok": None,
+                 "prefill_s": None, "ctx_tokens": None, "running": None}
+    try:
+        if template.startswith("llamacpp"):
+            m = _prom(_http_text(ep + "/metrics"))
+            out["gen_tok"] = m.get("llamacpp:tokens_predicted_total")
+            out["gen_s"] = m.get("llamacpp:tokens_predicted_seconds_total")
+            out["prompt_tok"] = m.get("llamacpp:prompt_tokens_total")
+            out["prefill_s"] = m.get("llamacpp:prompt_seconds_total")
+            out["running"] = int(m.get("llamacpp:requests_processing") or 0)
+            try:
+                slots = _http_json(ep + "/slots")
+                slots = slots if isinstance(slots, list) else slots.get("slots", [])
+                out["ctx_tokens"] = max(
+                    ((s.get("n_past") or s.get("n_prompt_tokens", 0)) for s in slots),
+                    default=0) or None
+            except Exception:  # noqa: BLE001 — /slots may be disabled
+                pass
+        elif template.startswith("vllm"):
+            mtext = _http_text(ep + "/metrics")
+            m = _prom(mtext)
+            out["gen_tok"] = _prom_sum(mtext, "vllm:generation_tokens_total")
+            # real KV-computed prefill tokens (excludes vLLM's own prefix-cache
+            # hits) paired with the matching time sum -> honest prefill tok/s
+            out["prompt_tok"] = (_prom_sum(mtext, "vllm:request_prefill_kv_computed_tokens_sum")
+                                 or _prom_sum(mtext, "vllm:prompt_tokens_total"))
+            out["prefill_s"] = _prom_sum(mtext, "vllm:request_prefill_time_seconds_sum")
+            out["running"] = int(_prom_sum(mtext, "vllm:num_requests_running") or 0)
+            frac = m.get("vllm:kv_cache_usage_perc")
+            pool = _prom_label(mtext, "vllm:cache_config_info", "kv_cache_size_tokens")
+            if frac is not None and (pool or "").isdigit():
+                out["ctx_tokens"] = round(frac * int(pool))
+        elif template.startswith("sglang"):
+            t = _http_text(ep + "/metrics")
+            # decode: pair streaming gen tokens with the inter-token-latency sum
+            # (both streaming-domain) -> a real cumulative decode-seconds counter,
+            # so a whole request between polls is still measured. Falls back to
+            # the total gen counter when the fork doesn't expose ITL.
+            out["gen_tok"] = (_prom_sum(t, "sglang:generation_tokens_total", is_streaming="true")
+                              or _prom_sum(t, "sglang:generation_tokens_total"))
+            out["gen_s"] = _prom_sum(t, "sglang:inter_token_latency_seconds_sum")
+            # prefill: prefer the compute-only stage timer + compute-only token
+            # counter (excludes queue wait + cache hits); else TTFT + prompt total.
+            out["prompt_tok"] = (_prom_sum(t, "sglang:realtime_tokens_total", mode="prefill_compute")
+                                 or _prom_sum(t, "sglang:prompt_tokens_total"))
+            out["prefill_s"] = (_prom_sum(t, "sglang:per_stage_req_latency_seconds_sum",
+                                          stage="prefill_forward")
+                                or _prom_sum(t, "sglang:time_to_first_token_seconds_sum"))
+            out["running"] = int(_prom_sum(t, "sglang:num_running_reqs") or 0)
+            used = _prom_sum(t, "sglang:kv_used_tokens") or _prom_sum(t, "sglang:num_used_tokens")
+            pool = _prom_sum(t, "sglang:max_total_num_tokens")
+            frac = _prom_sum(t, "sglang:token_usage")
+            if used:
+                out["ctx_tokens"] = int(used)
+            elif frac is not None and pool:
+                out["ctx_tokens"] = round(frac * pool)
+        else:
+            return None
+    except Exception:  # noqa: BLE001 — best-effort
+        return None
+    return out

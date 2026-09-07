@@ -137,10 +137,13 @@ def savings(store: Store, cfg: dict, *, from_day: str | None = None,
     pay = next((b for b in blocks if b["label"] == pay_label), blocks[-1] if blocks else None)
     payback_pct = round(max(0.0, pay["net"]) / hw * 100, 2) if (hw > 0 and pay) else None
 
-    _pfm = sum(r.get("prefill_ms") or 0 for r in rows)
-    _pft = sum(r.get("prefill_tok") or 0 for r in rows)
-    _dcm = sum(r.get("decode_ms") or 0 for r in rows)
-    _dct = sum(r.get("decode_tok") or 0 for r in rows)
+    # tok/s + peak context: the engines' own /metrics counters (engine_daily).
+    # ctx_avg (per-request mean) still comes from the ledger.
+    erows = store.engine_rows(days[0], days[-1]) if days else []
+    _pfm = sum(r.get("prefill_ms") or 0 for r in erows)
+    _pft = sum(r.get("prefill_tok") or 0 for r in erows)
+    _dcm = sum(r.get("decode_ms") or 0 for r in erows)
+    _dct = sum(r.get("decode_tok") or 0 for r in erows)
     _cxn = sum(r.get("ctx_n") or 0 for r in rows)
     return {
         "from": days[0] if days else None, "to": days[-1] if days else None,
@@ -149,12 +152,12 @@ def savings(store: Store, cfg: dict, *, from_day: str | None = None,
         "reqs": sum(r["reqs"] for r in rows),
         "prompt_tokens": sum(r["prompt_tokens"] for r in rows),
         "completion_tokens": sum(r["completion_tokens"] for r in rows),
-        # token-weighted throughput + context size over the range (timed rows only)
+        # engine-measured throughput (token-weighted) + peak context over the range
         "throughput": {
             "decode_tps": round(_dct * 1000 / _dcm, 1) if _dcm else 0.0,
             "prefill_tps": round(_pft * 1000 / _pfm, 1) if _pfm else 0.0,
             "ctx_avg": round(sum(r.get("ctx_tokens_sum") or 0 for r in rows) / _cxn) if _cxn else 0,
-            "ctx_max": max((r.get("ctx_tokens_max") or 0 for r in rows), default=0),
+            "ctx_max": max((r.get("ctx_tokens_max") or 0 for r in erows), default=0),
         },
         "energy": {**energy, "kwh": round(kwh, 4), "cost": energy_cost,
                    "price_per_kwh": cfg["electricity_price_per_kwh"]},
@@ -166,6 +169,64 @@ def savings(store: Store, cfg: dict, *, from_day: str | None = None,
         "last_openrouter_fetch": store.get_meta("last_openrouter_fetch"),
         "token_total_for_share": tok_total,
     }
+
+
+def _apportion(total: int, weights: list[float]) -> list[int]:
+    """Split `total` across `weights` so the parts are integers that sum to
+    exactly `total` (largest-remainder). All-zero weights -> an even split."""
+    n = len(weights)
+    if n == 0 or total == 0:
+        return [0] * n
+    wsum = sum(weights)
+    if wsum <= 0:
+        weights = [1.0] * n
+        wsum = float(n)
+    raw = [total * w / wsum for w in weights]
+    out = [int(x) for x in raw]
+    rem = total - sum(out)
+    for i in sorted(range(n), key=lambda i: raw[i] - out[i], reverse=True)[:rem]:
+        out[i] += 1
+    return out
+
+
+def _join_engine_throughput(facts: list[dict], erows: list[dict], keys) -> None:
+    """Fold engine_daily's per-`(day, stack)` token/ms totals onto the priced
+    facts, pro-rated by each fact's token share (decode by completion tokens,
+    prefill by prompt tokens). Because tps = Σtok/Σms, splitting numerator and
+    denominator by the same ratio leaves every sub-row showing the engine's real
+    sustained rate — so a user/API-name filter still reads correctly. A `(day,
+    stack)` with engine timing but no matching priced row lands on a synthetic
+    `user_email='(engine)'` fact so the tree totals still reconcile."""
+    buckets: dict[tuple, dict] = {}
+    for r in erows:
+        b = buckets.setdefault((r["day"], r["served_stack"]),
+                               {"dct": 0, "dcm": 0, "pft": 0, "pfm": 0, "cxm": 0})
+        b["dct"] += r.get("decode_tok") or 0;  b["dcm"] += r.get("decode_ms") or 0
+        b["pft"] += r.get("prefill_tok") or 0; b["pfm"] += r.get("prefill_ms") or 0
+        b["cxm"] = max(b["cxm"], r.get("ctx_tokens_max") or 0)
+
+    by_ds: dict[tuple, list[dict]] = {}
+    for f in facts:
+        by_ds.setdefault((f["day"], f["served_stack"]), []).append(f)
+
+    for (day, stack), b in buckets.items():
+        grp = by_ds.get((day, stack))
+        if not grp:
+            f = {k: v for k, v in zip(keys, (day, "(engine)", "(engine)", stack, "(engine)", "(engine)"))}
+            f.update(reqs=0, prompt_tokens=0, completion_tokens=0, cached_tokens=0,
+                     ctx_tokens_sum=0, ctx_n=0, ctx_tokens_max=0,
+                     prefill_ms=0, prefill_tok=0, decode_ms=0, decode_tok=0,
+                     engine_ctx_max=0, gross={})
+            facts.append(f)
+            grp = [f]
+        dec_w = [f["completion_tokens"] for f in grp]
+        pre_w = [f["prompt_tokens"] for f in grp]
+        for f, dt, dm, pt, pm in zip(grp,
+                                     _apportion(b["dct"], dec_w), _apportion(b["dcm"], dec_w),
+                                     _apportion(b["pft"], pre_w), _apportion(b["pfm"], pre_w)):
+            f["decode_tok"] += dt;  f["decode_ms"] += dm
+            f["prefill_tok"] += pt; f["prefill_ms"] += pm
+            f["engine_ctx_max"] = max(f.get("engine_ctx_max") or 0, b["cxm"])
 
 
 def savings_facts(store: Store, cfg: dict, *, from_day: str | None = None,
@@ -203,13 +264,18 @@ def savings_facts(store: Store, cfg: dict, *, from_day: str | None = None,
     for key, g in groups.items():
         rec = dict(zip(keys, key))
         for col in ("reqs", "prompt_tokens", "completion_tokens", "cached_tokens",
-                    "prefill_ms", "prefill_tok", "decode_ms", "decode_tok",
                     "ctx_tokens_sum", "ctx_n"):
             rec[col] = sum(x.get(col) or 0 for x in g)
         rec["ctx_tokens_max"] = max((x.get("ctx_tokens_max") or 0 for x in g), default=0)
+        # timing is filled below from engine_daily, pro-rated by token share
+        rec["prefill_ms"] = rec["prefill_tok"] = 0
+        rec["decode_ms"] = rec["decode_tok"] = 0
+        rec["engine_ctx_max"] = 0
         rec["gross"] = {t["label"]: _gross_for(_tier_rows(g, t), store, t["ref"])
                         for t in tiers}
         facts.append(rec)
+
+    _join_engine_throughput(facts, store.engine_rows(from_day, to_day), keys)
 
     return {
         "from": days[0] if days else None, "to": days[-1] if days else None,
