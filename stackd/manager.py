@@ -549,6 +549,34 @@ class Manager:
                 return {}
         stack_tm = {n: _tm(n, rt.device) for n, rt in self.state.stacks.items()}
         idle_evict_in = None if deadline is None else round(deadline - now)
+
+        pools = [{"pool": p.pool, "used": p.used_gib, "limit": p.limit_gib,
+                  "headroom": p.headroom_gib, "ok": p.ok, "breakdown": dict(p.breakdown)}
+                 for p in report.pools]
+        # The elastic image tier isn't a profile member, so validate_profile()
+        # never charges its host RAM to host_unified. Fold the RESIDENT entry's
+        # declared host_ram_gib in here so the dashboard's reserved-vs-actual
+        # view is complete and Σ(reserved) — OS reserve included — is a real
+        # number to compare against the box's RAM. (Runtime placement already
+        # honours it: reconciler._pick_image / swap_image guard on it.)
+        image_ram_budget = None
+        img = self.state.image
+        if img is not None:
+            tier = self.cfg.media.get("image")
+            ld = next((l for l in tier.prefer if l.active_model == img.active_model),
+                      None) if tier else None
+            gib = ld.host_ram_gib.get(img.backend) if ld else None
+            if gib:
+                image_ram_budget = {"model": img.active_model, "backend": img.backend,
+                                    "device": img.device, "gib": round(gib, 2)}
+                for pd in pools:
+                    if pd["pool"] != "host_unified":
+                        continue
+                    pd["used"] = round(pd["used"] + gib, 2)
+                    pd["headroom"] = round(pd["limit"] - pd["used"], 2)
+                    pd["ok"] = pd["used"] <= pd["limit"] + 1e-6
+                    pd["breakdown"][f"image:{img.active_model}"] = round(gib, 2)
+
         return {
             "active_profile": self.state.active_profile,
             "pinned": self.state.pinned,
@@ -579,9 +607,8 @@ class Manager:
                 if self.state.image is not None else None
             ),
             "missing": [n for n in report.resident if n not in running],
-            "pools": [{"pool": p.pool, "used": p.used_gib, "limit": p.limit_gib,
-                       "headroom": p.headroom_gib, "ok": p.ok, "breakdown": p.breakdown}
-                      for p in report.pools],
+            "pools": pools,
+            "image_ram_budget": image_ram_budget,
             "devices": [{"device": d.device, "budget": d.budget_gib, "used": d.used_gib,
                          "headroom": d.headroom_gib, "ok": d.ok, "models": d.models}
                         for d in report.devices],

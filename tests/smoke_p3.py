@@ -91,6 +91,24 @@ def main() -> int:
     check("video slot empty (no video tier)", caps["video"] is None)
     check("engines() lists 2 LLM stacks + the image slot", len(m.engines()) == 3)
 
+    # status(): the resident image tier's declared host_ram_gib folds into the
+    # host_unified pool so the dashboard's reserved-vs-actual view is complete.
+    ld = next(l for l in m.cfg.media["image"].prefer if l.active_model == "flux2-dev-turbo")
+    ld.host_ram_gib = {"cuda": 40.0}
+    stt = m.status()
+    irb = stt["image_ram_budget"]
+    check("status.image_ram_budget carries the resident entry's host_ram_gib",
+          irb and irb["model"] == "flux2-dev-turbo" and irb["gib"] == 40.0)
+    hup = next(p for p in stt["pools"] if p["pool"] == "host_unified")
+    check("host_unified pool charges the image tier's host RAM",
+          hup["breakdown"].get("image:flux2-dev-turbo") == 40.0
+          and hup["used"] <= hup["limit"] + 1e-6)
+    ld.host_ram_gib = {}
+    check("no host_ram_gib -> image_ram_budget is None, pool unaffected",
+          m.status()["image_ram_budget"] is None
+          and "image:flux2-dev-turbo" not in
+          next(p for p in m.status()["pools"] if p["pool"] == "host_unified")["breakdown"])
+
     # mid-swap contention: a co-device (cuda0) stack warming -> image not serveable
     m.state.stacks["chat"].state = EngineState.warming
     caps2 = m.capabilities()

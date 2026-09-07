@@ -90,6 +90,9 @@
   .seg-row .sw.crashed { outline:1px solid var(--red); }
   .seg-row .sw.cache { background-image:repeating-linear-gradient(45deg,#0000,#0000 3px,#ffffff40 3px,#ffffff40 6px); }
   .bar .free { flex:1; }
+  /* reserved (budget) twin bar in the host-RAM lane — narrower, sits beside the measured bar */
+  .lane .bar-budget { width:26px; opacity:.9; }
+  .bar-budget.over { border-color:var(--red); box-shadow:inset 0 0 0 1px var(--red); }
   .marker { position:absolute; left:-4px; right:-4px; border-top:2px dashed var(--accent); z-index:5; transition:bottom .4s ease; }
   .marker span { position:absolute; right:0; top:-14px; font-size:.62rem; color:var(--accent); background:var(--bg); padding:0 2px; }
   .ghost { font-size:.76rem; color:var(--dim); border:1px dashed var(--border); border-radius:6px; padding:4px 8px; margin-top:6px; display:inline-block; }
@@ -558,46 +561,69 @@ const MUTED_SEG = "#3a4152";
 function hostRamSegs(host, st) {
   if (!host || host.mem_anon_gib == null) return null;
   const cont = host.containers || {};
+  const osUsed = host.mem_used_gib || 0;             // MemTotal - MemAvailable (the line)
+  const physUsed = host.mem_phys_used_gib || osUsed;  // MemTotal - MemFree
+  const shmem = host.mem_shmem_gib || 0;
+  const slabU = host.mem_slab_unreclaim_gib || 0;
+  const mr = st.model_ram || {};
+  const hu = (st.pools || []).find(p => p.pool === "host_unified");
+  const bd = (hu && hu.breakdown) || {};
+  const reserveBudget = (bd.host_reserve || 0) + (bd.load_slack || 0);
+
+  // ---- measured: solid segments summing to "OS used" + a cache band on top --
   const segs = [];
   let engAnon = 0;
-  // one segment per resident engine, coloured to its profile chip / VRAM segment
   for (const [name, s] of Object.entries(st.stacks || {})) {
     const c = s && s.container && cont[s.container];
     if (!c || !c.anon_gib) continue;
     engAnon += c.anon_gib;
-    segs.push({ label: name + " · engine RSS", gib: c.anon_gib,
-                color: modelColor(name),
-                cls: s.state === "warming" ? "warming" : "",
-                tag: "measured" });
+    segs.push({ label: name + " · engine RSS", gib: c.anon_gib, color: modelColor(name),
+                cls: s.state === "warming" ? "warming" : "", tag: "measured",
+                budget: mr[name] });
   }
   const im = st.image;
   if (im && im.container && cont[im.container] && cont[im.container].anon_gib) {
     engAnon += cont[im.container].anon_gib;
     segs.push({ label: "image · " + im.active_model + " · engine RSS",
-                gib: cont[im.container].anon_gib, cls: "elastic", tag: "measured" });
+                gib: cont[im.container].anon_gib, cls: "elastic", tag: "measured",
+                color: modelColor("image:" + im.active_model),
+                budget: st.image_ram_budget && st.image_ram_budget.gib });
   }
-  // everything else anonymous: the host itself + containers stackd doesn't own
-  const otherAnon = Math.max(0, (host.mem_anon_gib || 0) - engAnon);
-  if (otherAnon > 0.05)
-    segs.push({ label: "host + other containers · anon", gib: otherAnon,
-                color: MUTED_SEG, tag: "measured" });
-  if ((host.mem_shmem_gib || 0) > 0.3)
-    segs.push({ label: "tmpfs / shmem", gib: host.mem_shmem_gib,
-                cls: "resv", tag: "needs swap" });
-  if ((host.mem_slab_unreclaim_gib || 0) > 0.3)
-    segs.push({ label: "kernel slab (unreclaimable)", gib: host.mem_slab_unreclaim_gib,
-                cls: "resv", tag: "unreclaimable" });
-  const committed = segs.reduce((a, s) => a + (s.gib || 0), 0);
-  if ((host.mem_cache_reclaimable_gib || 0) > 0.05)
-    segs.push({ label: "page cache · reclaimable", gib: host.mem_cache_reclaimable_gib,
-                cls: "cache", color: "#2a3040", tag: "evictable" });
-  const physUsed = host.mem_phys_used_gib
-    ?? segs.reduce((a, s) => a + (s.gib || 0), 0);
-  return { segs, committed, physUsed };
+  if (shmem > 0.3)
+    segs.push({ label: "tmpfs / shmem", gib: shmem, cls: "resv", tag: "needs swap" });
+  if (slabU > 0.3)
+    segs.push({ label: "kernel slab (unreclaimable)", gib: slabU, cls: "resv",
+               tag: "unreclaimable" });
+  // residual committed memory, forced so the solid stack height == "OS used".
+  const otherCommitted = Math.max(0, osUsed - engAnon - shmem - slabU);
+  if (otherCommitted > 0.05)
+    segs.push({ label: "host + other containers", gib: otherCommitted, color: MUTED_SEG,
+                tag: "measured", budget: reserveBudget });
+  const committed = segs.reduce((a, s) => a + (s.gib || 0), 0);   // ≈ osUsed
+  const cache = Math.max(0, physUsed - committed);
+  if (cache > 0.05)
+    segs.push({ label: "page cache · reclaimable", gib: cache, cls: "cache",
+                color: "#2a3040", tag: "evicts under pressure" });
+
+  // ---- reserved: the budget stack (Σ must stay under the box's RAM) ---------
+  const budgetLimit = (hu && hu.limit) || host.mem_total_gib || physUsed;
+  const budgetSegs = [];
+  if (reserveBudget > 0.05)
+    budgetSegs.push({ label: "OS + containers reserve", gib: reserveBudget, color: MUTED_SEG });
+  for (const [name, s] of Object.entries(st.stacks || {})) {
+    if (mr[name]) budgetSegs.push({ label: name, gib: mr[name], color: modelColor(name) });
+  }
+  if (st.image_ram_budget && st.image_ram_budget.gib)
+    budgetSegs.push({ label: "image · " + st.image_ram_budget.model,
+                      gib: st.image_ram_budget.gib, cls: "elastic",
+                      color: modelColor("image:" + st.image_ram_budget.model) });
+  const budgetTotal = budgetSegs.reduce((a, s) => a + (s.gib || 0), 0);
+
+  return { segs, committed, physUsed, osUsed, budgetSegs, budgetTotal, budgetLimit };
 }
 
-// in-place per-tick repaint of the host RAM lane's bar + legend (its segments
-// move every tick, unlike the other lanes which only rebuild on a map change).
+// in-place per-tick repaint of the host RAM lane: measured bar (segments move
+// every tick), the reserved twin bar, and the legend.
 function hostRamRepaint(lane, host, st) {
   const r = hostRamSegs(host, st);
   if (!r || !lane) return false;
@@ -608,10 +634,10 @@ function hostRamRepaint(lane, host, st) {
   const sl = lane.querySelector(".seglist");
   const frow = sl.querySelector(".free-row");
   sl.querySelectorAll(".seg-row:not(.free-row)").forEach(n => n.remove());
-  let used = 0;
+  let drawn = 0;
   for (const s of r.segs) {
     if (!s.gib || s.gib <= 0.02) continue;
-    used += s.gib;
+    drawn += s.gib;
     const d = el("div", "seg" + (s.cls ? " " + s.cls : ""));
     d.style.height = Math.max(0.4, (s.gib / limit) * 100) + "%";
     d.style.background = segColor(s);
@@ -620,22 +646,43 @@ function hostRamRepaint(lane, host, st) {
     const row = el("div", "seg-row");
     const sw = el("span", "sw" + (s.cls ? " " + s.cls : "")); sw.style.background = segColor(s);
     row.append(sw, el("span", "nm", s.label), el("span", "gb", fmtGib(s.gib)));
-    if (s.tag) row.append(el("span", "tg", s.tag));
+    if (s.budget != null && s.budget > 0.05) {
+      const over = s.gib - s.budget;
+      const t = el("span", "tg", over > 0.5 ? `over ${fmtGib(over)}` : `budget ${fmtGib(s.budget)}`);
+      if (over > 0.5) t.style.color = "var(--orange)";
+      row.append(t);
+    } else if (s.tag) row.append(el("span", "tg", s.tag));
     sl.insertBefore(row, frow);
   }
-  frow.querySelector(".gb").textContent = fmtGib(Math.max(0, limit - used));
-  // over-delta on the "OS used" line is now measured vs the committed (non-
-  // reclaimable) stack — a small positive number = the slice of page cache the
-  // kernel won't promise back. Near zero => the decomposition adds up.
+  frow.querySelector(".gb").textContent = fmtGib(Math.max(0, limit - drawn));
+
+  // reserved twin bar (created on first repaint; the lane is rebuilt only on a
+  // map change, so it may not exist yet).
+  let bb = lane.querySelector(".bar-budget");
+  if (!bb) { bb = el("div", "bar bar-budget"); bar.after(bb); }
+  bb.querySelectorAll(".seg,.free").forEach(n => n.remove());
+  for (const s of r.budgetSegs) {
+    if (!s.gib || s.gib <= 0.02) continue;
+    const d = el("div", "seg" + (s.cls ? " " + s.cls : ""));
+    d.style.height = Math.max(0.4, (s.gib / limit) * 100) + "%";
+    d.style.background = segColor(s);
+    d.title = `${s.label} · budget ${fmtGib(s.gib)}`;
+    bb.append(d);
+  }
+  bb.append(el("div", "free"));
+  bb.classList.toggle("over", r.budgetTotal > limit + 0.5);
+
+  // "in RAM now" == the committed stack == the "OS used" line the marker sits at.
   lane.dataset.budgeted = r.committed;
   const bs = lane.querySelector(".lane-bud");
-  if (bs) bs.innerHTML = `in RAM now <b>${fmtGib(used)}</b> / ${fmtGib(limit)}`;
+  if (bs) bs.innerHTML = `in RAM now <b>${fmtGib(r.committed)}</b> / ${fmtGib(limit)}`;
   const as = lane.querySelector(".lane-alt");
-  const hu = (st.pools || []).find(p => p.pool === "host_unified");
-  if (as && hu) {
-    const d = used - hu.used;
-    as.innerHTML = `solver budget <b>${fmtGib(hu.used)}</b>`
-      + (Math.abs(d) >= 1 ? ` · ${d > 0 ? "+" : ""}${fmtGib(d)} vs in-RAM` : "");
+  if (as) {
+    const over = r.budgetTotal > limit + 0.5;
+    const bits = r.budgetSegs.map(s => `${s.label.replace(/^image · /, "img ")} ${fmtGib(s.gib)}`);
+    as.innerHTML = `reserved <b style="color:${over ? "var(--red)" : "var(--text)"}">`
+      + `${fmtGib(r.budgetTotal)}</b> / ${fmtGib(limit)}`
+      + `<span class="muted" style="display:block;font-size:.92em">${bits.join(" · ")}</span>`;
   }
   return true;
 }
@@ -714,17 +761,19 @@ function renderMap(st, eng, img, gpu, host) {
       const measured = hostRamSegs(host, st);
       if (measured) {
         lanes.append(laneEl({
-          name: "host RAM", sub: "unified LPDDR5X — what's physically resident",
-          limit: Math.max(host.mem_total_gib || hu.limit, measured.physUsed),
+          name: "host RAM", sub: "unified LPDDR5X — measured vs reserved",
+          limit: Math.max(host.mem_total_gib || 0, hu.limit || 0, measured.physUsed),
           segs: measured.segs, budgeted: measured.committed,
           budLabel: "in RAM now", budShown: measured.committed,
-          altStat: `solver budget <b>${fmtGib(hu.used)}</b>`,
+          altStat: `reserved <b>${fmtGib(measured.budgetTotal)}</b>`,
           real: host && host.mem_used_gib, realLabel: "OS used",
-          note: "Measured, not budgeted. The solid bar is 'OS used' (what the "
-            + "marker points at) broken down by tenant — engine RSS is anon only. "
-            + "The hatched band on top is reclaimable page cache (mmap'd model "
-            + "files etc.): physically resident, but the kernel drops it on "
-            + "demand, so it's not in 'in RAM now'. Solver budget is separate.",
+          note: "Left bar: measured. Solid = 'OS used' (the marker), by tenant — "
+            + "engine RSS is anon only; the hatched band on top is reclaimable "
+            + "page cache (mmap'd model files), physically resident but dropped on "
+            + "demand, so not in 'in RAM now'. Right bar: what each tenant is "
+            + "allowed to grow into — OS reserve + per-engine budget + the image "
+            + "tier's host_ram_gib. Σ reserved stays under the box's RAM by "
+            + "construction (the solver + image guard enforce it).",
         }));
       } else {
         // FALLBACK (no container stats): the old budget bar.
