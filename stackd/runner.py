@@ -74,6 +74,15 @@ class LaunchSpec:
     mem_limit_gib: float | None = None           # hard cgroup memory ceiling (memory == memory-swap)
     labels: dict[str, str] = field(default_factory=dict)
     health_url: str | None = None
+    # optional cheap liveness endpoint used for the STEADY-STATE poll once the
+    # stack is `ready` (health_url stays the readiness gate + the deep check).
+    # Lets an engine whose /health runs a real forward pass (SGLang-Pennyroyal)
+    # not wake the GPU every tick. When None, health_url is polled as before.
+    live_health_url: str | None = None
+    # if >0 and live_health_url is set: still hit the (generative) health_url
+    # every Nth ready-tick to catch a wedged scheduler that keeps serving the
+    # cheap endpoint.
+    deep_health_every: int = 0
     ready_timeout_s: float = 300.0
     stop_grace_s: int | None = None
 

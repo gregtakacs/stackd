@@ -64,7 +64,14 @@ class SglangPennyroyalAdapter(EngineAdapter):
             i += 1
         out += ["--served-model-name", self.served_name()]
         spec.cmd = out
-        spec.health_url = self._url().rstrip("/") + "/health"
+        # /health on the Pennyroyal fork runs a real 64-token forward pass — keep
+        # it as the readiness gate + a periodic deep check, but poll the cheap
+        # metadata endpoint in steady state so `--sleep-on-idle` can actually
+        # park the GPU between requests instead of being woken every tick.
+        base = self._url().rstrip("/")
+        spec.health_url = base + "/health"
+        spec.live_health_url = base + "/get_model_info"
+        spec.deep_health_every = 15          # ~5 min at the 20s default tick
         # Cold boot: torch.compile + FlashInfer JIT + the 524K-token KV pool
         # allocation + (on the 27B) a second speculative draft model. Well past
         # vLLM's 900s.

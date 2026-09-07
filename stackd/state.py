@@ -8,7 +8,7 @@ import json
 import os
 import pathlib
 import tempfile
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 
 from stackd.engines.base import EngineState
 
@@ -33,9 +33,13 @@ class StackRuntime:
     container: str | None = None
     port: int | None = None
     health_url: str | None = None
+    live_health_url: str | None = None   # cheap steady-state liveness (see LaunchSpec)
+    deep_health_every: int = 0           # hit health_url every Nth ready-tick anyway
+    health_ticks: int = 0               # counter toward deep_health_every
     endpoint: str | None = None
     started_at: float | None = None
     ready_at: float | None = None
+    stopped_at: float | None = None
     ready_timeout: float = 300.0
     stop_grace: int | None = None
     restarts: int = 0
@@ -99,17 +103,23 @@ class RuntimeState:
         if not path.exists():
             return cls.fresh(default_profile)
         raw = json.loads(path.read_text())
+        _sr = {f.name for f in fields(StackRuntime)}
         stacks = {
-            k: StackRuntime(**{**v, "state": EngineState(v.get("state", "down"))})
+            k: StackRuntime(**{**{kk: vv for kk, vv in v.items() if kk in _sr},
+                               "state": EngineState(v.get("state", "down"))})
             for k, v in raw.get("stacks", {}).items()
         }
         raw["stacks"] = stacks
         img = raw.get("image")
+        _is = {f.name for f in fields(ImageSlot)}
         raw["image"] = (
-            ImageSlot(**{**img, "state": EngineState(img.get("state", "down"))})
+            ImageSlot(**{**{kk: vv for kk, vv in img.items() if kk in _is},
+                         "state": EngineState(img.get("state", "down"))})
             if img else None
         )
-        return cls(**raw)
+        # tolerate keys from a newer/older schema (e.g. a since-removed field)
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in raw.items() if k in known})
 
     def boot_reset(self) -> list[str]:
         """Called once at daemon start. A fresh process gets a fresh retry budget

@@ -539,6 +539,15 @@ class Manager:
         # negative during the min-residency hold.
         now = time.time()
         deadline = self._idle_evict_at(now)
+
+        def _tm(name: str, dev: str) -> dict:
+            """measured swap-phase timings for a stack, from its catalog entry."""
+            try:
+                cur = self.catalog.for_model(self.cfg, name, dev) if self.catalog else None
+                return dict(cur.timings) if cur and cur.timings else {}
+            except Exception:  # noqa: BLE001
+                return {}
+        stack_tm = {n: _tm(n, rt.device) for n, rt in self.state.stacks.items()}
         idle_evict_in = None if deadline is None else round(deadline - now)
         return {
             "active_profile": self.state.active_profile,
@@ -550,9 +559,16 @@ class Manager:
             "stacks": {
                 n: {"state": rt.state.value, "device": rt.device, "kind": rt.kind,
                     "owner": rt.owner_profile, "port": rt.port, "container": rt.container,
-                    "endpoint": rt.endpoint, "restarts": rt.restarts}
+                    "endpoint": rt.endpoint, "restarts": rt.restarts,
+                    "started_at": rt.started_at, "ready_at": rt.ready_at,
+                    "ready_timeout": rt.ready_timeout,
+                    # measured EMA from the catalog (dashboard loading-bar ETA);
+                    # None until the 1st sample (a bench run or a real switch)
+                    "est_load_s": stack_tm[n].get("load_s"),
+                    "est_teardown_s": stack_tm[n].get("teardown_s")}
                 for n, rt in self.state.stacks.items()
             },
+            "timings": stack_tm,
             "image": (
                 {"active_model": self.state.image.active_model,
                  "state": self.state.image.state.value,

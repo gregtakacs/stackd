@@ -125,6 +125,8 @@ def bench_stack(
     base_vram = sampler.vram_used_gib(dev.backend.value, idx)
     vram_pts: list[tuple[int, float]] = []
     ram_pts: list[tuple[int, float]] = []
+    load_secs: list[float] = []
+    teardown_secs: list[float] = []
 
     lc_mounts = [Mount(m.host_path, m.container_path, m.ro) for m in cfg.runtime.mounts]
     # per-backend container knobs (GPU access etc.) — same as the reconciler applies
@@ -149,9 +151,11 @@ def bench_stack(
         if hasattr(sampler, "for_ctx"):
             sampler.for_ctx(ctx)  # FakeSampler
 
+        _t_spawn = time.time()
         handle = runner.spawn(spec)
         try:
             _wait_ready(runner, spec.health_url, min(spec.ready_timeout_s, 900), handle)
+            load_secs.append(time.time() - _t_spawn)
             _warm(adapter.endpoint(p))
             vram_pts.append((ctx, round(sampler.vram_used_gib(dev.backend.value, idx) - base_vram, 2)))
             ram_pts.append((ctx, sampler.proc_ram_gib(-1)))
@@ -160,8 +164,24 @@ def bench_stack(
             # a 5s SIGKILL mid-teardown is what wedges the RTX); else fast on cuda.
             grace = spec.stop_grace_s if spec.stop_grace_s is not None else (
                 5 if dev.backend.value == "cuda" else 20)
+            _t_stop = time.time()
             runner.stop(handle, remove=True, timeout=grace)
+            teardown_secs.append(time.time() - _t_stop)
             time.sleep(0.2)
+
+    # measured swap-phase durations — averaged over the ctx sweep. `stackctl bench`
+    # seeds these; the daemon's passive per-switch EMA (Reconciler._record_timing)
+    # refines them under real conditions.
+    timings: dict | None = None
+    if load_secs or teardown_secs:
+        timings = {"n": max(len(load_secs), len(teardown_secs)),
+                   "measured_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")}
+        if load_secs:
+            timings["load_s"] = round(sum(load_secs) / len(load_secs), 1)
+            timings["last_load_s"] = round(load_secs[-1], 1)
+        if teardown_secs:
+            timings["teardown_s"] = round(sum(teardown_secs) / len(teardown_secs), 1)
+            timings["last_teardown_s"] = round(teardown_secs[-1], 1)
 
     return catalog.write_curve(
         curve_key(cfg, stack_name),
@@ -170,6 +190,7 @@ def bench_stack(
         vram_points=vram_pts, ram_points=ram_pts, source=source,
         measured_at=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
         notes=f"stackctl bench {stack_name} @ ctx {ctx_points}",
+        timings=timings,
     )
 
 

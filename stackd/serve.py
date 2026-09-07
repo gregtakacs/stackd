@@ -110,6 +110,15 @@ class _Handler(BaseHTTPRequestHandler):
     owu_base_url: str | None = None
     pricing_path: str | None = None
     cleaner = None  # stackd.cleaner.Cleaner | None
+    # --- shared, read-mostly caches so GET /status and GET /profiles never
+    # block for the full ~40s a converge holds `lock` (dashboard would freeze
+    # on the pre-switch snapshot). Refreshed whenever the lock IS free.
+    _status_cache: dict | None = None
+    _profiles_cache: dict | None = None
+    # {"to": <profile>, "since": <epoch>} while an activate is converging, so the
+    # dashboard header can show the switch immediately even though status() is
+    # still returning the stale (pre-switch) snapshot.
+    _switch: dict | None = None
 
     def log_message(self, fmt, *args):  # quieter than the default stderr spew
         pass
@@ -189,8 +198,21 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/slots/"):
             return self._slots(self.path[len("/slots/"):].split("?")[0])
         if self.path == "/status":
-            with self.lock:
-                return self._send_json(200, self.mgr.status())
+            got = self.lock.acquire(timeout=0.5)
+            try:
+                if got:
+                    snap = self.mgr.status()
+                    _Handler._status_cache = snap
+                else:  # a converge is holding the lock — serve the last snapshot
+                    snap = dict(_Handler._status_cache or {"stacks": {}, "pools": []})
+                    snap["stale"] = True
+            finally:
+                if got:
+                    self.lock.release()
+            if _Handler._switch:
+                snap = dict(snap)
+                snap["switching"] = _Handler._switch
+            return self._send_json(200, snap)
         if self.path in ("/v1/models", "/models"):
             with self.lock:
                 cat = self.mgr.models_catalog()
@@ -411,10 +433,14 @@ class _Handler(BaseHTTPRequestHandler):
         with self.lock:
             rows = self.store.usage_rows(span[0], span[-1])
             erows = self.store.energy_rows(span[0], span[-1])
+            engrows = self.store.engine_rows(span[0], span[-1])
             from stackd.pricing import load_pricing, savings
             pricing = load_pricing(self.pricing_path)
             per_day = {d: savings(self.store, pricing, from_day=d, to_day=d) for d in span}
-        acc = [dict(pfm=0, pft=0, dcm=0, dct=0, cxs=0, cxm=0, cxn=0) for _ in span]
+        # tok/s + peak context come from the engines' own /metrics counters
+        # (engine_daily); ctx_avg (per-request mean) still comes from the ledger.
+        acc = [dict(cxs=0, cxn=0) for _ in span]
+        eng = [dict(pfm=0, pft=0, dcm=0, dct=0, cxm=0) for _ in span]
         for r in rows:
             i = idx.get(r["day"])
             if i is None:
@@ -425,17 +451,22 @@ class _Handler(BaseHTTPRequestHandler):
                 series = out[col].setdefault(prof, [0] * days)
                 series[i] += r.get(key) or 0
             a = acc[i]
-            a["pfm"] += r.get("prefill_ms") or 0;  a["pft"] += r.get("prefill_tok") or 0
-            a["dcm"] += r.get("decode_ms") or 0;   a["dct"] += r.get("decode_tok") or 0
             a["cxs"] += r.get("ctx_tokens_sum") or 0
-            a["cxm"] = max(a["cxm"], r.get("ctx_tokens_max") or 0)
             a["cxn"] += r.get("ctx_n") or 0
+        for r in engrows:
+            i = idx.get(r["day"])
+            if i is None:
+                continue
+            e = eng[i]
+            e["pfm"] += r.get("prefill_ms") or 0;  e["pft"] += r.get("prefill_tok") or 0
+            e["dcm"] += r.get("decode_ms") or 0;   e["dct"] += r.get("decode_tok") or 0
+            e["cxm"] = max(e["cxm"], r.get("ctx_tokens_max") or 0)
         tp = out["throughput"]
-        for i, a in enumerate(acc):
-            tp["decode_tps"][i] = round(a["dct"] * 1000 / a["dcm"], 1) if a["dcm"] else 0.0
-            tp["prefill_tps"][i] = round(a["pft"] * 1000 / a["pfm"], 1) if a["pfm"] else 0.0
+        for i, (a, e) in enumerate(zip(acc, eng)):
+            tp["decode_tps"][i] = round(e["dct"] * 1000 / e["dcm"], 1) if e["dcm"] else 0.0
+            tp["prefill_tps"][i] = round(e["pft"] * 1000 / e["pfm"], 1) if e["pfm"] else 0.0
             tp["ctx_avg"][i] = round(a["cxs"] / a["cxn"]) if a["cxn"] else 0
-            tp["ctx_max"][i] = a["cxm"]
+            tp["ctx_max"][i] = e["cxm"]
         for r in erows:
             i = idx.get(r["day"])
             if i is not None:
@@ -455,7 +486,12 @@ class _Handler(BaseHTTPRequestHandler):
     def _profiles_list(self):
         from stackd.planner import plan_transition
         from stackd.validator import validate_profile
-        with self.lock:
+        got = self.lock.acquire(timeout=0.5)
+        if not got:  # converge in progress — serve the last snapshot
+            cached = dict(_Handler._profiles_cache or {"active": None, "profiles": []})
+            cached["stale"] = True
+            return self._send_json(200, cached)
+        try:
             cfg, cat = self.mgr.cfg, self.mgr.catalog
             active = self.mgr.state.active_profile
             pinned = self.mgr.state.pinned
@@ -487,9 +523,13 @@ class _Handler(BaseHTTPRequestHandler):
                     "states": {m: run_state.get(m) for m in pr.models},  # ready|warming|... per model
                     "would_evict": would_evict,
                 })
-        converging = any(s == "warming" for s in run_state.values())
-        return self._send_json(200, {"active": active, "pinned": pinned,
-                                     "converging": converging, "profiles": out})
+            converging = any(s == "warming" for s in run_state.values())
+            result = {"active": active, "pinned": pinned,
+                      "converging": converging, "profiles": out}
+            _Handler._profiles_cache = result
+        finally:
+            self.lock.release()
+        return self._send_json(200, result)
 
     def _engine(self, stack: str):
         """Normalised live telemetry for one running engine (llama.cpp /slots +
@@ -585,6 +625,9 @@ class _Handler(BaseHTTPRequestHandler):
         if len(parts) != 3:
             return self._send_json(404, {"error": {"message": "bad control path"}})
         _, name, verb = parts
+        if verb in ("activate", "pin", "evict"):
+            _Handler._switch = {"to": ("(floor)" if verb == "evict" else name),
+                                "verb": verb, "since": time.time()}
         try:
             with self.lock:
                 evs = []
@@ -608,6 +651,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._send_json(200, self.mgr.status())
         except Exception as e:  # noqa: BLE001
             return self._send_json(400, {"error": {"message": str(e)}})
+        finally:
+            _Handler._switch = None
 
     def _reload(self):
         """Re-read config/*.yaml + the bind-mounted .env, then re-converge the
@@ -720,7 +765,7 @@ class _Handler(BaseHTTPRequestHandler):
 
         def _on_body(buf: bytes, status: int, meta: dict | None = None) -> None:
             self._record_usage(model, rr, buf, status, embeddings=is_embeddings,
-                               req_body=body, meta=meta)
+                               req_body=body)
             _capture_gen(rr.stack, buf)
 
         self._relay(rr.endpoint.rstrip("/") + self.path, "POST",
@@ -729,8 +774,10 @@ class _Handler(BaseHTTPRequestHandler):
 
     # -- ledger ------------------------------------------------------------------------
     def _record_usage(self, requested_model, rr, buf: bytes, status: int, *,
-                      embeddings: bool, req_body: dict | None = None,
-                      meta: dict | None = None):
+                      embeddings: bool, req_body: dict | None = None):
+        # No per-request timing is stored — it proved too noisy for tok/s (queue
+        # + client backpressure). Throughput comes from the engines' own /metrics
+        # counters, sampled into `engine_daily` by serve._engine_sampler.
         if self.store is None or embeddings:
             return
         usage = _extract_usage(buf)
@@ -738,16 +785,6 @@ class _Handler(BaseHTTPRequestHandler):
                  or self.headers.get("X-OpenWebUI-User-Id") or "direct")
         prompt = usage.get("prompt_tokens", 0)
         completion = usage.get("completion_tokens", 0)
-        # prompt-processing / generation time: prefer the engine's own numbers
-        # (llama.cpp `timings`, ms), else the proxy's wall-clock split (meta).
-        tim = _extract_timings(buf)
-        if tim and (tim.get("prompt_ms") or tim.get("predicted_ms")):
-            prefill_ms = round(tim.get("prompt_ms") or 0)
-            decode_ms = round(tim.get("predicted_ms") or 0)
-        else:
-            m = meta or {}
-            prefill_ms = round((m.get("prefill_s") or 0) * 1000)
-            decode_ms = round((m.get("decode_s") or 0) * 1000)
         try:
             with self.lock:
                 # cached_tokens = a synthetic *commercial* prefix-cache estimate
@@ -759,7 +796,7 @@ class _Handler(BaseHTTPRequestHandler):
                     user_email=email, requested_model=requested_model,
                     served_stack=rr.stack, served_model=rr.artifact, served_profile=rr.profile,
                     prompt_tokens=prompt, completion_tokens=completion, cached_tokens=cached,
-                    prefill_ms=prefill_ms, decode_ms=decode_ms, ctx_tokens=prompt + completion,
+                    ctx_tokens=prompt + completion,
                     off_home=(rr.route_kind != "native"),
                     ok=(200 <= status < 300),
                 )
@@ -1179,9 +1216,111 @@ def serve(mgr: Manager, host: str, port: int, api_key: str | None,
             except Exception as e:  # noqa: BLE001
                 print(f"[tick] error: {e}")
 
+    _fast = [False]      # sampler cadence: True while any engine has work in flight
+
+    def _engine_sampler():
+        """Poll each running engine's own /metrics counters and fold honest
+        poll-to-poll deltas into `engine_daily` (token-weighted). Fast cadence
+        (~3s) while any engine has a request in flight — so a wall-clock decode
+        window for vLLM/SGLang doesn't straddle idle and read low — then ~20s
+        when everything's quiet (the counters are cumulative, nothing is missed).
+        Accumulates in memory and flushes to the store every ~30s."""
+        if store is None:
+            return
+        from stackd.telemetry import engine_counters
+
+        def _pos(cur, prev):
+            try:
+                d = cur - prev
+            except TypeError:
+                return None
+            return d if d >= 0 else None          # negative -> engine restarted
+
+        snap: dict = {}      # endpoint -> {"c": counters, "ts": float}
+        acc: dict = {}       # (stack, model, profile) -> running sums
+        last_flush = time.time()
+        # 3s while a request is in flight (tight windows for vanilla vLLM's
+        # wall-clock decode fallback + a live ctx peak); 10s idle — short enough
+        # that a request starting mid-gap is still seen. llama.cpp & SGLang carry
+        # a real decode-seconds counter, so for them a whole request between two
+        # polls is measured regardless of cadence.
+        while not stop.wait(3.0 if _fast[0] else 10.0):
+            try:
+                now = time.time()
+                with lock:
+                    targets = [(rt.name, rt.endpoint, rt.owner_profile,
+                                (mgr.cfg.models.get(rt.name).engine.template
+                                 if mgr.cfg.models.get(rt.name) else ""),
+                                (mgr.cfg.models.get(rt.name).engine.model
+                                 if mgr.cfg.models.get(rt.name) else None))
+                               for rt in mgr.state.stacks.values() if rt.endpoint]
+                any_active = False
+                for name, ep, profile, tmpl, model in targets:
+                    cur = engine_counters(ep, tmpl)      # network — outside the lock
+                    if not cur:
+                        continue
+                    if (cur.get("running") or 0) > 0:
+                        any_active = True
+                    prev = snap.get(ep)
+                    snap[ep] = {"c": cur, "ts": now}
+                    if not prev:
+                        continue
+                    p, dt = prev["c"], now - prev["ts"]
+                    if dt <= 0 or dt > 180:             # missed cycles / clock jump
+                        continue
+                    dg = _pos(cur.get("gen_tok"), p.get("gen_tok")) or 0
+                    dp = _pos(cur.get("prompt_tok"), p.get("prompt_tok")) or 0
+                    dps = (max(cur["prefill_s"] - p["prefill_s"], 0.0)
+                           if cur.get("prefill_s") is not None and p.get("prefill_s") is not None
+                           else 0.0)
+                    a = acc.setdefault((name, model, profile),
+                                       {"dt": 0, "dm": 0.0, "pt": 0, "pm": 0.0, "cx": 0})
+                    a["cx"] = max(a["cx"], cur.get("ctx_tokens") or 0)
+
+                    # Token vs time counters advance at DIFFERENT moments — several
+                    # engines bump the token total once at request end while the
+                    # time sum grows per-step. So accumulate each independently:
+                    # Σtok / Σms over the whole active period stays correct, and
+                    # gating both on one window would drop most of the time.
+                    a["pt"] += dp
+                    a["pm"] += dps * 1000.0                       # prefill_s: a counter on all 3 engines
+
+                    if cur.get("gen_s") is not None and p.get("gen_s") is not None:
+                        # real decode-seconds counter (llama.cpp, SGLang ITL sum)
+                        a["dt"] += dg
+                        a["dm"] += max(cur["gen_s"] - p["gen_s"], 0.0) * 1000.0
+                    elif (p.get("running") or 0) > 0 or ((cur.get("running") or 0) > 0 and dt <= 12.0):
+                        # no time counter (vanilla vLLM): wall-clock, but only a
+                        # window we actually saw a request in — so tokens land with
+                        # matching time (a request wholly between idle polls is lost,
+                        # not mis-rated).
+                        a["dt"] += dg
+                        a["dm"] += dt * 1000.0
+                _fast[0] = any_active
+                if acc and now - last_flush >= 30:
+                    with lock:
+                        for (stk, mdl, prof), a in acc.items():
+                            if not any((a["dt"], a["dm"], a["pt"], a["pm"], a["cx"])):
+                                continue
+                            store.add_engine_sample(
+                                served_stack=stk, served_model=mdl, served_profile=prof,
+                                decode_tok=int(a["dt"]), decode_ms=int(a["dm"]),
+                                prefill_tok=int(a["pt"]), prefill_ms=int(a["pm"]),
+                                ctx_tokens_max=int(a["cx"]), now=now)
+                    acc.clear()
+                    last_flush = now
+            except Exception as e:  # noqa: BLE001 — sampler is best-effort
+                print(f"[engine-sampler] error: {e}")
+
+    threading.Thread(target=_engine_sampler, daemon=True).start()
+
     for _n in mgr.state.boot_reset():
         print(f"[boot] dropped stale/crashed stack {_n} — will respawn fresh")
         events.record("boot-reset", _n, "stale/crashed — respawning", source="boot")
+    # kept stacks: re-derive health URLs / timeouts from the current adapters so a
+    # spec change (e.g. a new health endpoint) applies on a plain daemon restart.
+    mgr.rec.refresh_specs(mgr.state)
+    mgr.state.save(mgr.state_path)
 
     # converge the active (default on fresh state) profile before accepting traffic
     try:

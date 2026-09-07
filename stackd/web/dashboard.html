@@ -43,6 +43,8 @@
     padding:2px 9px; border-radius:999px; background:var(--surface2); border:1px solid var(--border); }
   .pill.ok { color:var(--green); border-color:#2c5138; }
   .pill.warn { color:var(--yellow); border-color:#5c5222; }
+  .pill.prog { color:var(--yellow); border-color:#5c5222; font-variant-numeric:tabular-nums;
+    background:linear-gradient(90deg, rgba(250,204,21,.28) calc(var(--p,0)*1%), transparent 0); }
   .pill.bad { color:var(--red); border-color:#5c2c2c; }
   .pill.info { color:var(--accent); border-color:#33417a; }
   .dot { width:8px; height:8px; border-radius:50%; display:inline-block; background:var(--dim); flex-shrink:0; }
@@ -260,6 +262,7 @@
     <a class="pill" href="/register" target="_blank" rel="noopener">Register a key ↗</a>
     <div class="spacer"></div>
     <span id="hdrProfile" class="pill info"></span>
+    <span id="hdrLoad" class="pill prog hidden" title="engine load progress — elapsed / estimate (from measured history)"></span>
     <span id="hdrIdle" class="pill hidden" title="time until this profile idle-evicts back to the floor"></span>
     <span id="hdrPinned" class="pill hidden"></span>
     <span id="hdrClean" class="pill hidden"></span>
@@ -351,7 +354,7 @@
         <div><div class="muted" style="font-size:.78rem; margin-bottom:4px;">Requests / day (by profile)</div><div id="chReq" class="chartwrap"></div></div>
         <div><div class="muted" style="font-size:.78rem; margin-bottom:4px;">Tokens / day</div><div id="chTok" class="chartwrap"></div></div>
         <div><div class="muted" style="font-size:.78rem; margin-bottom:4px;">Energy (kWh) &amp; cumulative net savings ($)</div><div id="chEng" class="chartwrap"></div></div>
-        <div><div class="muted" style="font-size:.78rem; margin-bottom:4px;">Throughput tok/s &amp; context size (weighted /day)</div><div id="chTps" class="chartwrap"></div></div>
+        <div><div class="muted" style="font-size:.78rem; margin-bottom:4px;">Throughput tok/s &amp; context size (engine-measured /day)</div><div id="chTps" class="chartwrap"></div></div>
       </div>
     </div>
 
@@ -667,13 +670,44 @@ function paintIdle() {
   e.textContent = "⏱ idle-evict " + (s < 0 ? "now" : m + ":" + ss);
   e.className = "pill " + (s <= 60 ? "warn" : "info");
 }
+function mmss(s) {
+  s = Math.max(0, Math.round(s));
+  return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+}
 function renderHeader(st, cleaner) {
-  const loading = Object.entries(st.stacks || {}).filter(([, v]) => v.state === "warming").map(([k]) => k);
+  const warmEntries = Object.entries(st.stacks || {}).filter(([, v]) => v.state === "warming");
+  const loading = warmEntries.map(([k]) => k);
   const imgWarming = st.image && st.image.state === "warming";
+  const sw = st.switching;                       // {to, verb, since} while a converge holds the lock
   const hp = $("#hdrProfile");
-  hp.textContent = "profile: " + st.active_profile + ((loading.length || imgWarming) ? " · loading…" : "");
-  hp.className = "pill " + ((loading.length || imgWarming) ? "warn" : "info");
-  hp.title = loading.length ? "warming: " + loading.join(", ") : "";
+  if (sw && !loading.length) {
+    hp.textContent = "profile: " + (st.active_profile || "…") + " → " + sw.to + " · switching…";
+    hp.className = "pill warn";
+  } else {
+    hp.textContent = "profile: " + st.active_profile + ((loading.length || imgWarming) ? " · loading…" : "");
+    hp.className = "pill " + ((loading.length || imgWarming) ? "warn" : "info");
+  }
+  hp.title = (st.stale ? "(updating…) " : "") + (loading.length ? "warming: " + loading.join(", ") : "");
+
+  // loading-bar ETA: first warming stack with a start time, else "starting…" while switching
+  const hl = $("#hdrLoad");
+  const w = warmEntries.find(([, v]) => v.started_at);
+  if (w) {
+    const v = w[1];
+    const el = Date.now() / 1000 - v.started_at;
+    const est = v.est_load_s || v.ready_timeout || 300;
+    const pct = Math.max(2, Math.min(99, (el / est) * 100));
+    hl.style.setProperty("--p", pct.toFixed(0));
+    hl.textContent = "⏳ " + w[0] + " " + mmss(el) + " / ~" + mmss(est) +
+      (v.est_load_s ? "" : " (est)");
+    hl.classList.remove("hidden");
+  } else if (sw || imgWarming) {
+    hl.style.setProperty("--p", 0);
+    hl.textContent = "⏳ " + (sw ? sw.to : "image") + " starting…";
+    hl.classList.remove("hidden");
+  } else {
+    hl.classList.add("hidden");
+  }
   IDLE_DEADLINE = (typeof st.idle_evict_in_s === "number")
     ? Date.now() + st.idle_evict_in_s * 1000 : null;
   paintIdle();
@@ -1259,13 +1293,17 @@ function xpNet(gross, tier) {
   const tot = tier.total_gross || 0, ec = (LAST_FACTS && LAST_FACTS.energy_cost) || 0;
   return gross - ec * (tot ? gross / tot : 0);
 }
-// token-weighted throughput + context for an explorer node (0 where untimed)
+// engine-measured throughput + context for an explorer node. tok/s comes from
+// each engine's own /metrics counters (engine_daily), pro-rated onto these rows
+// by token share — so the rate holds up under a user / API-name filter. ctx is
+// the per-request mean from the ledger; engine_ctx_max is the engine-wide peak.
 function xpDerive(n) {
   return {
     gen: n.decode_ms ? n.decode_tok * 1000 / n.decode_ms : 0,
     pre: n.prefill_ms ? n.prefill_tok * 1000 / n.prefill_ms : 0,
     ctx: n.ctx_n ? Math.round(n.ctx_tokens_sum / n.ctx_n) : 0,
     ctxMax: n.ctx_max || 0,
+    engCtx: n.engine_ctx_max || 0,
   };
 }
 function xpTpCells(node) {
@@ -1273,7 +1311,10 @@ function xpTpCells(node) {
   const g = el("td", "num", d.gen ? rnd1(d.gen) : "–");
   const p = el("td", "num", d.pre ? rnd1(d.pre) : "–");
   const c = el("td", "num", d.ctx ? fmtSI(d.ctx) : "–");
-  if (d.ctxMax) c.title = "peak " + fmtNum(d.ctxMax) + " tok";
+  const tip = [];
+  if (d.ctxMax) tip.push("biggest request " + fmtNum(d.ctxMax) + " tok");
+  if (d.engCtx) tip.push("engine peak " + fmtNum(d.engCtx) + " tok (all traffic)");
+  if (tip.length) c.title = tip.join(" · ");
   return [g, p, c];
 }
 const XP_TIMING = ["prefill_ms", "prefill_tok", "decode_ms", "decode_tok", "ctx_tokens_sum", "ctx_n"];
@@ -1283,12 +1324,13 @@ function xpAcc(node, r, tiers) {
   node.tout += r.completion_tokens || 0;
   for (const k of XP_TIMING) node[k] += r[k] || 0;
   node.ctx_max = Math.max(node.ctx_max, r.ctx_tokens_max || 0);
+  node.engine_ctx_max = Math.max(node.engine_ctx_max, r.engine_ctx_max || 0);
   for (const t of tiers) node.gross[t.label] += (r.gross && r.gross[t.label]) || 0;
 }
 function xpBuild() {
   const dims = XP.order.filter(k => XP.active.includes(k));
   const tiers = xpTiers();
-  const mk = () => ({ reqs: 0, tin: 0, tout: 0, ctx_max: 0,
+  const mk = () => ({ reqs: 0, tin: 0, tout: 0, ctx_max: 0, engine_ctx_max: 0,
                       ...Object.fromEntries(XP_TIMING.map(k => [k, 0])),
                       gross: Object.fromEntries(tiers.map(t => [t.label, 0])), kids: new Map() });
   const root = mk();
@@ -1491,9 +1533,9 @@ function renderExplorer() {
   t.innerHTML = "<thead><tr><th>" +
     (dims.length ? dims.map(k => XP_DIMS.find(x => x.k === k).label).join(" › ") : "total") +
     "</th><th class=num>reqs</th><th class=num>tok in</th><th class=num>tok out</th>" +
-    "<th class=num title='token-weighted generation tok/s'>gen t/s</th>" +
-    "<th class=num title='token-weighted prompt/prefill tok/s'>pre t/s</th>" +
-    "<th class=num title='mean context size (hover a row for peak)'>ctx</th>" +
+    "<th class=num title='engine-measured generation tok/s (from /metrics counters, pro-rated by token share)'>gen t/s</th>" +
+    "<th class=num title='engine-measured prompt/prefill tok/s (from /metrics counters, pro-rated by token share)'>pre t/s</th>" +
+    "<th class=num title='mean context size per request (hover a row for the biggest request + engine-wide peak)'>ctx</th>" +
     tiers.map(t2 => `<th class="num xp-sorth" data-tier="${t2.label}">${t2.label}` +
       `<br><span style="font-weight:400;font-size:.9em">net $</span></th>`).join("") +
     "</tr></thead>";
@@ -1612,8 +1654,8 @@ async function loadUsage() {
   box.append(stat(fmtNum(sv.reqs), "requests"));
   box.append(stat(fmtSI((sv.prompt_tokens || 0) + (sv.completion_tokens || 0)), "tokens"));
   const tp = sv.throughput || {};
-  if (tp.decode_tps) box.append(stat(rnd1(tp.decode_tps) + " tok/s", "generation (weighted)"));
-  if (tp.prefill_tps) box.append(stat(rnd1(tp.prefill_tps) + " tok/s", "prompt / prefill (weighted)"));
+  if (tp.decode_tps) box.append(stat(rnd1(tp.decode_tps) + " tok/s", "generation (engine)"));
+  if (tp.prefill_tps) box.append(stat(rnd1(tp.prefill_tps) + " tok/s", "prompt / prefill (engine)"));
   if (tp.ctx_avg) box.append(stat(fmtSI(tp.ctx_avg) + (tp.ctx_max ? " / " + fmtSI(tp.ctx_max) : ""),
                                   "context avg / peak"));
   if (pay) { box.append(stat(fmtUsd(pay.gross), `would cost · ${pay.label}`)); box.append(stat(fmtUsd(pay.net), "net of energy")); }
@@ -1698,6 +1740,15 @@ async function tick() {
     ]);
     $("#topErr").classList.add("hidden");
     renderHeader(st, cleaner);
+    // keep the profile selector's loading chips in step with reality: refresh it
+    // whenever something is warming or a switch is mid-flight, plus one trailing
+    // refresh the tick after it clears — otherwise the 15s interval leaves the
+    // pulsing "⏳ loading" chips stale for up to 15s after the engine is ready.
+    const anyWarm = !!st.switching ||
+      Object.values(st.stacks || {}).some(v => v.state === "warming") ||
+      (st.image && st.image.state === "warming");
+    if (anyWarm || tick._wasWarm) loadProfiles();
+    tick._wasWarm = anyWarm;
     renderGauges(gpu, host);
     renderMap(st, eng, img, gpu, host);
     renderImage(img);

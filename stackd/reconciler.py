@@ -52,6 +52,26 @@ class Reconciler:
     def _emit(self, stack: str, action: str, detail: str = "") -> None:
         self.events.append(ReconcileEvent(stack, action, detail))
 
+    def _record_timing(self, name: str, device: str, field_: str, secs: float) -> None:
+        """Fold a measured swap-phase duration (load_s / teardown_s) into the
+        model's catalog entry, EMA-smoothed and persisted to the overlay dir.
+        This is the passive half of "automated benchmarking" — every real switch
+        refines the numbers `stackctl bench` seeds. Best-effort, never raises."""
+        try:
+            if not getattr(self, "catalog", None) or secs is None or secs <= 0 or secs > 3600:
+                return
+            if name not in self.cfg.models:
+                return
+            from stackd.catalog import curve_key
+            m = self.cfg.models[name]
+            self.catalog.update_timings(
+                curve_key(self.cfg, name, device or None),
+                model=m.engine.model or name, engine=m.engine.template, device=device,
+                **{field_: secs},
+            )
+        except Exception:  # noqa: BLE001 — telemetry must not break a converge
+            pass
+
     def _lc(self, device: str, port: int | None) -> LaunchContext:
         from stackd.runner import DeviceKnobs
         rt = self.cfg.runtime
@@ -74,6 +94,27 @@ class Reconciler:
     def _solve(self, profile: str):
         return solve(self.cfg, profile, self.catalog)
 
+    def refresh_specs(self, state: RuntimeState) -> None:
+        """Re-derive spec-driven fields (health URLs, timeouts, endpoint) for
+        stacks kept across a daemon restart, so an engine-adapter or config
+        change takes effect without a full stack rebuild. Best-effort."""
+        for name, rt in state.stacks.items():
+            try:
+                m = self.cfg.models.get(name)
+                if not m or rt.device not in self.cfg.devices:
+                    continue
+                adapter = adapter_for(m, self.cfg.devices[rt.device])
+                spec = adapter.launch_spec(self._lc(rt.device, rt.port))
+                rt.health_url = spec.health_url
+                rt.live_health_url = spec.live_health_url
+                rt.deep_health_every = spec.deep_health_every
+                rt.ready_timeout = spec.ready_timeout_s
+                rt.stop_grace = spec.stop_grace_s
+                if adapter.endpoint(rt.port):
+                    rt.endpoint = adapter.endpoint(rt.port)
+            except Exception:  # noqa: BLE001
+                pass
+
     # ---------------------------------------------------------------- start/stop ---
     def _start(self, state: RuntimeState, p: Placed, owner: str, now: float) -> None:
         m = self.cfg.models[p.name]
@@ -84,6 +125,7 @@ class Reconciler:
             name=p.name, owner_profile=owner, kind="container", device=p.device,
             identity=p.identity, state=EngineState.warming, handle=handle,
             container=spec.name, port=p.port, health_url=spec.health_url,
+            live_health_url=spec.live_health_url, deep_health_every=spec.deep_health_every,
             endpoint=adapter.endpoint(p.port), started_at=now,
             ready_timeout=spec.ready_timeout_s,
             stop_grace=spec.stop_grace_s,
@@ -99,9 +141,13 @@ class Reconciler:
         # R1: fast SIGKILL on cuda0 to clear the driver quickly, unless the model
         # sets its own stop_grace_s (vLLM needs a graceful shutdown of its workers).
         grace = rt.stop_grace if rt.stop_grace is not None else (5 if is_cuda else 30)
+        _t0 = time.time()
         self.runner.stop(rt.handle or rt.container, remove=remove, timeout=grace)
+        _dt = time.time() - _t0
+        rt.stopped_at = time.time()
         self._emit(name, "teardown",
-                   ("remove" if remove else "stop") + f" (t={grace}s)")
+                   ("remove" if remove else "stop") + f" (t={grace}s) — {_dt:.0f}s")
+        self._record_timing(name, rt.device, "teardown_s", _dt)
         if is_cuda and not self.runner.probe_accelerator("cuda"):
             self._emit(name, "degraded", "nvidia-smi did not respond after teardown")
         state.stacks.pop(name, None)
@@ -632,23 +678,43 @@ class Reconciler:
             if rt.handle is None:
                 continue
 
-            healthy = bool(rt.health_url) and self.runner.http_ok(rt.health_url)
             if rt.state == EngineState.warming:
+                # readiness always uses the real (generative) health_url so we
+                # don't flip `ready` before the model can actually serve
+                healthy = bool(rt.health_url) and self.runner.http_ok(rt.health_url)
                 if healthy:
                     rt.state = EngineState.ready
                     rt.ready_at = now
                     rt.unhealthy_ticks = 0
+                    rt.health_ticks = 0
+                    if rt.started_at:
+                        self._record_timing(name, rt.device, "load_s", now - rt.started_at)
                     self._emit(name, "ready")
                 elif rt.started_at and now - rt.started_at > (rt.ready_timeout or 300.0):
                     rt.state = EngineState.error
                     self._schedule_restart(rt, now, "warmup timeout")
             elif rt.state == EngineState.ready:
-                if healthy:
+                # steady state: poll the cheap endpoint when the engine gave us
+                # one (SGLang-Pennyroyal — its /health runs a forward pass and
+                # would fight --sleep-on-idle every tick)
+                probe = rt.live_health_url or rt.health_url
+                healthy = bool(probe) and self.runner.http_ok(probe)
+                deep_bad = False
+                if healthy and rt.live_health_url and rt.deep_health_every and rt.health_url:
+                    rt.health_ticks += 1
+                    if rt.health_ticks >= rt.deep_health_every:
+                        rt.health_ticks = 0
+                        # generative check catches a wedged scheduler still
+                        # serving the cheap endpoint; retry once for a transient
+                        deep_bad = not (self.runner.http_ok(rt.health_url, timeout=15.0)
+                                        or self.runner.http_ok(rt.health_url, timeout=15.0))
+                if healthy and not deep_bad:
                     rt.unhealthy_ticks = 0
                 else:
                     rt.unhealthy_ticks += 1
-                    if rt.unhealthy_ticks >= _UNHEALTHY_LIMIT:
-                        self._emit(name, "crash", "health flatlined")
+                    if deep_bad or rt.unhealthy_ticks >= _UNHEALTHY_LIMIT:
+                        self._emit(name, "crash",
+                                   "health flatlined (deep)" if deep_bad else "health flatlined")
                         self._schedule_restart(rt, now, "unhealthy")
                         rt.state = EngineState.error
 
@@ -743,6 +809,9 @@ class Reconciler:
         rt.started_at = now
         rt.backoff_until = None
         rt.unhealthy_ticks = 0
+        rt.health_ticks = 0
+        rt.live_health_url = spec.live_health_url
+        rt.deep_health_every = spec.deep_health_every
         rt.restarts += 1
         if rt.health_url:
             getattr(self.runner, "reset_health", lambda *_: None)(rt.health_url)

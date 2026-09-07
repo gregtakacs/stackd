@@ -101,6 +101,11 @@ class FootprintCurve:
     ram: Axis
     measured_at: str | None = None
     notes: str = ""
+    # measured swap-phase durations (seconds), EMA-smoothed. Filled both by
+    # `stackctl bench` and passively by the daemon on every real switch:
+    #   {"load_s": <ema>, "teardown_s": <ema>, "last_load_s": .., "last_teardown_s": ..,
+    #    "n": <count>, "measured_at": <iso>}
+    timings: dict = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d: dict) -> "FootprintCurve":
@@ -115,6 +120,7 @@ class FootprintCurve:
             ram=Axis.from_points(pts.get("ram", [])),
             measured_at=d.get("measured_at"),
             notes=d.get("notes", ""),
+            timings=dict(d.get("timings", {})),
         )
 
     def estimate(self, ctx: float | None) -> tuple[float, float]:
@@ -132,12 +138,16 @@ class FootprintCurve:
 class Catalog:
     curves: dict[str, FootprintCurve] = field(default_factory=dict)
     path: pathlib.Path | None = None
+    # the durable / bind-mounted dir (config overlay) — where the daemon writes
+    # passively-measured `timings` so they survive an image rebuild. Falls back
+    # to `path` when no overlay is in play.
+    overlay_path: pathlib.Path | None = None
 
     @classmethod
     def load(cls, directory: str | pathlib.Path,
              overlay: str | pathlib.Path | None = None) -> "Catalog":
         d = pathlib.Path(directory)
-        cat = cls(path=d)
+        cat = cls(path=d, overlay_path=pathlib.Path(overlay) if overlay else None)
         for src in (d, pathlib.Path(overlay) if overlay else None):
             if src is None or not src.is_dir():
                 continue
@@ -163,10 +173,18 @@ class Catalog:
     def write_curve(
         self, key: str, *, model: str, engine: str, device: str,
         vram_points, ram_points, source: str = "measured",
-        measured_at: str | None = None, notes: str = "",
+        measured_at: str | None = None, notes: str = "", timings: dict | None = None,
     ) -> pathlib.Path:
         assert self.path is not None
         self.path.mkdir(parents=True, exist_ok=True)
+        out = self.path / f"{key_slug(key)}.json"
+        # carry an existing timings block forward unless a fresh one is supplied
+        prev_timings = {}
+        if timings is None and out.exists():
+            try:
+                prev_timings = json.loads(out.read_text()).get("timings", {}) or {}
+            except Exception:  # noqa: BLE001
+                prev_timings = {}
         payload = {
             "key": key, "model": model, "engine": engine, "device": device,
             "source": source, "measured_at": measured_at,
@@ -175,8 +193,62 @@ class Catalog:
                 "ram": [[float(x), float(y)] for x, y in ram_points],
             },
             "notes": notes,
+            "timings": timings if timings is not None else prev_timings,
         }
-        out = self.path / f"{key_slug(key)}.json"
         out.write_text(json.dumps(payload, indent=2))
         self.curves[key] = FootprintCurve.from_dict(payload)
         return out
+
+    def update_timings(
+        self, key: str, *, load_s: float | None = None, teardown_s: float | None = None,
+        model: str = "", engine: str = "", device: str = "", alpha: float = 0.4,
+    ) -> dict:
+        """Fold one measured phase duration into the `timings` block of catalog
+        entry `key`, EMA-smoothed, and persist it. Writes to the overlay dir so
+        the value survives an image rebuild; read-merges so `points` / `notes` /
+        `source` are preserved. Best-effort — returns the new timings dict (or {}
+        on any failure) and never raises."""
+        import datetime
+        try:
+            samples = {k: v for k, v in (("load_s", load_s), ("teardown_s", teardown_s))
+                       if v is not None and 0 < v <= 3600}
+            if not samples:
+                return {}
+            target = self.overlay_path or self.path
+            if target is None:
+                return {}
+            target.mkdir(parents=True, exist_ok=True)
+            out = target / f"{key_slug(key)}.json"
+            base = {}
+            for cand in (out, (self.path / f"{key_slug(key)}.json") if self.path else None):
+                if cand and cand.exists():
+                    try:
+                        base = json.loads(cand.read_text())
+                        break
+                    except Exception:  # noqa: BLE001
+                        pass
+            cur = self.curves.get(key)
+            base.setdefault("key", key)
+            base.setdefault("model", model or (cur.model if cur else ""))
+            base.setdefault("engine", engine or (cur.engine if cur else ""))
+            base.setdefault("device", device or (cur.device if cur else ""))
+            base.setdefault("source", "measured")
+            base.setdefault("points", {"vram": [], "ram": []})
+            base.setdefault("notes", "")
+            t = dict(base.get("timings") or {})
+            for k, v in samples.items():
+                t[k] = round(v if k not in t else alpha * v + (1 - alpha) * t[k], 1)
+                t["last_" + k] = round(v, 1)
+            t["n"] = int(t.get("n", 0)) + 1
+            t["measured_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+            base["timings"] = t
+            tmp = out.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(base, indent=2))
+            tmp.replace(out)
+            if cur is not None:
+                cur.timings = t
+            else:
+                self.curves[key] = FootprintCurve.from_dict(base)
+            return t
+        except Exception:  # noqa: BLE001 — telemetry must never break a converge
+            return {}
