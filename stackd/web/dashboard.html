@@ -707,24 +707,24 @@ function renderMap(st, eng, img, gpu, host) {
     }
     const hu = pool("host_unified");
     if (hu) {
-      // MEASURED mode: /host gave us per-container anon RSS -> decompose real
-      // physical RAM (bar sums to MemTotal-MemFree; the "OS used" marker lands
-      // where reclaimable page cache begins). hostRamRepaint() then refreshes
-      // this lane's bar every tick.
+      // MEASURED mode: /host gave us per-container anon RSS. The solid segments
+      // sum to "OS used" (== the marker); the hatched band above extends the bar
+      // to MemTotal-MemFree but isn't in "in RAM now". hostRamRepaint() refreshes
+      // it every tick.
       const measured = hostRamSegs(host, st);
       if (measured) {
         lanes.append(laneEl({
           name: "host RAM", sub: "unified LPDDR5X — what's physically resident",
-          limit: host.mem_phys_used_gib != null
-            ? Math.max(host.mem_total_gib || hu.limit, measured.physUsed) : hu.limit,
+          limit: Math.max(host.mem_total_gib || hu.limit, measured.physUsed),
           segs: measured.segs, budgeted: measured.committed,
-          budLabel: "in RAM now", budShown: measured.physUsed,
+          budLabel: "in RAM now", budShown: measured.committed,
           altStat: `solver budget <b>${fmtGib(hu.used)}</b>`,
           real: host && host.mem_used_gib, realLabel: "OS used",
-          note: "Measured, not budgeted. Everything below the 'OS used' line is "
-            + "committed (engine RSS + host anon + tmpfs); the hatched band above "
-            + "it is reclaimable page cache — mmap'd model files the kernel drops "
-            + "on demand. The solver budget is a separate planning number.",
+          note: "Measured, not budgeted. The solid bar is 'OS used' (what the "
+            + "marker points at) broken down by tenant — engine RSS is anon only. "
+            + "The hatched band on top is reclaimable page cache (mmap'd model "
+            + "files etc.): physically resident, but the kernel drops it on "
+            + "demand, so it's not in 'in RAM now'. Solver budget is separate.",
         }));
       } else {
         // FALLBACK (no container stats): the old budget bar.
