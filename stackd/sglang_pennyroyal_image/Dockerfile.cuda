@@ -28,21 +28,30 @@
 FROM nvidia/cuda:13.3.1-devel-ubuntu24.04@sha256:4ff859525f99de5782aa73607ce24219b07dddd48d12b97c1c301d7e1cfb0a87
 
 ARG SGLANG_FORK_REPO=https://github.com/jpezzulli/sglang-rtxpro6000.git
-# Pinned to release tag pennyroyal-v2.3.1 (commit
-# 21eb654ac08cfe9d2f0d7bea913a98c9e541f8ab, released 2026-09-06 — also the
-# current tip of pennyroyal-main-sm120-final). Bumped 2026-09-06 from the
-# earlier box build at 38a5ecb (pre-v2.3.0).
+# Pinned to release tag pennyroyal-v2.3.1.1 (commit
+# ccabd15479a5d46ffef6d1dd28a6e1f01aa05199, released 2026-09-07). Bumped
+# 2026-09-07 from pennyroyal-v2.3.1 (55c44438ab6bc50e3fc0f7b797356b8c0b92efe3);
+# rollback lever: set SGLANG_FORK_REF back to that tag.
 #   v2.3   — Flash-Next FR-Spec: 65,536-token draft map + launcher/map-builder.
 #            Decode-throughput win for the Flash-Next profile, but ONLY if the
 #            launch config switches to the FR-Spec launcher (coding-long.yaml
 #            still uses --speculative-algorithm NEXTN — not yet updated).
 #   v2.3.1 — GDN gate-rounding correctness fix on the Triton verify path used by
 #            27B FP8/DFlash2. Flash-Next's FlashInfer/WY path is UNCHANGED.
-# BUILD.md @ v2.3.1 qualifies the same toolchain this Dockerfile already uses
+#   v2.3.1.1 — bundles the Froggeric v22.5 chat template (an unmodified copy of
+#            froggeric/Qwen-Fixed-Chat-Templates: folds the OpenAI effort
+#            vocabulary onto xhigh/medium/low, no raise_exception, default
+#            medium) at configs/pennyroyal/templates/, and the launchers add
+#            --image-processor-backend pil for a near-full-VRAM heavy-vision
+#            case. BUILD.md: "no runtime rebuild needed" — the SGLang executable
+#            (commit 739aff3dc5) is UNCHANGED from v2.3.1, only launchers/
+#            template/docs differ. coding-long.yaml points --chat-template at
+#            the baked /opt/pennyroyal/configs/pennyroyal/templates path.
+# BUILD.md @ v2.3.1.1 qualifies the same toolchain this Dockerfile already uses
 # (Python 3.12.13, CUDA 13.3, GCC 15.3.1, PyTorch 2.13.0+cu130) and the same
 # NIXL_REF below — no dependency changes. The git-checkout layer changes, so a
-# from-scratch ~20 min sm120 rebuild.
-ARG SGLANG_FORK_REF=pennyroyal-v2.3.1
+# from-scratch ~20 min sm120 rebuild (produces the same wheel as v2.3.1).
+ARG SGLANG_FORK_REF=pennyroyal-v2.3.1.1
 # NIXL commit from the fork's BUILD.md (POSIX FILE plugin for the HiCache
 # storage backend). Only needed once phase-2 NIXL persistence is turned on, but
 # built now so the image is complete.

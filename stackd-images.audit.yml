@@ -48,8 +48,8 @@ services:
     build:
       context: stackd/sglang_pennyroyal_image
       dockerfile: Dockerfile.cuda
-    # pinned via Dockerfile ARG SGLANG_FORK_REF=pennyroyal-v2.3.1
-    # (jpezzulli/sglang-rtxpro6000 @ 21eb654ac08cfe9d2f0d7bea913a98c9e541f8ab)
+    # pinned via Dockerfile ARG SGLANG_FORK_REF=pennyroyal-v2.3.1.1
+    # (jpezzulli/sglang-rtxpro6000 @ ccabd15479a5d46ffef6d1dd28a6e1f01aa05199)
 
   # config/media/image.yaml containers.cuda.image -- plain vendor pull.
   # Current value: AI-STACK/.env COMFYUI_CUDA_IMAGE
