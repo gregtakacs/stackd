@@ -253,6 +253,32 @@ published ports — those shape the compose file itself, not just stackd's confi
   versa: this box's `7.0.0` kernel has no `amdttm` module at all. **Widen
   `HOST_RESERVE_GIB` in the same change** — with the aperture open the reserve is
   the only guard left between a booked plan and an OOM.
+- **Unified-memory iGPU (Strix Halo / gfx1151 — no VRAM carve-out)** — a ComfyUI
+  checkpoint load looks like it costs twice its size: `stackctl image bench
+  flux2-klein` here reports 19.3 GiB on the device against 36.62 GiB of host RAM
+  *added*, and the tier's `host_ram_gib` for klein (42) vs `footprint_gib` (23)
+  carries that ratio into every fit decision. It is not ComfyUI reading the file
+  twice. Sampling the load at 400 ms: `RssAnon` tracks `mem_info_gtt_used` nearly
+  1:1 (peak 19.11 vs 21.9 GiB) and `RssFile` never climbs off 0.5 GiB — one set
+  of pages, shared with the GPU. Meanwhile whole-machine `MemTotal -
+  MemAvailable` rises by roughly twice the process's own RSS, because the
+  checkpoint's page cache and the driver's GTT pages are charged to the load
+  too, and that is exactly what bench.py's host sampler reads. Keep `host_ram_gib`
+  measured as-is (over-estimating is the safe direction); expect ~2x
+  `footprint_gib` on any device that shares system RAM.
+  What *does* cut the peak is ComfyUI's residency flags: with no carve-out,
+  "unload to CPU" copies weights into the RAM the device just unmapped, so
+  eviction holds the model twice at swap time and buys nothing.
+  `--highvram --disable-smart-memory` moved the cold-load peak from 58.76 to
+  47.37 GiB on the same model with the coding profile co-resident. Those two are
+  now the image CMD defaults in `imagegen/comfyui_image/Dockerfile.igpu`,
+  overridable per box via `COMFYUI_ROCM_CLI_ARGS`. Upstream's answer to this
+  report class — Comfy-Org/ComfyUI#10896, `--disable-mmap` plus `copy=False` on
+  the `tensor.to()` in `comfy/utils.py` — measured as **no help here**: 47.53 GiB
+  peak with it vs 47.37 without, because the DGX Spark path that patch fixes is
+  pinned-staging-buffer doubling, which amdgpu's system-memory allocator doesn't
+  do. Deliberately not applied. (The PR the issue links as closing it, #12611, is
+  still open and does not touch that copy at all.)
 
 ## Notes
 

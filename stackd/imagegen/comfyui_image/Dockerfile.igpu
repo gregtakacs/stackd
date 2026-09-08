@@ -55,6 +55,19 @@ COPY clipseg_mask.py /opt/ComfyUI/custom_nodes/clipseg_mask.py
 WORKDIR /opt/ComfyUI
 EXPOSE 8188
 
-# --highvram: keep weights resident (GTT is huge here). --disable-smart-memory
-# avoids ComfyUI's aggressive unload heuristics that assume a small dGPU.
-CMD ["python3", "main.py", "--listen", "0.0.0.0", "--port", "8188"]
+# Launch flags come from CLI_ARGS so they are tunable per box from .env without
+# another build (media/image.yaml's vulkan block passes it through) — the same
+# env name the comfyui-boot image uses on the cuda side. This image previously
+# had no such knob, and the --highvram / --disable-smart-memory its comment
+# described were never actually passed: the CMD was a bare `main.py --listen`.
+# Both flags are defaults here because this device has no VRAM carve-out:
+# "unload to CPU" copies weights into the very RAM the device just mapped, so
+# eviction buys nothing and holds the model twice at swap time. Measured on
+# flux2-klein, cold load, coding profile co-resident — peak whole-machine RAM
+# 58.76 GiB without them vs 47.37 GiB with (see deploy/README.md, which also
+# records why upstream ComfyUI#10896's copy=False loader patch is deliberately
+# NOT applied here).
+# `:-` so an empty CLI_ARGS from the container env falls back to these defaults
+# rather than silently clearing them. `exec` keeps ComfyUI as PID 1 so `docker
+# stop` reaches it directly — this image runs no supervisor.
+CMD exec python3 main.py --listen 0.0.0.0 --port 8188 ${CLI_ARGS:---highvram --disable-smart-memory}
