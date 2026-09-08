@@ -627,6 +627,26 @@ class Reconciler:
             self._teardown_image(state, now)
             slot, healthy = None, False
 
+        # A user-pinned slot that lost its container (force-removed for a clean bench
+        # baseline, or crashed) must RESTORE the pinned model — not revert to the
+        # auto-preferred tier. Re-spawn the pinned model on its original backend/device.
+        # This runs only while the slot is unhealthy (handle is None), so it self-limits:
+        # once the respawned container is warming/ready, `healthy` is True and the
+        # early-return above takes over. If the pinned model no longer fits, fall through
+        # to the auto-pick below.
+        if slot is not None and not healthy and slot.pinned_by == "user":
+            ld = self._loadable(tier, slot.active_model)
+            if ld is not None and slot.backend in ld.backends:
+                pin_hr = headroom(self.cfg, profile, self.catalog, reserve_gib=tier.margin_gib)
+                pin_avail = self._real_host_ram_avail(tier, profile)
+                pin_pick = self._pick_image(tier, pin_hr, host_ram_avail=pin_avail,
+                                            want_model=slot.active_model, want_backend=slot.backend)
+                if pin_pick is not None:
+                    dev, backend, ld = pin_pick
+                    self._spawn_image(state, tier, dev, backend, ld, now, pinned_by="user")
+                    return
+            # Pinned model no longer fits (or is gone from the tier) -> fall through.
+
         hr = headroom(self.cfg, profile, self.catalog, reserve_gib=tier.margin_gib)
         host_ram_avail = self._real_host_ram_avail(tier, profile)
         pick = self._pick_image(tier, hr, host_ram_avail=host_ram_avail)
@@ -652,7 +672,20 @@ class Reconciler:
         code = self.runner.poll(slot.handle)
         if code is not None and not slot.intentional_stop:
             self._emit(f"image:{slot.active_model}", "crash", f"exit {code}")
-            state.image = None
+            if slot.pinned_by == "user":
+                # A user-pinned slot whose container died (a force `docker rm -f` for a
+                # clean bench baseline, or a real crash) must RESTORE the pinned model —
+                # not revert to the auto-preferred tier. Keep the slot (clearing the dead
+                # handle, going `down`) so _reconcile_image's user-pin carve-out re-spawns
+                # it; only an auto-picked slot drops to `state.image = None` here.
+                # (2026-09-08: a force-removed image container dropped the pin, so the
+                # next tick re-converged to the auto tier — turbo/cuda — and a
+                # `stackctl image bench` on the vulkan backend had no container to hit.)
+                slot.handle = None
+                slot.container = None
+                slot.state = EngineState.down
+            else:
+                state.image = None
             return
         if not slot.health_url:
             return
