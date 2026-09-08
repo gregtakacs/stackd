@@ -493,9 +493,12 @@ async function api(path, opts = {}) {
   // cuda drain for minutes, an image swap waits for the engine to warm). Without
   // it, one wedged read stalls `tick()` — the `_busy` guard then skips every
   // poll after it, and the whole dashboard goes silent with no explanation.
+  // 8s keeps the worst-case tick (8 + 1.2s engine stage) under the sample
+  // grid's 20s hold window, so a wedged read degrades to a stale-hold, never
+  // a hole in the charts.
   const get = !opts.method || opts.method === "GET";
   const signal = opts.signal || (get && window.AbortSignal && AbortSignal.timeout
-    ? AbortSignal.timeout(15000) : undefined);
+    ? AbortSignal.timeout(8000) : undefined);
   const r = await fetch(path, { ...opts, signal, headers: { "Authorization": "Bearer " + KEY(),
     ...(opts.body ? {"content-type":"application/json"} : {}), ...(opts.headers||{}) } });
   if (r.status === 401) { showGate("Token rejected."); throw new Error("401"); }
@@ -1903,6 +1906,10 @@ const SAMPLE_MS = 1000;
 const HOLD_S = 20;                 // hold a value this long after its poll went stale
 let SNAP = { at: 0, gpu: null, host: null, tel: {} };
 let ENGINE_NAMES = [];
+// last good /engine answer per engine: if the engine itself is slow to
+// answer (long prefill) or momentarily unreachable we hold this for a few
+// seconds instead of tearing a hole in the lines
+const LAST_TEL = {}, LAST_TEL_AT = {};
 function snapshot(gpu, host, tel) { SNAP = { at: Date.now(), gpu, host, tel }; }
 function sampleLive(now) {
   TS.push(now / 1000);
@@ -2548,21 +2555,37 @@ async function tick() {
     engineSkeleton(names);
     const tel = {};
     await Promise.all(names.map(async n => {
-      try { tel[n] = await api("/engine/" + encodeURIComponent(n)); } catch (e) { tel[n] = { error: String(e) }; }
+      // /engine reaches the engine itself, so during a long prefill it can be
+      // the slowest thing on the page. Give it its own short deadline so one
+      // busy engine can't drag the whole tick past the sample grid's hold
+      // window (that was the hole in the charts). On a miss, hold the last
+      // good telemetry for a few seconds; after that the 20s hold window
+      // turns the line into an honest gap — a dead engine shouldn't look
+      // alive forever.
+      let fresh = false;
+      try {
+        const r = await api("/engine/" + encodeURIComponent(n),
+                            { signal: window.AbortSignal ? AbortSignal.timeout(1200) : undefined });
+        if (r && !r.error) { tel[n] = r; fresh = true; LAST_TEL[n] = r; LAST_TEL_AT[n] = Date.now(); }
+      } catch (e) { /* deadline or unreachable — fall back below */ }
+      if (!fresh)
+        tel[n] = (LAST_TEL[n] && Date.now() - (LAST_TEL_AT[n] || 0) < 10000) ? LAST_TEL[n] : null;
       fillEngine(n, st.stacks[n], tel[n]);
       // one data point per COMPLETED request — the only real "generation happened"
       // measurement; the rolling avg is computed from these, never from idle polls.
-      const lr = tel[n] && tel[n].last_request;
-      if (lr && lr.seq && lr.seq > (genSeq[n] || 0)) {
+      // Fresh samples only — held-stale telemetry must not re-sample the same
+      // live window.
+      const t = tel[n], lr = t && t.last_request;
+      if (fresh && lr && lr.seq && lr.seq > (genSeq[n] || 0)) {
         genSeq[n] = lr.seq;
         (GENHIST[n] ||= []).push({ t: lr.at || Date.now() / 1000,
           gen: lr.gen_tok_s, prompt: lr.prompt_tok_s, mtp: lr.mtp_accept_pct });
-      } else if (tel[n] && tel[n].active && !lr && (tel[n].gen_tok_s != null || tel[n].mtp_accept_pct != null)) {
+      } else if (fresh && t && t.active && !lr && (t.gen_tok_s != null || t.mtp_accept_pct != null)) {
         // vLLM has no per-request `timings` block -> fall back to live-poll
         // samples taken only while a request is actually running, so the
         // "avg (active periods only)" line still has something to average
-        (GENHIST[n] ||= []).push({ t: Date.now() / 1000, gen: tel[n].gen_tok_s,
-          prompt: tel[n].prompt_tok_s, mtp: tel[n].mtp_accept_pct });
+        (GENHIST[n] ||= []).push({ t: Date.now() / 1000, gen: t.gen_tok_s,
+          prompt: t.prompt_tok_s, mtp: t.mtp_accept_pct });
       }
       const cut = Date.now() / 1000 - 600;
       if (GENHIST[n]) GENHIST[n] = GENHIST[n].filter(p => p.t >= cut);
@@ -2574,7 +2597,16 @@ async function tick() {
     snapshot(gpu, host, tel);
     pumpCharts();
 
-    if (!evPaused && !uiLocked()) renderEvents(await api("/events?since=" + lastEvSeq), false);
+    // events are fire-and-forget: awaiting them used to extend the tick (and
+    // with it `tick._busy`) AFTER the snapshot was already fed — one slow
+    // /events could still push the next snapshot past the hold window
+    if (!evPaused && !uiLocked() && !tick._evBusy) {
+      tick._evBusy = true;
+      api("/events?since=" + lastEvSeq)
+        .then(j => { if (!uiLocked()) renderEvents(j, false); })
+        .catch(() => {})
+        .finally(() => { tick._evBusy = false; });
+    }
   } catch (e) {
     if (e.message !== "401") { $("#topErr").textContent = "poll error: " + e.message; $("#topErr").classList.remove("hidden"); }
   } finally {

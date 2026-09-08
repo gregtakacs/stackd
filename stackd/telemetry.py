@@ -378,13 +378,13 @@ def _prom_sum(text: str, metric: str, **match) -> float | None:
     return total if seen else None
 
 
-def _http_json(url: str, timeout: float = 4.0):
+def _http_json(url: str, timeout: float = 1.0):
     import urllib.request
     with urllib.request.urlopen(url, timeout=timeout) as r:
         return json.loads(r.read())
 
 
-def _http_text(url: str, timeout: float = 4.0) -> str:
+def _http_text(url: str, timeout: float = 1.0) -> str:
     import urllib.request
     with urllib.request.urlopen(url, timeout=timeout) as r:
         return r.read().decode("utf-8", "replace")
@@ -548,17 +548,16 @@ def engine_telemetry(endpoint: str, template: str) -> dict:
                 # live rates from the phase-specific slot counters (~2s window
                 # delta; the /metrics counters only move at request end).
                 bw = base_wall if (base_wall and base_wall.get("running", 0) > 0) else None
+                # Only the decode-only counter is safe to difference across a
+                # window: n_decoded / n_prompt_tokens_processed reset when the
+                # slot's next request starts, but a cached slot's POSITION does
+                # not — netting position-minus-prefill across a request
+                # boundary reads the whole cached context as "decoded" and
+                # produced 36k tok/s blips. A counter reset inside the window
+                # yields a negative delta, which _wall_rate already drops, and
+                # a fresh request in the same slot can't fake a large positive
+                # one (it can only accumulate a real decode rate in 1.8 s).
                 live = _wall_rate(bw, cur, "dec")
-                if live is None and bw is not None:
-                    # builds without an n_decoded field: position growth with
-                    # the prefill growth netted out is the decode growth —
-                    # but only while the prefill counter is quiet, otherwise
-                    # the net is just sampling lag between the two counters.
-                    if _wall_rate(bw, cur, "pref") is None:
-                        net = (cur["pos"] - bw["pos"]) - (cur["pref"] - bw["pref"])
-                        dt = cur["ts"] - bw["ts"]
-                        if dt > 0.5 and 0 < net < 1e6:
-                            live = round(net / dt, 1)
                 d["gen_tok_s"] = live or _win_rate(base, cur, "pred_tok", "pred_s") \
                     or (round(g, 1) if g else None) or ls.get("gen_tok_s")
                 # prompt rate: the slot counter while the context loads (the

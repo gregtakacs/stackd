@@ -128,6 +128,13 @@ def main() -> int:
               and b" vram/" not in raw and b"refused before start" not in raw)
         check("image ladder rows show the model capabilities on the line",
               b'el("span", "caps"' in raw and b"CAP_ABBR" in raw)
+        # one slow /engine (long prefill) must not stall the tick: the engine
+        # reads sit on their own short deadline with a brief stale hold, and the
+        # overall GET deadline keeps the worst-case tick under the sample grid's
+        # 20s hold window — a wedged engine degrades to a held line, not a hole
+        check("engine reads are deadline-bounded so a busy engine can't gap the charts",
+              b"AbortSignal.timeout(1200)" in raw and b"LAST_TEL" in raw
+              and b"AbortSignal.timeout(8000)" in raw)
         code, ct, raw = _req(f"{base}/static/uplot.min.js")
         check("GET /static/uplot.min.js served", code == 200 and b"uPlot" in raw)
         check("static content-type is js", "javascript" in ct)
