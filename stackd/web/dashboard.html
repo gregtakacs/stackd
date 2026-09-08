@@ -182,7 +182,10 @@
   .rung { display:grid; grid-template-columns:minmax(0,1fr) 96px 78px 68px; align-items:center;
     gap:10px; font-size:.82rem; padding:6px 10px; border-radius:7px;
     background:var(--bg); border:1px solid var(--border); }
-  .rung .nm { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .rung .nm { display:block; min-width:0; font-weight:600; overflow:hidden;
+    text-overflow:ellipsis; white-space:nowrap; }
+  .rung .caps { font-weight:400; font-size:.68rem; color:var(--dim); white-space:nowrap;
+    overflow:hidden; text-overflow:ellipsis; }
   .rung .st { font-size:.72rem; color:var(--dim); white-space:nowrap; }
   .rung .st.no { color:var(--red); }
   .rung .fp { text-align:right; color:var(--dim); font-variant-numeric:tabular-nums;
@@ -1511,6 +1514,8 @@ async function ctl(name, verb) {
 // blocked it and the tooltip carries the sentence.
 const axisOf = why => /host RAM/i.test(why || "") ? "RAM"
   : /VRAM/i.test(why || "") ? "VRAM" : "fit";
+// the capability tags on the line, shortened — full names in the tooltip
+const CAP_ABBR = { generate: "gen", edit: "edit", stylize: "styl" };
 
 function renderImage(img) {
   if (unchanged("image", [img.resident, img.headroom_gib, img.host_ram_avail_gib, img.prefer])) return;
@@ -1552,8 +1557,12 @@ function renderImage(img) {
     const why = (p.backends || []).map(b => (fit[b] || {}).reason).filter(Boolean);
     const rung = el("div", "rung" + (here ? " here" : "") + (refused ? " refused" : ""));
     const nm = el("span", "nm");
-    nm.textContent = p.active_model;
-    nm.title = (p.capabilities || []).join(", ");
+    nm.append(el("b", null, p.active_model));
+    // the capabilities live on the line again (short tags, full names on hover)
+    const caps = el("span", "caps");
+    caps.textContent = (p.capabilities || []).map(c => CAP_ABBR[c] || c).join(" · ");
+    caps.title = (p.capabilities || []).join(", ");
+    nm.append(document.createTextNode(" "), caps);
     const st = el("span", "st" + (refused ? " no" : ""));
     // the axis is taken from the route the numbers in the next column describe,
     // not the first refusal in list order — dev-turbo's cuda route is blocked by

@@ -126,6 +126,8 @@ def main() -> int:
               b"grid-template-columns:minmax(0,1fr) 96px 78px 68px" in raw
               and b'el("span", "st"' in raw
               and b" vram/" not in raw and b"refused before start" not in raw)
+        check("image ladder rows show the model capabilities on the line",
+              b'el("span", "caps"' in raw and b"CAP_ABBR" in raw)
         code, ct, raw = _req(f"{base}/static/uplot.min.js")
         check("GET /static/uplot.min.js served", code == 200 and b"uPlot" in raw)
         check("static content-type is js", "javascript" in ct)
