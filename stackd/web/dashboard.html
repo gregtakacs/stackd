@@ -2042,9 +2042,16 @@ function trimLive(tEnd) {
 // tail and forces the middle samples to be skipped as "already have it".
 let backfilling = false;
 // The daemon replays the per-request completion points it recorded itself (its
-// meta `genhist/<stack>`), so the 10-minute corner averages survive a reload AND
-// a daemon restart — previously they restarted from zero points on every boot
-// even when the box had served 40 requests a minute earlier.
+// meta `genhist/<stack>`), so on a llama.cpp-style engine the 10-minute corner
+// averages survive a reload AND a daemon restart — previously they restarted
+// from zero points on every boot even when the box had served 40 requests a
+// minute earlier. vLLM/SGLang report no per-request series: their corners are
+// derived from the live 1 s buffer on each /live call, which survives a
+// web-asset reload and `stackctl reload` (same process, buffer intact) but starts
+// fresh after a *daemon* restart, because that buffer is memory-only. Persisting
+// it is not just a shutdown flush — _genhist_from_live skips any stack whose ring
+// is already non-empty, so seeded derived points would freeze the chart on
+// pre-restart values for the rest of the 900 s window instead of resuming.
 //
 // Deduped two ways, because this page already counts generations itself: tick()
 // pushes a point the first time it sees a `last_request.at` that differs from
