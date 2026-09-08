@@ -478,7 +478,7 @@ let timer = null, evPaused = false, lastEvSeq = 0, view = "main";
 const H = {};                       // history-chart uPlot instances
 const LC = {};                      // live-chart uPlot instances
 const GENHIST = {};                 // engine -> [{t, gen, prompt, mtp}] — one point per COMPLETED request
-const genSeq = {};                  // engine -> last seen last_request.seq
+const lastReqAt = {};               // engine -> last-seen last_request.at (completion timestamp)
 const TS = [];                      // live sample timestamps (s)
 const SER = {};                     // live series: name -> number[] aligned to TS
 const guard = { _: {} };            // anti-flicker: skip a rebuild when data is unchanged
@@ -2591,9 +2591,14 @@ async function tick() {
       // Fresh samples only — held-stale telemetry must not re-sample the same
       // live window.
       const t = tel[n], lr = t && t.last_request;
-      if (fresh && lr && lr.seq && lr.seq > (genSeq[n] || 0)) {
-        genSeq[n] = lr.seq;
-        (GENHIST[n] ||= []).push({ t: lr.at || Date.now() / 1000,
+      if (fresh && lr && lr.at != null && lr.at !== lastReqAt[n]) {
+        // Gate on `at` (the completion timestamp), which uniquely identifies a
+        // completed request — so exactly one point is pushed per request, and it
+        // survives a daemon restart. The old `seq > lastSeq` gate wedged on a
+        // restart (the in-memory seq counter resets to 0, falling below the page's
+        // stale value), which silently froze the rolling-average lines.
+        lastReqAt[n] = lr.at;
+        (GENHIST[n] ||= []).push({ t: lr.at,
           gen: lr.gen_tok_s, prompt: lr.prompt_tok_s, mtp: lr.mtp_accept_pct });
       } else if (fresh && t && t.active && !lr && (t.gen_tok_s != null || t.mtp_accept_pct != null)) {
         // vLLM has no per-request `timings` block -> fall back to live-poll
