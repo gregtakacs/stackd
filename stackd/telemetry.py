@@ -20,6 +20,8 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
+from stackd.gpu_discovery import amdgpu_device_dirs
+
 _TTL_S = 2.0
 _lock = threading.Lock()
 _cache: dict = {"at": 0.0, "data": None}
@@ -76,35 +78,41 @@ def _igpu0_sysfs() -> dict | None:
     42 GiB image model resident, cgroup anon + AnonPages + Shmem + SUnreclaim
     accounted for only 30.9 of a 54.4 GiB "OS used" — the missing ~20 GiB was
     exactly `gtt_used`, driver pages that belong to no process's RSS.
+
+    Which card is `igpu0` comes from gpu_discovery.amdgpu_device_dirs — the SAME
+    helper fit.gtt_window_gib() clamps the configured budget against. Two
+    independent "find the amdgpu card" rules is how a box ends up reporting a GTT
+    window for one card while budgeting another.
     """
-    import re
-    for dev in sorted(glob.glob("/sys/class/drm/card[0-9]*/device")):
-        if not re.fullmatch(r"card[0-9]+", os.path.basename(os.path.dirname(dev))):
-            continue  # skip the cardN-DP-* connector dirs
-        try:
-            drv = os.path.basename(os.path.realpath(os.path.join(dev, "driver")))
-        except OSError:
-            continue
-        if drv != "amdgpu":
-            continue
-        vram_u = _b_to_gib(_read(os.path.join(dev, "mem_info_vram_used"))) or 0
-        gtt_u = _b_to_gib(_read(os.path.join(dev, "mem_info_gtt_used"))) or 0
-        gtt_t = _b_to_gib(_read(os.path.join(dev, "mem_info_gtt_total")))
-        used = _f(vram_u + gtt_u) if (vram_u or gtt_u) else None
-        total = _f(gtt_t) if gtt_t else _f(_b_to_gib(_read(os.path.join(dev, "mem_info_vram_total"))))
-        util = _f(_read(os.path.join(dev, "gpu_busy_percent")))
-        pw = pw_cap = temp = None
-        for hw in glob.glob(os.path.join(dev, "hwmon", "hwmon*")):
-            pw = pw or _uw_to_w(_read(os.path.join(hw, "power1_average")) or _read(os.path.join(hw, "power1_input")))
-            pw_cap = pw_cap or _uw_to_w(_read(os.path.join(hw, "power1_cap")))
-            temp = temp or _mc_to_c(_read(os.path.join(hw, "temp1_input")))
-        if used is None and util is None:
-            return None
-        return {"vram_used_gib": used, "vram_total_gib": total, "util_pct": util,
-                "power_w": _f(pw), "power_limit_w": _f(pw_cap), "temp_c": _f(temp),
-                "gtt_used_gib": _f(gtt_u) if gtt_u else 0.0,
-                "gtt_total_gib": _f(gtt_t), "stolen_used_gib": _f(vram_u) if vram_u else 0.0}
-    return None
+    amd = amdgpu_device_dirs()
+    if not amd:
+        return None
+    dev = amd[0]     # igpu0 is the first amdgpu card, card-number order
+    vram_u = _b_to_gib(_read(os.path.join(dev, "mem_info_vram_used"))) or 0
+    gtt_u = _b_to_gib(_read(os.path.join(dev, "mem_info_gtt_used"))) or 0
+    gtt_t = _b_to_gib(_read(os.path.join(dev, "mem_info_gtt_total")))
+    used = _f(vram_u + gtt_u) if (vram_u or gtt_u) else None
+    total = _f(gtt_t) if gtt_t else _f(_b_to_gib(_read(os.path.join(dev, "mem_info_vram_total"))))
+    util = _f(_read(os.path.join(dev, "gpu_busy_percent")))
+    pw = pw_cap = temp = None
+    for hw in glob.glob(os.path.join(dev, "hwmon", "hwmon*")):
+        pw = pw or _uw_to_w(_read(os.path.join(hw, "power1_average")) or _read(os.path.join(hw, "power1_input")))
+        pw_cap = pw_cap or _uw_to_w(_read(os.path.join(hw, "power1_cap")))
+        temp = temp or _mc_to_c(_read(os.path.join(hw, "temp1_input")))
+    if used is None and util is None:
+        return None
+    return {"vram_used_gib": used, "vram_total_gib": total, "util_pct": util,
+            "power_w": _f(pw), "power_limit_w": _f(pw_cap), "temp_c": _f(temp),
+            "gtt_used_gib": _f(gtt_u) if gtt_u else 0.0,
+            "gtt_total_gib": _f(gtt_t), "stolen_used_gib": _f(vram_u) if vram_u else 0.0}
+
+
+def gtt_window_gib(index: int = 0) -> float | None:
+    """The GTT window the driver exposes for `igpu<index>` — the hardware side of
+    the ceiling. Thin re-export of gpu_discovery's probe; `stackd.fit` is the one
+    that decides what the effective budget is (min with the configured ceiling)."""
+    from stackd.gpu_discovery import gtt_window_gib as _probe
+    return _probe(index=index)
 
 
 def _b_to_gib(s):

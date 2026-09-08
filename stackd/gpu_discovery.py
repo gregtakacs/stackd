@@ -63,3 +63,54 @@ def render_nodes_by_vendor(vendor: str, sys_class_drm: str = "/sys/class/drm") -
     gets index 0 in devices.yaml, index 1 is the next of that vendor, etc."""
     return [g["render_node"] for g in enumerate_gpus(sys_class_drm)
             if g["vendor"] == vendor and g["render_node"]]
+
+
+def amdgpu_device_dirs(sys_class_drm: str = "/sys/class/drm") -> list[str]:
+    """`cardN/device` paths of cards driven by `amdgpu`, in card-number order.
+
+    Same selection rule `telemetry._igpu0_sysfs` uses (driver symlink, not PCI
+    vendor: an NVIDIA card is `nvidia`, an Intel one `i915`), and the same
+    `card[0-9]+` filter that skips the `cardN-DP-*` connector dirs. Shared by
+    the live sample and the offline fit check so the two can never disagree
+    about WHICH card the iGPU's budget refers to (see `gtt_window_gib`)."""
+    import re
+    out = []
+    for drm_dir in sorted(glob.glob(os.path.join(sys_class_drm, "card[0-9]*"))):
+        if not re.fullmatch(r"card[0-9]+", os.path.basename(drm_dir)):
+            continue  # skip the cardN-DP-* connector dirs
+        dev_dir = os.path.join(drm_dir, "device")
+        try:
+            drv = os.path.basename(os.path.realpath(os.path.join(dev_dir, "driver")))
+        except OSError:
+            continue
+        if drv == "amdgpu":
+            out.append(dev_dir)
+    return out
+
+
+def gtt_window_gib(*, index: int = 0, sys_class_drm: str = "/sys/class/drm") -> float | None:
+    """The GTT window amdgpu actually exposes for `igpu<index>`, in GiB — the
+    hardware's real claim on host RAM, or None if it can't be measured.
+
+    Why this exists and not just `IGPU_VRAM_BUDGET_GIB`: that env var is a
+    config *wish*, and the box happily accepts 90 on hardware that exposes a
+    62.2 GiB window (Strix Halo: `mem_info_gtt_total` = 66812620800). Only GTT
+    is a claim on host RAM — the stolen window is boot-carved and never shows
+    up in MemTotal (see telemetry._igpu0_sysfs) — so GTT total is the number
+    the pool math must clamp against. None (no amdgpu card, no /sys access,
+    container without /dev/dri, CI) means UNKNOWN, not zero: the caller must
+    then fall back to the configured budget rather than clamping a device to
+    0 GiB it is plainly using.
+    """
+    dirs = amdgpu_device_dirs(sys_class_drm)
+    if len(dirs) <= index:
+        return None
+    try:
+        raw = _read(os.path.join(dirs[index], "mem_info_gtt_total"))
+    except OSError:
+        return None
+    try:
+        gib = int(raw) / (1024 ** 3)
+    except (TypeError, ValueError):
+        return None
+    return round(gib, 1) if gib > 0 else None

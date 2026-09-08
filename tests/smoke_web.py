@@ -4,6 +4,7 @@ it polls (/events, /gpu, /history, /profiles, /slots). Stdlib only."""
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import re
 import sys
@@ -179,6 +180,18 @@ def main() -> int:
               b"async function checkRev" in raw and b'setInterval(checkRev, 20000)' in raw
               and b'idle && sessionStorage.getItem("stackd_reloaded") !== live' in raw
               and b'id="webStale"' in raw and b'!uiLocked()' in raw)
+        # The auto-reload itself cannot be driven headless (no Chrome-driving
+        # library here, and --dump-dom can't see sessionStorage), so the four
+        # idle guards are asserted as source: each one exists to stop a reload
+        # landing on top of something the user was doing, and any of them could
+        # go missing one careless line-edit at a time.
+        check("the idle reload refuses to fire over a hidden tab, a locked UI, "
+              "a running tick, or fresh input — once per build",
+              b'document.visibilityState === "visible" && !uiLocked()' in raw
+              and b"!tick._busy && Date.now() - lastInputAt > 15000" in raw
+              and b'sessionStorage.setItem("stackd_reloaded", live)' in raw
+              and b'for (const ev of ["pointerdown", "keydown", "wheel"])' in raw
+              and b"lastInputAt = Date.now()" in raw)
         web_bak = serve._WEB_DIR
         (tmp / "web").mkdir()
         serve._WEB_DIR = tmp / "web"
@@ -354,9 +367,18 @@ def main() -> int:
                       - t["total_gross"]) < 1e-6 for t in j["tiers"]))
 
         # --- /profiles ---------------------------------------------------
+        # A subset check, not an equality: the box's config.local overlay adds its
+        # own profiles (coding-long, code-autocomplete…) on top of the shipped
+        # config/, and this suite reads whichever config is actually loaded. An
+        # exact set made the suite red inside the container for the wrong reason
+        # and cast doubt on the other 67 checks.
         code, j = _json_req(f"{base}/profiles", token="admin")
-        check("/profiles lists all configured profiles", code == 200
-              and {p["name"] for p in j["profiles"]} == {"chat", "coding"})
+        _names = {p["name"] for p in j["profiles"]}
+        _want = {pr.profile for pr in mgr.cfg.profiles.values()}
+        check("/profiles lists exactly the configured profiles", code == 200
+              and _names == _want, (_names, _want))
+        check("/profiles always carries the two reference profiles it is tested against",
+              {"chat", "coding"} <= _names, sorted(_names))
         ev = next(p for p in j["profiles"] if p["name"] == "chat")
         cd = next(p for p in j["profiles"] if p["name"] == "coding")
         check("/profiles marks the active one", ev["active"] and not cd["active"])
@@ -370,6 +392,142 @@ def main() -> int:
               and any(isinstance(p.get("breakdown"), dict) and p["breakdown"] for p in j["pools"]))
         check("/status exposes devices[]", isinstance(j.get("devices"), list) and j["devices"])
         check("/status exposes footprint sources", isinstance(j.get("sources"), dict))
+
+        # --- the GTT clamp: ONE source of truth for the iGPU ceiling -------------
+        # IGPU_VRAM_BUDGET_GIB is a config *wish*; the GTT window the driver
+        # exposes is the hardware. fit.budget_facts takes the min, and /status,
+        # the breakdown's ≤ label and validate's flag all follow that one number.
+        # The dashboard used to be the only place that clamped, so `stackctl
+        # status` printed ≤90 over a lane that said 62.2 on this box — and a
+        # mistuned budget passed validation and then OOMed the host. These are the
+        # checks that keep the two halves from drifting apart again.
+        _c, j = _json_req(f"{base}/status", token="admin")
+        _ig = next((d for d in (j.get("devices") or []) if d.get("device") == "igpu0"), {})
+        _cfg_budget = _ig.get("budget")
+        check("with no window measurable, nothing is clamped and the config budget stands",
+              _cfg_budget and _ig.get("gtt_window") is None
+              and _ig.get("budget_effective") == _cfg_budget)
+        os.environ["STACKD_GTT_WINDOW_GIB"] = "62.2"
+        try:
+            _c, j = _json_req(f"{base}/status", token="admin")
+            _ig = next((d for d in (j.get("devices") or []) if d.get("device") == "igpu0"), {})
+            check("/status budget_effective == min(configured budget, measured GTT window)",
+                  _ig.get("gtt_window") == 62.2 and _cfg_budget > 62.2
+                  and _ig.get("budget_effective") == min(_cfg_budget, 62.2),
+                  _ig)
+            _hu = next((p for p in j["pools"] if p["pool"] == "host_unified"), {})
+            _lbl = [k for k in (_hu.get("breakdown") or {}) if k.startswith("vram:igpu0")]
+            check("the breakdown's ≤ label follows the effective cap, not the env var",
+                  len(_lbl) == 1 and "(≤62.2)" in _lbl[0], _lbl)
+            check("validate names the clamp rather than silently shrinking the cap",
+                  any("clamped" in f and "62.2" in f and "90" in f for f in j.get("flags") or []),
+                  j.get("flags"))
+            # The whole point: the shell must read the server's number, not
+            # re-derive its own min() and drift from it again.
+            _sc, _sct, shell = _req(f"{base}/")
+            check("the dashboard's gttCap consumes the server's budget_effective",
+                  _sc == 200 and b"budget_effective" in shell
+                  and b"const gttSrvCap" in shell
+                  and b"const gttCaps = [gttCeiling, gttWindow, gttSrvCap]" in shell)
+            check("the printed cap is the same min() the fit math used",
+                  b"gttSrvCap || gttCeiling" in shell)
+        finally:
+            os.environ.pop("STACKD_GTT_WINDOW_GIB", None)
+        # --- GENHIST backfill: corner averages that outlive the tab --------------
+        # The 10-min average on the request corners was a purely client-side ring:
+        # reload the page, or bounce the daemon, and it read `avg –` until the next
+        # generation, however warm the box was — while the sticky "last" number
+        # beside it had been persisted months ago. serve.py now keeps its own ring
+        # in meta and replays it on /live.
+        _lk = threading.Lock()
+        _gb = (b'data: {"id":2,"timings":{"predicted_per_second":120.0,'
+               b'"prompt_per_second":4000.0,"prompt_n":80,"predicted_n":40}}\n\n')
+        serve._GENHIST.clear()
+        serve._GENHIST_SEEDED.clear()
+        check("a daemon with nothing recorded replays an empty history",
+              serve._genhist_seed(store, ["chat"], _lk) == {})
+        _now = time.time()
+        serve._meta_set(store, "genhist/chat",
+                        [{"t": _now - 7200, "gen": 1.0, "prompt": 1.0, "mtp": 1.0}]
+                        + [{"t": _now - 300 + i, "gen": 50.0 + i, "prompt": 900.0, "mtp": 70.0}
+                           for i in range(4)], _lk)
+        serve._GENHIST_SEEDED.clear()
+        _h = serve._genhist_seed(store, ["chat"], _lk)
+        check("the replay window is the window the corner averages, oldest points dropped",
+              len(_h.get("chat") or []) == 4 and [p["gen"] for p in _h["chat"]] == [50.0, 51.0, 52.0, 53.0],
+              _h)
+        serve._capture_gen("chat", _gb, store, _lk)
+        check("a completed request lands in the replay ring",
+              len(serve._GENHIST["chat"]) == 5, serve._GENHIST["chat"])
+        check("the ring stays in timestamp order as requests arrive out of a restart",
+              [p["t"] for p in serve._GENHIST["chat"]]
+              == sorted(p["t"] for p in serve._GENHIST["chat"]))
+        serve._GENHIST.clear()
+        serve._GENHIST_SEEDED.clear()
+        serve._LAST_GEN.clear()          # a replay must not fake a sticky "last"
+        _c, jl = _json_req(f"{base}/live?since=0", token="admin")
+        _gh = (jl.get("gen_history") or {}).get("chat") or []
+        check("GET /live replays the ring to a cold dashboard",
+              _c == 200 and len(_gh) == 5 and _gh[-1]["gen"] == 120.0, _gh)
+        check("GET /live keeps its old shape for an older dashboard",
+              "samples" in jl and "next" in jl)
+        check("the replay is read-only — it must not fake a sticky 'last' number",
+              "chat" not in serve._LAST_GEN, serve._LAST_GEN)
+        check("the ring is capped so meta cannot grow without bound",
+              len(serve._genhist_prune([{"t": _now - i * 0.1, "gen": float(i)} for i in range(400)]))
+              == serve._GENHIST_MAX_PTS)
+        check("pruning skips malformed points instead of raising",
+              len(serve._genhist_prune([None, {"gen": 5}, {"t": "x"}, {"t": _now}])) == 1)
+        # vLLM/SGLang have no per-request `timings` at all, so nothing reaches the
+        # append above — and this box serves its main profile on vLLM. Those
+        # corners were always filled by the dashboard's active-poll fallback, so
+        # the server has to derive the same points from its own 1 s buffer or the
+        # reload blanks exactly the engines that are actually running.
+        _bk = list(serve._LIVE_BUF)
+        try:
+            serve._LIVE_BUF.clear()
+            for k in range(120):                       # oldest first, 1 s apart, like the sampler
+                serve._LIVE_BUF.append({"ts": _now - (119 - k),
+                                        "eng": {"vllmish": {"active": True, "gen_tok_s": 40.0 + k,
+                                                            "prompt_tok_s": None,
+                                                            "mtp_accept_pct": None}}})
+            _lv = serve._genhist_from_live(["vllmish"], {"vllmish": "vllm-cuda"}, {})
+            _pts = [p["t"] for p in _lv.get("vllmish") or []]
+            check("a no-timings engine gets its corner back from the live buffer",
+                  len(_pts) == 24 and _pts == sorted(_pts), len(_pts))
+            check("the derived series is stepped, not one point per sample",
+                  len(_pts) * 5 > 115 and all(
+                      b - a >= serve._GENHIST_LIVE_STEP_S for a, b in zip(_pts, _pts[1:])))
+            check("a stack with a real per-request ring is not overwritten by samples",
+                  serve._genhist_from_live(["vllmish"], {"vllmish": "vllm-cuda"},
+                                           {"vllmish": [{"t": _now, "gen": 1.0}]}) == {})
+            check("a timings-capable engine keeps its own source, not samples",
+                  serve._genhist_from_live(["llamish"], {"llamish": "llamacpp-cuda"}, {}) == {})
+            serve._LIVE_BUF.clear()
+            serve._LIVE_BUF.extend({"ts": _now - k, "eng": {"vllmish": {"active": False,
+                                                                       "gen_tok_s": 163.0,
+                                                                       "prompt_tok_s": 30209.7,
+                                                                       "mtp_accept_pct": 35.0}}}
+                                   for k in range(30))
+            check("idle session gauges are not re-timestamped as fresh points "
+                  "(they would freeze the corner warm forever)",
+                  serve._genhist_from_live(["vllmish"], {"vllmish": "vllm-cuda"}, {}) == {})
+        finally:
+            serve._LIVE_BUF.clear()
+            serve._LIVE_BUF.extend(_bk)
+        _shc, _sht, _shell = _req(f"{base}/")
+        _sh = _shell.decode()
+        check("the dashboard seeds GENHIST from the replay instead of thin air",
+              _shc == 200 and "seedGenHist(pay.gen_history)" in _sh
+              and "let genHistSeeded = false" in _sh)
+        # the trap: tick() pushes a point the first time it sees a last_request.at
+        # transition, so seeding must consume the newest one or the first poll
+        # counts that request twice and skews every average on screen.
+        check("seeding claims lastReqAt so the newest request is not double-counted",
+              "lastReqAt[n] = newest" in _sh and "have.has(p.t)" in _sh)
+        check("the (n pts) figure is what the mean consumed, not the whole ring",
+              "const n = w.n || 0;" in _sh and "600, 120, w)" in _sh)
+
     finally:
         httpd.shutdown()
 

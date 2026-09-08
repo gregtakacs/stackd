@@ -791,7 +791,13 @@ function hostRamSegs(host, st, gpu) {
   const gttKey = Object.keys(bd).find(k => k.startsWith("vram:igpu0"));
   const gttCharge = gttKey ? bd[gttKey] : 0;
   const igDev = (st.devices || []).find(d => d.device === "igpu0");
+  // gttCeiling is the CONFIGURED budget (what the label calls "ceiling");
+  // gttSrvCap is what the SERVER capped it to — fit.budget_facts already took
+  // min(budget, the driver's GTT window) so validate/solver/status and this lane
+  // cannot disagree about the number that guards the host. It's null on a daemon
+  // too old to send it, which is why the local min() at gttCap stays.
   const gttCeiling = igDev ? (igDev.budget || 0) : 0;
+  const gttSrvCap = (igDev && igDev.budget_effective != null) ? igDev.budget_effective : null;
   const onIgpu = n => ((((st.stacks || {})[n] || {}).device) === "igpu0");
 
   // ---- measured: solid segments summing to "OS used" + a cache band on top.
@@ -881,8 +887,12 @@ function hostRamSegs(host, st, gpu) {
   const ig = gpu && gpu.igpu0;
   const gttWindow = ig && ig.gtt_total_gib != null ? ig.gtt_total_gib : null;
   const gttLive = ig ? (ig.gtt_used_gib != null ? ig.gtt_used_gib : ig.vram_used_gib) : null;
-  const gttCap = (gttCeiling && gttWindow) ? Math.min(gttCeiling, gttWindow)
-                                           : (gttWindow || gttCeiling || 0);
+  // The cap is the smallest of what we know: the configured budget, the driver's
+  // measured window, and the server's own effective cap (fit.budget_facts — the
+  // number validate/the solver booked against, so the lane can no longer disagree
+  // with it). 0 when nothing is known at all, which the lane reads as "skip".
+  const gttCaps = [gttCeiling, gttWindow, gttSrvCap].filter(v => v != null && v > 0);
+  const gttCap = gttCaps.length ? Math.min(...gttCaps) : 0;
   const igpuTen = Object.entries(st.stacks || {})
     .filter(([, s]) => ((s || {}).device) === "igpu0")
     .map(([n]) => ({ n, mv: (st.model_vram || {})[n] || 0, color: modelColor(n) }));
@@ -1246,13 +1256,18 @@ function renderMap(st, eng, img, gpu, host) {
     const gttKey = hu ? Object.keys(hu.breakdown || {}).find(k => k.startsWith("vram:igpu0")) : null;
     const gttCharge = gttKey ? (hu.breakdown[gttKey] || 0) : 0;
     const gttCeiling = ig ? (ig.budget || 0) : 0;
+    // The server's effective cap (fit.budget_facts: min(configured budget, the
+    // measured GTT window). The dotted line sits here, not at the configured
+    // budget — a line at 90 on a box whose driver window is 62.2 promises headroom
+    // the hardware can't reach. The label still names both numbers.
+    const gttSrvCap = (ig && ig.budget_effective != null) ? ig.budget_effective : null;
     // Meaningful only while the ceiling lands inside the drawn bar — a no-iGPU host
     // (or a ceiling at/above the limit) draws neither line nor bracket. The line
     // sits at the LOWER of the configured budget and the driver's GTT window: this
     // box is told 90 GiB while amdgpu exposes a 62.2 GiB window, so a line at 90
     // implies headroom the hardware can never actually reach.
     const gttOpts = (limit, g) => {
-      const b = (g && g.boundary) || gttCeiling;
+      const b = (g && g.boundary) || gttSrvCap || gttCeiling;
       if (!b || b >= limit) return {};
       const chg = (g && g.charge) || gttCharge, win = (g && g.window) || b;
       return {
@@ -1842,7 +1857,7 @@ function hoverTip(fmtX, fmtVal) {
 // line drifting smoothly across an idle stretch — the exact artifact this chart
 // is supposed to show the absence of. Past `maxAgeS` it returns null and the line
 // stops where the traffic stopped.
-function genWinMean(engineNames, key, tEnd, winS, maxAgeS = 120) {
+function genWinMean(engineNames, key, tEnd, winS, maxAgeS = 120, out = null) {
   const lo = tEnd - winS;
   let sum = 0, n = 0, newest = -Infinity;
   for (const e of engineNames) {
@@ -1850,6 +1865,11 @@ function genWinMean(engineNames, key, tEnd, winS, maxAgeS = 120) {
       if (p.t > lo && p.t <= tEnd && p[key] != null) { sum += p[key]; n++; if (p.t > newest) newest = p.t; }
     }
   }
+  // `out.n` — how many points this mean actually consumed. The caption needs it:
+  // GENHIST[e].length counts points outside the window and points with no value
+  // for this key, so after a server-side backfill it read "(12 pts)" over a
+  // 3-point average.
+  if (out) out.n = n;
   if (!n || newest < tEnd - maxAgeS) return null;
   return Math.round(sum / n * 10) / 10;
 }
@@ -1915,8 +1935,13 @@ function renderLive(engineNames) {
   // caption: latest (sticky) value · 10-min per-request average (idle excluded)
   const capReq = (id, series, key, suf) => {
     const e = $(".lv-" + id); if (!e) return;
-    const l = last(series), a = genWinMean([e0], key, Date.now() / 1000, 600);
-    const n = (GENHIST[e0] || []).length;
+    const w = {};
+    const l = last(series), a = genWinMean([e0], key, Date.now() / 1000, 600, 120, w);
+    // The count is the number of points the average CONSUMED, not the length of
+    // the engine's whole history: GENHIST now arrives pre-seeded from the daemon
+    // with more points than the 600 s window holds, so printing the total next to
+    // a windowed mean ("avg 172.7 (12 pts)" over a 3-point average) lied.
+    const n = w.n || 0;
     e.textContent = l == null && a == null ? e0pre + "–"
       : `${e0pre}${rnd(l) ?? "–"}${suf} · avg ${a == null ? "–" : rnd(a) + suf}${a == null ? "" : ` (${n} pts)`}`;
   };
@@ -2016,14 +2041,50 @@ function trimLive(tEnd) {
 // Pumping is parked while this runs so no live point lands *before* the grid's
 // tail and forces the middle samples to be skipped as "already have it".
 let backfilling = false;
+// The daemon replays the per-request completion points it recorded itself (its
+// meta `genhist/<stack>`), so the 10-minute corner averages survive a reload AND
+// a daemon restart — previously they restarted from zero points on every boot
+// even when the box had served 40 requests a minute earlier.
+//
+// Deduped two ways, because this page already counts generations itself: tick()
+// pushes a point the first time it sees a `last_request.at` that differs from
+// lastReqAt[n]. So (a) skip a seeded point whose timestamp the grid already
+// holds, and (b) claim the newest seeded timestamp into lastReqAt[n], which makes
+// that completion read as already consumed. Without (b) the page loads, pushes
+// the same completion a second time on the first poll, and every corner number
+// is weighted by a request it saw twice.
+let genHistSeeded = false;
+function seedGenHist(hist) {
+  if (genHistSeeded || !hist) return;
+  genHistSeeded = true;
+  const cut = Date.now() / 1000 - 600;          // the window the corners average
+  for (const [n, pts] of Object.entries(hist)) {
+    if (!Array.isArray(pts) || !pts.length) continue;
+    const gh = GENHIST[n] ||= [];
+    const have = new Set(gh.map(p => p.t));
+    let newest = -Infinity;
+    for (const p of pts) {
+      if (!p || typeof p.t !== "number" || p.t < cut || have.has(p.t)) continue;
+      have.add(p.t);
+      gh.push({ t: p.t, gen: p.gen, prompt: p.prompt, mtp: p.mtp });
+      if (p.t > newest) newest = p.t;
+    }
+    if (newest > -Infinity) {
+      gh.sort((a, b) => a.t - b.t);
+      if (lastReqAt[n] == null || newest > lastReqAt[n]) lastReqAt[n] = newest;
+    }
+  }
+}
 async function backfillLive() {
   if (backfilling) return;
   backfilling = true;
   try {
     const since = TS.length ? TS[TS.length - 1] : Date.now() / 1000 - 600;
-    let smp = [];
-    try { smp = ((await api("/live?since=" + since)) || {}).samples || []; }
+    let pay = {};
+    try { pay = (await api("/live?since=" + since)) || {}; }
     catch (e) { return; }                   // unreachable daemon / no such endpoint yet
+    seedGenHist(pay.gen_history);
+    const smp = pay.samples || [];
     if (!smp.length) return;
     if (!TS.length) {
       // Seeding: engine series are written per-name at feed time, so the name

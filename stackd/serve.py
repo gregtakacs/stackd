@@ -123,8 +123,13 @@ def _live_trim(gpu: dict, host: dict, engs: dict) -> dict:
         "gpu": {k: dev((gpu or {}).get(k)) for k in ("cuda0", "igpu0")},
         "host": {"cpu_pct": (host or {}).get("cpu_pct"),
                  "load1": ((host or {}).get("loadavg") or [None])[0]},
-        "eng": {n: {k: t.get(k) for k in ("gen_tok_s", "prompt_tok_s", "mtp_accept_pct",
-                                          "kv_pct", "ctx_tokens")}
+        # `active` is not drawn by any chart — it rides along because /live also
+        # derives the request corners' history from this buffer (see
+        # _genhist_from_live), and a rate sample is only a *measurement* while a
+        # request is generating: engines stick their session average on the gauges
+        # once idle, which without this flag would be re-timestamped forever.
+        "eng": {n: {k: t.get(k) for k in ("active", "gen_tok_s", "prompt_tok_s",
+                                         "mtp_accept_pct", "kv_pct", "ctx_tokens")}
                 for n, t in (engs or {}).items()},
     }
 
@@ -802,7 +807,11 @@ class _Handler(BaseHTTPRequestHandler):
         up to the buffer's ~15 min. The dashboard uses it to backfill the
         seconds the browser throttled away while the tab was hidden, and to
         seed the first 10 minutes on page load. `next` is the newest sample ts
-        so the caller can ask for exactly what it still lacks."""
+        so the caller can ask for exactly what it still lacks.
+
+        `gen_history` rides along: the per-request completion points behind the
+        corners' 10-minute average, replayed from meta. Without it a daemon
+        restart reset every average to zero points while the box was still warm."""
         q = self.path.split("?", 1)[1] if "?" in self.path else ""
         since = 0.0
         for kv in q.split("&"):
@@ -813,8 +822,17 @@ class _Handler(BaseHTTPRequestHandler):
                     pass
         with _LIVE_LOCK:
             rows = [s for s in _LIVE_BUF if s["ts"] > since]
+        with self.lock:
+            stacks = list(self.mgr.state.stacks)
+            tmpl = {n: (self.mgr.cfg.models.get(rt.name).engine.template
+                        if self.mgr.cfg.models.get(rt.name) else "")
+                    for n, rt in self.mgr.state.stacks.items() if rt.endpoint}
+        hist = _genhist_seed(self.store, stacks, self.lock)
+        for n, pts in _genhist_from_live(stacks, tmpl, hist).items():
+            hist.setdefault(n, pts)
         return self._send_json(200, {"samples": rows,
-                                     "next": rows[-1]["ts"] if rows else since})
+                                     "next": rows[-1]["ts"] if rows else since,
+                                     "gen_history": hist})
 
     def _slots(self, stack: str):
         """Reverse-proxy a llama.cpp engine's /slots for the live engine card.
@@ -1269,6 +1287,102 @@ _LAST_CTX: dict = {}
 _SESS_WRITTEN: dict = {}
 _SESS_SEEDED = set()
 
+# --- per-request generation history, for the dashboard's 10-minute averages ----
+# GENHIST used to exist only in one browser tab's memory: filled from transitions
+# of /engine's `last_request` and pruned to a 600 s window. Reload the page or
+# restart the daemon and every corner read `avg –` again, even though the box had
+# served 40 requests a minute ago — the *sticky* number survived (last_gen/<stack>
+# in meta) and the *average* did not, because nothing persisted the series.
+# The usage ledger can't answer this: it has no duration or rate columns (the
+# prefill/decode columns were deliberately dropped in the v5→v6 migration), and
+# engine_daily is day-granular — the wrong shape for a 10-minute stat.
+# So the ring lives in meta too: one append per completed request, pruned to the
+# window the corner actually averages over, replayed to any tab via /live.
+_GENHIST: dict = {}
+_GENHIST_SEEDED = set()
+_GENHIST_WINDOW_S = 900.0        # the corner shows a 600 s mean; keep some slack
+_GENHIST_MAX_PTS = 200
+
+
+def _genhist_prune(ring: list, now: float | None = None) -> list:
+    """Drop points outside the replay window, newest-first, capped by count."""
+    now = time.time() if now is None else now
+    keep = [p for p in ring if isinstance(p, dict) and isinstance(p.get("t"), (int, float))]
+    keep = [p for p in keep if p["t"] >= now - _GENHIST_WINDOW_S]
+    keep.sort(key=lambda p: p["t"])
+    return keep[-_GENHIST_MAX_PTS:]
+
+
+def _genhist_append(stack: str, point: dict, store=None, lock=None) -> None:
+    """Mirror one completed request into the ring (memory + meta, best-effort)."""
+    ring = _genhist_prune(_GENHIST.setdefault(stack, []) + [point])
+    _GENHIST[stack] = ring
+    _meta_set(store, f"genhist/{stack}", ring, lock)
+
+
+def _genhist_seed(store, stacks, lock=None) -> dict:
+    """Rehydrate the rings for `stacks` from meta, once per stack per process —
+    the same lazy-seed shape as _engine's `_SESS_SEEDED` block, so a daemon that
+    restarts mid-traffic re-serves the window it had already earned."""
+    for s in stacks:
+        if s in _GENHIST_SEEDED:
+            continue
+        _GENHIST_SEEDED.add(s)
+        if _GENHIST.get(s) is None:
+            pts = _meta_get(store, f"genhist/{s}", lock)
+            if isinstance(pts, list) and pts:
+                _GENHIST[s] = _genhist_prune(list(pts))
+    return {s: _GENHIST[s] for s in stacks if _GENHIST.get(s)}
+
+
+# vLLM and SGLang have no per-request `timings` channel, so nothing ever reaches
+# _capture_gen's append for them — their ring would stay empty forever even
+# though their corners have always shown an average. Those numbers come from the
+# dashboard's own fallback: 1 s telemetry polls taken *while a request is
+# running*. The daemon already records exactly those samples (its 1 s live
+# buffer), so derive the same series from there instead of inventing a second
+# measurement. Every second is far denser than the corner needs and would ship a
+# fat payload, so step through the buffer at 5 s — an equally-spaced sample of a
+# roughly constant rate gives the same mean.
+#
+# Only rows sampled while the engine was GENERATING count. Every engine sticks
+# its session average on the gauges once idle (by design — the cards and charts
+# hold a real number instead of dropping to 0), so re-timestamping idle rows would
+# feed the corner fresh points forever and its `maxAgeS` cutoff would never fire:
+# the average would read warm long after the traffic stopped, the exact artifact
+# the cutoff exists to remove.
+_GENHIST_LIVE_STEP_S = 5.0
+_NO_TIMING_TEMPLATES = ("vllm", "sglang")
+
+
+def _genhist_from_live(stacks, templates: dict, ring_by_stack: dict) -> dict:
+    """Corner points for engines whose stack has no per-request series."""
+    out: dict = {}
+    cut = time.time() - _GENHIST_WINDOW_S
+    with _LIVE_LOCK:
+        rows = [r for r in _LIVE_BUF if r.get("ts", 0) >= cut]
+    for n in stacks:
+        if ring_by_stack.get(n):
+            continue        # a stack that reports per-request timings keeps its exact ring
+        if not str(templates.get(n) or "").lower().startswith(_NO_TIMING_TEMPLATES):
+            continue        # llama.cpp-style template: its ring is not empty by accident
+        pts, last_t = [], 0.0
+        for r in rows:
+            ts = r["ts"]
+            if ts - last_t < _GENHIST_LIVE_STEP_S:
+                continue
+            e = (r.get("eng") or {}).get(n) or {}
+            if not e.get("active"):
+                continue                      # idle: the client's fallback never fires either
+            if all(e.get(k) is None for k in ("gen_tok_s", "prompt_tok_s", "mtp_accept_pct")):
+                continue                      # active but nothing measurable yet
+            pts.append({"t": ts, "gen": e.get("gen_tok_s"), "prompt": e.get("prompt_tok_s"),
+                        "mtp": e.get("mtp_accept_pct")})
+            last_t = ts
+        if pts:
+            out[n] = pts
+    return out
+
 
 def _meta_set(store, key: str, obj: dict, lock=None) -> None:
     """Best-effort meta upsert — the ledger must never break a response."""
@@ -1351,9 +1465,14 @@ def _capture_gen(stack: str | None, buf: bytes, store=None, lock=None) -> None:
     if g is None and p is None:
         return
     _GEN_SEQ[0] += 1
+    at = time.time()
     _LAST_GEN[stack] = {"gen_tok_s": g, "prompt_tok_s": p, "mtp_accept_pct": mtp,
-                        "ctx_tokens": ctx or None, "at": time.time(), "seq": _GEN_SEQ[0]}
+                        "ctx_tokens": ctx or None, "at": at, "seq": _GEN_SEQ[0]}
     _meta_set(store, f"last_gen/{stack}", _LAST_GEN[stack], lock)
+    # Same timestamp as the sticky hint above, deliberately: the dashboard dedupes
+    # the backfill against `last_request.at`, so one completed request is one
+    # point no matter which path delivered it.
+    _genhist_append(stack, {"t": at, "gen": g, "prompt": p, "mtp": mtp}, store, lock)
 
 
 # --- Ollama-style timing injection for OpenAI-shaped backends (vLLM / SGLang) --

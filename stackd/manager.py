@@ -719,6 +719,15 @@ class Manager:
             "pools": pools,
             "image_ram_budget": image_ram_budget,
             "devices": [{"device": d.device, "budget": d.budget_gib, "used": d.used_gib,
+                         # budget = CONFIGURED ceiling; budget_effective = what the
+                         # fit math capped it at (min with the measured GTT window),
+                         # gtt_window = the driver's own number or null when it
+                         # can't be measured. The dashboard's gttCap must agree
+                         # with budget_effective — that equality is the whole point
+                         # of item 2, and printing the raw budget here is what made
+                         # `stackctl status` say ≤90 over the lane's 62.2.
+                         "budget_effective": d.budget_effective_gib,
+                         "gtt_window": d.gtt_window_gib,
                          "headroom": d.headroom_gib, "ok": d.ok, "models": d.models}
                         for d in report.devices],
             "sources": report.sources,

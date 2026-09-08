@@ -2,8 +2,12 @@ profile: coding
 priority: 500             # outranks chat; may evict it, never the reverse
 idle_evict: 45m          # revert to the default profile after this idle span
 # coding's serves include "assistant*", so it stands in for chat.
-# code-autocomplete is listed here too -> the solver places it on igpu0 with
-# the same identity as under `chat`, so a switch leaves it running untouched.
+# code-autocomplete is listed here too -> the solver keeps it on igpu0 across a
+# chat<->coding switch. Note "keeps" means it stays *resident*, not that the
+# container survives: llamacpp's ports are handed out in profile order, so this
+# stack is 11501 under `chat` and 11500 under `coding`, and the port is part of
+# its identity (solver.model_identity) — the switch re-creates it on the other
+# port. It is byte-identical apart from that.
 # No image entry — the elastic image tier (config/media/image.yaml) rebuilds
 # itself from whatever VRAM this profile leaves free (klein on the iGPU here,
 # since vLLM claims the RTX).

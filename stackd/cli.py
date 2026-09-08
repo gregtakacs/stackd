@@ -39,8 +39,13 @@ def _fmt_report(r: FitReport) -> str:
     out.append("  devices:")
     for d in r.devices:
         mark = "ok  " if d.ok else "FAIL"
+        # Show what the fit math actually caps the device at, and name the
+        # configured number when it's lower — "igpu0 62.2 / 90.0" would otherwise
+        # read as stackd having lost 27.8 GiB on its own.
+        cap = d.ceiling_gib
+        annot = f"  (configured {d.budget_gib:.1f})" if d.clamped else ""
         out.append(
-            f"    [{mark}] {d.device:<13} {d.used_gib:>7.1f} / {d.budget_gib:<6.1f} GiB"
+            f"    [{mark}] {d.device:<13} {d.used_gib:>7.1f} / {cap:>6.1f} GiB{annot}"
             f"   headroom {d.headroom_gib:>7.1f}   [{', '.join(d.models) or '-'}]"
         )
     if r.placement:
@@ -82,14 +87,26 @@ def _fmt_status(s: dict) -> str:
         # up (90 + 128 read as 218 GiB on a 128 GiB box). Matches the dashboard's
         # unified-RAM lane: ceiling is a cap on what the iGPU may claim, not a
         # reservation; the number shown is what pool_charge actually books.
+        # The cap printed here is the EFFECTIVE one — min(configured budget, the
+        # GTT window amdgpu actually exposes), the same min() the dashboard applies
+        # at gttCap. Printing the raw config number made the CLI say ≤90 while the
+        # lane said 62.2 on this box. When they differ, name both: quietly shrinking
+        # a printed cap is how you get "stackd lost 26 GiB".
         gtt = next((v for k, v in (p.get("breakdown") or {}).items()
                     if k.startswith("vram:igpu0")), None)
         if gtt:
-            ceil = next((d.get("budget") for d in (s.get("devices") or [])
+            igpu = next((d for d in (s.get("devices") or [])
                          if d.get("device") == "igpu0"), None)
-            out.append(f"{'':23}└─ of which igpu0 GTT {gtt:>5.1f}"
-                       + (f" / ≤{ceil:g}" if ceil else "")
-                       + " GiB (cap, not reserved)")
+            if igpu:
+                ceil = igpu.get("budget_effective")
+                if ceil is None:        # a status snapshot from before this field
+                    ceil = igpu.get("budget")
+                cfg_b = igpu.get("budget")
+                ctxt = f" / ≤{ceil:g}" if ceil else ""
+                if ceil and cfg_b and ceil < cfg_b - 1e-6:
+                    ctxt += f" (configured {cfg_b:g})"
+                out.append(f"{'':23}└─ of which igpu0 GTT {gtt:>5.1f}" + ctxt
+                           + " GiB (cap, not reserved)")
     for f in s["flags"]:
         out.append(f"  ! {f}")
     return "\n".join(out)

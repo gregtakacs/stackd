@@ -1,6 +1,9 @@
 """The daemon's 1 s live ring buffer trims each source to just the numbers the
 dashboard's live charts draw, so the buffer and the /live replays stay small and
-a backfilled point feeds feedPoint() with the same shape as a live one."""
+a backfilled point feeds feedPoint() with the same shape as a live one. One
+non-chart field is kept on purpose: engine `active`, which is what tells
+/live's history derivation ("was a request generating?") from "what did the
+engine's session gauges stick at after it finished"."""
 from stackd.serve import _live_trim
 
 
@@ -16,7 +19,7 @@ def test_trim_keeps_only_chart_fields():
     assert out["gpu"]["cuda0"] == {"util_pct": 90.0, "power_w": 570.8,
                                    "vram_used_gib": 80.7}
     assert out["host"] == {"cpu_pct": 7.4, "load1": 1.92}
-    assert out["eng"]["chat"] == {"gen_tok_s": 150.2, "prompt_tok_s": 3340.0,
+    assert out["eng"]["chat"] == {"active": True, "gen_tok_s": 150.2, "prompt_tok_s": 3340.0,
                                   "mtp_accept_pct": 80.8, "kv_pct": 12.5,
                                   "ctx_tokens": 12345}
 
@@ -38,6 +41,6 @@ def test_trim_handles_error_shaped_sources():
                      {"error": "boom"}, {"chat": {"gen_tok_s": None}})
     assert out["gpu"] == {"cuda0": None, "igpu0": None}
     assert out["host"] == {"cpu_pct": None, "load1": None}
-    assert out["eng"] == {"chat": {"gen_tok_s": None, "prompt_tok_s": None,
+    assert out["eng"] == {"chat": {"active": None, "gen_tok_s": None, "prompt_tok_s": None,
                                    "mtp_accept_pct": None, "kv_pct": None,
                                    "ctx_tokens": None}}
