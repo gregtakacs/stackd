@@ -66,7 +66,17 @@ def _igpu0_sysfs() -> dict | None:
 
     On an APU the dedicated `vram` window is tiny (~1 GiB stolen); the iGPU really
     allocates from `gtt` (a GART view of system RAM). So `used` = vram + gtt used
-    and `total` = gtt total — that's what lines up with the igpu0 lane's budget."""
+    and `total` = gtt total — that's what lines up with the igpu0 lane's budget.
+
+    `gtt_used_gib` / `gtt_total_gib` / `stolen_used_gib` are broken out separately
+    because only GTT is a claim on host RAM: the stolen window is carved out at
+    boot and never appears in MemTotal, so charging it to the host_unified pool
+    (as `vram_used_gib` does, kept for compatibility) slightly overstates it. The
+    dashboard's pool decomposition uses the GTT figure. Fixed 2026-09-07: with a
+    42 GiB image model resident, cgroup anon + AnonPages + Shmem + SUnreclaim
+    accounted for only 30.9 of a 54.4 GiB "OS used" — the missing ~20 GiB was
+    exactly `gtt_used`, driver pages that belong to no process's RSS.
+    """
     import re
     for dev in sorted(glob.glob("/sys/class/drm/card[0-9]*/device")):
         if not re.fullmatch(r"card[0-9]+", os.path.basename(os.path.dirname(dev))):
@@ -91,7 +101,9 @@ def _igpu0_sysfs() -> dict | None:
         if used is None and util is None:
             return None
         return {"vram_used_gib": used, "vram_total_gib": total, "util_pct": util,
-                "power_w": _f(pw), "power_limit_w": _f(pw_cap), "temp_c": _f(temp)}
+                "power_w": _f(pw), "power_limit_w": _f(pw_cap), "temp_c": _f(temp),
+                "gtt_used_gib": _f(gtt_u) if gtt_u else 0.0,
+                "gtt_total_gib": _f(gtt_t), "stolen_used_gib": _f(vram_u) if vram_u else 0.0}
     return None
 
 
@@ -219,7 +231,13 @@ def host_stats() -> dict:
             phys_used = mt - mf                       # everything not on the freelist
             # what's left once the reclaimable pools are removed: process anon +
             # mlocked + page tables + kernel stacks etc. — the genuinely committed
-            # slice that a new allocation can't get back cheaply.
+            # slice that a new allocation can't get back cheaply. NOTE: this is a
+            # *derived* figure, so anything the kernel charges outside
+            # Cached/Shmem/SUnreclaim lands in it — on an AMD box that includes the
+            # iGPU's GTT window (~20 GiB with an image model resident), which is why
+            # it reads far above AnonPages. The real per-process number is
+            # `mem_anonpages_gib` below; the host-RAM lane needs both to keep
+            # driver-pinned GPU pages out of "host + other processes".
             anon = max(0.0, phys_used - cache_reclaimable - shmem - sunreclaim)
             out["mem_total_gib"] = round(mt, 2)
             out["mem_free_gib"] = round(mf, 2)
@@ -229,6 +247,7 @@ def host_stats() -> dict:
             out["mem_cache_reclaimable_gib"] = round(cache_reclaimable, 2)
             out["mem_shmem_gib"] = round(shmem, 2)
             out["mem_slab_unreclaim_gib"] = round(sunreclaim, 2)
+            out["mem_anonpages_gib"] = round(mi.get("AnonPages", 0.0), 2)
             out["mem_anon_gib"] = round(anon, 2)
     except (OSError, ValueError):
         pass

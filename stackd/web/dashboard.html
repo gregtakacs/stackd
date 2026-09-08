@@ -622,9 +622,12 @@ function laneLive(lane, val) {   // per-tick: real-usage marker + the "real" hea
 // this same LPDDR5X, so a separate 90 GiB bar implied memory that does not exist
 // (90 + 128 read as 218 GiB on a 128 GiB box, and made the pool that is actually
 // full look empty — the exact misreading behind a klein "won't fit" surprise).
-// It is represented here instead as: a dotted CEILING line at IGPU_VRAM_BUDGET_GIB
+// It is represented here instead as: a dotted CEILING line at the iGPU's GTT cap
 // (a cap on what the iGPU may claim, NOT a reservation), a bracket at what the
-// solver actually books, and a `GTT` stripe on the iGPU's own tenants. The booked
+// solver actually books, and the iGPU's tenants drawn as their own family at the
+// BASE of the stack — each with a GTT row (driver pages, from amdgpu sysfs) and a
+// host RSS row (the container's own anon), because those are two separate piles of
+// physical RAM and the process RSS alone hides ~20 GiB of driver claims. The booked
 // figure is fit.py::pool_charge's `min(demand + vram_headroom_gib, ceiling)`,
 // surfaced in the pool breakdown as "vram:igpu0 (≤90)".
 const MUTED_SEG = "#3a4152";
@@ -649,29 +652,50 @@ function hostRamSegs(host, st, gpu) {
   const onIgpu = n => ((((st.stacks || {})[n] || {}).device) === "igpu0");
 
   // ---- measured: solid segments summing to "OS used" + a cache band on top.
-  // Stacked bottom->top in the SAME order as the reserved bar: OS / host stuff
-  // at the base, then engines, then the image tier, then the cache band.
-  // Each engine contributes anon RSS + its own shmem (SGLang's PLE table /
-  // HiCache host pool live in /dev/shm and are just as un-reclaimable as anon —
-  // conceptually part of that model's footprint). Both sub-segments carry the
-  // model colour; the budget tag compares anon+shmem against model_ram.
+  // Stacked base->top: the iGPU's family first (driver-pinned GTT pages, claimed
+  // before anything else), then host / kernel residue, then the CPU-side engines,
+  // then the cache band on top. Each engine contributes anon RSS + its own shmem
+  // (SGLang's PLE table / HiCache host pool live in /dev/shm and are just as
+  // un-reclaimable as anon — conceptually part of that model's footprint), and both
+  // sub-segments carry the model colour; the budget tag compares anon+shmem against
+  // model_ram. The reserved twin bar draws in its own order (see budgetSegs).
   const engSegs = [];
+  // An iGPU-placed tenant does NOT join engSegs. Its RAM is GTT pages of this same
+  // pool, so it belongs in one contiguous family at the BASE of the stack, under the
+  // ceiling line — not stacked above the CPU-side tenants as if it were ordinary
+  // RSS (a 42 GiB image tier parked on the iGPU used to float clean past the line).
+  // One record per tenant: the driver's GTT share + what the process itself holds
+  // (cgroup anon + its shmem) — two separate piles of physical RAM, one per row.
+  const fam = [];
+  const famOf = (label, color, cls, budget, warm) => {
+    let f = fam.find(x => x.label === label);
+    if (!f) fam.push(f = { label, color, cls, budget: budget || 0, warm: !!warm,
+                           gtt: 0, rss: 0, rssSegs: [] });
+    return f;
+  };
   let engAnon = 0, engShmem = 0;
   const pushEngine = (label, c, extra) => {
-    const grp = (c.anon_gib || 0) + (c.shmem_gib || 0);
-    engAnon += c.anon_gib || 0;
-    engShmem += c.shmem_gib || 0;
-    // iGPU tenant -> stripe it and say so, because the RAM it is holding is GTT
-    // pages inside THIS pool (the same physical sticks the CPU is allocating from).
+    const anon = c.anon_gib || 0, shm = c.shmem_gib || 0, grp = anon + shm;
+    engAnon += anon;
+    engShmem += shm;
     const g = !!extra.gtt;
     const cls = (extra.cls || "") + (g ? " gtt" : "");
-    const gtag = g ? " · GTT" : "";
-    engSegs.push({ label: label + " · engine RSS", gib: c.anon_gib || 0, tag: "measured" + gtag,
-                   groupGib: grp, budget: extra.budget, color: extra.color, cls });
-    if ((c.shmem_gib || 0) > 0.3)
-      engSegs.push({ label: label + " · KV / PLE cache (shmem)", gib: c.shmem_gib,
-                     color: extra.color, cls,
-                     tag: "shmem · not reclaimable" + gtag });
+    if (!g) {
+      engSegs.push({ label: label + " · engine RSS", gib: anon, tag: "measured",
+                     groupGib: grp, budget: extra.budget, color: extra.color, cls });
+      if (shm > 0.3)
+        engSegs.push({ label: label + " · KV / PLE cache (shmem)", gib: shm,
+                       color: extra.color, cls, tag: "shmem · not reclaimable" });
+      return;
+    }
+    const f = famOf(label, extra.color, cls, extra.budget, extra.cls === "warming");
+    f.rss += grp;
+    if (anon > 0.02)
+      f.rssSegs.push({ label: label + " · host RSS", gib: anon, color: extra.color, cls,
+                       tag: "cgroup anon · additional to its GTT slice" });
+    if (shm > 0.3)
+      f.rssSegs.push({ label: label + " · KV / PLE cache (shmem)", gib: shm,
+                       color: extra.color, cls, tag: "shmem · charged to the cgroup" });
   };
   for (const [name, s] of Object.entries(st.stacks || {})) {
     const c = s && s.container && cont[s.container];
@@ -687,52 +711,114 @@ function hostRamSegs(host, st, gpu) {
                  color: modelColor("image:" + im.active_model), cls: "elastic",
                  gtt: im.device === "igpu0" });
   }
-  // ---- iGPU tenants that have no process-side stats --------------------------
-  // A Vulkan / llama.cpp engine's weights do NOT live in its own anon RSS — they
-  // sit in the GPU's GTT window, allocated by the driver. On this box
-  // stackd-code-autocomplete reports anon 0.0 / shmem 0.0 / file 0.01 while
-  // amdgpu sysfs says the iGPU is holding 3.1 GiB, so the loop above skipped it
-  // entirely and the unified lane showed no iGPU tenant at all. Those pages ARE
-  // physical RAM already inside "OS used", so CARVE them out of the residual
-  // rather than adding them on top — the solid stack still sums to the marker.
-  const igpuAll = Object.entries(st.stacks || {})
+  // ---- the iGPU family: what the driver holds inside THIS pool ----------------
+  // Device-first, because the driver counter is the only number that sees all of
+  // it. An APU's weights are GTT pages allocated in kernel context: they are in NO
+  // container's cgroup `anon` and barely in its smaps. Measured here 2026-09-07
+  // with klein resident — comfyui cgroup anon 18.7, amdgpu gtt_used 19.7, and
+  // AnonPages + Shmem + SUnreclaim = 30.9 against an "OS used" of 54.4, i.e. ~20
+  // GiB that is none of those three. The previous version carved GTT only for
+  // tenants with no RSS, so an image tier's share stayed in the residual: the lane
+  // reported "host + other containers 23.8" for a ~3 GiB reality and then tagged
+  // the OS as overspending its reserve. Carve the device figure, then attribute it.
+  const ig = gpu && gpu.igpu0;
+  const gttWindow = ig && ig.gtt_total_gib != null ? ig.gtt_total_gib : null;
+  const gttLive = ig ? (ig.gtt_used_gib != null ? ig.gtt_used_gib : ig.vram_used_gib) : null;
+  // The cap the bar can actually reach is the smaller of the configured budget and
+  // the driver's real window: this box is told 90 GiB, amdgpu exposes 62.2.
+  const gttCap = (gttCeiling && gttWindow) ? Math.min(gttCeiling, gttWindow)
+                                           : (gttWindow || gttCeiling || 0);
+  const igpuTen = Object.entries(st.stacks || {})
     .filter(([, s]) => ((s || {}).device) === "igpu0")
-    .map(([n, s]) => {
-      const c = s && s.container && cont[s.container];
-      return { n, s, mv: (st.model_vram || {})[n] || 0,
-               measured: c ? (c.anon_gib || 0) + (c.shmem_gib || 0) : 0,
-               warm: s.state === "warming" };
-    });
-  const igpuBare = igpuAll.filter(t => t.measured <= 0.05 && t.mv > 0);
-  const gttLive = gpu && gpu.igpu0 && gpu.igpu0.vram_used_gib;
-  // measured device hold wins when it is smaller than the booking; fall back to
-  // the booking when there is no sysfs sample (no AMD GPU / no /dev access).
-  const gttWant = igpuBare.reduce((a, t) => a + t.mv, 0);
-  const gttPool = gttWant ? Math.min(gttLive != null ? gttLive : gttWant, gttWant) : 0;
-  const gttRoom = Math.max(0, osUsed - engAnon - shmem - slabU);
-  const gttSegs = [];
-  let gttCarved = 0;
-  for (const t of igpuBare) {
-    const share = Math.min(gttPool * (t.mv / gttWant), Math.max(0, gttRoom - gttCarved));
+    .map(([n]) => ({ n, mv: (st.model_vram || {})[n] || 0, color: modelColor(n) }));
+  if (im && im.device === "igpu0" && im.container)
+    igpuTen.push({ n: "image · " + im.active_model, mv: 0,
+                   color: modelColor("image:" + im.active_model) });
+  const tenOf = t => fam.find(x => x.label === t.n);
+  const tenRss = t => { const f = tenOf(t); return f ? f.rss : 0; };
+  // RSS-less tenants (a Vulkan llama.cpp server keeps its weights in GTT, so its
+  // cgroup reads 0.0) claim their declared VRAM first; whatever the device still
+  // reports goes to the RSS-bearing tenants pro-rata on RSS, and only if no tenant
+  // can own it is it drawn as driver-held. It never slides back into the residual.
+  let gttDev = gttLive != null ? gttLive : igpuTen.reduce((a, t) => a + t.mv, 0);
+  if (gttCap) gttDev = Math.min(gttDev, gttCap);
+  const gttSrc = gttLive != null ? "amdgpu sysfs" : "declared";
+  let gttCarved = 0, gttUnattributed = 0, rest = gttDev;
+  for (const t of igpuTen.filter(x => tenRss(x) <= 0.05 && x.mv > 0)) {
+    const share = Math.min(t.mv, Math.max(0, rest));
     if (share <= 0.02) continue;
+    rest -= share;
     gttCarved += share;
-    gttSegs.push({ label: t.n + " · igpu0 GTT", gib: share, color: modelColor(t.n),
-                   cls: "gtt" + (t.warm ? " warming" : ""), groupGib: share, budget: t.mv,
-                   tag: "GTT pages · " + (gttLive != null ? "amdgpu sysfs" : "declared") });
+    famOf(t.n, t.color, "gtt", t.mv, false).gtt = share;
   }
-  // residual committed memory, forced so the solid stack height == "OS used".
-  // (engAnon + engShmem + leftover shmem + slab + GTT carve + residual == osUsed)
-  const otherCommitted = Math.max(0, osUsed - engAnon - shmem - slabU - gttCarved);
+  const rssTen = igpuTen.filter(x => tenRss(x) > 0.05);
+  const rssSum = rssTen.reduce((a, x) => a + tenRss(x), 0);
+  if (rest > 0.02 && rssSum > 0) {
+    for (const t of rssTen) {
+      const share = rest * (tenRss(t) / rssSum);
+      rest -= share;
+      gttCarved += share;
+      famOf(t.n, t.color, "gtt", 0, false).gtt += share;
+    }
+  }
+  gttUnattributed = Math.max(0, rest);
+  // GTT can only be carved from what the unattributed slice actually has room for.
+  // If the device reports more, the GTT figure and AnonPages are disagreeing (a
+  // kernel that charged TTM pages into the container's own memcg would do exactly
+  // that) — scale back rather than drive the host row negative, and surface it on
+  // the stack instead of hiding it in a total that still happens to add up.
+  // What actually leaves the residual is the whole GTT carve — attributed *and*
+  // driver-held. Dropping the unattributed part over-counts the stack by exactly
+  // that slice (caught by the coding-long case: 0.6 GiB of extra bar).
+  const gttRoom = Math.max(0, osUsed - engAnon - shmem - slabU);
+  let gttOverlap = false;
+  let gttTotal = gttCarved + gttUnattributed;
+  if (gttTotal > gttRoom + 0.02) {
+    const k = gttRoom / gttTotal;
+    fam.forEach(f => { f.gtt *= k; });
+    gttCarved *= k;
+    gttUnattributed *= k;
+    gttTotal = gttRoom;
+    gttOverlap = true;
+  }
+  // Host processes: the real per-process anon (AnonPages) minus what stackd's own
+  // tenants already account for — nothing GPU, nothing kernel. What the kernel
+  // pins that is neither anon, shmem, slab nor the iGPU's GTT window gets its own
+  // row, because charging it to "host + other containers" is what made a box with
+  // 16 GiB of reserve headroom report itself 3.8 GiB over budget.
+  const anonPages = host.mem_anonpages_gib;
   const leftoverShmem = Math.max(0, shmem - engShmem);
+  const hostOther = anonPages != null
+    ? Math.max(0, anonPages - engAnon)
+    : Math.max(0, osUsed - engAnon - shmem - slabU - gttTotal);   // pre-AnonPages daemon
+  const kernelSlack = Math.max(0, osUsed - gttTotal - hostOther - leftoverShmem
+                               - slabU - engAnon - engShmem);
   const segs = [];
-  // GTT goes at the BASE of the stack: those are pinned driver pages the iGPU
-  // claimed first, and it is the only placement that puts them on the correct
-  // side of the ceiling line (a 2.5 GiB base band sits under the 90 GiB mark;
-  // stacked above the engines it floated past it).
-  segs.push(...gttSegs);
-  if (otherCommitted > 0.05)
-    segs.push({ label: "host + other containers", gib: otherCommitted, color: MUTED_SEG,
-                tag: "measured", budget: reserveBudget });
+  // The iGPU family goes at the BASE: driver-pinned pages claimed before anything
+  // else, and the only placement that leaves the dotted ceiling line ABOVE the
+  // memory it is a cap on. Tenant order == footprint order, biggest first; inside a
+  // tenant, the GTT row leads and the process's own RSS follows underneath it.
+  for (const f of fam.slice().sort((a, b) => (b.gtt + b.rss) - (a.gtt + a.rss))) {
+    const foot = f.gtt + f.rss;
+    if (f.gtt > 0.02) {
+      const bud = f.budget > 0.05;
+      f.rssSegs.unshift({ label: f.label + " · iGPU GTT", gib: f.gtt, color: f.color,
+                          cls: "gtt" + (f.warm ? " warming" : ""),
+                          tag: `GTT pages · ${gttSrc}`
+                             + (bud ? ` · iGPU footprint ${fmtGib(foot)} vs budget ${fmtGib(f.budget)}` : ""),
+                          overTag: bud && foot - f.budget > 0.5 });
+    }
+    segs.push(...f.rssSegs);
+  }
+  if (gttUnattributed > 0.02)
+    segs.push({ label: "igpu0 GTT · driver-held", gib: gttUnattributed, color: MUTED_SEG,
+                cls: "gtt", tag: "held by amdgpu — no resident tenant claims it" });
+  if (hostOther > 0.05)
+    segs.push({ label: "host + other processes", gib: hostOther, color: MUTED_SEG,
+                tag: "measured anon", budget: reserveBudget });
+  if (kernelSlack > 0.05)
+    segs.push({ label: "kernel / driver slack", gib: kernelSlack, cls: "resv",
+                tag: gttOverlap ? "GTT/RSS overlap?" : "page tables, stacks, watermarks" });
   if (leftoverShmem > 0.3)
     segs.push({ label: "tmpfs / shmem (host)", gib: leftoverShmem, cls: "resv",
                tag: "needs swap" });
@@ -740,7 +826,7 @@ function hostRamSegs(host, st, gpu) {
     segs.push({ label: "kernel slab (unreclaimable)", gib: slabU, cls: "resv",
                tag: "unreclaimable" });
   segs.push(...engSegs);
-  const committed = segs.reduce((a, s) => a + (s.gib || 0), 0);   // ≈ osUsed
+  const committed = segs.reduce((a, s) => a + (s.gib || 0), 0);   // == osUsed
   const cache = Math.max(0, physUsed - committed);
   if (cache > 0.05)
     segs.push({ label: "page cache · reclaimable", gib: cache, cls: "cache",
@@ -774,9 +860,10 @@ function hostRamSegs(host, st, gpu) {
                       color: modelColor("image:" + st.image_ram_budget.model) });
   const budgetTotal = budgetSegs.reduce((a, s) => a + (s.gib || 0), 0);
 
-  const igLive = gpu && gpu.igpu0 && gpu.igpu0.vram_used_gib;
   return { segs, committed, physUsed, osUsed, budgetSegs, budgetTotal, budgetLimit,
-           gtt: { ceiling: gttCeiling, charge: gttCharge, live: igLive } };
+           gtt: { ceiling: gttCeiling, window: gttWindow, boundary: gttCap || gttCeiling,
+                  charge: gttCharge, live: gttLive, stolen: (ig && ig.stolen_used_gib) || 0,
+                  unattributed: gttUnattributed, overlap: gttOverlap } };
 }
 
 // in-place per-tick repaint of the unified RAM lane: measured bar (segments move
@@ -822,7 +909,11 @@ function hostRamRepaint(lane, host, st, gpu) {
         : `${grp}budget ${fmtGib(s.budget)}`);
       if (over > 0.5) t.style.color = "var(--orange)";
       row.append(t);
-    } else if (s.tag) row.append(el("span", "tg", s.tag));
+    } else if (s.tag) {
+      const t = el("span", "tg", s.tag);
+      if (s.overTag) t.style.color = "var(--orange)";   // composed tag, own over-flag
+      row.append(t);
+    }
     rows.push(row);
   }
   // legend order mirrors the bar: free band first (top), then topmost segment
@@ -865,7 +956,7 @@ function renderMap(st, eng, img, gpu, host) {
   const engState = {};
   (eng.engines || []).forEach(e => engState[e.stack] = e.state);
   const stackState = n => (st.stacks[n] && st.stacks[n].state) || engState[n] || engState["image:" + n];
-  const RESV_LBL = { host_reserve: "host + other containers (reserve)",
+  const RESV_LBL = { host_reserve: "host + other processes (reserve)",
     load_slack: "page-cache load slack", "vram:cuda0": null };
   const srcTag = m => (st.sources || {})[m] || "";
   const segFor = (label, gib) => {
@@ -928,13 +1019,22 @@ function renderMap(st, eng, img, gpu, host) {
     const gttCharge = gttKey ? (hu.breakdown[gttKey] || 0) : 0;
     const gttCeiling = ig ? (ig.budget || 0) : 0;
     // Meaningful only while the ceiling lands inside the drawn bar — a no-iGPU host
-    // (or a ceiling at/above the limit) draws neither line nor bracket.
-    const gttOpts = limit => (!gttCeiling || gttCeiling >= limit) ? {} : {
-      gtt: true,
-      boundary: { gib: gttCeiling, label: `GTT ≤${rnd1(gttCeiling)}` },
-      bracket: { gib: gttCharge,
-                 label: `igpu0 GTT booked ${fmtGib(gttCharge)} (demand + headroom) `
-                      + `against a ${fmtGib(gttCeiling)} ceiling — a cap, not a reservation` },
+    // (or a ceiling at/above the limit) draws neither line nor bracket. The line
+    // sits at the LOWER of the configured budget and the driver's GTT window: this
+    // box is told 90 GiB while amdgpu exposes a 62.2 GiB window, so a line at 90
+    // implies headroom the hardware can never actually reach.
+    const gttOpts = (limit, g) => {
+      const b = (g && g.boundary) || gttCeiling;
+      if (!b || b >= limit) return {};
+      const chg = (g && g.charge) || gttCharge, win = (g && g.window) || b;
+      return {
+        gtt: true,
+        boundary: { gib: b, label: `GTT ≤${rnd1(b)}${win < gttCeiling - 0.5 ? " (driver window)" : ""}` },
+        bracket: { gib: chg,
+                   label: `igpu0 GTT booked ${fmtGib(chg)} (demand + headroom) — ceiling `
+                        + `${fmtGib(gttCeiling)}, driver GTT window ${fmtGib(win)}: a cap on `
+                        + `what the iGPU may claim from this pool, not a reservation` },
+      };
     };
     if (hu) {
       // MEASURED mode: /host gave us per-container anon RSS. The solid segments
@@ -951,19 +1051,24 @@ function renderMap(st, eng, img, gpu, host) {
           budLabel: "in RAM now", budShown: measured.committed,
           altStat: `reserved <b>${fmtGib(measured.budgetTotal)}</b>`,
           real: host && host.mem_used_gib, realLabel: "OS used",
-          ...gttOpts(lim),
-          note: "Left bar: measured. Solid = 'OS used' (the marker), by tenant — "
-            + "engine RSS is anon only; the hatched band on top is reclaimable "
-            + "page cache (mmap'd model files), physically resident but dropped on "
-            + "demand, so not in 'in RAM now'. Right bar: what each tenant is "
-            + "allowed to grow into — OS reserve + the igpu0 GTT carve + per-engine "
-            + "budget + the image tier's host_ram_gib. Σ reserved stays under the "
-            + "box's RAM by construction (the solver + image guard enforce it). "
-            + "Dotted line = the iGPU's GTT CEILING, a cap on what it may claim from "
-            + "this pool rather than a reservation; the bracket on the left is what "
-            + "stackd books there today. A GTT-striped tenant holds iGPU pages, so it "
-            + "is RAM the CPU side cannot also count as free — that is why a bar that "
-            + "looks empty here can still refuse to load an image model.",
+          ...gttOpts(lim, measured.gtt),
+          note: "Left bar: measured. Solid = 'OS used' (the marker), stacked base-up: "
+            + "the iGPU's own family first — a GTT row is driver pages inside this pool, "
+            + "a 'host RSS' row is the same tenant's process memory, two separate piles "
+            + "rather than one counted twice — then host + other processes (AnonPages "
+            + "minus the tenants), kernel / driver slack, tmpfs, slab, then the CPU-side "
+            + "engines. The hatched band on top is reclaimable page cache (mmap'd model "
+            + "files), physically resident but dropped on demand, so not in 'in RAM now'. "
+            + "Right bar: what each tenant is allowed to grow into — OS reserve + the "
+            + "igpu0 GTT carve + per-engine budget + the image tier's host_ram_gib. "
+            + "Σ reserved stays under the box's RAM by construction (the solver + image "
+            + "guard enforce it). Dotted line = the iGPU's GTT CEILING, the driver's "
+            + "window where it is tighter than the budget — a cap on what it may claim "
+            + "from this pool, not a reservation; the bracket on the left is what stackd "
+            + "books there today. Nothing GPU is charged to 'host + other processes' any "
+            + "more, so its budget tag is a real verdict; and a GTT-striped tenant still "
+            + "holds RAM the CPU side cannot count as free, which is why a bar that looks "
+            + "empty here can refuse to load an image model.",
         }));
       } else {
         // FALLBACK (no container stats): the old budget bar.
@@ -1032,26 +1137,31 @@ function renderMap(st, eng, img, gpu, host) {
     }
   }
 }
-// igpu0's live GTT readout, refreshed every tick from the amdgpu sysfs sample
-// (vram+gtt used — telemetry.py). Budgeted vs ceiling is what the solver booked;
-// "now" is what the driver actually holds, which is the number that has to share
-// this pool with every CPU-side tenant.
+// igpu0's live GTT readout, refreshed every tick from the amdgpu sysfs sample.
+// GTT only: that is the slice which actually comes out of this pool. Budgeted vs
+// ceiling is what the solver booked; "now" is what the driver holds, which is the
+// number that has to share these sticks with every CPU-side tenant.
 function laneGtt(lane, gpu) {
   if (!lane) return;
   const n = lane.querySelector(".lane-gtt");
   if (!n) return;
   const lim = +lane.dataset.gttCeiling || 0, bud = +lane.dataset.gttBudget || 0;
-  const ig = gpu && gpu.igpu0, now = ig && ig.vram_used_gib;
-  n.innerHTML = `igpu0 GTT <b>${fmtGib(bud)}</b> booked / ${fmtGib(lim)} ceiling`
+  const ig = gpu && gpu.igpu0;
+  const now = ig ? (ig.gtt_used_gib != null ? ig.gtt_used_gib : ig.vram_used_gib) : null;
+  const stolen = ig && ig.stolen_used_gib;
+  n.innerHTML = `igpu0 GTT <b>${fmtGib(bud)}</b> booked / ${fmtGib(lim)} cap`
     + (now != null ? ` · <b>${fmtGib(now)}</b> held now` : ` · <span class="over">no amdgpu sample</span>`)
-    + ` <span class="muted">— a cap the iGPU may claim up to, not a reservation</span>`;
+    + (stolen ? ` <span class="muted">(+${fmtGib(stolen)} stolen VRAM, outside MemTotal)</span>` : "")
+    + ` <span class="muted">— a cap the iGPU may claim up to, not a reservation. The booked`
+    + ` figure is the chat side; an iGPU-resident image tier is booked through its own</span>`
+    + ` <span class="muted">host_ram_gib budget, which is also why "held now" can exceed it.</span>`;
   // keep the bracket honest as the real claim overtakes the booked figure
   const k = lane.querySelector(".bracket");
   if (k && now != null && now > bud + 0.5) {
     const l = +lane.dataset.limit || 1;
     k.style.height = Math.max(0.6, (now / l) * 100) + "%";
-    k.title = `igpu0 holding ${fmtGib(now)} live — above the ${fmtGib(bud)} booked `
-            + `(demand + headroom) against a ${fmtGib(lim)} ceiling`;
+    k.title = `igpu0 holding ${fmtGib(now)} of GTT live — above the ${fmtGib(bud)} booked `
+            + `(demand + headroom) against a ${fmtGib(lim)} cap`;
   }
 }
 function imgFootprint(img) {

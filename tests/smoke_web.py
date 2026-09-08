@@ -128,7 +128,15 @@ def main() -> int:
               and {"loadavg", "cpu_pct", "mem_used_gib", "mem_total_gib"} <= set(j))
         check("/host carries the physical-RAM decomposition (dashboard host-RAM lane)",
               {"mem_phys_used_gib", "mem_cache_reclaimable_gib", "mem_anon_gib",
-               "mem_shmem_gib", "mem_slab_unreclaim_gib", "mem_free_gib"} <= set(j))
+               "mem_shmem_gib", "mem_slab_unreclaim_gib", "mem_free_gib",
+               "mem_anonpages_gib"} <= set(j))
+        # The dashboard needs the *real* AnonPages, not the derived one: `anon` is
+        # computed as phys - cache - shmem - slab, so anything the kernel charges
+        # outside those pools lands in it — on an AMD box that is the iGPU's GTT
+        # window (~20 GiB with an image model resident), which the lane must carve
+        # separately or "host + other processes" reports 7x its real size.
+        check("/host real AnonPages <= the derived anon (the gap is driver/GTT pages)",
+              j["mem_anonpages_gib"] >= 0 and j["mem_anonpages_gib"] <= j["mem_anon_gib"] + 0.6)
         check("/host decomposition sums to physical use",
               abs((j["mem_anon_gib"] + j["mem_cache_reclaimable_gib"] + j["mem_shmem_gib"]
                    + j["mem_slab_unreclaim_gib"]) - j["mem_phys_used_gib"]) <= 0.6)
@@ -140,6 +148,14 @@ def main() -> int:
         code, j = _json_req(f"{base}/gpu", token="admin")
         check("/gpu returns a cuda0 block from nvidia-smi", code == 200 and j["cuda0"]["util_pct"] == 42.0)
         check("/gpu vram parsed to GiB", 11.9 < j["cuda0"]["vram_used_gib"] < 12.1)
+        _ig = j.get("igpu0")
+        if _ig:
+            check("/gpu igpu0 breaks GTT out from the stolen window (pool charge is GTT only)",
+                  {"gtt_used_gib", "gtt_total_gib", "stolen_used_gib"} <= set(_ig)
+                  and _ig["vram_used_gib"] >= _ig["gtt_used_gib"]
+                  and _ig["gtt_total_gib"] > 0)
+        else:
+            check("/gpu igpu0 absent with no amdgpu — the lane must skip ceiling/bracket/readout", True)
         # igpu0 is None where there's no AMD GPU / no /sys access, else a stats dict
         check("/gpu igpu0 is null or a well-formed block",
               j["igpu0"] is None or {"vram_used_gib", "util_pct", "temp_c"} <= set(j["igpu0"]))
