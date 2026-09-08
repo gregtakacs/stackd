@@ -105,6 +105,27 @@ def main() -> int:
         # The lane must fit one grid track: a lane spanning the whole row pushed the
         # map onto its own line on a desktop.
         check("no lane spans the whole grid row", b"grid-column:1 / -1" not in raw)
+        # The live charts keep their own 1 s sample grid, decoupled from the poll.
+        # Sampling once per poll meant any pause — refresh select focused, poll
+        # error, `paused`, an engine that stopped reporting — left a hole in the
+        # time axis, and uPlot bridged it with a curve: idle stretches read as a
+        # slow smooth ramp instead of flat-or-missing.
+        check("charts sample on their own 1s grid, not once per poll",
+              b"const SAMPLE_MS = 1000" in raw and b"setInterval(pumpCharts, SAMPLE_MS)" in raw)
+        check("1s is the default refresh rate",
+              b'<option value="1000" selected>' in raw
+              and b'<option value="3000" selected>' not in raw)
+        check("no live line bridges a data gap", b"spanGaps: true" not in raw)
+        check("focused form control pauses polling, sample grid keeps running",
+              b"uiLocked()" in raw and b"tick._busy" in raw)
+        # The image ladder is a grid of name/verdict/footprint/action. Reasons are
+        # sentences ("host RAM 122 > 64.9 free (vulkan) (unreachable: ...)"); inline,
+        # they wrapped each row into a paragraph and knocked the numbers out of
+        # column, so they belong in the tooltip.
+        check("image ladder is a grid with the reasons in tooltips",
+              b"grid-template-columns:minmax(0,1fr) 96px 78px 68px" in raw
+              and b'el("span", "st"' in raw
+              and b" vram/" not in raw and b"refused before start" not in raw)
         code, ct, raw = _req(f"{base}/static/uplot.min.js")
         check("GET /static/uplot.min.js served", code == 200 and b"uPlot" in raw)
         check("static content-type is js", "javascript" in ct)

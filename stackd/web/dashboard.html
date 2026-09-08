@@ -175,18 +175,24 @@
   .chip.plan { color:var(--dim); }
   .chip.unplaced { color:var(--red); border-color:#5c2c2c; text-decoration:line-through; }
 
-  /* image ladder */
-  .ladder { display:flex; flex-direction:column; gap:6px; }
-  .rung { display:flex; align-items:center; gap:9px; font-size:.82rem; padding:7px 10px; border-radius:7px;
+  /* image ladder — a grid, not a sentence: name | verdict | footprint | action.
+     Reasons used to be printed inline, which turned every rung into a paragraph
+     and pushed the numbers out of column; they live in the tooltip now. */
+  .ladder { display:flex; flex-direction:column; gap:4px; }
+  .rung { display:grid; grid-template-columns:minmax(0,1fr) 96px 78px 68px; align-items:center;
+    gap:10px; font-size:.82rem; padding:6px 10px; border-radius:7px;
     background:var(--bg); border:1px solid var(--border); }
+  .rung .nm { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .rung .st { font-size:.72rem; color:var(--dim); white-space:nowrap; }
+  .rung .st.no { color:var(--red); }
+  .rung .fp { text-align:right; color:var(--dim); font-variant-numeric:tabular-nums;
+    font-size:.76rem; white-space:nowrap; }
+  .rung button { justify-self:end; }
   .rung.here { border-color:var(--purple); }
-  .rung.toobig { opacity:.5; }
-  /* A candidate the scheduler would refuse before start: shown, greyed, and its
-     Load button disabled, so "available" is never implied by its presence. */
-  .rung.refused { opacity:.5; border-left:2px solid var(--red); }
-  .rung button:disabled { opacity:.45; cursor:not-allowed; }
-  .pill.deny { color:var(--red); border-color:var(--red); }
-  .toobig-inline { color:var(--red); }
+  .rung.refused { opacity:.55; }
+  .rung button:disabled { opacity:.5; cursor:not-allowed; }
+  .imgline { display:flex; gap:10px; align-items:center; flex-wrap:wrap;
+    margin:2px 0 8px; font-size:.74rem; color:var(--dim); }
 
   /* events */
   #events { max-height:340px; overflow-y:auto; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.78rem; }
@@ -345,8 +351,8 @@
     <span id="hdrClean" class="pill hidden"></span>
     <span id="hdrUpdated" class="muted" style="font-size:.76rem;"></span>
     <select id="refreshRate" title="refresh interval">
-      <option value="1000">1s</option><option value="2000">2s</option>
-      <option value="3000" selected>3s</option><option value="5000">5s</option>
+      <option value="1000" selected>1s</option><option value="2000">2s</option>
+      <option value="3000">3s</option><option value="5000">5s</option>
       <option value="10000">10s</option><option value="30000">30s</option>
       <option value="0">paused</option>
     </select>
@@ -370,7 +376,7 @@
 
     <div class="card" style="margin-bottom:16px;">
       <div class="row"><h2 style="margin:0;">Live · last 10 min</h2>
-        <div class="spacer"></div><span class="muted" style="font-size:.72rem;">sampled every refresh</span></div>
+        <div class="spacer"></div><span class="muted" id="sampleNote" style="font-size:.72rem;">sampling 1s</span></div>
       <div class="livegrid" id="liveGrid" style="margin-top:14px;"></div>
     </div>
 
@@ -380,7 +386,7 @@
         <div id="profiles"></div>
       </div>
       <div class="card">
-        <h2>Image tier <span class="muted" style="text-transform:none; letter-spacing:0; font-weight:400;">— elastic, never at an LLM's expense</span></h2>
+        <h2>Image tier</h2>
         <div id="imageTier"></div>
       </div>
     </div>
@@ -480,7 +486,14 @@ function unchanged(key, data) {
 }
 
 async function api(path, opts = {}) {
-  const r = await fetch(path, { ...opts, headers: { "Authorization": "Bearer " + KEY(),
+  // GETs get a deadline; POSTs deliberately don't (an activate can sit behind a
+  // cuda drain for minutes, an image swap waits for the engine to warm). Without
+  // it, one wedged read stalls `tick()` — the `_busy` guard then skips every
+  // poll after it, and the whole dashboard goes silent with no explanation.
+  const get = !opts.method || opts.method === "GET";
+  const signal = opts.signal || (get && window.AbortSignal && AbortSignal.timeout
+    ? AbortSignal.timeout(15000) : undefined);
+  const r = await fetch(path, { ...opts, signal, headers: { "Authorization": "Bearer " + KEY(),
     ...(opts.body ? {"content-type":"application/json"} : {}), ...(opts.headers||{}) } });
   if (r.status === 401) { showGate("Token rejected."); throw new Error("401"); }
   const ct = r.headers.get("content-type") || "";
@@ -1490,79 +1503,82 @@ async function ctl(name, verb) {
 }
 
 // ---- image tier -----------------------------------------------------
+// Deliberately terse: one line of budgets, then the ladder as an aligned grid —
+// name | verdict | footprint | action. Refusal reasons are sentences by nature
+// ("host RAM 122 > 64.9 free (vulkan) (unreachable: 122 + 4 margin exceeds
+// MemTotal 124.5)"); printed inline they turned each rung into a paragraph and
+// knocked the numbers out of column, so the row carries only the axis that
+// blocked it and the tooltip carries the sentence.
+const axisOf = why => /host RAM/i.test(why || "") ? "RAM"
+  : /VRAM/i.test(why || "") ? "VRAM" : "fit";
+
 function renderImage(img) {
-  if (unchanged("image", [img.resident, img.headroom_gib, img.prefer])) return;
+  if (unchanged("image", [img.resident, img.headroom_gib, img.host_ram_avail_gib, img.prefer])) return;
   const box = $("#imageTier"); box.innerHTML = "";
   const res = img.resident;
-  const head = el("div", "row");
+
+  const head = el("div", "imgline");
   if (res) {
-    head.append(el("span", "pill " + (res.serveable ? "ok" : "warn"),
-      (res.serveable ? "● " : "○ ") + res.active_model));
-    head.append(el("span", "muted", `${res.device} · ${res.backend} · pinned_by ${res.pinned_by}`));
-    if (res.co_device_warming) head.append(el("span", "pill warn", "co-device warming"));
-  } else {
-    head.append(el("span", "muted", "no image engine resident"));
-  }
-  box.append(head);
-  const hr = el("div", "row"); hr.style.margin = "8px 0";
-  for (const [dv, g] of Object.entries(img.headroom_gib || {}))
-    hr.append(el("span", "pill", `${dv} headroom ${fmtGib(g)}`));
-  // The axis the ladder verdicts are actually gated on: device VRAM is rarely the
-  // binding constraint for image models — the shared host-RAM pool is, and a
-  // Vulkan engine's working set lives there (including GTT pages charged to
-  // /proc/meminfo that no cgroup reading shows). Without this pill the card read
-  // "igpu0 headroom 83.5" next to a model needing 122 and looked loadable.
+    const p = el("span", "pill " + (res.serveable ? "ok" : "warn"),
+      (res.serveable ? "● " : "○ ") + res.active_model);
+    p.title = `${res.device} · ${res.backend} · pinned_by ${res.pinned_by}`
+      + (res.co_device_warming ? " · co-device warming" : "");
+    head.append(p);
+  } else head.append(el("span", "pill", "none resident"));
+  const bud = el("span", null);
+  const parts = Object.entries(img.headroom_gib || {}).map(([dv, g]) => `${dv} ${rnd1(g)}`);
+  if (parts.length) bud.textContent = "headroom " + parts.join(" · ") + " GiB";
   if (img.host_ram_avail_gib != null)
-    hr.append(el("span", "pill", `host RAM ${fmtGib(img.host_ram_avail_gib)} free of ${fmtGib(img.mem_total_gib)}`));
-  if (img.teardown_credit_gib > 0)
-    hr.append(el("span", "pill muted", `+${fmtGib(img.teardown_credit_gib)} credited to a cross-backend swap`));
-  box.append(hr);
+    bud.textContent += (parts.length ? " · " : "") + "RAM " + rnd1(img.host_ram_avail_gib)
+      + "/" + rnd1(img.mem_total_gib) + " GiB";
+  bud.title = "Free VRAM per device and free host RAM, as of this poll. A model is"
+    + " refused when either is short."
+    + (img.teardown_credit_gib > 0 ? " Swapping to the other backend also frees "
+      + rnd1(img.teardown_credit_gib) + " GiB of host RAM first." : "");
+  head.append(bud);
+  box.append(head);
+
   const ladder = el("div", "ladder");
   for (const p of img.prefer || []) {
     const here = res && res.active_model === p.active_model;
-    // Verdicts come from the SERVER (`fit`: Reconciler._backend_fit — host RAM
-    // first, then device VRAM, teardown credit already applied). The client used
-    // to derive this itself from footprint_gib vs device headroom alone, which
-    // advertised flux2-dev-turbo on the iGPU with an enabled Load button while
-    // the scheduler refuses it outright: its host_ram_gib alone (122) exceeds the
-    // whole box (124.4), so no free-RAM figure can ever make it fit.
     const fit = p.fit || {};
+    // the backend this row is about: where it lives, where it would land, or the
+    // last one listed for a model with nowhere to go (cuda is rarely the route).
+    const be = here ? res.backend
+      : (p.would_load_on ? p.would_load_on[1] : (p.backends || []).slice(-1)[0]);
+    const v = fit[be] || {};
+    const fp = (p.footprint_gib || {})[be], hp = (p.host_ram_gib || {})[be];
     const refused = !here && p.fits === false;
+    const why = (p.backends || []).map(b => (fit[b] || {}).reason).filter(Boolean);
     const rung = el("div", "rung" + (here ? " here" : "") + (refused ? " refused" : ""));
-    rung.append(el("span", "dot " + (here ? "ready" : "")));
-    rung.append(el("b", null, p.active_model));
-    const bd = el("span", "muted");
-    (p.backends || []).forEach((be, i) => {
-      const v = fit[be] || {};
-      const fp = (p.footprint_gib || {})[be];
-      const hp = (p.host_ram_gib || {})[be];
-      const dv = (here && res.backend === be) ? res.device
-        : (v.device || (be === "cuda" ? "cuda0" : "igpu0"));
-      const txt = `${be}:${fmtGib(fp)} vram/${fmtGib(hp)} host → ${dv}`
-        + (v.fits === false ? ` — ${v.reason}` : "");
-      bd.append(el("span", v.fits === false ? "toobig-inline" : "", (i ? "  ·  " : "") + txt));
-    });
-    rung.append(bd);
-    if (!here && p.would_load_on)
-      rung.append(el("span", "pill", "would load on " + p.would_load_on[0]));
-    if (refused) rung.append(el("span", "pill deny", "refused before start"));
-    rung.append(el("span", "muted", (p.capabilities || []).join(" ")));
-    rung.append(el("div", "spacer"));
+    const nm = el("span", "nm");
+    nm.textContent = p.active_model;
+    nm.title = (p.capabilities || []).join(", ");
+    const st = el("span", "st" + (refused ? " no" : ""));
+    // the axis is taken from the route the numbers in the next column describe,
+    // not the first refusal in list order — dev-turbo's cuda route is blocked by
+    // VRAM while the iGPU route (the one shown) is blocked by host RAM, and the
+    // row has to say why *it* can't run.
+    st.textContent = here ? "resident"
+      : refused ? "refused · " + axisOf(v.reason || why[0]) : "→ " + (v.device || "");
+    const fpc = el("span", "fp");
+    fpc.textContent = fp == null ? "–" : rnd1(fp) + (hp != null ? "/" + rnd1(hp) : "");
+    fpc.title = (p.backends || []).map(b => `${b} ${rnd1((p.footprint_gib || {})[b])} GiB VRAM`
+      + ((p.host_ram_gib || {})[b] != null ? ` + ${rnd1(p.host_ram_gib[b])} GiB host RAM` : "")
+      + ((fit[b] || {}).fits === false ? ` — ${fit[b].reason}` : "")).join("\n");
+    const btn = el("span", null, "");
     if (!here) {
-      const b = el("button", "sm" + (refused ? " deny" : ""), refused ? "Blocked" : "Load");
-      if (refused) {
-        b.disabled = true;
-        b.title = "Would be refused: " + (p.backends || [])
-          .map(be => (fit[be] || {}).reason).filter(Boolean).join("; ")
-          + " — to bench it anyway: stackctl image bench --unsafe";
-      } else b.onclick = () => swapImage("model", p.active_model);
-      rung.append(b);
+      const b = el("button", "sm", refused ? "Blocked" : "Load");
+      if (refused) { b.disabled = true; b.title = why.join("\n"); }
+      else b.onclick = () => swapImage("model", p.active_model);
+      btn.append(b);
     }
+    rung.append(nm, st, fpc, btn);
     ladder.append(rung);
   }
   box.append(ladder);
-  const caps = el("div", "row"); caps.style.marginTop = "10px";
-  caps.append(el("span", "muted", "need capability:"));
+  const caps = el("div", "imgline"); caps.style.marginTop = "10px";
+  caps.append(el("span", null, "need:"));
   for (const v of ["generate", "edit", "stylize"]) {
     const b = el("button", "sm", v);
     b.onclick = () => swapImage("capability", v);
@@ -1794,25 +1810,34 @@ function hoverTip(fmtX, fmtVal) {
   };
 }
 // mean over the completed-request points (across engines) whose timestamp falls
-// in the trailing `winS` seconds ending at time `tEnd`. Returns null when no
-// request happened in that window — so the avg line simply isn't drawn over
-// idle stretches, never dragged toward a held value.
-function genWinMean(engineNames, key, tEnd, winS) {
+// in the trailing `winS` seconds ending at time `tEnd`. `maxAgeS` bounds how long
+// it keeps drawing after the LAST request: a 10-min trailing window otherwise
+// averages stale points for 10 minutes after activity stops, which reads as the
+// line drifting smoothly across an idle stretch — the exact artifact this chart
+// is supposed to show the absence of. Past `maxAgeS` it returns null and the line
+// stops where the traffic stopped.
+function genWinMean(engineNames, key, tEnd, winS, maxAgeS = 120) {
   const lo = tEnd - winS;
-  let sum = 0, n = 0;
+  let sum = 0, n = 0, newest = -Infinity;
   for (const e of engineNames) {
     for (const p of (GENHIST[e] || [])) {
-      if (p.t > lo && p.t <= tEnd && p[key] != null) { sum += p[key]; n++; }
+      if (p.t > lo && p.t <= tEnd && p[key] != null) { sum += p[key]; n++; if (p.t > newest) newest = p.t; }
     }
   }
-  return n ? Math.round(sum / n * 10) / 10 : null;
+  if (!n || newest < tEnd - maxAgeS) return null;
+  return Math.round(sum / n * 10) / 10;
 }
 function renderLive(engineNames) {
   ensureLiveGrid(engineNames);
+  // spanGaps:false — with it on, uPlot bridges every null with a curve, so an
+  // idle stretch (or a paused poll) drew a long smooth arc between the last value
+  // before the silence and the first after it. The sample grid (sampleLive) now
+  // supplies a value per second and an explicit null when nothing is known; a
+  // null must read as "no data", i.e. a break in the line, not a transition.
   const line = (name, label, i, scale) => ({ _n: name, label, stroke: PAL[i % PAL.length],
-    width: 2.5, spanGaps: true, points: { show: false }, paths: SPLINE, ...(scale ? { scale } : {}) });
+    width: 2.5, spanGaps: false, points: { show: false }, paths: SPLINE, ...(scale ? { scale } : {}) });
   const avgLine = name => ({ _n: name, label: "avg (active only)", stroke: "#e1e4ed", width: 1.25,
-    dash: [6, 4], spanGaps: true, points: { show: false }, paths: SPLINE });
+    dash: [6, 4], spanGaps: false, points: { show: false } });
 
   // rolling avg lines from the per-request points only (10-min trailing window)
   SER["tok_roll"] = TS.map(t => genWinMean(engineNames, "gen", t, 600));
@@ -1857,24 +1882,56 @@ function renderLive(engineNames) {
   if (e0) { capReq("tokps", "tok_" + e0, "gen", ""); capReq("mtp", "mtp_" + e0, "mtp", "%"); }
   else { cap("tokps", null); cap("mtp", null); }
 }
-function sampleLive(now, gpu, host, engTel) {
+// ---- live sample grid ------------------------------------------------
+// The charts keep their OWN 1 s grid, fed by the newest poll result. Sampling
+// used to happen exactly once per poll, so every pause in polling — the refresh
+// select focused, a poll error, `paused` selected, an engine that stopped
+// reporting — left a hole in the time axis and the next sample landed much later;
+// the chart then had to connect two points nowhere near each other in time, which
+// is what made idle stretches read as a slow smooth ramp. Now there is a value
+// (or an explicit null) at every sample point.
+const SAMPLE_MS = 1000;
+const HOLD_S = 20;                 // hold a value this long after its poll went stale
+let SNAP = { at: 0, gpu: null, host: null, tel: {} };
+let ENGINE_NAMES = [];
+function snapshot(gpu, host, tel) { SNAP = { at: Date.now(), gpu, host, tel }; }
+function sampleLive(now) {
   TS.push(now / 1000);
+  // Past the hold window the snapshot is not a measurement any more, so say so
+  // with a gap rather than drawing a held number forever or (worse) interpolating
+  // between the two real ones around it.
+  const s = (now - SNAP.at) / 1000 <= HOLD_S ? SNAP : { gpu: null, host: null, tel: {} };
+  const gpu = s.gpu, host = s.host, engTel = s.tel;
   const put = (n, v) => { const a = SER[n] ||= []; while (a.length < TS.length - 1) a.push(null); a.push(v == null ? null : +v); };
   put("gu_cuda0", gpu?.cuda0?.util_pct); put("gu_igpu0", gpu?.igpu0?.util_pct);
   put("gp_cuda0", gpu?.cuda0?.power_w);  put("gp_igpu0", gpu?.igpu0?.power_w);
   put("gv_cuda0", gpu?.cuda0?.vram_used_gib); put("gv_igpu0", gpu?.igpu0?.vram_used_gib);
   put("h_cpu", host?.cpu_pct); put("h_load", host?.loadavg ? host.loadavg[0] : null);
-  for (const [name, t] of Object.entries(engTel || {})) {
-    put("tok_" + name, t && t.gen_tok_s);        // sticky (main line)
+  for (const name of ENGINE_NAMES) {                     // every engine, every tick
+    const t = (engTel || {})[name];                      // absent -> null, not skipped
+    put("tok_" + name, t && t.gen_tok_s);                // sticky (main line)
     put("mtp_" + name, t && t.mtp_accept_pct);
     put("kv_" + name, t && t.kv_pct);
-    put("ctxt_" + name, t && t.ctx_tokens);      // absolute token count, for the caption
+    put("ctxt_" + name, t && t.ctx_tokens);              // absolute token count, for the caption
   }
   // trim to 10 min
   const cut = now / 1000 - 600;
   let i = 0; while (i < TS.length && TS[i] < cut) i++;
   if (i) { TS.splice(0, i); for (const k in SER) SER[k].splice(0, i); }
 }
+function paintSampleNote() {
+  const e = $("#sampleNote"); if (!e) return;
+  const age = Math.round((Date.now() - SNAP.at) / 1000);
+  const poll = +$("#refreshRate").value;
+  const why = uiLocked() ? "a field has focus" : poll === 0 ? "polling paused" : null;
+  if (SNAP.at === 0) { e.textContent = "sampling 1s …"; return; }
+  if (age > HOLD_S)
+    // past the hold window the lines are gaps, not held values — say which.
+    e.textContent = `no data for ${age}s` + (why ? ` (${why})` : " — daemon not answering");
+  else if (why) e.textContent = `sampling 1s · held (${why})`;
+  else e.textContent = age * 1000 > poll * 3 ? `sampling 1s · no data for ${age}s` : "sampling 1s";
+}
+function pumpCharts() { sampleLive(Date.now()); renderLive(ENGINE_NAMES); paintSampleNote(); }
 
 // ---- history charts (usage view) -----------------------------
 function mkHist(id, series, data, opts = {}) {
@@ -2441,15 +2498,27 @@ async function loadUsers() {
 }
 
 // ---- poll loop --------------------------------------------
-async function tick() {
-  // don't yank a native <select>/<input> popup out from under the user mid-click
+// True while a form control owns focus. The poll pauses then — a repaint would
+// replace the DOM under an open native popup — but the chart grid (pumpCharts)
+// keeps sampling, so the pause shows up as held values and then gaps, never as a
+// hole in the time axis for the renderer to interpolate across.
+function uiLocked() {
   const ae = document.activeElement;
-  if (ae && (ae.tagName === "SELECT" || ae.tagName === "INPUT" || ae.tagName === "OPTION")) return;
+  return !!ae && (ae.tagName === "SELECT" || ae.tagName === "INPUT" || ae.tagName === "OPTION");
+}
+async function tick() {
+  if (uiLocked() || tick._busy) return;      // no pile-up: 1 s cadence, ~10 endpoints
+  tick._busy = true;
   try {
     const [st, eng, img, models, gpu, host, cleaner] = await Promise.all([
       api("/status"), api("/engines"), api("/image"), api("/v1/models"),
       api("/gpu"), api("/host").catch(() => ({})), api("/cleaner").catch(() => null),
     ]);
+    // focus may have arrived while these were in flight — dropping the response
+    // is the point of the pause; painting it was the bug (the early return above
+    // only stopped a poll from *starting*, so an in-flight tick still yanked the
+    // refresh dropdown's popup away mid-click).
+    if (uiLocked()) return;
     $("#topErr").classList.add("hidden");
     renderHeader(st, cleaner);
     // keep the profile selector's loading chips in step with reality: refresh it
@@ -2490,12 +2559,17 @@ async function tick() {
       if (GENHIST[n]) GENHIST[n] = GENHIST[n].filter(p => p.t >= cut);
     }));
 
-    sampleLive(Date.now(), gpu, host, tel);
-    renderLive(names);
+    // Feed the sample grid; the 1 s pump (not this poll) owns the time axis, so a
+    // slow or skipped poll can never widen the spacing between chart points.
+    ENGINE_NAMES = names;
+    snapshot(gpu, host, tel);
+    pumpCharts();
 
-    if (!evPaused) renderEvents(await api("/events?since=" + lastEvSeq), false);
+    if (!evPaused && !uiLocked()) renderEvents(await api("/events?since=" + lastEvSeq), false);
   } catch (e) {
     if (e.message !== "401") { $("#topErr").textContent = "poll error: " + e.message; $("#topErr").classList.remove("hidden"); }
+  } finally {
+    tick._busy = false;
   }
 }
 async function loadProfiles() { try { renderProfiles(await api("/profiles")); } catch (e) {} }
@@ -2503,7 +2577,12 @@ function schedule() {
   if (timer) clearInterval(timer);
   const ms = +$("#refreshRate").value;
   if (ms) timer = setInterval(tick, ms);
+  paintSampleNote();
 }
+// Release the pause the moment the control lets go, rather than waiting out the
+// interval — otherwise picking a rate and clicking away leaves the dashboard
+// frozen until the next tick fires.
+$("#refreshRate").addEventListener("blur", () => { paintSampleNote(); tick(); });
 function setView(v) {
   view = v;
   $("#viewMain").classList.toggle("hidden", v !== "main");
@@ -2533,6 +2612,7 @@ async function start() {
   try { renderEvents(await api("/events"), true); } catch (e) {}
   loadProfiles(); loadUsers();
   schedule();
+  setInterval(pumpCharts, SAMPLE_MS);   // the chart grid: 1 s regardless of poll rate
   setInterval(loadProfiles, 15000);
   setInterval(paintIdle, 1000);
 }
