@@ -628,9 +628,14 @@ def _cmd_image_bench(args, base, headers) -> int:
         print(f"  {p['px']:>5}²  {p['secs']:>6}  {p['added_gib']:>6}G  {p['peak_total_gib']:>9}G  "
               f"{p['peak_comfy_gib']:>8}G  {p['added_host_gib']:>9}G  {p['peak_host_gib']:>9}G")
     print(f"\nfootprint (peak VRAM the pipeline added): {out['footprint_gib']}G")
-    print(f"host RAM this generation added: {out['added_host_gib']}G "
-          f"(peak {out['peak_host_gib']}G of whole-machine RAM in use) — checked live against real "
-          f"available memory by reconciler.py::_real_host_ram_avail on every pick/swap.")
+    if out.get("container_peak_gib"):
+        print(f"host RAM the ComfyUI container held (its own cgroup peak): {out['container_peak_gib']}G "
+              f"— what ComfyUI is responsible for, isolated from the co-resident LLMs and page cache")
+    else:
+        print(f"host RAM this generation added (whole-machine delta): {out['added_host_gib']}G "
+              f"— Docker API unreachable, so this is the whole-machine figure, not ComfyUI's share")
+    print(f"  (whole-machine context: +{out['added_host_gib']}G added, peak {out['peak_host_gib']}G in use — "
+          f"checked live against real available memory by reconciler.py::_real_host_ram_avail on every pick/swap)")
     print(f"→ suggested  footprint_gib: {{ {backend}: {out['suggest_footprint_gib']} }}  "
           f"host_ram_gib: {{ {backend}: {out['suggest_host_ram_gib']} }}  (each: measured + 3G cushion)")
     print(f"  paste both into config.local/media/image.yaml under `- active_model: {model}`. "

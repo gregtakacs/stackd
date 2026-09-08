@@ -12,8 +12,12 @@ LLM for the device).
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import re
 import threading
 import time
+import urllib.request
 
 from stackd.imagegen.comfyui_client import get_json, post_json, submit_workflow
 from stackd.imagegen import workflows
@@ -96,26 +100,63 @@ def _host_used_mib() -> float:
         return 0.0
 
 
+def _container_mem_mib(container_name: str) -> float:
+    """The ComfyUI container's OWN cgroup memory (MiB) via the Docker Engine API
+    (`DOCKER_API_URL`, the scoped socket-proxy) — the slice of host RAM this
+    container is actually responsible for, isolated from the co-resident LLMs and
+    the rest of the box. This is what `host_ram_gib` should be built from: the
+    whole-machine `MemTotal - MemAvailable` delta above also swings with page
+    cache and any other resident process, so it over-books ComfyUI's share (the
+    70G-vs-53G gap on flux2-dev-turbo). Best-effort: 0.0 if DOCKER_API_URL is
+    unset or the stats call fails — bench_image then falls back to the
+    whole-machine delta so a bench never reports no host-RAM number at all."""
+    base = os.environ.get("DOCKER_API_URL", "").rstrip("/")
+    if not base or not container_name:
+        return 0.0
+    try:
+        with urllib.request.urlopen(
+                f"{base}/containers/{container_name}/stats?stream=false", timeout=20) as r:
+            st = json.loads(r.read() or b"{}")
+        return float(st.get("memory_stats", {}).get("usage", 0)) / (1024 * 1024)
+    except Exception:  # noqa: BLE001 — telemetry must never fail the bench
+        return 0.0
+
+
+def _container_name_from_endpoint(endpoint: str) -> str | None:
+    """`http://comfyui-cuda:8188` -> `comfyui-cuda`. The ComfyUI endpoint's host
+    is the docker service name, which matches the container name stackd creates
+    (see image.yaml `containers.<backend>.name`), so it can be queried at the
+    socket-proxy directly."""
+    m = re.match(r"https?://([^/:]+)", (endpoint or "").strip())
+    return m.group(1) if m else None
+
+
 class _VramSampler(threading.Thread):
-    def __init__(self, interval: float = 0.4, backend: str = "cuda"):
+    def __init__(self, interval: float = 0.4, backend: str = "cuda",
+                 container: str | None = None):
         super().__init__(daemon=True)
         self.interval = interval
         self.backend = backend
+        self.container = container
         self._stop = threading.Event()
         self.peak_total = 0.0
         self.peak_comfy = 0.0
         self.peak_host = 0.0
+        self.peak_container = 0.0
 
     def reset(self):
         self.peak_total = 0.0
         self.peak_comfy = 0.0
         self.peak_host = 0.0
+        self.peak_container = 0.0
 
     def run(self):
         while not self._stop.wait(self.interval):
             self.peak_total = max(self.peak_total, total_used_mib(self.backend))
             self.peak_comfy = max(self.peak_comfy, comfy_used_mib(self.backend))
             self.peak_host = max(self.peak_host, _host_used_mib())
+            if self.container:
+                self.peak_container = max(self.peak_container, _container_mem_mib(self.container))
 
     def stop(self):
         self._stop.set()
@@ -199,7 +240,8 @@ async def _one_generation(model: str, px: int, prompt: str, base: str,
 async def bench_image(model: str, sizes: list[int], prompt: str, base: str,
                       backend: str = "cuda", gen_timeout: float = GEN_TIMEOUT_S,
                       warmup: int = 1) -> dict:
-    sampler = _VramSampler(backend=backend)
+    container = _container_name_from_endpoint(base)
+    sampler = _VramSampler(backend=backend, container=container)
     sampler.start()
     time.sleep(0.6)
     # Baseline is read HERE, before any generation (warm-up included) — the
@@ -246,12 +288,16 @@ async def bench_image(model: str, sizes: list[int], prompt: str, base: str,
                   "peak_comfy_gib": round(sampler.peak_comfy / 1024, 2),
                   "resident_comfy_gib": round(comfy_used_mib(backend) / 1024, 2),
                   "peak_host_gib": round(sampler.peak_host / 1024, 2),
-                  "added_host_gib": round(added_host, 2)}
+                  "added_host_gib": round(added_host, 2),
+                  "container_peak_gib": round(sampler.peak_container / 1024, 2)}
             points.append(pt)
+            host_note = (f"· container {pt['container_peak_gib']}G "
+                         if pt["container_peak_gib"] else "")
             print(f"  {px}²: {secs}s · added {pt['added_gib']}G "
                   f"· total peak {pt['peak_total_gib']}G "
                   f"· comfy-pid {pt['peak_comfy_gib']}G "
-                  f"· host RAM +{pt['added_host_gib']}G (peak {pt['peak_host_gib']}G)", flush=True)
+                  f"{host_note}· host RAM +{pt['added_host_gib']}G (peak {pt['peak_host_gib']}G)",
+                  flush=True)
     finally:
         sampler.stop()
     ok_pts = [p for p in points if p.get("ok")]
@@ -260,6 +306,7 @@ async def bench_image(model: str, sizes: list[int], prompt: str, base: str,
     peak_host = max((p["peak_host_gib"] for p in ok_pts), default=0.0)
     added_peak = max((p["added_gib"] for p in ok_pts), default=0.0)
     added_host = max((p["added_host_gib"] for p in ok_pts), default=0.0)
+    peak_container = max((p.get("container_peak_gib", 0.0) for p in ok_pts), default=0.0)
     if backend == "vulkan":
         # igpu0 shares VRAM/GTT with system RAM, and whatever else is placed
         # there (e.g. code-autocomplete) can be co-resident during a bench.
@@ -276,14 +323,17 @@ async def bench_image(model: str, sizes: list[int], prompt: str, base: str,
         # so total VRAM on the card IS this pipeline's footprint bar a ~1G
         # idle ComfyUI base.
         footprint = max(peak_total - 1.0, peak_comfy, 0.0)
-    # host RAM: `added_host` (delta vs baseline) is the honest per-generation
-    # figure on EITHER backend -- unlike the vram/GTT footprint, host RAM was
-    # never "cleared to a device ceiling" in the first place, so `peak_host`
-    # always conflates this pipeline with the OS baseline and whatever else
-    # was resident when the bench started. `added_host` is what
-    # config.local/media/image.yaml's `host_ram_gib` should be built from —
-    # see solver.py::host_ram_headroom / reconciler.py::_real_host_ram_avail,
-    # which check the REAL remaining host RAM against this per-model figure.
+    # host RAM: the container's OWN cgroup peak (`peak_container` — what the
+    # ComfyUI container actually held, isolated from the co-resident LLMs and the
+    # box's page cache) is the honest figure for `host_ram_gib`. The whole-
+    # machine `added_host` delta over-books it: `MemTotal - MemAvailable` also
+    # swings with page cache and any other resident process (the 70G-reserved-
+    # vs-53G-held gap on flux2-dev-turbo). Fall back to the whole-machine delta
+    # when the Docker API is unreachable (no DOCKER_API_URL, e.g. stackd running
+    # on the host) so a bench still reports a number. Both are checked live
+    # against real remaining host RAM by reconciler.py::_real_host_ram_avail on
+    # every pick/swap.
+    host_ram_base = peak_container if peak_container > 0 else added_host
     return {
         "model": model,
         "baseline_total_gib": round(baseline_total / 1024, 2),
@@ -294,6 +344,7 @@ async def bench_image(model: str, sizes: list[int], prompt: str, base: str,
         "baseline_host_gib": round(baseline_host / 1024, 2),
         "peak_host_gib": peak_host,
         "added_host_gib": added_host,
-        "suggest_host_ram_gib": int(added_host + 3 + 0.999),   # ceil + 3 GiB cushion
+        "container_peak_gib": peak_container,
+        "suggest_host_ram_gib": int(host_ram_base + 3 + 0.999),   # ceil + 3 GiB cushion
         "points": points,
     }
