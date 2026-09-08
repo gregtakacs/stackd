@@ -62,11 +62,15 @@ EXPOSE 8188
 # described were never actually passed: the CMD was a bare `main.py --listen`.
 # Both flags are defaults here because this device has no VRAM carve-out:
 # "unload to CPU" copies weights into the very RAM the device just mapped, so
-# eviction buys nothing and holds the model twice at swap time. Measured on
-# flux2-klein, cold load, coding profile co-resident — peak whole-machine RAM
-# 58.76 GiB without them vs 47.37 GiB with (see deploy/README.md, which also
-# records why upstream ComfyUI#10896's copy=False loader patch is deliberately
-# NOT applied here).
+# eviction buys nothing and holds the model twice at swap time. Be honest about
+# the evidence, though: measured cold on flux2-klein, the flags moved the
+# model's own host-RAM contribution only 36.62 -> 35.25 GiB — inside run noise.
+# The absolute peaks of those two runs (58.76 vs 47.45) differ mostly because
+# their *baselines* did (22.14 vs 12.03), which is the raw-peak-vs-baseline-delta
+# trap the tier config comments warn about; I fell for it and reported a win
+# that wasn't there. Kept on principle, not for a measured load-time saving.
+# Measured numbers, and why upstream ComfyUI#10896's copy=False loader patch is
+# deliberately NOT applied here: see deploy/README.md.
 # `:-` so an empty CLI_ARGS from the container env falls back to these defaults
 # rather than silently clearing them. `exec` keeps ComfyUI as PID 1 so `docker
 # stop` reaches it directly — this image runs no supervisor.

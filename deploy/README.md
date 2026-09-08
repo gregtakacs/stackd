@@ -266,19 +266,41 @@ published ports — those shape the compose file itself, not just stackd's confi
   too, and that is exactly what bench.py's host sampler reads. Keep `host_ram_gib`
   measured as-is (over-estimating is the safe direction); expect ~2x
   `footprint_gib` on any device that shares system RAM.
-  What *does* cut the peak is ComfyUI's residency flags: with no carve-out,
-  "unload to CPU" copies weights into the RAM the device just unmapped, so
-  eviction holds the model twice at swap time and buys nothing.
-  `--highvram --disable-smart-memory` moved the cold-load peak from 58.76 to
-  47.37 GiB on the same model with the coding profile co-resident. Those two are
-  now the image CMD defaults in `imagegen/comfyui_image/Dockerfile.igpu`,
-  overridable per box via `COMFYUI_ROCM_CLI_ARGS`. Upstream's answer to this
-  report class — Comfy-Org/ComfyUI#10896, `--disable-mmap` plus `copy=False` on
-  the `tensor.to()` in `comfy/utils.py` — measured as **no help here**: 47.53 GiB
-  peak with it vs 47.37 without, because the DGX Spark path that patch fixes is
-  pinned-staging-buffer doubling, which amdgpu's system-memory allocator doesn't
-  do. Deliberately not applied. (The PR the issue links as closing it, #12611, is
-  still open and does not touch that copy at all.)
+  The ComfyUI **residency flags** (`--highvram --disable-smart-memory`) are now
+  the image CMD defaults in `imagegen/comfyui_image/Dockerfile.igpu`, overridable
+  per box via `COMFYUI_ROCM_CLI_ARGS`. They were documented in that Dockerfile's
+  comment for its whole life and never actually passed. Keep them on principle:
+  with no carve-out, "unload to CPU" copies weights into the RAM the device just
+  unmapped, so eviction holds the model twice at swap time and buys nothing —
+  but do not expect a smaller load. Measured cold on klein, the flags moved its
+  own host-RAM contribution 36.62 -> 35.25 GiB, inside run-to-run noise. (Their
+  absolute peaks were 58.76 vs 47.45, which looks like an 11 GiB win and is not:
+  the two runs had different *baselines*, 22.14 vs 12.03. Peak-without-baseline
+  is exactly the contamination the tier config comments warn about — that one is
+  on me, and it is the trap this whole box keeps re-teaching.)
+  Upstream's answer to this report class — Comfy-Org/ComfyUI#10896,
+  `--disable-mmap` plus `copy=False` on the `tensor.to()` in `comfy/utils.py` —
+  was built, loaded, and removed. The direct A/B was confounded by page-cache
+  state (the patched run happened to have a warm cache: 31.60 G added vs 35.25
+  cold), but the mechanism it fixes is absent here: `RssFile` stays ~0.5 GiB
+  through a whole load while GTT and `RssAnon` move together, so the weights are
+  single-copy and there is no pinned staging buffer to double. Not applied, so
+  the build carries no assertion for an unproven gain. (The PR the issue links as
+  closing it, #12611, is still open and does not touch that copy at all.)
+- **Bench a big model on a unified-memory iGPU with a floor under it.** The same
+  box's largest checkpoint (flux2-dev-turbo, 33 GiB fp8mixed) was re-benched cold
+  with `--unsafe` — which bypasses stackd's estimate-based refusals by design.
+  MemAvailable reached **5.23 GiB** before anything stopped it: `deploy/mem-floor-watchdog.py`,
+  polling `/proc/meminfo` at 0.4 s and `docker rm -f`-ing the container under a
+  6 GiB floor. Neither the container's `mem_limit_gib: 118` nor stackd's
+  own guard fired first — a cgroup cap is a page-cache-loose proxy for host
+  safety, since most of what a model load charges to a cgroup is reclaimable file
+  cache that `MemAvailable` never counted. So the load is only as safe as the
+  weakest guard *you* put around it. It confirmed the recorded 122 GiB host
+  figure rather than correcting it, and generated 4 steps in ~10 s once resident:
+  the blocker is RAM, not speed. If dev-class output is ever wanted here, the
+  route is the GGUF already on disk (20 GiB), not the fp8mixed file — the same
+  place the #10896 reporter landed, for the same reason.
 
 ## Notes
 
