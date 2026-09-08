@@ -1970,6 +1970,14 @@ const SAMPLE_MS = 1000;
 const HOLD_S = 20;                 // hold a value this long after its poll went stale
 let SNAP = { at: 0, gpu: null, host: null, tel: {} };
 let ENGINE_NAMES = [];
+// Browser→daemon clock offset (seconds), refreshed on every /live backfill. The chart
+// grid is on the DAEMON's clock: backfilled points arrive with the daemon's `ts`, and
+// live points are stamped with Date.now() SHIFTED by this offset so both sources share
+// one timeline. Without it the append-backfill keys `since` off a browser-clock tail and
+// silently drops the newest daemon samples whenever the two clocks differ (browser on a
+// different machine than stackd) — the "tab back but it didn't fill everything" bug.
+let CLK_OFF = 0;
+function nowT() { return Date.now() / 1000 + CLK_OFF; }
 // Last good daemon readings. The GPU util/power/VRAM and host CPU/load lines are
 // slow physical measurements, and — unlike the engine lines — they should read as
 // continuous: a single missed /gpu or /host poll, or a snapshot that goes briefly
@@ -2009,7 +2017,7 @@ function feedPoint(s) {
   }
 }
 function sampleLive(now) {
-  const t = now / 1000;
+  const t = now / 1000 + CLK_OFF;   // push on the daemon's timeline, not the browser's
   // If the 1s grid was throttled (tab in the background — the browser slows its
   // timers) or the poll stalled, the gap since the last sample is more than a few
   // seconds. For the engine lines that would make uPlot connect the two sides with
@@ -2086,31 +2094,44 @@ async function backfillLive() {
   if (backfilling) return;
   backfilling = true;
   try {
-    const since = TS.length ? TS[TS.length - 1] : Date.now() / 1000 - 600;
+    // Ask for the WHOLE visible window on the daemon's clock, anchored to browser-now —
+    // never to TS[last]. The old append version used `since = TS[TS.length-1]`, a
+    // BROWSER-clock number, and filtered returned samples with `p.ts > since`; when the
+    // browser and the stackd host disagree by NTP (normal — dashboard opened from
+    // another machine), the newest daemon samples fell at/below that browser tail and
+    // were silently dropped as "already have it": the gap only partly filled. A
+    // generous fixed look-back always covers the buffer.
+    const since = Date.now() / 1000 - 630;
     let pay = {};
     try { pay = (await api("/live?since=" + since)) || {}; }
     catch (e) { return; }                   // unreachable daemon / no such endpoint yet
     seedGenHist(pay.gen_history);
     const smp = pay.samples || [];
     if (!smp.length) return;
-    if (!TS.length) {
-      // Seeding: engine series are written per-name at feed time, so the name
-      // set has to exist BEFORE the history points go in. A later tick re-derives
-      // it from /status; sput pads anything new with nulls for older points.
-      const names = Object.keys(smp[smp.length - 1].eng || {}).sort();
-      if (names.length) ENGINE_NAMES = names;
-    }
-    let added = 0;
+    // Put live points on the daemon timeline: shift Date.now() so a fresh sample lands at
+    // the daemon's newest ts. Recomputed every call (survives an NTP step on the host).
+    const newest = smp[smp.length - 1].ts;
+    CLK_OFF = newest - Date.now() / 1000;
+    // Engine series are written per-name at feed time, so the name set must exist BEFORE
+    // the points go in; re-derive it each call so an engine that started/stopped while the
+    // tab was hidden is reflected rather than missed. sput pads anything new with nulls.
+    const names = Object.keys(smp[smp.length - 1].eng || {}).sort();
+    if (names.length) ENGINE_NAMES = names;
+    // REBUILD the grid from the daemon's own samples rather than appending to a
+    // browser-stamped tail: append loses everything at/older than the browser's last
+    // point (the skew above) and can't repair a hole mid-series. The 600 s chart window is
+    // exactly what /live replays, so a full rebuild loses nothing and always shows the
+    // whole period the tab missed.
+    TS.length = 0; for (const k in SER) delete SER[k];
+    LAST_GOOD = { gpu: null, host: null };
     for (const p of smp) {
-      if (!(p.ts > (TS[TS.length - 1] ?? 0))) continue;   // keep the grid sorted + deduped
       TS.push(p.ts);
       feedPoint({ gpu: p.gpu,
                   host: p.host && p.host.cpu_pct != null
                     ? { cpu_pct: p.host.cpu_pct, loadavg: [p.host.load1] } : null,
                   tel: p.eng || {} });
-      added++;
     }
-    if (added) { trimLive(Date.now() / 1000); renderLive(ENGINE_NAMES); }
+    trimLive(nowT()); renderLive(ENGINE_NAMES);
   } finally {
     backfilling = false;
   }
@@ -2128,6 +2149,16 @@ function paintSampleNote() {
   else e.textContent = age * 1000 > poll * 3 ? `sampling 1s · no data for ${age}s` : "sampling 1s";
 }
 function pumpCharts() {
+  // Park while the tab is hidden. The 1 s timer is only THROTTLED in a background tab,
+  // not stopped, so every throttled fire used to run sampleLive(Date.now()) and push a
+  // fresh timestamp onto the grid on held/null points even though nothing real was
+  // sampled. That dragged the time-axis tail to ~now, so the return-time backfill
+  // concluded it was already current and left the missed window as junk. (The backfill
+  // now REBUILDS the grid from the daemon's clock rather than appending to this tail —
+  // see backfillLive — but parking here is still required: a throttled live fire landing
+  // between the backfill's fetch and its render would insert a point ahead of the replay
+  // and desync it.) Parking leaves the tail frozen at the last real sample while hidden.
+  if (typeof document !== "undefined" && document.hidden) return;
   if (typeof backfilling !== "undefined" && backfilling) return;   // grid tail owned by /live replay
   sampleLive(Date.now()); renderLive(ENGINE_NAMES); paintSampleNote();
 }

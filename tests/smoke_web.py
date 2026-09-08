@@ -148,6 +148,28 @@ def main() -> int:
               and b'api("/live?since="' in raw
               and b"backfillLive().then(() => tick())" in raw
               and b"if (typeof backfilling !== \"undefined\" && backfilling) return;" in raw)
+        # The 1s timer is only THROTTLED while hidden, not stopped — if the pump kept
+        # running it would ratchet the grid tail to ~now on held/null points, so the
+        # return-time backfill (which keys off that tail) sees a fake "caught up" and
+        # /live?since=now yields nothing: blank until a hard refresh. Park the pump on
+        # document.hidden so the tail stays at the last real sample and gets refilled.
+        check("the 1s pump is parked while the tab is hidden (blank-until-refresh guard)",
+              b"function pumpCharts() {" in raw
+              and b"if (typeof document !== \"undefined\" && document.hidden) return;" in raw)
+        # Parking the pump fixed the tail *ratchet*, but the gap still came back partly
+        # unfilled: the append-backfill requested `/live?since=<browser-clock tail>` and
+        # dropped every daemon sample at/below that tail, so a browser and a stackd host
+        # that disagree by NTP lost the newest part of the window. The grid is now on the
+        # DAEMON clock alone — `since` is anchored to browser-now (never TS[last]) and the
+        # whole replay REBUILDS TS/SER, with live points shifted onto that timeline by
+        # CLK_OFF. A refresh and a refocus must therefore show the identical window.
+        check("backfill rebuilds the grid on the daemon clock (no browser-clock since)",
+              b"since = Date.now() / 1000 - 630" in raw
+              and b"let CLK_OFF = 0;" in raw
+              and b"function nowT() { return Date.now() / 1000 + CLK_OFF; }" in raw
+              and b"TS.length = 0; for (const k in SER) delete SER[k];" in raw
+              and b"const t = now / 1000 + CLK_OFF;" in raw
+              and b"TS[TS.length - 1] : Date.now()" not in raw)   # the old browser-clock since is gone
         # Engine captions (tokps/mtp/kv corners) follow the ACTIVE engine, else
         # the one with the most real data, and name themselves when >1 engine
         # shares the page. (engineNames[0] pinned captions to the alphabetical
