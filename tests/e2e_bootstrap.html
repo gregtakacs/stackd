@@ -1,0 +1,13 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>e2e bootstrap</title>
+<!-- Test-only, same-origin bootstrap: the real shell gates on a key it reads
+     from localStorage, which a headless browser can't type into. Stash it, then
+     hand over to "/" so the dump is the dashboard itself, not this file. -->
+<script>
+const q = new URLSearchParams(location.search);
+const k = q.get("k");
+if (k) localStorage.setItem("stackd_key", k);
+const to = q.get("to") || "/";
+location.replace(to.startsWith("/") && !to.startsWith("//") ? to : "/");
+</script>

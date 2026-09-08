@@ -31,12 +31,14 @@ _WEB_DIR = pathlib.Path(__file__).resolve().parent / "web"
 _STATIC_TYPES = {".js": "text/javascript", ".css": "text/css", ".html": "text/html"}
 
 # Web assets are memoised by (mtime_ns, size) — deliberately NOT with
-# functools.lru_cache, which reads a file exactly ONCE per process. On this box
-# the source tree is bind-mounted into the container, so lru_cache served
-# whichever dashboard.html was on disk when the daemon booted: a dashboard-only
-# fix committed minutes later never reached a browser, however hard the user
-# reloaded, and read as "the caption fix didn't work". Re-stat on every request
-# (one syscall), re-read only when the file actually changed.
+# functools.lru_cache, which reads a file exactly ONCE per process. That is
+# invisible while the image is immutable, and fatal the moment a file changes
+# under a running daemon: the dashboard fix that shipped at 03:22 had been
+# copied into the container (its dashboard.html was newer than the boot), yet
+# the page served was still the bytes read at the 03:17 boot — so the fix
+# "didn't work", however hard the browser reloaded. A bind-mounted source tree
+# hits the same wall constantly. Re-stat on every request (one syscall), and
+# re-read only when the file actually changed.
 _WEB_ASSETS: dict[str, tuple[int, int, bytes, str]] = {}
 
 # The dashboard shell stamps its own build id into WEB_REV (see checkRev in

@@ -77,6 +77,13 @@ Drive it with `stackctl image` or `POST /image/{model,capability}`.
 `deploy/.env.example`). Edit `.env` or a config file, then `stackctl reload` — no
 restart; an engine whose spec changed is recreated, a pool/size change just re-solves.
 
+**Web assets are live; Python is not.** `web/dashboard.html` and `/static/*` are
+re-read the moment the file's mtime/size changes, so a UI-only fix lands without
+restarting the daemon — copy it into the running container or rebuild, and a tab
+that is already open notices the new build id and offers to reload (see `WEB_REV`
+in `dashboard.html`). Python is baked into the image with no source bind-mount, so
+a `.py` change always needs `docker compose build stackd && docker compose up -d`.
+
 **Config overlay.** `STACKD_CONFIG_OVERLAY` (or `-O`) is a second config dir that wins
 **per file** — mount your private `pools.yaml` / `models/*.yaml` / `catalog/*.json`
 there and keep the shipped `config/` a pristine generic example. A new file adds; an
