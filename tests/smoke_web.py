@@ -133,6 +133,19 @@ def main() -> int:
               and b'api("/live?since="' in raw
               and b"backfillLive().then(() => tick())" in raw
               and b"if (typeof backfilling !== \"undefined\" && backfilling) return;" in raw)
+        # Engine captions (tokps/mtp/kv corners) must follow the engine with the
+        # FRESHEST data. Picking engineNames[0] pinned them to the alphabetically
+        # first engine — in a coding profile that is the mostly-idle autocomplete,
+        # so the readouts sat frozen on a stale value while the lines were live.
+        check("engine captions follow the freshest engine, not the first name",
+              b'newestIdx(SER["tok_" + n]' in raw)
+        # The engine card must not reflow when a generation finishes: "(live)" ->
+        # "(last session)" and "context" -> "peak context · 130.4k / 131k" wrapped
+        # the stat row and visibly grew the card on every session end. Equal-length
+        # suffixes; the long peak string lives in the tooltip.
+        check("engine card labels keep their width when a generation finishes",
+              b'"tok/s gen (last)"' in raw and b'"context (last)"' in raw
+              and b'"peak context"' not in raw and b"gen (last session)" not in raw)
         # The image ladder is a grid of name/verdict/footprint/action. Reasons are
         # sentences ("host RAM 122 > 64.9 free (vulkan) (unreachable: ...)"); inline,
         # they wrapped each row into a paragraph and knocked the numbers out of

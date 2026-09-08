@@ -1692,7 +1692,7 @@ function fillEngine(name, rt, tel) {
   const rp = card.querySelector(".e-restarts");
   rp.classList.toggle("hidden", !rt.restarts);
   rp.classList.add("bad"); rp.textContent = (rt.restarts || 0) + " restarts";
-  const set = (c, v) => { const e = card.querySelector(c); if (e) e.textContent = v; };
+  const set = (c, v, tip) => { const e = card.querySelector(c); if (e) { e.textContent = v; if (tip !== undefined) e.title = tip; } };
   if (!tel || tel.error) {
     ["gen","pp","kv","req","mtp"].forEach(k => set(".e-"+k, "–"));
     card.querySelector(".e-slots").classList.add("hidden");
@@ -1706,13 +1706,18 @@ function fillEngine(name, rt, tel) {
   set(".e-gen", n1(tel.gen_tok_s));
   set(".e-pp",  n0(tel.prompt_tok_s));
   set(".e-mtp", tel.mtp_accept_pct != null ? n0(tel.mtp_accept_pct) + "%" : "–");
-  set(".e-gen-lbl", active ? "tok/s gen (live)" : "tok/s gen (last session)");
-  set(".e-pp-lbl",  active ? "tok/s prefill (live)" : "tok/s prefill (session)");
-  set(".e-mtp-lbl", active ? "MTP accept (live)" : "MTP accept (session)");
+  // Label widths must NOT depend on state or the numbers: when a generation
+  // stopped, "(live)" -> "(last session)" and "context" -> "peak context ·
+  // 130.4k / 131k" wrapped the stat row and the whole card visibly grew
+  // (reflow on every finish). Suffixes are now equal-length, the long peak
+  // string lives in the tooltip, and the value already shows the live/peak pct.
+  set(".e-gen-lbl", active ? "tok/s gen (live)" : "tok/s gen (last)");
+  set(".e-pp-lbl",  active ? "tok/s prefill (live)" : "tok/s prefill (last)");
+  set(".e-mtp-lbl", active ? "MTP accept (live)" : "MTP accept (last)");
   set(".e-kv",  tel.kv_pct != null ? n1(tel.kv_pct) + "%" : "–");
   const km = tel.ctx_tokens != null && tel.ctx_max
-    ? `${active ? "context" : "peak context"} · ${(tel.ctx_tokens/1000).toFixed(1)}k / ${(tel.ctx_max/1000).toFixed(0)}k` : "context";
-  set(".e-kv-lbl", km);
+    ? `${active ? "context" : "peak"} · ${(tel.ctx_tokens/1000).toFixed(1)}k of ${(tel.ctx_max/1000).toFixed(0)}k tok window` : "";
+  set(".e-kv-lbl", active ? "context (live)" : "context (last)", km);
   set(".e-req", (tel.running ?? 0) + (tel.waiting ? " +" + tel.waiting + " queued" : ""));
   // concurrency lights: one square per slot, lit = a request occupies it.
   // slot count unknown for vLLM idle -> fall back to running+waiting.
@@ -1872,15 +1877,27 @@ function renderLive(engineNames) {
   const rnd = v => v == null ? null : Math.round(v * 10) / 10;
   const last = n => { const a = SER[n] || []; for (let i = a.length-1; i>=0; i--) if (a[i]!=null) return a[i]; return null; };
   const cap = (id, v, suf) => { const e = $(".lv-" + id); if (e) e.textContent = v==null ? "" : rnd(v) + (suf||""); };
+  // Caption engine: the one with the FRESHEST data, not the first name sorted.
+  // A multi-engine profile (e.g. coding-long + code-autocomplete) otherwise
+  // pinned every engine caption to the alphabetically-first engine — whose
+  // mostly-idle series made the tokps/mtp/kv readouts look frozen while the
+  // lines were live. Series are index-aligned to TS, so the newest non-null
+  // index wins.
+  const newestIdx = a => { for (let i = a.length - 1; i >= 0; i--) if (a[i] != null) return i; return -1; };
+  let e0 = null, e0at = -1;
+  for (const n of engineNames) {
+    const i = Math.max(newestIdx(SER["tok_" + n] || []), newestIdx(SER["kv_" + n] || []));
+    if (i > e0at) { e0at = i; e0 = n; }
+  }
+  if (!e0 && engineNames.length) e0 = engineNames[0];
   // caption: latest (sticky) value · 10-min per-request average (idle excluded)
   const capReq = (id, series, key, suf) => {
     const e = $(".lv-" + id); if (!e) return;
-    const l = last(series), a = genWinMean(engineNames, key, Date.now() / 1000, 600);
-    const n = (GENHIST[engineNames[0]] || []).length;
+    const l = last(series), a = genWinMean([e0], key, Date.now() / 1000, 600);
+    const n = (GENHIST[e0] || []).length;
     e.textContent = l == null && a == null ? ""
       : `${rnd(l) ?? "–"}${suf} · avg ${a == null ? "–" : rnd(a) + suf}${a == null ? "" : ` (${n} pts)`}`;
   };
-  const e0 = engineNames[0];
   const dash = v => rnd(v) ?? "–";
   { const e = $(".lv-gpuutil");
     if (e) e.textContent = `cuda0 ${dash(last("gu_cuda0"))}% · igpu0 ${dash(last("gu_igpu0"))}% · CPU ${dash(last("h_cpu"))}%`; }
