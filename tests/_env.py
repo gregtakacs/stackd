@@ -60,3 +60,8 @@ def _from_example() -> dict[str, str]:
 for _k, _v in {**_FALLBACK, **_from_example()}.items():
     if _v:
         os.environ.setdefault(_k, _v)
+
+# The smoke suite runs FakeRunner load/teardown cycles against the checked-in
+# config/, and the reconciler's passive EMA would otherwise fold those synthetic
+# durations into config/catalog/*.json on every run. Freeze it for tests.
+os.environ.setdefault("STACKD_PASSIVE_TIMINGS", "0")
