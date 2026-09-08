@@ -1906,6 +1906,13 @@ const SAMPLE_MS = 1000;
 const HOLD_S = 20;                 // hold a value this long after its poll went stale
 let SNAP = { at: 0, gpu: null, host: null, tel: {} };
 let ENGINE_NAMES = [];
+// Last good daemon readings. The GPU util/power/VRAM and host CPU/load lines are
+// slow physical measurements, and — unlike the engine lines — they should read as
+// continuous: a single missed /gpu or /host poll, or a snapshot that goes briefly
+// stale, holds the last real value (a flat "held" line, with the sample note
+// saying how stale it is) instead of tearing a hole in the line. This is how they
+// behaved before the 1s grid, minus the old spline's fake ramps across the gap.
+let LAST_GOOD = { gpu: null, host: null };
 // last good /engine answer per engine: if the engine itself is slow to
 // answer (long prefill) or momentarily unreachable we hold this for a few
 // seconds instead of tearing a hole in the lines
@@ -1915,10 +1922,11 @@ function sampleLive(now) {
   const t = now / 1000;
   // If the 1s grid was throttled (tab in the background — the browser slows its
   // timers) or the poll stalled, the gap since the last sample is more than a few
-  // seconds. uPlot would connect the two sides with a long diagonal "ramp" across
-  // the missing time. Break the line instead: emit this resume sample as a null
-  // gap; the next tick (1s later, once tick() has refreshed SNAP) is the first
-  // real point, so the line resumes cleanly instead of smearing.
+  // seconds. For the engine lines that would make uPlot connect the two sides with
+  // a long diagonal "ramp" across the missing time, so on a resume we null the
+  // snapshot: the engine lines break cleanly and the next tick (1s later, once
+  // tick() has refreshed SNAP) is the first real point. The daemon lines are
+  // unaffected — they hold their last good value (see below) and stay flat.
   const resume = TS.length ? (t - TS[TS.length - 1]) > 3 : false;
   TS.push(t);
   // Past the hold window the snapshot is not a measurement any more, so say so
@@ -1926,7 +1934,16 @@ function sampleLive(now) {
   // between the two real ones around it.
   const s = resume || (now - SNAP.at) / 1000 > HOLD_S
     ? { gpu: null, host: null, tel: {} } : SNAP;
-  const gpu = s.gpu, host = s.host, engTel = s.tel;
+  const engTel = s.tel;
+  // Daemon lines hold the last good reading (see LAST_GOOD): a missed /gpu or
+  // /host poll, or a briefly-stale snapshot, keeps the line flat at the last real
+  // value instead of blanking. Engine lines below stay honest — they gap when the
+  // engine has no fresh sample, because a gap there means generation actually
+  // stopped.
+  const gpu = (s.gpu && (s.gpu.cuda0 || s.gpu.igpu0)) ? s.gpu : LAST_GOOD.gpu;
+  const host = (s.host && s.host.cpu_pct != null) ? s.host : LAST_GOOD.host;
+  if (gpu && (gpu.cuda0 || gpu.igpu0)) LAST_GOOD.gpu = gpu;
+  if (host && host.cpu_pct != null) LAST_GOOD.host = host;
   const put = (n, v) => { const a = SER[n] ||= []; while (a.length < TS.length - 1) a.push(null); a.push(v == null ? null : +v); };
   put("gu_cuda0", gpu?.cuda0?.util_pct); put("gu_igpu0", gpu?.igpu0?.util_pct);
   put("gp_cuda0", gpu?.cuda0?.power_w);  put("gp_igpu0", gpu?.igpu0?.power_w);
