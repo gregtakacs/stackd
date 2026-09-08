@@ -133,12 +133,14 @@ def main() -> int:
               and b'api("/live?since="' in raw
               and b"backfillLive().then(() => tick())" in raw
               and b"if (typeof backfilling !== \"undefined\" && backfilling) return;" in raw)
-        # Engine captions (tokps/mtp/kv corners) must follow the engine with the
-        # FRESHEST data. Picking engineNames[0] pinned them to the alphabetically
-        # first engine — in a coding profile that is the mostly-idle autocomplete,
-        # so the readouts sat frozen on a stale value while the lines were live.
-        check("engine captions follow the freshest engine, not the first name",
-              b'newestIdx(SER["tok_" + n]' in raw)
+        # Engine captions (tokps/mtp/kv corners) follow the ACTIVE engine, else
+        # the one with the most real data, and name themselves when >1 engine
+        # shares the page. (engineNames[0] pinned captions to the alphabetical
+        # first — a mostly-idle autocomplete — so they read frozen or blank
+        # while the working engine's lines were live.)
+        check("engine captions follow the active/fullest engine and name it",
+              b"const isActive = n =>" in raw and b"cnt(b) - cnt(a)" in raw
+              and b"e0pre" in raw)
         # The engine card must not reflow when a generation finishes: "(live)" ->
         # "(last session)" and "context" -> "peak context · 130.4k / 131k" wrapped
         # the stat row and visibly grew the card on every session end. Equal-length

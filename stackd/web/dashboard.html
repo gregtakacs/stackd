@@ -1877,26 +1877,28 @@ function renderLive(engineNames) {
   const rnd = v => v == null ? null : Math.round(v * 10) / 10;
   const last = n => { const a = SER[n] || []; for (let i = a.length-1; i>=0; i--) if (a[i]!=null) return a[i]; return null; };
   const cap = (id, v, suf) => { const e = $(".lv-" + id); if (e) e.textContent = v==null ? "" : rnd(v) + (suf||""); };
-  // Caption engine: the one with the FRESHEST data, not the first name sorted.
-  // A multi-engine profile (e.g. coding-long + code-autocomplete) otherwise
-  // pinned every engine caption to the alphabetically-first engine — whose
-  // mostly-idle series made the tokps/mtp/kv readouts look frozen while the
-  // lines were live. Series are index-aligned to TS, so the newest non-null
-  // index wins.
-  const newestIdx = a => { for (let i = a.length - 1; i >= 0; i--) if (a[i] != null) return i; return -1; };
-  let e0 = null, e0at = -1;
-  for (const n of engineNames) {
-    const i = Math.max(newestIdx(SER["tok_" + n] || []), newestIdx(SER["kv_" + n] || []));
-    if (i > e0at) { e0at = i; e0 = n; }
-  }
-  if (!e0 && engineNames.length) e0 = engineNames[0];
+  // Caption engine: the ACTIVE engine if one is generating (that's the story
+  // the corner is telling); otherwise the one with the most real data. Index
+  // freshness cannot rank engines — feedPoint stamps every engine's sticky
+  // value at every second, so all names tie on index and a strict > silently
+  // keeps the alphabetically-first one (the original bug). And with more than
+  // one engine on the page, a bare number is ambiguous, so the name is
+  // prefixed into the caption.
+  const isActive = n => !!(SNAP.tel && SNAP.tel[n] && SNAP.tel[n].active);
+  let e0 = engineNames[0] || null;
+  if (!engineNames.some(isActive) && engineNames.length > 1) {
+    const cnt = n => ((SER["tok_" + n] || []).filter(v => v != null).length
+                    + (SER["mtp_" + n] || []).filter(v => v != null).length);
+    e0 = engineNames.slice().sort((a, b) => cnt(b) - cnt(a))[0];
+  } else for (const n of engineNames) if (isActive(n)) { e0 = n; break; }
+  const e0pre = engineNames.length > 1 && e0 ? e0 + "  " : "";
   // caption: latest (sticky) value · 10-min per-request average (idle excluded)
   const capReq = (id, series, key, suf) => {
     const e = $(".lv-" + id); if (!e) return;
     const l = last(series), a = genWinMean([e0], key, Date.now() / 1000, 600);
     const n = (GENHIST[e0] || []).length;
-    e.textContent = l == null && a == null ? ""
-      : `${rnd(l) ?? "–"}${suf} · avg ${a == null ? "–" : rnd(a) + suf}${a == null ? "" : ` (${n} pts)`}`;
+    e.textContent = l == null && a == null ? e0pre + "–"
+      : `${e0pre}${rnd(l) ?? "–"}${suf} · avg ${a == null ? "–" : rnd(a) + suf}${a == null ? "" : ` (${n} pts)`}`;
   };
   const dash = v => rnd(v) ?? "–";
   { const e = $(".lv-gpuutil");
@@ -1906,8 +1908,8 @@ function renderLive(engineNames) {
   { const e = $(".lv-vram");
     if (e) e.textContent = `cuda0 ${dash(last("gv_cuda0"))} GiB · igpu0 ${dash(last("gv_igpu0"))} GiB`; }
   { const e = $(".lv-kv"), pct = e0 ? last("kv_" + e0) : null, ct = e0 ? last("ctxt_" + e0) : null;
-    if (e) e.textContent = pct == null ? ""
-      : (ct != null ? fmtSI(ct) + " tok · " : "") + rnd(pct) + "%"; }
+    if (e) e.textContent = pct == null ? e0pre + "–"
+      : e0pre + (ct != null ? fmtSI(ct) + " tok · " : "") + rnd(pct) + "%"; }
   if (e0) { capReq("tokps", "tok_" + e0, "gen", ""); capReq("mtp", "mtp_" + e0, "mtp", "%"); }
   else { cap("tokps", null); cap("mtp", null); }
 }
