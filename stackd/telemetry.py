@@ -393,6 +393,26 @@ def _http_text(url: str, timeout: float = 1.0) -> str:
 _eng_state: dict = {}   # endpoint -> {prev, sess_start, last_sess}
 
 
+def has_session(endpoint: str) -> bool:
+    """True if this daemon process has already captured a finished generation
+    session for this engine (sticky last_sess exists in memory)."""
+    st = _eng_state.get(endpoint.rstrip("/"))
+    return bool(st and st.get("last_sess"))
+
+
+def seed_last_session(endpoint: str, sess: dict) -> None:
+    """Restore a persisted last-session snapshot after a daemon restart — so an
+    idle engine's card keeps its sticky numbers instead of showing "–" until the
+    next request. Only fills an empty slot; a session this process observed
+    itself is never overwritten."""
+    if not sess:
+        return
+    st = _eng_state.setdefault(endpoint.rstrip("/"),
+                               {"prev": None, "sess_start": None, "last_sess": {}})
+    if not st["last_sess"]:
+        st["last_sess"] = sess
+
+
 def _win_rate(a: dict | None, b: dict, tk: str, sc: str):
     """tokens/s over the window a->b, from the monotonic count/time counters."""
     if a and b and a.get(tk) is not None and b.get(tk) is not None:

@@ -671,8 +671,38 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send_json(404, {"error": {"message": f"no running stack {stack!r}"}})
         if not endpoint:
             return self._send_json(503, {"error": {"message": "no endpoint yet"}})
+        # A daemon restart wipes every "last session" cache, so the first poll
+        # per stack after a boot rehydrates them from the store's meta table
+        # (written by _capture_gen / the persist below) BEFORE the telemetry
+        # call — an idle engine then reads exactly like one that never lost its
+        # daemon. One attempt per stack per process, not per poll.
+        if stack not in _SESS_SEEDED:
+            _SESS_SEEDED.add(stack)
+            from stackd.telemetry import has_session, seed_last_session
+            if not has_session(endpoint):
+                sess = _meta_get(self.store, f"last_sess/{stack}", self.lock)
+                if sess:
+                    seed_last_session(endpoint, sess)
+            if _LAST_GEN.get(stack) is None:
+                hg = _meta_get(self.store, f"last_gen/{stack}", self.lock)
+                if hg:
+                    _LAST_GEN[stack] = hg
+            if _LAST_CTX.get(stack) is None:
+                lc = _meta_get(self.store, f"last_ctx/{stack}", self.lock)
+                if lc:
+                    _LAST_CTX[stack] = lc
         from stackd.telemetry import engine_telemetry
         tel = engine_telemetry(endpoint, tmpl)
+        # Persist the telemetry-derived sticky session (the engine-counter
+        # average; vLLM/SGLang have no proxy timings, this is their only
+        # last-session source) the moment it changes — once per session, not
+        # once per poll.
+        sv = {k: tel.get(k + "_session") for k in
+              ("gen_tok_s", "prompt_tok_s", "mtp_accept_pct")}
+        sv["ctx_peak"] = tel.get("ctx_peak_session")
+        if any(v is not None for v in sv.values()) and _SESS_WRITTEN.get(stack) != sv:
+            _SESS_WRITTEN[stack] = sv
+            _meta_set(self.store, f"last_sess/{stack}", sv, self.lock)
         if tel.get("slots") is None:   # vLLM/SGLang have no /slots — take the configured seq cap
             cap = (params.get("max_num_seqs") or params.get("parallel")
                    or _cli_val("--max-num-seqs") or _cli_val("--max-running-requests"))
@@ -923,7 +953,7 @@ class _Handler(BaseHTTPRequestHandler):
         def _on_body(buf: bytes, status: int, meta: dict | None = None) -> None:
             self._record_usage(model, rr, buf, status, embeddings=is_embeddings,
                                req_body=body)
-            _capture_gen(rr.stack, buf)
+            _capture_gen(rr.stack, buf, self.store, self.lock)
 
         self._relay(rr.endpoint.rstrip("/") + self.path, "POST",
                     json.dumps(body).encode(), streaming=streaming, on_body=_on_body,
@@ -1169,6 +1199,49 @@ _GEN_SEQ = [0]
 # reads this.
 _LAST_CTX: dict = {}
 
+# The caches above (and telemetry._eng_state's sticky `last_sess`) are in-memory,
+# so a daemon restart wiped them and every idle engine card showed "–" until the
+# next completed request. Each is therefore mirrored to the store's `meta` table
+# on write and rehydrated in _engine on the first /engine poll per stack after a
+# restart (_SESS_SEEDED marks stacks already tried, so engines that never generated
+# don't re-read meta every second). _SESS_WRITTEN remembers what was last
+# persisted per stack so the sticky session lands in meta exactly once per change
+# rather than on every idle poll.
+_SESS_WRITTEN: dict = {}
+_SESS_SEEDED = set()
+
+
+def _meta_set(store, key: str, obj: dict, lock=None) -> None:
+    """Best-effort meta upsert — the ledger must never break a response."""
+    if store is None:
+        return
+    try:
+        if lock is not None:
+            lock.acquire()
+        try:
+            store.set_meta(key, json.dumps(obj))
+        finally:
+            if lock is not None:
+                lock.release()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _meta_get(store, key: str, lock=None):
+    if store is None:
+        return None
+    try:
+        if lock is not None:
+            lock.acquire()
+        try:
+            raw = store.get_meta(key)
+        finally:
+            if lock is not None:
+                lock.release()
+        return json.loads(raw) if raw else None
+    except Exception:  # noqa: BLE001
+        return None
+
 
 def _extract_timings(buf: bytes) -> dict:
     """llama.cpp `timings` block — JSON body or the final SSE `data:` line."""
@@ -1193,7 +1266,7 @@ def _extract_timings(buf: bytes) -> dict:
     return last
 
 
-def _capture_gen(stack: str | None, buf: bytes) -> None:
+def _capture_gen(stack: str | None, buf: bytes, store=None, lock=None) -> None:
     if not stack:
         return
     tm = _extract_timings(buf)
@@ -1209,6 +1282,7 @@ def _capture_gen(stack: str | None, buf: bytes) -> None:
                 "ctx_tokens": int((u.get("prompt_tokens") or 0) + u["completion_tokens"]),
                 "at": time.time(),
             }
+            _meta_set(store, f"last_ctx/{stack}", _LAST_CTX[stack], lock)
         return
     g = round(tm.get("predicted_per_second") or 0, 1) or None
     p = round(tm.get("prompt_per_second") or 0, 1) or None
@@ -1220,6 +1294,7 @@ def _capture_gen(stack: str | None, buf: bytes) -> None:
     _GEN_SEQ[0] += 1
     _LAST_GEN[stack] = {"gen_tok_s": g, "prompt_tok_s": p, "mtp_accept_pct": mtp,
                         "ctx_tokens": ctx or None, "at": time.time(), "seq": _GEN_SEQ[0]}
+    _meta_set(store, f"last_gen/{stack}", _LAST_GEN[stack], lock)
 
 
 # --- Ollama-style timing injection for OpenAI-shaped backends (vLLM / SGLang) --
