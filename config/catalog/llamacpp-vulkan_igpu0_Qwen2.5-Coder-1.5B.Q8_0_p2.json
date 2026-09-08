@@ -12,9 +12,9 @@
   "timings": {
     "teardown_s": 0.0,
     "last_teardown_s": 0.0,
-    "n": 275,
-    "measured_at": "2026-09-08T01:28:35+00:00",
-    "load_s": 6.2,
+    "n": 285,
+    "measured_at": "2026-09-08T01:41:36+00:00",
+    "load_s": 5.1,
     "last_load_s": 5
   }
 }

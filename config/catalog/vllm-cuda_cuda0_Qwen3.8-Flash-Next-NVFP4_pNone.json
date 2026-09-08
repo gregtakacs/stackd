@@ -21,10 +21,10 @@
   },
   "notes": "DERIVED 2026-09-03 \u2014 VRAM = --gpu-memory-utilization 0.94 x 95.6 = 89.9 (vLLM pre-allocates, deterministic). RAM ~58: with VLLM_PLE_CPU_OFFLOAD, holds a ~51 GiB quantised n-gram / per-layer-expert structure resident in host RAM (read every decode step, NOT reclaimable page cache), + ~7 GiB vLLM engine/KV staging/graphs. Still source=estimate \u2014 measure live: sample the vllm-flash container's RSS + nvidia-smi next agentic session, then `stackctl bench coding --ingest`.",
   "timings": {
-    "load_s": 7.0,
+    "load_s": 5.1,
     "last_load_s": 5,
-    "n": 135,
-    "measured_at": "2026-09-08T01:28:35+00:00",
+    "n": 143,
+    "measured_at": "2026-09-08T01:41:36+00:00",
     "teardown_s": 0.0,
     "last_teardown_s": 0.0
   }
