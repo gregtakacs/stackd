@@ -116,8 +116,14 @@ def main() -> int:
               b'<option value="1000" selected>' in raw
               and b'<option value="3000" selected>' not in raw)
         check("no live line bridges a data gap", b"spanGaps: true" not in raw)
-        check("focused form control pauses polling, sample grid keeps running",
-              b"uiLocked()" in raw and b"tick._busy" in raw)
+        check("focus pauses only the DOM repaints — the poll and 1s chart feed keep running",
+              b"snapshot(gpu, host, tel)" in raw
+              and b"if (uiLocked()) return;" in raw
+              and b"if (uiLocked() || tick._busy)" not in raw)
+        check("each poll endpoint degrades independently (a slow /v1/models can't drop /gpu)",
+              b'api("/status").catch(() => null)' in raw
+              and b'api("/v1/models").catch(() => null)' in raw
+              and b'api("/gpu").catch(() => ({}))' in raw)
         # The image ladder is a grid of name/verdict/footprint/action. Reasons are
         # sentences ("host RAM 122 > 64.9 free (vulkan) (unreachable: ...)"); inline,
         # they wrapped each row into a paragraph and knocked the numbers out of

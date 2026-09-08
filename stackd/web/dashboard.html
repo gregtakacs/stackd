@@ -2514,45 +2514,35 @@ async function loadUsers() {
 }
 
 // ---- poll loop --------------------------------------------
-// True while a form control owns focus. The poll pauses then — a repaint would
-// replace the DOM under an open native popup — but the chart grid (pumpCharts)
-// keeps sampling, so the pause shows up as held values and then gaps, never as a
-// hole in the time axis for the renderer to interpolate across.
+// True while a form control owns focus. Only the DOM repaints pause then —
+// those rebuild `innerHTML` under an open native popup and yank it shut. The
+// poll itself keeps running and keeps feeding the chart grid (SNAP): uPlot
+// draws to a <canvas>, and a canvas redraw can't steal focus or close a popup.
+// If the feed paused too, the daemon-sourced lines (GPU power/VRAM, CPU/util)
+// would go stale and blank after the hold window even though no chat is
+// involved — they have nothing to do with the engine.
 function uiLocked() {
   const ae = document.activeElement;
   return !!ae && (ae.tagName === "SELECT" || ae.tagName === "INPUT" || ae.tagName === "OPTION");
 }
 async function tick() {
-  if (uiLocked() || tick._busy) return;      // no pile-up: 1 s cadence, ~10 endpoints
+  if (tick._busy) return;                  // no pile-up: 1 s cadence, ~10 endpoints
   tick._busy = true;
   try {
+    // Every endpoint degrades independently. /v1/models proxies to the engine
+    // and is the one most likely to be slow while a session is running, so it
+    // must not be able to reject the whole batch and drop the daemon-side
+    // /gpu + /host data that feeds the GPU/CPU lines. A failed endpoint blanks
+    // only its own panel; the chart snapshot still runs.
     const [st, eng, img, models, gpu, host, cleaner] = await Promise.all([
-      api("/status"), api("/engines"), api("/image"), api("/v1/models"),
-      api("/gpu"), api("/host").catch(() => ({})), api("/cleaner").catch(() => null),
+      api("/status").catch(() => null), api("/engines").catch(() => null),
+      api("/image").catch(() => null),   api("/v1/models").catch(() => null),
+      api("/gpu").catch(() => ({})),     api("/host").catch(() => ({})),
+      api("/cleaner").catch(() => null),
     ]);
-    // focus may have arrived while these were in flight — dropping the response
-    // is the point of the pause; painting it was the bug (the early return above
-    // only stopped a poll from *starting*, so an in-flight tick still yanked the
-    // refresh dropdown's popup away mid-click).
-    if (uiLocked()) return;
-    $("#topErr").classList.add("hidden");
-    renderHeader(st, cleaner);
-    // keep the profile selector's loading chips in step with reality: refresh it
-    // whenever something is warming or a switch is mid-flight, plus one trailing
-    // refresh the tick after it clears — otherwise the 15s interval leaves the
-    // pulsing "⏳ loading" chips stale for up to 15s after the engine is ready.
-    const anyWarm = !!st.switching ||
-      Object.values(st.stacks || {}).some(v => v.state === "warming") ||
-      (st.image && st.image.state === "warming");
-    if (anyWarm || tick._wasWarm) loadProfiles();
-    tick._wasWarm = anyWarm;
-    renderGauges(gpu, host);
-    renderMap(st, eng, img, gpu, host);
-    renderImage(img);
-    renderCatalog(models, st.active_profile);
-
-    const names = Object.keys(st.stacks || {}).sort();
-    engineSkeleton(names);
+    // Engine names for the telemetry loop; if /status missed, fall back to the
+    // last known set so the engine chart lines still get fed from LAST_TEL.
+    const names = st ? Object.keys(st.stacks || {}).sort() : ENGINE_NAMES.slice();
     const tel = {};
     await Promise.all(names.map(async n => {
       // /engine reaches the engine itself, so during a long prefill it can be
@@ -2570,7 +2560,6 @@ async function tick() {
       } catch (e) { /* deadline or unreachable — fall back below */ }
       if (!fresh)
         tel[n] = (LAST_TEL[n] && Date.now() - (LAST_TEL_AT[n] || 0) < 10000) ? LAST_TEL[n] : null;
-      fillEngine(n, st.stacks[n], tel[n]);
       // one data point per COMPLETED request — the only real "generation happened"
       // measurement; the rolling avg is computed from these, never from idle polls.
       // Fresh samples only — held-stale telemetry must not re-sample the same
@@ -2591,11 +2580,39 @@ async function tick() {
       if (GENHIST[n]) GENHIST[n] = GENHIST[n].filter(p => p.t >= cut);
     }));
 
-    // Feed the sample grid; the 1 s pump (not this poll) owns the time axis, so a
-    // slow or skipped poll can never widen the spacing between chart points.
+    // Feed the sample grid FIRST and unconditionally — even while a field is
+    // focused. This is what keeps the daemon-sourced GPU/CPU/power/VRAM lines
+    // continuous; the 1 s pump (not this poll) owns the time axis, so a slow
+    // or skipped poll can never widen the spacing between chart points.
     ENGINE_NAMES = names;
     snapshot(gpu, host, tel);
     pumpCharts();
+
+    // Only here do we pause: the DOM repaints. A field owns focus, so skip
+    // rebuilding the header/gauges/map/catalog/engine cards — that was the
+    // repaint that yanked the open dropdown's popup away mid-click. The charts
+    // above already got their point, so nothing blanks.
+    if (uiLocked()) return;
+    $("#topErr").classList.add("hidden");
+    if (st) {
+      renderHeader(st, cleaner);
+      // keep the profile selector's loading chips in step with reality: refresh
+      // it whenever something is warming or a switch is mid-flight, plus one
+      // trailing refresh the tick after it clears — otherwise the 15s interval
+      // leaves the pulsing "⏳ loading" chips stale for up to 15s after the
+      // engine is ready.
+      const anyWarm = !!st.switching ||
+        Object.values(st.stacks || {}).some(v => v.state === "warming") ||
+        (st.image && st.image.state === "warming");
+      if (anyWarm || tick._wasWarm) loadProfiles();
+      tick._wasWarm = anyWarm;
+      engineSkeleton(names);
+      for (const n of names) fillEngine(n, st.stacks[n], tel[n]);
+    }
+    renderGauges(gpu, host);
+    if (st && eng && img) renderMap(st, eng, img, gpu, host);
+    if (img) renderImage(img);
+    if (st && models) renderCatalog(models, st.active_profile);
 
     // events are fire-and-forget: awaiting them used to extend the tick (and
     // with it `tick._busy`) AFTER the snapshot was already fed — one slow
