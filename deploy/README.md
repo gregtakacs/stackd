@@ -239,7 +239,14 @@ published ports — those shape the compose file itself, not just stackd's confi
   ```
 
   then `sudo update-grub` and reboot; `dmesg | grep 'GTT memory ready'` should show
-  the new size and the clamp flag disappears. On kernels where TTM is split out
+  the new size and the clamp flag disappears. **The reboot is not optional** —
+  `/sys/module/ttm/parameters/pages_limit` is mode `0644 root` and accepts a write
+  at runtime (it reads back exactly what you wrote), but `mem_info_gtt_total` does
+  not move: the GTT zone is sized once, at `amdgpu_ttm_init`, from the value present
+  at module load. Verified on this box — wrote 32505856, read it back, GTT stayed at
+  66812620800 (62.2 GiB), so the daemon kept clamping. Recovery-mode entries are
+  built from `GRUB_CMDLINE_LINUX` (not `..._DEFAULT`), so if you want the widened
+  window in recovery too, put the args in both. On kernels where TTM is split out
   (6.17+), add the `amdttm.*` equivalents — plain `ttm.*` is inert there, and vice
   versa: this box's `7.0.0` kernel has no `amdttm` module at all. **Widen
   `HOST_RESERVE_GIB` in the same change** — with the aperture open the reserve is
