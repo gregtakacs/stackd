@@ -517,6 +517,28 @@ def t_reload_config() -> None:
     check("reload reports the change", any("pool host_unified changed" in c for c in changed))
     check("rec.cfg is the new cfg", m.rec.cfg is m.cfg)
 
+    # A catalog-only change — exactly what `stackctl bench --ingest` writes — has
+    # to be reported. The curves are not config/*.yaml, and answering "no changes"
+    # straight after an ingest reads as though the ingest had failed.
+    import json as _json
+    ck = lambda n, c, i=None: check(n if c else n + f"   [{i}]", c)
+    key = "vllm-cuda|cuda0|ReloadTest|pNone"
+    curve = d / "catalog" / "reloadtest.json"
+    curve.write_text(_json.dumps({
+        "key": key, "model": "ReloadTest", "engine": "vllm-cuda", "device": "cuda0",
+        "source": "measured", "measured_at": "2026-01-01",
+        "points": {"vram": [[262144.0, 42.0]], "ram": [[262144.0, 4.0]]},
+        "notes": "reload probe", "timings": {}}))
+    changed = m.reload_config()
+    ck("a catalog-only edit is reported, not swallowed as 'no changes'",
+       any("catalog refreshed" in c for c in changed), changed)
+    ck("and the fresh curve is the live one",
+       m.catalog.curves[key].estimate(262144)[0] == 42.0, m.catalog.curves[key])
+    changed = m.reload_config()                       # nothing touched since
+    ck("an untouched catalog is not re-reported",
+       not any("catalog" in c for c in changed), changed)
+    curve.unlink()
+
     pf.write_text("pools:\n  cuda_vram:\n    total_gib: not-a-number\n")   # broken
     try:
         m.reload_config()
@@ -613,7 +635,7 @@ def t_image_swap() -> None:
     m2 = mgr(FakeRunner(ready_after=1))
     m2.use("chat", now=0)
     ready_all(m2)
-    m2.set_image(model="flux2-klein", now=5)          # resident := klein
+    m2.set_image(model="flux2-klein", backend="vulkan", now=5)          # resident := klein
     ready_all(m2, now_start=5)
     m2.cfg.media["image"].prefer[0].footprint_gib["cuda"] = 999.0
     r = m2.set_image(model="flux2-dev-turbo", now=30)
@@ -673,6 +695,114 @@ def t_image_host_ram_guard() -> None:
     check("swap succeeds via the one affordable backend",
           r["ok"] and r["active_model"] == "flux2-klein" and r.get("backend") == "vulkan")
 
+
+def t_image_teardown_credit_and_refusals() -> None:
+    """Two fixes from the 2026-09-08 flux2-dev-turbo investigation.
+
+    (a) Teardown credit: a swap onto a DIFFERENT container destroys the resident
+    image model first, so its host RAM must not count against the candidate —
+    refusing over memory this very swap frees made "load the bigger model"
+    unsable whenever any smaller model was resident. A SAME-backend swap only
+    relabels the slot (ComfyUI keeps the old checkpoint cached) and earns none.
+    (b) The refusal note must name the wall actually hit. The old one printed
+    min(footprint_gib) — a CUDA *VRAM* number — for a vulkan *host-RAM* refusal."""
+    from stackd.solver import headroom
+
+    m = mgr(FakeRunner(ready_after=1))
+    m.use("chat", now=0)
+    ready_all(m)
+    m.set_image(model="flux2-klein", backend="vulkan", now=5)
+    ready_all(m, now_start=5)
+    tier = m.cfg.media["image"]
+    kl = next(l for l in tier.prefer if l.active_model == "flux2-klein")
+    dt = next(l for l in tier.prefer if l.active_model == "flux2-dev-turbo")
+    check("klein resident on vulkan", m.state.image.active_model == "flux2-klein"
+          and m.state.image.backend == "vulkan")
+
+    # dev-turbo reachable on either backend, needing 60 host RAM; only 30 free.
+    dt.backends = ["cuda", "vulkan"]
+    dt.footprint_gib = {"cuda": 8.0, "vulkan": 8.0}
+    dt.host_ram_gib = {"cuda": 60.0, "vulkan": 60.0}
+    kl.host_ram_gib = {"cuda": 42.0, "vulkan": 42.0}
+    hr = headroom(m.cfg, "chat", m.catalog, reserve_gib=tier.margin_gib)
+    reasons: list[str] = []
+    p = m.rec._pick_image(tier, hr, want_model="flux2-dev-turbo", host_ram_avail=30.0,
+                          reasons=reasons)
+    check("no credit -> refused on both backends", p is None)
+    check("refusal names the host-RAM wall, per backend",
+          len(reasons) == 2 and all("host RAM 60 > 30.0 free" in r for r in reasons))
+
+    p = m.rec._pick_image(tier, hr, want_model="flux2-dev-turbo", host_ram_avail=30.0,
+                          freed_gib=42.0, freed_backend="vulkan")
+    check("cross-backend credit makes the pick fit",
+          p is not None and p[0] == "cuda0" and p[2].active_model == "flux2-dev-turbo")
+    p = m.rec._pick_image(tier, hr, want_model="flux2-dev-turbo", host_ram_avail=30.0,
+                          freed_gib=42.0, freed_backend="vulkan", want_backend="vulkan")
+    check("same-backend swap earns NO credit (relabel frees nothing)", p is None)
+
+    # a VRAM wall gets named with the device and its real headroom, too
+    dt.footprint_gib, dt.host_ram_gib = {"cuda": 500.0}, {}
+    reasons = []
+    m.rec._pick_image(tier, hr, want_model="flux2-dev-turbo", host_ram_avail=1e9,
+                      reasons=reasons)
+    check("VRAM refusal names device + headroom",
+          reasons and f"VRAM 500 > {hr['cuda0']:.1f} free on cuda0" in reasons[0])
+
+    # end-to-end through set_image(): same numbers, credit applied internally
+    m2 = mgr(FakeRunner(ready_after=1))
+    m2.use("chat", now=0)
+    ready_all(m2)
+    m2.set_image(model="flux2-klein", backend="vulkan", now=5)
+    ready_all(m2, now_start=5)
+    m2.rec._real_host_ram_avail = lambda tier_, profile_: 30.0   # deterministic
+    kl2 = next(l for l in m2.cfg.media["image"].prefer if l.active_model == "flux2-klein")
+    dt2 = next(l for l in m2.cfg.media["image"].prefer if l.active_model == "flux2-dev-turbo")
+    dt2.backends, dt2.footprint_gib, dt2.host_ram_gib = ["cuda"], {"cuda": 8.0}, {"cuda": 90.0}
+    kl2.host_ram_gib = {"cuda": 65.0, "vulkan": 65.0}
+    r = m2.set_image(model="flux2-dev-turbo", now=20)
+    check("swap succeeds: the resident model's RAM is credited, not the blocker",
+          r["ok"] and r["active_model"] == "flux2-dev-turbo" and r.get("backend") == "cuda")
+    kl2.host_ram_gib = {}                       # nothing to credit now
+    r = m2.set_image(model="flux2-klein", now=30)
+    ready_all(m2, now_start=30)
+    r = m2.set_image(model="flux2-dev-turbo", now=40)
+    check("without credit the same swap is refused", r["ok"] is not True
+          or r.get("downgraded_from") == "flux2-dev-turbo")
+
+    # the downgrade note quotes the refusing axis, never an unrelated footprint
+    m3 = mgr(FakeRunner(ready_after=1))
+    m3.use("chat", now=0)
+    ready_all(m3)
+    m3.rec._real_host_ram_avail = lambda tier_, profile_: 30.0
+    m3.set_image(model="flux2-klein", backend="vulkan", now=5)   # resident; owes no credit
+    ready_all(m3, now_start=5)
+    dt3 = next(l for l in m3.cfg.media["image"].prefer if l.active_model == "flux2-dev-turbo")
+    dt3.backends, dt3.footprint_gib = ["cuda", "vulkan"], {"cuda": 8.0, "vulkan": 8.0}
+    dt3.host_ram_gib = {"cuda": 90.0, "vulkan": 90.0}
+    r = m3.set_image(model="flux2-dev-turbo", now=10)
+    note = r.get("note") or ""
+    check("downgrade still serves klein", r["ok"] and r["active_model"] == "flux2-klein")
+    check("note names the host-RAM wall", "did not fit" in note and "host RAM 90" in note)
+    check("note no longer quotes the unrelated VRAM footprint", "needs ~" not in note)
+
+    # and when NOTHING fits, the 409-style error leads with the REFUSED model's
+    # own wall. Requesting ideogram4 (last in the ladder) while the two ahead of
+    # it are unfit on VRAM: wanted_reasons => host-RAM first; a leaked ladder
+    # scan => VRAM first.
+    dt3.footprint_gib = {k: 999.0 for k in dt3.footprint_gib}
+    dt3.host_ram_gib = {}
+    kl3 = next(l for l in m3.cfg.media["image"].prefer if l.active_model == "flux2-klein")
+    kl3.footprint_gib = {k: 999.0 for k in kl3.footprint_gib}
+    kl3.host_ram_gib = {}
+    id4 = next(l for l in m3.cfg.media["image"].prefer if l.active_model == "ideogram4")
+    id4.footprint_gib, id4.host_ram_gib = {"cuda": 8.0}, {"cuda": 90.0}
+    r = m3.set_image(model="ideogram4", now=20)
+    err = r.get("error") or ""
+    det = err.split(" — ", 1)[-1]        # the appended detail, not the boilerplate
+    check("total refusal leads with the refused model's own wall",
+          r["ok"] is False and "fits the headroom" in err
+          and "host RAM 90" in det
+          and (det.index("host RAM") < det.index("VRAM") if "VRAM" in det else True))
 
 def t_image_unsafe_bench_bypass() -> None:
     """`backend`/`unsafe` on swap_image() — the deliberate-measurement escape
@@ -800,6 +930,7 @@ def main() -> int:
         t_image_tier_no_headroom,
         t_image_swap,
         t_image_host_ram_guard,
+        t_image_teardown_credit_and_refusals,
         t_image_unsafe_bench_bypass,
         t_image_none_survives_pin,
         t_reload_config,

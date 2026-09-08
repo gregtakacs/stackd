@@ -55,10 +55,10 @@
     border-radius:6px; padding:5px 9px; margin-top:6px; }
 
   /* placement map */
-  #mapLanes { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:14px; }
+  #mapLanes { display:grid; grid-template-columns:repeat(auto-fit,minmax(330px,1fr)); gap:14px; }
   .lane { background:var(--bg); border:1px solid var(--border); border-radius:9px; padding:12px;
-    display:flex; gap:14px; }
-  .lane .bar { width:56px; flex-shrink:0; }
+    display:flex; gap:12px; }
+  .lane .bar { width:58px; flex-shrink:0; }
   .lane-body { flex:1; min-width:0; }
   .lane-body h3 { font-size:.9rem; font-weight:600; }
   .lane-body .sub { font-size:.74rem; color:var(--dim); margin:2px 0 6px; }
@@ -66,14 +66,15 @@
   .lane-stat b { color:var(--text); font-variant-numeric:tabular-nums; }
   .lane-real { font-size:.76rem; margin-top:1px; }
   .lane-real .over { color:var(--orange); }
-  .seglist { margin-top:9px; display:flex; flex-direction:column; gap:3px; font-size:.78rem; }
-  .seg-row { display:flex; align-items:center; gap:7px; }
-  .seg-row .sw { width:9px; height:9px; border-radius:2px; flex-shrink:0; }
-  .seg-row .sw.elastic { background-image:repeating-linear-gradient(45deg,#0000,#0000 3px,#ffffff40 3px,#ffffff40 6px); }
-  .seg-row .nm { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .seg-row .gb { font-variant-numeric:tabular-nums; color:var(--text); }
-  .seg-row .tg { font-size:.66rem; color:var(--dim); flex-shrink:0; }
-  .seg-row.free-row { color:var(--dim); }
+  /* allocation-table swatches — same classes the bar segments wear, so a stripe in
+     the table means what it means in the bar. NO ring on the GTT swatch: a 2 px
+     inset ring inside a 9 px square is mostly ring, and it swallowed the tenant's
+     real colour. The "iGPU GTT" suffix + the group divider say it well enough. */
+  .alloc td.sw i.elastic, .alloc td.sw i.cache {
+    background-image:repeating-linear-gradient(45deg,#0000,#0000 3px,#ffffff40 3px,#ffffff40 6px); }
+  .alloc td.sw i.warming { animation:pulse 1.4s infinite; }
+  .alloc td.sw i.crashed { outline:1px solid var(--red); }
+  .alloc td.n.over { color:var(--orange); }
   .lane-note { font-size:.72rem; color:var(--dim); margin-top:7px; line-height:1.5; }
   .bar { position:relative; height:260px; border-radius:7px; background:var(--surface2);
     border:1px solid var(--border); overflow:hidden; display:flex; flex-direction:column-reverse; }
@@ -86,19 +87,18 @@
     opacity:.7; }
   .seg.warming { animation:pulse 1.4s infinite; }
   .seg.crashed { outline:2px solid var(--red); outline-offset:-2px; }
-  .seg-row .sw.warming { animation:pulse 1.4s infinite; }
-  .seg-row .sw.crashed { outline:1px solid var(--red); }
-  .seg-row .sw.cache { background-image:repeating-linear-gradient(45deg,#0000,#0000 3px,#ffffff40 3px,#ffffff40 6px); }
   .bar .free { flex:1; }
   /* reserved (budget) twin bar in the unified-RAM lane — narrower, sits beside the measured bar */
   .lane .bar-budget { width:26px; opacity:.9; }
   .bar-budget.over { border-color:var(--red); box-shadow:inset 0 0 0 1px var(--red); }
   .marker { position:absolute; left:-4px; right:-4px; border-top:2px dashed var(--accent); z-index:5; transition:bottom .4s ease; }
-  /* label sits just ABOVE the dashed line by default, LEFT-anchored inside the bar,
-     never wrapping. When the marker is near the top it flips to just BELOW the line
-     (via .marker.label-below, set in laneLive) so the bar's overflow:hidden can't clip it. */
-  .marker span { position:absolute; left:2px; top:-13px; font-size:.62rem; line-height:1.1;
-    color:var(--accent); background:var(--bg); padding:0 3px; white-space:nowrap; border-radius:3px; }
+  /* two lines: WHAT the number is, then the number with its unit — a bare figure
+     on a bar is not a reading. Stays inside the bar (overflow:hidden). */
+  .marker span { position:absolute; left:2px; top:-27px; font-size:.58rem; line-height:1.2;
+    display:flex; flex-direction:column; color:var(--accent); background:var(--bg);
+    padding:0 3px; white-space:nowrap; border-radius:3px; }
+  .marker span i { font-style:normal; }
+  .marker span b { color:var(--text); font-variant-numeric:tabular-nums; font-weight:600; }
   .marker.label-below span { top:3px; }
   /* Static budget lines in the unified-RAM lane, distinct from .marker (which
      laneLive() owns as the per-tick OS-usage line):
@@ -107,8 +107,15 @@
        .bracket   a hollow left-edge bracket spanning 0 -> what stackd actually
                   books to igpu0 (demand + headroom), i.e. the real carve-out. */
   .boundary { position:absolute; left:-4px; right:-4px; border-top:2px dotted var(--dim); z-index:4; }
-  .boundary span { position:absolute; left:2px; top:-12px; font-size:.6rem; line-height:1.1;
-    color:var(--dim); background:var(--bg); padding:0 3px; white-space:nowrap; border-radius:3px; }
+  /* same two-line shape as .marker: the word, then the number with its unit. The
+     label is inside a clipped 82px bar, so anything longer has to live in the
+     tooltip and the lane's own GTT line — "(driver window)" used to be cut at the
+     "d" and read as nothing. */
+  .boundary span { position:absolute; left:2px; top:-25px; font-size:.58rem; line-height:1.2;
+    display:flex; flex-direction:column; color:var(--dim); background:var(--bg);
+    padding:0 3px; white-space:nowrap; border-radius:3px; }
+  .boundary span b { color:var(--text); font-variant-numeric:tabular-nums; font-weight:600; }
+  .boundary span i { font-style:normal; }
   .boundary.label-below span { top:3px; }
   .bracket { position:absolute; left:2px; width:8px; border:1px solid var(--accent);
     border-right:none; border-radius:3px 0 0 3px; z-index:4; pointer-events:none; }
@@ -116,7 +123,40 @@
      LPDDR5X as every other segment in this lane. Keeps the model's own colour and
      adds a left accent stripe rather than replacing it. */
   .seg.gtt { box-shadow: inset 3px 0 0 var(--accent); }
-  .seg-row .sw.gtt { box-shadow: inset 0 0 0 2px var(--accent); }
+  /* the seam between the two memory blocks. The bar stacks BASE-UP (column-reverse),
+     so a segment that opens a new group carries the line on its BOTTOM edge — that
+     is the face touching the group below it, and the same line the table draws above
+     its own boundary row. */
+  .seg.grp-start { border-bottom:2px solid var(--accent-dim); }
+  /* allocation table — one row per tenant slice. Numbers are unit-less (the header
+     carries "live GiB" / "plan GiB") so the two columns are the same narrow width
+     and the lane fits one grid track like every other lane. */
+  .alloc { width:100%; border-collapse:collapse; font-size:.72rem; margin-top:8px;
+    table-layout:fixed; }
+  .alloc th { text-align:right; font-size:.6rem; font-weight:600; color:var(--dim);
+    text-transform:uppercase; letter-spacing:.03em; padding:0 0 3px; }
+  .alloc th.al { text-align:left; }
+  .alloc td { padding:2px 0; border-top:1px solid var(--border); vertical-align:top; }
+  /* one divider between the GPU block and the CPU block, in both bar and table —
+     accent-tinted and 2px, not the hairline the row borders use */
+  .alloc tr.grp-start td { border-top:2px solid var(--accent-dim); padding-top:5px; }
+  .alloc td.sw { width:11px; padding:3px 0 0; }
+  .alloc td.sw i { display:block; width:9px; height:9px; border-radius:2px; }
+  .alloc td.al { color:var(--text); }
+  .alloc td.al small { color:var(--dim); font-size:.9em; }
+  .alloc td.n { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap;
+    width:3.4em; color:var(--text); }
+  .alloc td.n.live { color:var(--green); }
+  .alloc td.nt { font-size:.63rem; color:var(--dim); text-align:left; width:33%;
+    padding-left:7px !important; }
+  @media (max-width:760px){ .alloc td.nt { display:none; } .alloc th:last-child { display:none; } }
+  .alloc tr.sum td { border-top:2px solid var(--border); font-weight:600; }
+  .alloc tr.sum td.n.live { color:var(--green); }
+  .alloc tr.dim td { color:var(--dim); }
+  .alloc tr.dim td.al { color:var(--dim); }
+  /* rows paid for out of one allowance, and their subtotal */
+  .alloc tr.sumgrp td { border-top:1px solid var(--border); }
+  .alloc tr.sumgrp td.al, .alloc tr.sumgrp td.n { color:var(--text); font-weight:600; }
   .lane-gtt { font-size:.72rem; color:var(--dim); margin-top:2px; }
   .lane-gtt b { color:var(--text); font-variant-numeric:tabular-nums; }
   .ghost { font-size:.76rem; color:var(--dim); border:1px dashed var(--border); border-radius:6px; padding:4px 8px; margin-top:6px; display:inline-block; }
@@ -505,17 +545,86 @@ const profileColor = n => `hsl(${hue("profile∷" + n)} 50% 52%)`;
 function segColor(s) {
   return s.color || (s.cls === "resv" ? "#2a2f3d" : `hsl(${hue(s.label)} 55% 62%)`);
 }
+// The allocation table: one row per memory slice, with the LIVE reading and the
+// PLANNED figure in fixed-width columns so they read against each other, and a
+// short note beside each — previously the notes were a tooltip and the numbers
+// were flexbox-spaced, which aligned nothing. Rows come base-up, the same order
+// the bar stacks in, so the table and the bar share a reading direction.
+// Columns are dropped when a lane has no such figure (cuda0 has no measurement
+// per model — nvidia-smi only gives the lane total).
+function allocRow(r, hasLive, grpStart) {
+  const tr = el("tr", (grpStart ? "grp-start " : "")
+    + (r.sum ? "sumgrp " : "")
+    + (hasLive && !(r.live > 0.02) ? "dim" : ""));
+  const td0 = el("td", "sw"), i = el("i", r.cls || null);
+  i.style.background = segColor(r);
+  td0.append(i);
+  const td1 = el("td", "al");
+  td1.append(document.createTextNode((r.parent ? "↳ " : "") + r.label));
+  if (r.part) td1.append(el("small", null, " " + r.part));
+  // Numbers carry no unit: it is in the column header, so every cell is the same
+  // few characters wide and the two columns line up as columns should.
+  const lvc = el("td", "n live gb" + (r.over ? " over" : ""), r.live > 0.02 ? rnd1(r.live) : "–");
+  const pln = el("td", "n gb", r.plan != null ? rnd1(r.plan) : "–");
+  const nt = el("td", "nt", r.sub || "");
+  tr.append(td0, td1, lvc, pln, nt);
+  tr.title = `${r.label}${r.part ? " · " + r.part : ""}: ${r.sub || "no note"}`;
+  return tr;
+}
+function allocTable(o) {
+  const hasLive = !!o.live;
+  const t = el("table", "alloc");
+  const head = el("tr");
+  head.append(el("th", null, ""), el("th", "al", o.labelHead || "allocation"));
+  if (o.live) head.append(el("th", null, o.live));
+  if (o.plan) head.append(el("th", null, o.plan));
+  head.append(el("th", "al", "notes"));
+  const thead = el("thead"); thead.append(head);
+  const tbody = el("tbody", "alloc-body");
+  // The bar is drawn BASE-UP — rows[0] is the segment resting on the floor — so the
+  // table reads in the OPPOSITE order: its first row is the bar's topmost segment.
+  // Each change of kind then gets its divider as the top border of the row sitting
+  // below the boundary, which is the same line the bar draws at that height.
+  const disp = (o.rows || []).slice().reverse();
+  let prev = null;
+  for (const r of disp) {
+    tbody.append(allocRow(r, hasLive, prev != null && !!r.kind && r.kind !== prev));
+    prev = r.kind || prev;
+  }
+  // "in RAM now" is the committed stack: the reclaimable cache band sits above the
+  // OS-used line precisely because it is NOT committed, so it is excluded here and
+  // shown in its own row. A group subtotal is skipped on the LIVE axis (its parts
+  // are already separate rows) but counted on the PLAN axis (the allowance lives
+  // only on the subtotal, not on the parts).
+  const sum = (k) => (o.rows || []).filter(r => r.kind !== "cache" && !(r.sum && k === "live"))
+    .reduce((a, r) => a + (r[k] > 0.02 ? r[k] : 0), 0);
+  const tot = el("tr", "sum"), tds = [el("td", "sw"), el("td", "al", o.sumLabel)];
+  if (o.live) tds.push(el("td", "n live", rnd1(sum("live"))));
+  if (o.plan) tds.push(el("td", "n", rnd1(sum("plan"))));
+  tds.push(el("td", "nt", o.sumNote || `of ${fmtGib(o.limit)}`));
+  tot.append(...tds);
+  const free = el("tr", "dim free-row"), fds = [el("td", "sw"), el("td", "al", "free")];
+  if (o.live) fds.push(el("td", "n live gb", ""));
+  if (o.plan) fds.push(el("td", "n gb", ""));
+  fds.push(el("td", "nt", o.freeNote || "unused"));
+  free.append(...fds);
+  tbody.append(tot, free);
+  t.append(thead, tbody);
+  return t;
+}
 function laneEl(o) {
   const lane = el("div", "lane"); lane.dataset.name = o.name;
   lane.dataset.budgeted = o.budgeted ?? 0;
   lane.dataset.limit = o.limit;               // shared by hostRamRepaint()'s per-tick rescale
   lane.dataset.realLabel = o.realLabel || "actual";
   const bar = el("div", "bar");
-  let used = 0;
+  let used = 0, prevKind = null;
   for (const s of (o.segs || [])) {
     if (!s.gib || s.gib <= 0.02) continue;
     used += s.gib;
-    const d = el("div", "seg" + (s.cls ? " " + s.cls : ""));
+    const d = el("div", "seg" + (s.cls ? " " + s.cls : "")
+      + (s.kind && prevKind && prevKind !== s.kind ? " grp-start" : ""));
+    prevKind = s.kind || prevKind;
     d.style.height = Math.max(0.4, (s.gib / o.limit) * 100) + "%";
     d.style.background = segColor(s);
     d.title = `${s.label} — ${fmtGib(s.gib)}${s.tag ? " (" + s.tag + ")" : ""}`;
@@ -532,7 +641,10 @@ function laneEl(o) {
     const b = el("div", "boundary");
     const bpct = o.boundary.gib / o.limit;
     b.style.bottom = (bpct * 100) + "%";
-    b.append(el("span", null, o.boundary.label || ""));
+    const bs = el("span");
+    bs.append(el("i", null, o.boundary.name || "GTT ceiling"),
+              el("b", null, fmtGib(o.boundary.gib)));
+    b.append(bs);
     if (bpct > 0.8) b.classList.add("label-below");   // don't let .bar clip it
     bar.append(b);
     lane.dataset.gttCeiling = o.boundary.gib;
@@ -552,37 +664,32 @@ function laneEl(o) {
   if (o.sub) body.append(el("div", "sub", o.sub));
   const bud = o.budgeted ?? used;
   lane.dataset.budgeted = bud;
-  const st1 = el("div", "lane-stat lane-bud");
-  st1.innerHTML = `${o.budLabel || "budgeted"} <b>${fmtGib(o.budShown ?? bud)}</b> / ${fmtGib(o.limit)}`;
-  body.append(st1);
-  if (o.altStat) { const a = el("div", "lane-stat lane-alt muted"); a.innerHTML = o.altStat; body.append(a); }
+  // A lane that carries a row list shows its totals in the table's Σ row instead
+  // of a stat line above it — the same number twice, 8 px apart, is noise.
+  if (!o.rows && !o.noStat) {
+    const st1 = el("div", "lane-stat lane-bud");
+    st1.innerHTML = `${o.budLabel || "budgeted"} <b>${fmtGib(o.budShown ?? bud)}</b> / ${fmtGib(o.limit)}`;
+    body.append(st1);
+    if (o.altStat) { const a = el("div", "lane-stat lane-alt muted"); a.innerHTML = o.altStat; body.append(a); }
+  }
   // .lane-real is refreshed every tick by laneLive() — always render the slot
   body.append(el("div", "lane-real muted"));
   // .lane-gtt is refreshed every tick by laneGtt() — only rendered when the box
   // has an igpu0 to talk about (see renderMap).
   if (o.gtt) { const g = el("div", "lane-gtt"); body.append(g); }
-  // The legend MIRRORS the bar. .bar is flex-direction:column-reverse, so segs[0]
-  // is the BASE of the stack and the free space is at the top; reading this list
-  // top-to-bottom therefore walks the bar top-to-bottom (free, then the topmost
-  // segment, … down to the base) instead of the reverse of it.
-  const rows = [];
-  for (const s of (o.segs || [])) {
-    if (!s.gib || s.gib <= 0.02) continue;
-    const row = el("div", "seg-row");
-    const sw = el("span", "sw" + (s.cls ? " " + s.cls : "")); sw.style.background = segColor(s);
-    row.append(sw, el("span", "nm", s.label), el("span", "gb", fmtGib(s.gib)));
-    if (s.tag) row.append(el("span", "tg", s.tag));
-    else if (s.cls === "warming" || s.cls === "crashed") row.append(el("span", "tg", s.cls));
-    rows.push(row);
-  }
-  const sl = el("div", "seglist");
-  const fr = el("div", "seg-row free-row");
-  fr.append(el("span", "sw"), el("span", "nm", "free"),
-            el("span", "gb", fmtGib(Math.max(0, o.limit - used))));
-  sl.append(fr);                                   // free sits at the top of the bar
-  rows.slice().reverse().forEach(r => sl.append(r));
-  body.append(sl);
-  if (o.note) body.append(el("div", "lane-note", o.note));
+  // The allocation table. Measured rows are refreshed every tick by
+  // hostRamRepaint(); other lanes are budget-only (nvidia-smi gives a lane total,
+  // not a per-model split), so they carry a single column.
+  body.append(allocTable({
+    rows: o.rows || (o.segs || []).filter(s => s.gib > 0.02).map(s => ({
+      label: s.label, part: "", color: s.color, cls: s.cls, live: null, plan: s.gib,
+      sub: s.tag || (s.cls === "resv" ? "reservation" : "") })),
+    live: o.rows ? "live GiB" : null, plan: o.rows ? "plan GiB" : "budget GiB",
+    sumLabel: o.sumLabel || (o.rows ? "in RAM now" : "reserved"),
+    sumNote: o.sumNote, limit: o.limit,
+    freeNote: o.rows ? "reclaimable cache + unused" : "unused",
+  }));
+  body.append(el("div", "lane-note", o.note));
   lane.append(body);
   return lane;
 }
@@ -596,10 +703,13 @@ function laneLive(lane, val) {   // per-tick: real-usage marker + the "real" hea
            const pct = (val / lim) * 100;
            m.style.bottom = pct + "%";
            m.classList.toggle("label-below", pct > 80);   // flip label under the line near the top
-           // bare number only — it must fit inside the 56px bar (overflow:hidden);
-           // the unit + full "OS used" readout is on the lane-real line in the body.
+           // Two lines: what the number is, then the number and its unit. A bare
+           // figure on a bar is not a reading.
            m.innerHTML = "";
-           m.append(el("span", null, (Math.round(val * 10) / 10).toLocaleString())); }
+           const ms = el("span");
+           ms.append(el("i", null, lane.dataset.realLabel || "actual"),
+                     el("b", null, fmtGib(val)));
+           m.append(ms); }
   }
   const r = lane.querySelector(".lane-real");
   if (r && val != null) {
@@ -679,23 +789,35 @@ function hostRamSegs(host, st, gpu) {
     engAnon += anon;
     engShmem += shm;
     const g = !!extra.gtt;
-    const cls = (extra.cls || "") + (g ? " gtt" : "");
+    // The GTT stripe means "driver pages". It belongs on the tenant's GTT row and
+    // NOWHERE else — the same tenant's process RSS is ordinary CPU-side memory and
+    // wearing the stripe there too (as this used to) made a CPU allocation look
+    // like GPU memory. The GTT row stamps itself, at the point it is built.
+    const cls = extra.cls || "";
     if (!g) {
-      engSegs.push({ label: label + " · engine RSS", gib: anon, tag: "measured",
-                     groupGib: grp, budget: extra.budget, color: extra.color, cls });
+      // Shmem below the drawing threshold is folded into the RSS row rather than
+      // dropped: it is part of what that process holds, and leaving it out made
+      // the lane's stack come up short against "OS used" by exactly that much.
+      engSegs.push({ label: label + " · engine RSS", nm: label,
+                     gib: anon + (shm > 0.3 ? 0 : shm),
+                     mix: shm > 0.02 && shm <= 0.3 ? shm : 0,
+                     tag: "measured", groupGib: grp, budget: extra.budget,
+                     color: extra.color, cls });
       if (shm > 0.3)
-        engSegs.push({ label: label + " · KV / PLE cache (shmem)", gib: shm,
-                       color: extra.color, cls, tag: "shmem · not reclaimable" });
+        engSegs.push({ label: label + " · KV / PLE cache (shmem)", nm: label, gib: shm,
+                       color: extra.color, cls, sh: 1, tag: "shmem · not reclaimable" });
       return;
     }
     const f = famOf(label, extra.color, cls, extra.budget, extra.cls === "warming");
     f.rss += grp;
     if (anon > 0.02)
-      f.rssSegs.push({ label: label + " · host RSS", gib: anon, color: extra.color, cls,
+      f.rssSegs.push({ label: label + " · host RSS", gib: anon + (shm > 0.3 ? 0 : shm),
+                       mix: shm > 0.02 && shm <= 0.3 ? shm : 0,
+                       color: extra.color, cls, sh: 0,
                        tag: "cgroup anon · additional to its GTT slice" });
     if (shm > 0.3)
       f.rssSegs.push({ label: label + " · KV / PLE cache (shmem)", gib: shm,
-                       color: extra.color, cls, tag: "shmem · charged to the cgroup" });
+                       color: extra.color, cls, sh: 1, tag: "shmem · charged to the cgroup" });
   };
   for (const [name, s] of Object.entries(st.stacks || {})) {
     const c = s && s.container && cont[s.container];
@@ -721,11 +843,11 @@ function hostRamSegs(host, st, gpu) {
   // tenants with no RSS, so an image tier's share stayed in the residual: the lane
   // reported "host + other containers 23.8" for a ~3 GiB reality and then tagged
   // the OS as overspending its reserve. Carve the device figure, then attribute it.
+  // The cap the bar can actually reach is the smaller of the configured budget and
+  // the driver's real window: this box is told 90 GiB, amdgpu exposes 62.2.
   const ig = gpu && gpu.igpu0;
   const gttWindow = ig && ig.gtt_total_gib != null ? ig.gtt_total_gib : null;
   const gttLive = ig ? (ig.gtt_used_gib != null ? ig.gtt_used_gib : ig.vram_used_gib) : null;
-  // The cap the bar can actually reach is the smaller of the configured budget and
-  // the driver's real window: this box is told 90 GiB, amdgpu exposes 62.2.
   const gttCap = (gttCeiling && gttWindow) ? Math.min(gttCeiling, gttWindow)
                                            : (gttWindow || gttCeiling || 0);
   const igpuTen = Object.entries(st.stacks || {})
@@ -793,74 +915,174 @@ function hostRamSegs(host, st, gpu) {
     : Math.max(0, osUsed - engAnon - shmem - slabU - gttTotal);   // pre-AnonPages daemon
   const kernelSlack = Math.max(0, osUsed - gttTotal - hostOther - leftoverShmem
                                - slabU - engAnon - engShmem);
-  const segs = [];
-  // The iGPU family goes at the BASE: driver-pinned pages claimed before anything
-  // else, and the only placement that leaves the dotted ceiling line ABOVE the
-  // memory it is a cap on. Tenant order == footprint order, biggest first; inside a
-  // tenant, the GTT row leads and the process's own RSS follows underneath it.
-  for (const f of fam.slice().sort((a, b) => (b.gtt + b.rss) - (a.gtt + a.rss))) {
-    const foot = f.gtt + f.rss;
-    if (f.gtt > 0.02) {
-      const bud = f.budget > 0.05;
-      f.rssSegs.unshift({ label: f.label + " · iGPU GTT", gib: f.gtt, color: f.color,
-                          cls: "gtt" + (f.warm ? " warming" : ""),
-                          tag: `GTT pages · ${gttSrc}`
-                             + (bud ? ` · iGPU footprint ${fmtGib(foot)} vs budget ${fmtGib(f.budget)}` : ""),
-                          overTag: bud && foot - f.budget > 0.5 });
-    }
-    segs.push(...f.rssSegs);
-  }
-  if (gttUnattributed > 0.02)
-    segs.push({ label: "igpu0 GTT · driver-held", gib: gttUnattributed, color: MUTED_SEG,
-                cls: "gtt", tag: "held by amdgpu — no resident tenant claims it" });
-  if (hostOther > 0.05)
-    segs.push({ label: "host + other processes", gib: hostOther, color: MUTED_SEG,
-                tag: "measured anon", budget: reserveBudget });
-  if (kernelSlack > 0.05)
-    segs.push({ label: "kernel / driver slack", gib: kernelSlack, cls: "resv",
-                tag: gttOverlap ? "GTT/RSS overlap?" : "page tables, stacks, watermarks" });
-  if (leftoverShmem > 0.3)
-    segs.push({ label: "tmpfs / shmem (host)", gib: leftoverShmem, cls: "resv",
-               tag: "needs swap" });
-  if (slabU > 0.3)
-    segs.push({ label: "kernel slab (unreclaimable)", gib: slabU, cls: "resv",
-               tag: "unreclaimable" });
-  segs.push(...engSegs);
-  const committed = segs.reduce((a, s) => a + (s.gib || 0), 0);   // == osUsed
-  const cache = Math.max(0, physUsed - committed);
-  if (cache > 0.05)
-    segs.push({ label: "page cache · reclaimable", gib: cache, cls: "cache",
-                color: "#2a3040", tag: "evicts under pressure" });
-
-  // ---- reserved: the budget stack (Σ must stay under the box's RAM) ---------
+  // ---- ONE canonical row list, feeding the measured bar, the reserved bar and
+  // the allocation table. The previous version grew two independent arrays and
+  // they drifted: the plan bar put the image's host-RAM row between two GTT rows,
+  // so GPU and CPU memory interleaved on one side and not the other. A row now
+  // carries BOTH numbers for the same slice and each bar is a projection of this
+  // list, so the two cannot disagree and the table is the list.
+  // kind: "gtt" = driver pages inside the iGPU's GTT window; "cpu" = everything the
+  // CPU side holds; "cache" = reclaimable, above the OS-used line.
+  const rows = [];
+  // What stackd BOOKS per iGPU chat tenant: the `vram:igpu0` pool charge (demand +
+  // headroom) split by declared demand — NOT the catalog estimate the measured row
+  // was sized from, which made the comparison vacuous and hid the 3 GiB of headroom.
+  const gttChat = igpuTen.filter(t => t.n.indexOf("image · ") !== 0 && t.mv > 0);
+  const gttChatWant = gttChat.reduce((a, t) => a + t.mv, 0);
+  const gttBooked = n => {
+    const t = gttChat.find(x => x.n === n);
+    return t && gttChatWant > 0.05 ? gttCharge * (t.mv / gttChatWant) : 0;
+  };
+  const isImg = f => f.label.indexOf("image · ") === 0;
+  const famSorted = fam.slice().sort((a, b) => (b.gtt + b.rss) - (a.gtt + a.rss));
   const budgetLimit = (hu && hu.limit) || host.mem_total_gib || physUsed;
-  const budgetSegs = [];
-  // Devices whose VRAM demand is charged INTO this pool (igpu0 GTT) already have
-  // their engine RAM folded into that figure — fit.py::pool_charge skips dev_ram
-  // for exactly those devices. Charging their model_ram on top would double-count
-  // them and push the lane's reserved total above `stackctl validate`.
+  const imgBud = st.image_ram_budget || {};
+  const imgTot = imgBud.gib || 0;
+  // The GPU slice of the image allowance; with no footprint figure (older daemon)
+  // the whole allowance is drawn as the GPU row rather than guessed at.
+  const imgGpu = !imgTot ? 0
+    : (imgBud.footprint_gib > 0.05 && imgBud.footprint_gib < imgTot ? imgBud.footprint_gib : imgTot);
+  const imgBal = imgTot - imgGpu > 0.5 ? imgTot - imgGpu : 0;
+  const gttMv = n => { const t = igpuTen.find(x => x.n === n); return t ? t.mv : 0; };
+  // Devices whose VRAM demand is charged INTO this pool already carry their engine
+  // RAM inside that figure (fit.py::pool_charge skips dev_ram for GTT devices);
+  // charging model_ram on top would push reserved past `stackctl validate`.
   const vramDevInPool = new Set(Object.keys(bd)
     .filter(k => k.startsWith("vram:")).map(k => k.slice(5).split(" ")[0]));
-  // The iGPU's booked slice goes at the BASE here too, so the reserved twin bar
-  // stacks in the same order as the measured bar beside it (pool_charge fills
-  // reserve/slack first, but the *drawing* order is shared with the left bar).
-  if (gttCharge > 0.05)
-    budgetSegs.push({ label: "igpu0 GTT", gib: gttCharge, cls: "resv", color: MUTED_SEG,
-                      title: `iGPU "VRAM" is ${fmtGib(gttCharge)} booked here `
-                           + `(demand + headroom, ceiling ${fmtGib(gttCeiling)})` });
-  if (reserveBudget > 0.05)
-    budgetSegs.push({ label: "OS + containers reserve", gib: reserveBudget, color: MUTED_SEG });
-  for (const [name, s] of Object.entries(st.stacks || {})) {
-    if (mr[name] && !vramDevInPool.has((s || {}).device))
-      budgetSegs.push({ label: name, gib: mr[name], color: modelColor(name) });
-  }
-  if (st.image_ram_budget && st.image_ram_budget.gib)
-    budgetSegs.push({ label: "image · " + st.image_ram_budget.model,
-                      gib: st.image_ram_budget.gib, cls: "elastic",
-                      color: modelColor("image:" + st.image_ram_budget.model) });
-  const budgetTotal = budgetSegs.reduce((a, s) => a + (s.gib || 0), 0);
+  const add = r => { rows.push(r); return r; };
 
-  return { segs, committed, physUsed, osUsed, budgetSegs, budgetTotal, budgetLimit,
+  // -- GPU group: driver pages, base of the bar, biggest tenant first -----------
+  // Base placement is also the only one that leaves the dotted ceiling line ABOVE
+  // the memory it caps. Every GTT row is contiguous here — the complaint this
+  // replaces was the image's host-RAM row sitting between two GTT rows.
+  let bookedGtt = 0;
+  for (const f of famSorted) {
+    if (f.gtt <= 0.02) continue;
+    const img = isImg(f), foot = f.gtt + f.rss;
+    const plan = img ? imgGpu : gttBooked(f.label);
+    if (!img) bookedGtt += plan;
+    add({ key: img ? "imggtt" : "gtt:" + f.label, kind: "gtt", label: f.label,
+          part: "iGPU GTT", color: f.color, cls: "gtt" + (f.warm ? " warming" : ""),
+          live: f.gtt, plan: plan > 0.05 ? plan : null, over: img && foot - imgTot > 0.5,
+          sub: img ? `${gttSrc} · footprint ${rnd1(foot)} of ${rnd1(imgTot)} allowed`
+                   : `booked ${rnd1(plan)} = demand ${rnd1(gttMv(f.label))} + headroom` });
+  }
+  // The booking with no resident tenant and the pages the driver holds with no
+  // booking are the same unowned slice: one row, planned figure beside measured.
+  const unbooked = gttCharge - bookedGtt;
+  if (gttUnattributed > 0.02 || unbooked > 0.05)
+    add({ key: "gttres", kind: "gtt", label: "igpu0 GTT", part: "unowned",
+          color: MUTED_SEG, cls: "gtt resv", live: gttUnattributed,
+          plan: unbooked > 0.05 ? unbooked : null,
+          sub: "driver pages no resident tenant claims" });
+  // -- CPU group: process pages, host residue, kernel, then the CPU-side engines
+  for (const f of famSorted)
+    for (const s of f.rssSegs) {
+      const img = isImg(f);
+      add({ key: (img ? "imgrss" : "rss:" + f.label) + (s.sh ? ":shm" : ""), kind: "cpu",
+            label: f.label, part: s.sh ? "shmem" : "host RSS", color: f.color, cls: f.cls,
+            live: s.gib, plan: img && !s.sh ? imgBal : null,
+            sub: img ? `staging + cache · ${rnd1(imgTot)} less footprint`
+                     : (s.sh ? "shared pages, not reclaimable"
+                             : (s.mix ? `anon ${rnd1(s.gib - s.mix)} + shmem ${rnd1(s.mix)}`
+                                      : "cgroup anon, on top of its GTT")) });
+    }
+  const engSeen = {};
+  // What host_unified charges each DEVICE for RAM spill ("ram:<dev>" in the pool
+  // breakdown, the same numbers `stackctl validate` prints). model_ram is keyed by
+  // stack name and drops out whenever the placement reports no figure for it, and
+  // a measured row with a null plan renders as "–" with no block in the reserved
+  // bar — which read as "coding has no RAM budget" while the solver was in fact
+  // charging 58 GiB for it. Fall back to the device charge when the device has
+  // exactly one tenant on it; splitting a shared figure would be inventing.
+  const ramOn = {}, ramTenants = {};
+  for (const [k, v] of Object.entries(bd)) {
+    if (k.indexOf("ram:") !== 0 || !(v > 0)) continue;
+    const dev = k.slice(4);
+    ramOn[dev] = v;
+    ramTenants[dev] = Object.keys(st.stacks || {})
+      .filter(n => ((st.stacks || {})[n] || {}).device === dev).length;
+  }
+  for (const s of engSegs) {
+    const key = "ram:" + s.nm;                       // nm, not the label: "image · x"
+    const tot = s.groupGib != null ? s.groupGib : s.gib;
+    const dev = ((st.stacks || {})[s.nm] || {}).device;
+    const exempt = vramDevInPool.has(dev);           // its RAM is inside the GTT charge
+    let plan = mr[s.nm] != null && !exempt ? mr[s.nm]
+             : (s.nm.indexOf("image · ") === 0 && imgTot ? imgTot : null);
+    let fromPool = false;
+    if (plan == null && !exempt && ramOn[dev] != null && ramTenants[dev] === 1) {
+      plan = ramOn[dev]; fromPool = true;
+    }
+    engSeen[key] = true;
+    add({ key, kind: "cpu", label: s.nm, part: s.sh ? "shmem" : "host RSS",
+          color: s.color, cls: s.cls, live: s.gib, plan: s.sh ? null : plan,
+          over: !s.sh && plan != null && tot - plan > 0.5, sub: s.sh
+            ? "shared pages, not reclaimable"
+            : (s.mix ? `anon ${rnd1(s.gib - s.mix)} + shmem ${rnd1(s.mix)}`
+                     : (tot - s.gib > 0.5 ? `anon ${rnd1(s.gib)} + shmem ${rnd1(tot - s.gib)}`
+                     : fromPool ? "budget = the device's host-RAM charge"
+                                : "engine process RSS")) });
+  }
+  // What stackd does not place, then what the kernel pins. All four are paid for
+  // out of the same host_reserve + load_slack allowance, so they carry no plan of
+  // their own and the group is totalled underneath them — otherwise the 20 GiB
+  // booked for them floats next to a single row and the rest read as unbudgeted.
+  const osGroup = [];
+  const osRow = (key, label, part, live, sub) => {
+    if (live <= 0.05) return;
+    osGroup.push(live);
+    add({ key, kind: "cpu", label, part, color: MUTED_SEG, cls: "resv", live, sub,
+          parent: "OS reserve" });
+  };
+  osRow("os", "host + other processes", "", hostOther, "everything stackd does not place");
+  osRow("slack", "kernel / driver slack", "", kernelSlack,
+        gttOverlap ? "GTT/RSS overlap?" : "page tables, stacks, watermarks");
+  osRow("shmem", "tmpfs / shmem", "", leftoverShmem, "needs swap to reclaim");
+  osRow("slab", "kernel slab", "unreclaimable", slabU, "not reclaimable");
+  if (osGroup.length && reserveBudget > 0.05)
+    add({ key: "osres", kind: "cpu", label: "OS reserve", part: "total",
+          color: MUTED_SEG, cls: "resv", sum: true, live: osGroup.reduce((a, b) => a + b, 0),
+          plan: reserveBudget, over: osGroup.reduce((a, b) => a + b, 0) - reserveBudget > 0.5,
+          sub: `= host_reserve ${rnd1(bd.host_reserve || 0)}`
+             + ` + load_slack ${rnd1(bd.load_slack || 0)}` });
+  // Budget the CPU side cannot spend even though nothing is resident: an engine not
+  // loaded, or an image tier planned on another device.
+  for (const [name, s] of Object.entries(st.stacks || {}))
+    if (mr[name] && !vramDevInPool.has((s || {}).device) && !fam.some(f => f.label === name)
+        && !engSeen["ram:" + name])
+      add({ key: "ram:" + name, kind: "cpu", label: name, part: "planned",
+            color: modelColor(name), live: 0, plan: mr[name], sub: "not resident" });
+  if (imgTot && !fam.some(isImg) && !engSeen["ram:image · " + imgBud.model])
+    add({ key: "imgcpu", kind: "cpu", label: "image · " + imgBud.model, part: "planned",
+          color: modelColor("image:" + imgBud.model), cls: "elastic", live: 0, plan: imgTot,
+          sub: "resident off this device" });
+  const committed = rows.reduce((a, r) => a + (r.sum ? 0 : (r.live || 0)), 0);   // == osUsed
+  const cache = Math.max(0, physUsed - committed);
+  if (cache > 0.05)
+    add({ key: "cache", kind: "cache", label: "page cache", part: "reclaimable",
+          color: "#2a3040", cls: "cache", live: cache, sub: "evicts under pressure" });
+
+  // ---- both bars are projections of `rows` ---------------------------------
+  // Same order, same grouping, by construction: the GPU slices are contiguous on
+  // each bar and the CPU slices follow them, so a plan row always sits level with
+  // its measured twin. Σ is unchanged — the image allowance and the igpu0 booking
+  // are SPLIT across rows, never duplicated.
+  // A `sum` row (the OS reserve group) is drawn ONLY on the plan bar: the kernel
+  // pins nothing separately on the live side that isn't already its own segment,
+  // while on the plan side the whole group is a single allowance.
+  const segs = rows.filter(r => r.live > 0.02 && !r.sum).map(r => ({
+    label: r.part ? `${r.label} · ${r.part}` : r.label, gib: r.live, kind: r.kind,
+    color: r.color, cls: r.cls, tag: r.sub }));
+  const budgetSegs = rows.filter(r => r.plan > 0.02).map(r => ({
+    label: r.part ? `${r.label} · ${r.part}` : r.label, gib: r.plan, kind: r.kind,
+    // `resv` means "flat grey reservation" and its CSS is !important — stamping it
+    // on every row that happened to have no class overpainted the tenants' own
+    // colours, so coding's 40 GiB block was drawn and then painted reservation-grey.
+    // Only rows that ARE reservations may wear it.
+    color: r.color, cls: r.cls || (r.resv || r.sum ? "resv" : ""), title: r.sub }));
+  const budgetTotal = budgetSegs.reduce((a, s) => a + (s.gib || 0), 0);
+  return { rows, segs, committed, physUsed, osUsed, budgetSegs, budgetTotal, budgetLimit,
            gtt: { ceiling: gttCeiling, window: gttWindow, boundary: gttCap || gttCeiling,
                   charge: gttCharge, live: gttLive, stolen: (ig && ig.stolen_used_gib) || 0,
                   unattributed: gttUnattributed, overlap: gttOverlap } };
@@ -877,49 +1099,34 @@ function hostRamRepaint(lane, host, st, gpu) {
   const bar = lane.querySelector(".bar");
   const free = bar.querySelector(".free");
   bar.querySelectorAll(".seg").forEach(n => n.remove());
-  const sl = lane.querySelector(".seglist");
-  const frow = sl.querySelector(".free-row");
-  sl.querySelectorAll(".seg-row:not(.free-row)").forEach(n => n.remove());
-  let drawn = 0;
-  const rows = [];
-  // The BAR must be appended in array order (segs[0] = the base; .bar is
-  // column-reverse). The legend is collected and appended in REVERSE afterwards —
-  // reversing this loop itself would flip the bar too, not just the list.
+  let drawn = 0, prev = null;
+  // The BAR is appended in array order (segs[0] = the base; .bar is
+  // column-reverse), which is also the order of the table below it. A segment
+  // that opens a new group gets the seam class, so the GPU block and the CPU
+  // block read as two blocks and not as one long stack.
   for (const s of r.segs) {
     if (!s.gib || s.gib <= 0.02) continue;
     drawn += s.gib;
-    const d = el("div", "seg" + (s.cls ? " " + s.cls : ""));
+    const d = el("div", "seg" + (s.cls ? " " + s.cls : "")
+      + (s.kind && prev && prev !== s.kind ? " grp-start" : ""));
+    prev = s.kind || prev;
     d.style.height = Math.max(0.4, (s.gib / limit) * 100) + "%";
     d.style.background = segColor(s);
     d.title = `${s.label} — ${fmtGib(s.gib)}${s.tag ? " (" + s.tag + ")" : ""}`;
     bar.insertBefore(d, free);
-    const row = el("div", "seg-row");
-    const sw = el("span", "sw" + (s.cls ? " " + s.cls : "")); sw.style.background = segColor(s);
-    row.append(sw, el("span", "nm", s.label), el("span", "gb", fmtGib(s.gib)));
-    if (s.budget != null && s.budget > 0.05) {
-      // compare the tenant's WHOLE measured footprint (anon + its shmem) to its
-      // single budget. When they differ (shmem present) spell out the total so
-      // "over 3" on a row that shows 5.8 isn't baffling.
-      const measured = s.groupGib != null ? s.groupGib : s.gib;
-      const over = measured - s.budget;
-      const grp = s.groupGib != null && Math.abs(s.groupGib - s.gib) > 0.5
-        ? `${fmtGib(measured)} vs ` : "";
-      const t = el("span", "tg", over > 0.5
-        ? `${grp}budget ${fmtGib(s.budget)} · over ${fmtGib(over)}`
-        : `${grp}budget ${fmtGib(s.budget)}`);
-      if (over > 0.5) t.style.color = "var(--orange)";
-      row.append(t);
-    } else if (s.tag) {
-      const t = el("span", "tg", s.tag);
-      if (s.overTag) t.style.color = "var(--orange)";   // composed tag, own over-flag
-      row.append(t);
-    }
-    rows.push(row);
   }
-  // legend order mirrors the bar: free band first (top), then topmost segment
-  // down to the base.
-  rows.slice().reverse().forEach(rr => sl.append(rr));
-  frow.querySelector(".gb").textContent = fmtGib(Math.max(0, limit - drawn));
+  // The table is rebuilt whole rather than patched row-for-row: rows appear and
+  // disappear as tenants come and go, and matching them up by hand is how the
+  // legend and the bar drifted apart last time.
+  const old = lane.querySelector(".alloc");
+  const tbl = allocTable({ rows: r.rows, live: "live GiB", plan: "plan GiB", limit,
+                           sumLabel: "in RAM now",
+                           sumNote: `of ${fmtGib(limit)}, cache excluded`,
+                           freeNote: "reclaimable cache + unused" });
+  if (old) old.replaceWith(tbl); else lane.querySelector(".lane-body").append(tbl);
+  const gb = tbl.querySelectorAll(".free-row .gb");
+  if (gb[0]) gb[0].textContent = rnd1(Math.max(0, limit - r.committed));
+  if (gb[1]) gb[1].textContent = rnd1(Math.max(0, limit - r.budgetTotal));
 
   // reserved twin bar (created on first repaint; the lane is rebuilt only on a
   // map change, so it may not exist yet).
@@ -931,24 +1138,13 @@ function hostRamRepaint(lane, host, st, gpu) {
     const d = el("div", "seg" + (s.cls ? " " + s.cls : ""));
     d.style.height = Math.max(0.4, (s.gib / limit) * 100) + "%";
     d.style.background = segColor(s);
-    d.title = `${s.label} · budget ${fmtGib(s.gib)}`;
+    d.title = `${s.label} — planned ${fmtGib(s.gib)}`
+            + (s.title ? ` (${s.title})` : "");
     bb.append(d);
   }
   bb.append(el("div", "free"));
   bb.classList.toggle("over", r.budgetTotal > limit + 0.5);
-
-  // "in RAM now" == the committed stack == the "OS used" line the marker sits at.
-  lane.dataset.budgeted = r.committed;
-  const bs = lane.querySelector(".lane-bud");
-  if (bs) bs.innerHTML = `in RAM now <b>${fmtGib(r.committed)}</b> / ${fmtGib(limit)}`;
-  const as = lane.querySelector(".lane-alt");
-  if (as) {
-    const over = r.budgetTotal > limit + 0.5;
-    const bits = r.budgetSegs.map(s => `${s.label.replace(/^image · /, "img ")} ${fmtGib(s.gib)}`);
-    as.innerHTML = `reserved <b style="color:${over ? "var(--red)" : "var(--text)"}">`
-      + `${fmtGib(r.budgetTotal)}</b> / ${fmtGib(limit)}`
-      + `<span class="muted" style="display:block;font-size:.92em">${bits.join(" · ")}</span>`;
-  }
+  lane.dataset.budgeted = r.committed;      // laneLive() reads this for its delta
   return true;
 }
 
@@ -1002,9 +1198,8 @@ function renderMap(st, eng, img, gpu, host) {
       lanes.append(laneEl({
         name: "cuda0", sub: "RTX PRO 6000 · dedicated VRAM", limit: cv.limit, segs, budgeted,
         real: gpu && gpu.cuda0 && gpu.cuda0.vram_used_gib, realLabel: "nvidia-smi",
-        note: "nvidia-smi is the real allocation — it also includes the CUDA context, "
-          + "cuBLAS/cuDNN workspaces, allocator fragmentation, and the image model running "
-          + "larger than its catalog estimate. The budget is what the solver plans against.",
+        note: "nvidia-smi is the real allocation: it adds the CUDA context, workspaces "
+          + "and fragmentation on top of the budget the solver plans against.",
       }));
     }
     // igpu0 gets NO lane of its own: an iGPU has no memory, only a GTT window onto
@@ -1029,7 +1224,7 @@ function renderMap(st, eng, img, gpu, host) {
       const chg = (g && g.charge) || gttCharge, win = (g && g.window) || b;
       return {
         gtt: true,
-        boundary: { gib: b, label: `GTT ≤${rnd1(b)}${win < gttCeiling - 0.5 ? " (driver window)" : ""}` },
+        boundary: { gib: b, name: win < gttCeiling - 0.5 ? "GTT window" : "GTT ceiling" },
         bracket: { gib: chg,
                    label: `igpu0 GTT booked ${fmtGib(chg)} (demand + headroom) — ceiling `
                         + `${fmtGib(gttCeiling)}, driver GTT window ${fmtGib(win)}: a cap on `
@@ -1047,28 +1242,13 @@ function renderMap(st, eng, img, gpu, host) {
         lanes.append(laneEl({
           name: "unified RAM", sub: "LPDDR5X — host + igpu0 GTT, measured vs reserved",
           limit: lim,
-          segs: measured.segs, budgeted: measured.committed,
-          budLabel: "in RAM now", budShown: measured.committed,
-          altStat: `reserved <b>${fmtGib(measured.budgetTotal)}</b>`,
+          segs: measured.segs, budgeted: measured.committed, rows: measured.rows,
           real: host && host.mem_used_gib, realLabel: "OS used",
           ...gttOpts(lim, measured.gtt),
-          note: "Left bar: measured. Solid = 'OS used' (the marker), stacked base-up: "
-            + "the iGPU's own family first — a GTT row is driver pages inside this pool, "
-            + "a 'host RSS' row is the same tenant's process memory, two separate piles "
-            + "rather than one counted twice — then host + other processes (AnonPages "
-            + "minus the tenants), kernel / driver slack, tmpfs, slab, then the CPU-side "
-            + "engines. The hatched band on top is reclaimable page cache (mmap'd model "
-            + "files), physically resident but dropped on demand, so not in 'in RAM now'. "
-            + "Right bar: what each tenant is allowed to grow into — OS reserve + the "
-            + "igpu0 GTT carve + per-engine budget + the image tier's host_ram_gib. "
-            + "Σ reserved stays under the box's RAM by construction (the solver + image "
-            + "guard enforce it). Dotted line = the iGPU's GTT CEILING, the driver's "
-            + "window where it is tighter than the budget — a cap on what it may claim "
-            + "from this pool, not a reservation; the bracket on the left is what stackd "
-            + "books there today. Nothing GPU is charged to 'host + other processes' any "
-            + "more, so its budget tag is a real verdict; and a GTT-striped tenant still "
-            + "holds RAM the CPU side cannot count as free, which is why a bar that looks "
-            + "empty here can refuse to load an image model.",
+          note: "Left bar measured, right bar planned, same rows in the same order: "
+            + "iGPU GTT at the base, CPU-side memory above it, reclaimable cache on top. "
+            + "Dotted line = the iGPU's GTT ceiling, a cap it may claim up to, not a "
+            + "reservation.",
         }));
       } else {
         // FALLBACK (no container stats): the old budget bar.
@@ -1113,11 +1293,8 @@ function renderMap(st, eng, img, gpu, host) {
           limit: hu.limit, segs, budgeted: huBudgeted,
           real: host && host.mem_used_gib, realLabel: "OS used",
           ...gttOpts(hu.limit),
-          note: "The lane is stackd's budget for placing engines. The OS number is real "
-            + "memory pressure — ComfyUI/engine RSS and multi-GiB model-file page cache "
-            + "aren't in the budget (only 'load slack' gestures at it). Dotted line = the "
-            + "iGPU's GTT ceiling (a cap on what it may claim, not a reservation); the "
-            + "bracket is what stackd books there today.",
+          note: "Budget only — /host gave no per-container stats, so nothing here is "
+            + "measured. Dotted line = the iGPU's GTT ceiling, a cap not a reservation.",
         }));
       }
     }
@@ -1149,12 +1326,13 @@ function laneGtt(lane, gpu) {
   const ig = gpu && gpu.igpu0;
   const now = ig ? (ig.gtt_used_gib != null ? ig.gtt_used_gib : ig.vram_used_gib) : null;
   const stolen = ig && ig.stolen_used_gib;
-  n.innerHTML = `igpu0 GTT <b>${fmtGib(bud)}</b> booked / ${fmtGib(lim)} cap`
-    + (now != null ? ` · <b>${fmtGib(now)}</b> held now` : ` · <span class="over">no amdgpu sample</span>`)
-    + (stolen ? ` <span class="muted">(+${fmtGib(stolen)} stolen VRAM, outside MemTotal)</span>` : "")
-    + ` <span class="muted">— a cap the iGPU may claim up to, not a reservation. The booked`
-    + ` figure is the chat side; an iGPU-resident image tier is booked through its own</span>`
-    + ` <span class="muted">host_ram_gib budget, which is also why "held now" can exceed it.</span>`;
+  n.innerHTML = `igpu0 GTT <b>${fmtGib(now != null ? now : bud)}</b> live · `
+    + `<b>${fmtGib(bud)}</b> booked · <b>${fmtGib(lim)}</b> cap`
+    + (now == null ? ` <span class="over">no amdgpu sample</span>` : "")
+    + (stolen ? ` <span class="muted">+${fmtGib(stolen)} stolen, outside MemTotal</span>` : "");
+  n.title = "The cap is what the iGPU may claim from this pool, not a reservation. The "
+    + "booked figure covers the chat side only; an iGPU-resident image tier is booked "
+    + "through its own host_ram_gib budget, which is why live can run above booked.";
   // keep the bracket honest as the real claim overtakes the booked figure
   const k = lane.querySelector(".bracket");
   if (k && now != null && now > bud + 0.5) {

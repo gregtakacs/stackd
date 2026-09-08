@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import re
 import sys
 import threading
 import time
@@ -25,8 +26,8 @@ CFG = pathlib.Path(__file__).resolve().parent.parent / "config"
 CHECKS: list[tuple[str, bool]] = []
 
 
-def check(name, cond):
-    CHECKS.append((name, bool(cond)))
+def check(name, cond, info=None):
+    CHECKS.append((name + (f"   [{info}]" if info is not None and not cond else ""), bool(cond)))
 
 
 def _req(url, *, token=None, method="GET", body=None):
@@ -84,6 +85,26 @@ def main() -> int:
         code, ct, raw = _req(f"{base}/")
         check("GET / serves the dashboard shell", code == 200 and b"<title>stackd" in raw)
         check("GET / is html", ct.startswith("text/html"))
+        # The placement map used to carry a 1500-word essay per lane that nobody
+        # read. Lane notes are one glance now; anything that needs explaining lives
+        # in a row's note cell or a tooltip. (Regex over the served shell, since the
+        # prose is built in JS — this catches the source growing back, not the DOM.)
+        notes = ["".join(re.findall(r'"([^"]*)"', m.group(1)))
+                 for m in re.finditer(r"note: ((?:\"[^\"]*\"|\s*\+\s*|\n)+)", raw.decode())]
+        check("lane notes stay short (<=260 chars each)", all(len(n) <= 260 for n in notes),
+              [len(n) for n in notes])
+        # A unit-less number on a bar reads as nothing: every number column states
+        # its unit in the header, on the measured table and the budget-only one.
+        check("every number column carries its unit in the header",
+              b'"live GiB"' in raw and b'"plan GiB"' in raw and b'"budget GiB"' in raw)
+        # A 2px accent ring inside a 9px swatch is mostly ring: it ate the tenant's
+        # real colour, which is the only thing distinguishing klein from the chat
+        # engine there. Grouping is carried by the divider + the "iGPU GTT" suffix.
+        check("legend swatches wear no accent ring (the colour stays real)",
+              b"i.gtt" not in raw)
+        # The lane must fit one grid track: a lane spanning the whole row pushed the
+        # map onto its own line on a desktop.
+        check("no lane spans the whole grid row", b"grid-column:1 / -1" not in raw)
         code, ct, raw = _req(f"{base}/static/uplot.min.js")
         check("GET /static/uplot.min.js served", code == 200 and b"uPlot" in raw)
         check("static content-type is js", "javascript" in ct)

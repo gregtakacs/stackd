@@ -246,7 +246,9 @@ class Reconciler:
 
     def _pick_image(self, tier: MediaTier, hr: dict[str, float], *,
                     need_caps: list[str] | None = None, want_model: str | None = None,
-                    host_ram_avail: float = float("inf"), want_backend: str | None = None):
+                    host_ram_avail: float = float("inf"), want_backend: str | None = None,
+                    freed_gib: float = 0.0, freed_backend: str | None = None,
+                    reasons: list[str] | None = None):
         """(device, backend, loadable) — the first `prefer:` entry that fits a
         device with a matching backend, most-free device first. `want_model` /
         `need_caps` narrow the candidates first. `want_backend` forces trying
@@ -257,12 +259,26 @@ class Reconciler:
         can't see (see solver.py::host_ram_headroom) — a candidate whose known
         host_ram_gib would exceed it is skipped even if its device VRAM/GTT
         fits, so this also protects an explicit manual swap, not just
-        auto-pick. None if nothing fits."""
+        auto-pick. None if nothing fits.
+
+        `freed_gib`/`freed_backend` credit the host RAM the RESIDENT image model
+        will return when this swap destroys its container — credited only for a
+        candidate on a DIFFERENT backend, since a same-backend swap relabels the
+        slot in place (backend -> container is 1:1) and ComfyUI keeps the old
+        checkpoint cached, freeing nothing. See swap_image().
+
+        `reasons` (optional) collects why each rejected candidate was refused, so
+        the caller can name the wall it actually hit — the old note quoted
+        "needs ~56 GiB", the CUDA *VRAM* figure, when the refusal was really the
+        122 GiB vulkan *host-RAM* estimate (2026-09-08)."""
         want = set(need_caps or [])
         for ld in tier.prefer:
             if want_model is not None and ld.active_model != want_model:
                 continue
             if want and not want <= set(ld.capabilities):
+                if reasons is not None:
+                    reasons.append(f"{ld.active_model} lacks "
+                                   f"{'+'.join(sorted(want - set(ld.capabilities)))}")
                 continue
             backends = [want_backend] if want_backend else ld.backends
             for backend in backends:
@@ -270,18 +286,33 @@ class Reconciler:
                     continue
                 fp = ld.footprint_gib.get(backend)
                 if fp is None:
+                    if reasons is not None:
+                        reasons.append(f"{ld.active_model}: no {backend} footprint on record")
                     continue
+                credit = freed_gib if (freed_gib > 0 and backend != freed_backend) else 0.0
+                host_avail = host_ram_avail + credit
                 host_fp = ld.host_ram_gib.get(backend)
-                if host_fp is not None and host_fp > host_ram_avail + 1e-6:
+                if host_fp is not None and host_fp > host_avail + 1e-6:
+                    if reasons is not None:
+                        reasons.append(f"host RAM {host_fp:.0f} > {host_avail:.1f} free ({backend}"
+                                       + (f", incl. {credit:.0f} freeing)" if credit else ")"))
                     continue
-                for dev in sorted(
-                    (d for d in self.cfg.devices
-                     if self.cfg.devices[d].backend.value == backend),
-                    key=lambda d: -hr.get(d, 0.0),
-                ):
+                devs = [d for d in self.cfg.devices
+                        if self.cfg.devices[d].backend.value == backend]
+                for dev in sorted(devs, key=lambda d: -hr.get(d, 0.0)):
                     if hr.get(dev, 0.0) + 1e-6 >= fp:
                         return dev, backend, ld
+                if reasons is not None:
+                    if devs:
+                        best = max(devs, key=lambda d: hr.get(d, 0.0))
+                        reasons.append(f"VRAM {fp:.0f} > {hr.get(best, 0.0):.1f} free on {best}")
+                    else:
+                        reasons.append(f"no {backend} device configured")
         return None
+
+    def _refusal_detail(self, reasons: list[str]) -> str:
+        """Why a wanted model was refused, for the user-facing note."""
+        return "; ".join(reasons[:3]) if reasons else "device VRAM and/or host RAM"
 
     def _loadable(self, tier: MediaTier, active_model: str):
         return next((l for l in tier.prefer if l.active_model == active_model), None)
@@ -377,16 +408,38 @@ class Reconciler:
                             "RAM availability; watch it yourself",
                     "events": [f"{e.action} {e.stack}" for e in self.events]}
 
+        # Teardown credit: this swap destroys the resident container whenever it
+        # lands on a different backend, returning that model's host RAM *before*
+        # the new one spawns — so refusing a candidate over memory this very swap
+        # is about to free is wrong (2026-09-08: a resident klein blocked
+        # dev-turbo's cuda route on host RAM while klein was the thing being
+        # replaced). Both sides use declared estimates, so the comparison stays
+        # self-consistent with the figures that block it in the first place.
+        freed_gib, freed_backend = 0.0, None
+        if live:
+            rl = self._loadable(tier, slot.active_model)
+            rh = (rl.host_ram_gib or {}).get(slot.backend) if rl else None
+            if rh:
+                freed_gib, freed_backend = float(rh), slot.backend
+        reasons: list[str] = []
         pick = self._pick_image(tier, hr, need_caps=need_caps, want_model=model,
-                                host_ram_avail=host_ram_avail, want_backend=backend)
+                                host_ram_avail=host_ram_avail, want_backend=backend,
+                                freed_gib=freed_gib, freed_backend=freed_backend,
+                                reasons=reasons)
+        # Keep WHY THE REQUESTED MODEL was refused: the ladder scan below runs
+        # cap-wide and would otherwise overwrite it with other models' reasons.
+        wanted_reasons = list(reasons)
         downgraded_from = None
         if pick is None and model is not None:
             req = self._loadable(tier, model)
             if req is None:
                 return {"ok": False, "error": f"unknown image model {model!r}; "
                         f"prefer: {[l.active_model for l in tier.prefer]}"}
+            reasons = []
             pick = self._pick_image(tier, hr, need_caps=need_caps or list(req.capabilities),
-                                    host_ram_avail=host_ram_avail, want_backend=backend)
+                                    host_ram_avail=host_ram_avail, want_backend=backend,
+                                    freed_gib=freed_gib, freed_backend=freed_backend,
+                                    reasons=reasons)
             if pick is not None:
                 downgraded_from = model
         if pick is None:
@@ -394,15 +447,23 @@ class Reconciler:
                     else f"model {model!r}" if model else "an image model")
             return {"ok": False, "headroom": hr_r, "host_ram_headroom_gib": round(host_ram_avail, 1),
                     "error": f"no {what} fits the headroom under profile {profile!r} "
-                             f"(device VRAM and/or real host-RAM budget)"}
+                             f"(device VRAM and/or real host-RAM budget)"
+                             + (f" — {model}: {self._refusal_detail(wanted_reasons)}"
+                                if model and wanted_reasons else "")}
 
         dev, backend, ld = pick
         note = None
         if downgraded_from:
             dl = self._loadable(tier, downgraded_from)
             fp = min(dl.footprint_gib.values()) if dl and dl.footprint_gib else None
-            note = (f"{downgraded_from} did not fit the free VRAM under profile "
-                    f"{profile!r}" + (f" (needs ~{fp:.0f} GiB)" if fp else "")
+            # Name the wall actually hit. The old note quoted min(footprint_gib)
+            # — the CUDA *VRAM* figure — for refusals that were really the
+            # vulkan *host-RAM* estimate, pointing at the one axis that wasn't
+            # the problem; the fallback keeps that wording if no reason was
+            # recorded, so the note can never come out empty.
+            note = (f"{downgraded_from} did not fit under profile {profile!r}"
+                    + (f": {self._refusal_detail(wanted_reasons)}" if wanted_reasons
+                       else (f" (needs ~{fp:.0f} GiB)" if fp else ""))
                     + f" — using {ld.active_model} instead")
 
         if live and slot.active_model == ld.active_model and slot.device == dev:

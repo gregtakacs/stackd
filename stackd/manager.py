@@ -200,6 +200,19 @@ def _profiles_serving(cfg: Config, api_name: str) -> list[str]:
     return sorted(hits, key=lambda n: -cfg.profiles[n].priority)
 
 
+def _catalog_digest(cat) -> str:
+    """Fingerprint of the measured-catalog layer. `reload_config()` re-reads the
+    catalog too, but the catalog is not part of config/*.yaml — so after a
+    `stackctl bench --ingest` the reload answered "no changes" while the new curve
+    had in fact just gone live. Say which of the two layers moved."""
+    if cat is None:
+        return ""
+    return repr(sorted(
+        (k, c.source, c.measured_at or "", round(c.vram.intercept, 2),
+         f"{c.vram.slope:.4e}", round(c.ram.intercept, 2), f"{c.ram.slope:.4e}")
+        for k, c in cat.curves.items()))
+
+
 class Manager:
     def __init__(self, config_dir, state_path, runner: Runner | None = None, *,
                  models_dir: str = "/models", min_residency_s: float = 120.0,
@@ -235,6 +248,7 @@ class Manager:
         Config and swap it in. Raises ConfigError on a bad edit — the live config
         is untouched. Does NOT converge; the caller re-runs `use(active_profile)`.
         Returns a human diff of what changed."""
+        was = _catalog_digest(self.catalog)
         new = load_config(self.config_dir)          # validates; raises on error
         diff: list[str] = []
         for label, old_map, new_map in (
@@ -257,6 +271,9 @@ class Manager:
         self.rec.cfg = new
         self.catalog = self._load_catalog()
         self.rec.catalog = self.catalog
+        now = _catalog_digest(self.catalog)
+        if now != was:
+            diff.append("catalog refreshed")
         self._default = next(p.profile for p in new.profiles.values() if p.default)
         return diff or ["no changes"]
 
@@ -641,8 +658,17 @@ class Manager:
                       None) if tier else None
             gib = ld.host_ram_gib.get(img.backend) if ld else None
             if gib:
+                fp = (ld.footprint_gib or {}).get(img.backend)
                 image_ram_budget = {"model": img.active_model, "backend": img.backend,
-                                    "device": img.device, "gib": round(gib, 2)}
+                                    "device": img.device, "gib": round(gib, 2),
+                                    # The GPU part of that allowance. On igpu0 the GPU
+                                    # memory IS host RAM (GTT), so host_ram_gib is the
+                                    # TOTAL and `gib - footprint_gib` is the process's
+                                    # own RSS + staging (config/models.py: host_ram_gib
+                                    # "on igpu0 runs well above the VRAM/GTT figure").
+                                    # The dashboard needs both to draw its reserved bar
+                                    # with the same GTT/RSS split as the measured one.
+                                    "footprint_gib": round(fp, 2) if fp else None}
                 for pd in pools:
                     if pd["pool"] != "host_unified":
                         continue

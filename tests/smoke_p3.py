@@ -99,6 +99,14 @@ def main() -> int:
     irb = stt["image_ram_budget"]
     check("status.image_ram_budget carries the resident entry's host_ram_gib",
           irb and irb["model"] == "flux2-dev-turbo" and irb["gib"] == 40.0)
+    # The dashboard draws the allowance with the same GTT/RSS split on both bars,
+    # and it can only do that if the payload separates them: host_ram_gib is the
+    # TOTAL, footprint_gib the GPU part. None is a legal answer (older config, no
+    # bench figure) — the lane then draws the whole allowance as GTT rather than
+    # guessing — but the key must exist.
+    check("status.image_ram_budget splits gib into footprint_gib for the RAM lane",
+          irb and "footprint_gib" in irb
+          and (irb["footprint_gib"] is None or 0 < irb["footprint_gib"] <= irb["gib"]))
     hup = next(p for p in stt["pools"] if p["pool"] == "host_unified")
     check("host_unified pool charges the image tier's host RAM",
           hup["breakdown"].get("image:flux2-dev-turbo") == 40.0

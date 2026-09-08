@@ -173,7 +173,9 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("content-type", ctype + ("; charset=utf-8" if ctype.startswith("text/") else ""))
         self.send_header("content-length", str(len(raw)))
-        if cache_s:
+        if cache_s < 0:
+            self.send_header("cache-control", "no-cache")   # always revalidate
+        elif cache_s:
             self.send_header("cache-control", f"max-age={cache_s}")
         self.end_headers()
         self.wfile.write(raw)
@@ -206,7 +208,12 @@ class _Handler(BaseHTTPRequestHandler):
             hit = _web_file("dashboard.html")
             if not hit:
                 return self._send_json(404, {"error": {"message": "dashboard not bundled"}})
-            return self._send_bytes(200, hit[0], hit[1])
+            # The shell is the whole app (inline JS) and it changes on every image
+            # rebuild. With no validator at all, browsers reapply a heuristic
+            # freshness window — a "hard" reload then quietly keeps running the old
+            # dashboard, which reads as the fix "not working". Revalidate always;
+            # the file is a few hundred KB and 304s are nearly free.
+            return self._send_bytes(200, hit[0], hit[1], cache_s=-1)
         if self.path.startswith("/static/"):
             hit = _web_file(self.path[len("/static/"):].split("?")[0])
             if not hit:

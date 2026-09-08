@@ -195,15 +195,21 @@ def bench_stack(
 
 
 def ingest(cfg: Config, stack_name: str, catalog: Catalog, points: dict, *, notes: str = ""):
-    """points = {"vram": [[ctx, gib], ...], "ram": [[ctx, gib], ...]}"""
+    """points = {"vram": [[ctx, gib], ...], "ram": [[ctx, gib], ...]}
+
+    The dict may also carry "measured_at" (ISO date) and "notes". They are worth
+    filling in: `source=measured` with a null date is un-auditable, and an undated
+    measured figure is exactly how a plan drifts from reality unnoticed — a
+    hand-ingested point is older than the day it was taken and says so nowhere.
+    """
     st = cfg.models[stack_name]
     return catalog.write_curve(
         curve_key(cfg, stack_name),
         model=st.engine.model or st.engine.params.get("active_model", stack_name),
         engine=st.engine.template, device=primary_device(cfg, stack_name),
         vram_points=points.get("vram", []), ram_points=points.get("ram", []),
-        source="measured", measured_at=None,
-        notes=notes or f"ingested for {stack_name}",
+        source="measured", measured_at=points.get("measured_at") or None,
+        notes=notes or points.get("notes") or f"ingested for {stack_name}",
     )
 
 
