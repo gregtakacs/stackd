@@ -64,8 +64,10 @@ LLAMA_PROXY_REGISTER_URL = _env("LLAMA_PROXY_REGISTER_URL", "")
 # the prompt verbatim -- a rewrite must never block a generation.
 LLM_BASE_URL = _env("LLM_BASE_URL", "http://localhost:11444/v1")
 LLM_API_KEY = _env("LLM_API_KEY", "")
-# 'assistant-nothink' = the 27B with reasoning disabled -- fast, reliable single-shot JSON.
-LLM_MODEL = _env("LLM_MODEL", "assistant-nothink")
+# A pass-through model name (no pinned effort). prompt_llm.py forces
+# reasoning_effort=none / enable_thinking=false on the request itself, so this
+# stays a fast single-shot JSON rewrite whatever the resident engine is.
+LLM_MODEL = _env("LLM_MODEL", "assistant")
 LLM_TIMEOUT_S = _env_int("LLM_TIMEOUT_S", 90)
 # Master switch. "0"/"false"/"no"/"off" disables all rewriting (prompt used verbatim).
 LLM_REWRITE_ENABLE = (_env("LLM_REWRITE_ENABLE", "true") or "").strip().lower() not in ("0", "false", "no", "off")

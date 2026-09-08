@@ -106,6 +106,13 @@ async def rewrite(
         ],
         "temperature": 0.4,
         "stream": False,
+        # This is a fast single-shot JSON rewrite — never think. LLM_MODEL now
+        # points at a pass-through name (no pinned `-nothink` variant), so force
+        # it off in the request. The HTTP front translates this to the served
+        # engine's dialect (llama.cpp reasoning_effort=none / vLLM+SGLang
+        # chat_template_kwargs.enable_thinking=false); harmless if unsupported.
+        "reasoning_effort": "none",
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     if want_json:
         # llama.cpp / vLLM behind the proxy both honor this; harmless if ignored.

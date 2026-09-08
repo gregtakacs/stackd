@@ -72,7 +72,7 @@ services:
       - LLAMA_PROXY_REGISTER_URL=http://localhost:11444/register
       - TIMEOUT_S=600
       - LLM_BASE_URL=http://localhost:11444/v1     # self-loop for image-prompt rewriting
-      - LLM_MODEL=${LLM_REWRITE_MODEL:-}
+      - LLM_MODEL=${LLM_REWRITE_MODEL:-assistant}   # a pass-through name; prompt_llm.py forces no-think
       - LLM_API_KEY=${STACKD_API_KEY}
       - LLM_REWRITE_ENABLE=${LLM_REWRITE_ENABLE:-true}
       # box-specific — consumed by config/*.yaml (see .env.example)
