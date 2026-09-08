@@ -1912,11 +1912,20 @@ let ENGINE_NAMES = [];
 const LAST_TEL = {}, LAST_TEL_AT = {};
 function snapshot(gpu, host, tel) { SNAP = { at: Date.now(), gpu, host, tel }; }
 function sampleLive(now) {
-  TS.push(now / 1000);
+  const t = now / 1000;
+  // If the 1s grid was throttled (tab in the background — the browser slows its
+  // timers) or the poll stalled, the gap since the last sample is more than a few
+  // seconds. uPlot would connect the two sides with a long diagonal "ramp" across
+  // the missing time. Break the line instead: emit this resume sample as a null
+  // gap; the next tick (1s later, once tick() has refreshed SNAP) is the first
+  // real point, so the line resumes cleanly instead of smearing.
+  const resume = TS.length ? (t - TS[TS.length - 1]) > 3 : false;
+  TS.push(t);
   // Past the hold window the snapshot is not a measurement any more, so say so
   // with a gap rather than drawing a held number forever or (worse) interpolating
   // between the two real ones around it.
-  const s = (now - SNAP.at) / 1000 <= HOLD_S ? SNAP : { gpu: null, host: null, tel: {} };
+  const s = resume || (now - SNAP.at) / 1000 > HOLD_S
+    ? { gpu: null, host: null, tel: {} } : SNAP;
   const gpu = s.gpu, host = s.host, engTel = s.tel;
   const put = (n, v) => { const a = SER[n] ||= []; while (a.length < TS.length - 1) a.push(null); a.push(v == null ? null : +v); };
   put("gu_cuda0", gpu?.cuda0?.util_pct); put("gu_igpu0", gpu?.igpu0?.util_pct);
@@ -2641,6 +2650,15 @@ function schedule() {
 // interval — otherwise picking a rate and clicking away leaves the dashboard
 // frozen until the next tick fires.
 $("#refreshRate").addEventListener("blur", () => { paintSampleNote(); tick(); });
+// While the tab is in the background the browser throttles the 1s tick AND the
+// 1s sample grid, so sampling stops and the lines go stale (this is why the
+// dashboard looks "blanked" after alt-tabbing to the chat tab for a while). We
+// can't sample while hidden, but the moment the tab is visible again, refresh
+// immediately instead of waiting up to a second for the next interval — the
+// sampleLive time-jump break keeps the resume from smearing across the gap.
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) { paintSampleNote(); tick(); }
+});
 function setView(v) {
   view = v;
   $("#viewMain").classList.toggle("hidden", v !== "main");
