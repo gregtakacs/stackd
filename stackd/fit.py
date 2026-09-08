@@ -12,12 +12,18 @@ _EPS = 1e-6
 
 # ---------------------------------------------------------------- effective ceiling
 # `IGPU_VRAM_BUDGET_GIB` is a config *wish*, not a measurement. Nothing checked it
-# against the hardware, so a typo'd 90 on a box whose amdgpu driver exposes a
-# 62.2 GiB GTT window (Strix Halo) sailed through `stackctl validate` and had the
-# solver book min(demand + headroom, 90) — the dashboard already clamped to the
-# real window, so the UI said "you may claim 62" while the server blessed a plan
-# that claimed up to 90 out of a 128 GiB pool. Every reader of a device's ceiling
-# now goes through budget_facts() below, so the clamp exists exactly once.
+# against the driver, so a typo'd 90 on a box whose amdgpu driver exposes a
+# 62.2 GiB GTT window sailed through `stackctl validate` and had the solver book
+# min(demand + headroom, 90) — the dashboard already clamped to the real window,
+# so the UI said "you may claim 62" while the server blessed a plan that claimed
+# up to 90 out of a 128 GiB pool. Every reader of a device's ceiling now goes
+# through budget_facts() below, so the clamp exists exactly once.
+#
+# The window is a DRIVER limit, not silicon: `mem_info_gtt_total` is
+# `ttm.pages_limit` expressed in bytes, and the kernel auto-sets that to half of
+# MemTotal (130493404 kB / 2 = 62.224 GiB = 66812620800 B here). A budget above
+# half of RAM is therefore not a hardware impossibility, just an un-booted knob —
+# see gpu_discovery.gtt_window_gib() for the GRUB arg that raises it.
 _WINDOW_TTL_S = 300.0          # GTT total is fixed at driver load; re-probe rarely
 _windows: dict[int, tuple[float, float | None]] = {}   # index -> (at, GiB | None)
 

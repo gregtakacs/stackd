@@ -223,7 +223,27 @@ published ports — those shape the compose file itself, not just stackd's confi
 - **Multiple GPUs** — add more `devices:` entries and give each engine a
   `placement.devices` preference list.
 - **More/less RAM/VRAM** — `CUDA_VRAM_GIB`, `HOST_RAM_GIB`, `HOST_RESERVE_GIB` in `.env`.
-  Measure `HOST_RESERVE_GIB` as the RAM used with stackd's engines stopped.
+  Measure `HOST_RESERVE_GIB` as the RAM used with stackd's engines stopped, and set
+  `HOST_RAM_GIB` to `MemTotal` from `/proc/meminfo` rather than the size printed on
+  the kit (a 128 GB box reports ~124.4 GiB). Rounding the total up is a loan against
+  the reserve, and the solver can only spend it once.
+- **iGPU budget above half of RAM** — the amdgpu GTT window is `ttm.pages_limit`
+  reported in bytes (`mem_info_gtt_total`), and the kernel auto-sets it to **half of
+  MemTotal**. So `IGPU_VRAM_BUDGET_GIB` above that is not a hardware impossibility,
+  it is an un-booted knob: stackd clamps to the window and says so (`stackctl
+  validate`, `stackctl status`, and the dashboard lane). To raise it, add to
+  `GRUB_CMDLINE_LINUX_DEFAULT` (`32505856` pages = 124 GiB on a 128 GB box):
+
+  ```
+  ttm.pages_limit=32505856 ttm.page_pool_size=32505856
+  ```
+
+  then `sudo update-grub` and reboot; `dmesg | grep 'GTT memory ready'` should show
+  the new size and the clamp flag disappears. On kernels where TTM is split out
+  (6.17+), add the `amdttm.*` equivalents — plain `ttm.*` is inert there, and vice
+  versa: this box's `7.0.0` kernel has no `amdttm` module at all. **Widen
+  `HOST_RESERVE_GIB` in the same change** — with the aperture open the reserve is
+  the only guard left between a booked plan and an OOM.
 
 ## Notes
 

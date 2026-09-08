@@ -123,17 +123,20 @@ def validate_profile(cfg: Config, profile: str, catalog: "Catalog | None" = None
     for d in devices:
         if d.ok and d.models and d.headroom_gib < THIN_ABS_GIB:
             flags.append(f"thin margin on device {d.device}: {d.headroom_gib} GiB free")
-        # A budget the hardware can't honour is a config bug, not a fit failure:
-        # name it once, loudly, and say which number the math used. Boxes where
-        # the window can't be measured (no amdgpu / no /sys / CI) get nothing —
-        # this must not read as a warning to the `IGPU_VRAM_BUDGET_GIB=1` no-iGPU
-        # sentinel in deploy/README.
+        # A budget the driver won't honour is a config bug, not a fit failure:
+        # name it once, loudly, and say which number the math used. The window is
+        # the driver's TTM page limit and is raisable at boot (`ttm.pages_limit`),
+        # so the text says "driver GTT window" and not "hardware" — see
+        # gpu_discovery.gtt_window_gib. Boxes where the window can't be measured
+        # (no amdgpu / no /sys / CI) get nothing — this must not read as a warning
+        # to the `IGPU_VRAM_BUDGET_GIB=1` no-iGPU sentinel in deploy/README.
         if d.clamped:
             flags.append(
-                f"igpu budget clamped to hardware on {d.device}: configured "
+                f"igpu budget clamped on {d.device}: configured "
                 f"{cap_str(d.budget_gib)} GiB > driver GTT window "
                 f"{cap_str(d.gtt_window_gib)} GiB — the fit math caps at "
-                f"{cap_str(d.budget_effective_gib)} GiB")
+                f"{cap_str(d.budget_effective_gib)} GiB (window = "
+                f"ttm.pages_limit, kernel default half of host RAM)")
 
     tmpl_by_dev: dict[str, set[str]] = {}
     for p in pl.placed.values():

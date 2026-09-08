@@ -90,13 +90,21 @@ def amdgpu_device_dirs(sys_class_drm: str = "/sys/class/drm") -> list[str]:
 
 def gtt_window_gib(*, index: int = 0, sys_class_drm: str = "/sys/class/drm") -> float | None:
     """The GTT window amdgpu actually exposes for `igpu<index>`, in GiB — the
-    hardware's real claim on host RAM, or None if it can't be measured.
+    ceiling the driver will honour for host-RAM-backed claims, or None if it
+    can't be measured.
 
     Why this exists and not just `IGPU_VRAM_BUDGET_GIB`: that env var is a
-    config *wish*, and the box happily accepts 90 on hardware that exposes a
-    62.2 GiB window (Strix Halo: `mem_info_gtt_total` = 66812620800). Only GTT
-    is a claim on host RAM — the stolen window is boot-carved and never shows
-    up in MemTotal (see telemetry._igpu0_sysfs) — so GTT total is the number
+    config *wish*, and nothing rejects 90 on a driver that exposes 62.2 GiB.
+    The window is a DRIVER limit rather than silicon, though: `mem_info_gtt_total`
+    is exactly `ttm.pages_limit` in bytes (66812620800 = 16311675 pages × 4 KiB),
+    and the kernel auto-sets that to half of MemTotal. So a budget above half of
+    RAM is raised at boot, not in config: `ttm.pages_limit=<pages>` plus
+    `ttm.page_pool_size=<pages>` on the kernel command line (`amdttm.*` on the
+    kernels where TTM is split out), then `update-grub` + reboot. Until that
+    happens this probe keeps clamping, which is the point.
+
+    Only GTT is a claim on host RAM — the stolen window is boot-carved and never
+    shows up in MemTotal (see telemetry._igpu0_sysfs) — so GTT total is the number
     the pool math must clamp against. None (no amdgpu card, no /sys access,
     container without /dev/dri, CI) means UNKNOWN, not zero: the caller must
     then fall back to the configured budget rather than clamping a device to
