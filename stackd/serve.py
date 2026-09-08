@@ -741,7 +741,10 @@ class _Handler(BaseHTTPRequestHandler):
                     events.record_evt(e, source=f"control:{verb}")
                 if not evs:
                     events.record(verb, name, source="control")
-                return self._send_json(200, self.mgr.status())
+                body = self.mgr.status()
+                body["events"] = [{"action": e.action, "stack": e.stack,
+                                   "detail": getattr(e, "detail", "")} for e in evs or []]
+                return self._send_json(200, body)
         except Exception as e:  # noqa: BLE001
             return self._send_json(400, {"error": {"message": str(e)}})
         finally:

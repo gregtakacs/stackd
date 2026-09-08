@@ -18,7 +18,10 @@ import time
 from stackd.imagegen.comfyui_client import get_json, post_json, submit_workflow
 from stackd.imagegen import workflows
 
-GEN_TIMEOUT_S = 200.0   # hard per-generation cap — abort rather than hang
+GEN_TIMEOUT_S = 200.0   # default per-generation cap — abort rather than hang.
+# A cold first generation on a big model (Flux.2-dev on the Vulkan iGPU stages
+# ~51 GiB of weights before the first step) blows past this; pass a larger
+# --gen-timeout, or rely on the warm-up pass below so the measured run is warm.
 
 
 class BenchAborted(RuntimeError):
@@ -153,7 +156,8 @@ async def _abort_queue(base: str) -> None:
             pass
 
 
-async def _one_generation(model: str, px: int, prompt: str, base: str) -> float:
+async def _one_generation(model: str, px: int, prompt: str, base: str,
+                          timeout_s: float = GEN_TIMEOUT_S) -> float:
     _name, graph, nodes, _entry = workflows.load_model("generate", model)
     seed = int(time.time() * 1000) % (2 ** 31 - 1)
     nid = nodes.get("positive") or nodes.get("prompt")
@@ -168,7 +172,7 @@ async def _one_generation(model: str, px: int, prompt: str, base: str) -> float:
     # completion: either the prompt shows up in /history, or (fallback, since the
     # scratch janitor can clear /history mid-poll) it was seen in the queue and
     # has since left it. Never return before having positive evidence it ran.
-    deadline = time.monotonic() + GEN_TIMEOUT_S
+    deadline = time.monotonic() + timeout_s
     seen_in_queue = False
     b = base.rstrip("/")
     while True:
@@ -185,26 +189,46 @@ async def _one_generation(model: str, px: int, prompt: str, base: str) -> float:
             return round(time.monotonic() - t0, 1)
         if time.monotonic() > deadline:
             await _abort_queue(base)
-            raise BenchAborted(f"{px}px generation exceeded {GEN_TIMEOUT_S:.0f}s — "
-                               f"queue interrupted (ComfyUI likely thrashing model reloads)")
+            raise BenchAborted(
+                f"{px}px generation exceeded {timeout_s:.0f}s — queue interrupted. "
+                f"Raise --gen-timeout, or the model may be thrashing weight reloads "
+                f"under host-RAM pressure (check `docker logs` for repeated model loads).")
         await asyncio.sleep(1.5)
 
 
 async def bench_image(model: str, sizes: list[int], prompt: str, base: str,
-                      backend: str = "cuda") -> dict:
+                      backend: str = "cuda", gen_timeout: float = GEN_TIMEOUT_S,
+                      warmup: int = 1) -> dict:
     sampler = _VramSampler(backend=backend)
     sampler.start()
     time.sleep(0.6)
+    # Baseline is read HERE, before any generation (warm-up included) — the
+    # vulkan footprint math is peak − baseline, so the model's weights must not
+    # be staged yet or they'd fall out of the delta.
     baseline_total = total_used_mib(backend)
     baseline_comfy = comfy_used_mib(backend)
     baseline_host = _host_used_mib()
     points = []
     try:
+        # Warm-up: a cold first generation stages/compiles weights (tens of GiB
+        # on a big model) and is neither representative nor reliably under the
+        # timeout. Run it, throw the timing away, then measure warm — the number
+        # `footprint_gib` wants is the settled resident+active peak anyway. The
+        # warm-up gets a generous cap since it's the one expected to be slow.
+        for i in range(max(0, warmup)):
+            wpx = sizes[0]
+            print(f"  warm-up {i + 1}/{warmup} ({wpx}²) — not measured …", flush=True)
+            try:
+                wsecs = await _one_generation(model, wpx, prompt, base,
+                                              timeout_s=max(gen_timeout, 900.0))
+                print(f"  warm-up {i + 1}: {wsecs}s", flush=True)
+            except Exception as e:  # noqa: BLE001 — a bad warm-up still lets the measured run try
+                print(f"  warm-up {i + 1}: {e} — measuring anyway", flush=True)
         for px in sizes:
             sampler.reset()
             print(f"  {px}²: generating …", flush=True)
             try:
-                secs = await _one_generation(model, px, prompt, base)
+                secs = await _one_generation(model, px, prompt, base, timeout_s=gen_timeout)
             except BenchAborted as e:
                 print(f"  {px}²: ABORTED — {e}", flush=True)
                 points.append({"px": px, "ok": False, "error": str(e)})

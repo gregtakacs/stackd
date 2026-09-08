@@ -146,12 +146,25 @@ def _build_parser() -> argparse.ArgumentParser:
     so.add_argument("--budget-gib", type=float, default=None)
     so.add_argument("--at-ctx", type=int, default=None)
 
-    u = sub.add_parser("use", help="activate a profile (converge to it)")
+    def _daemon_client_args(p):
+        """use/pin/unpin/evict/status all drive the RUNNING daemon over HTTP — a
+        fresh local Manager here mutates state.json behind the daemon's back and
+        the two diverge (dashboard shows one profile, `stackctl status` another).
+        See the stackctl-use-vs-daemon split-brain notes."""
+        p.add_argument("--host", default=os.environ.get("STACKD_HOST", "127.0.0.1"))
+        p.add_argument("--port", type=int, default=int(os.environ.get("STACKD_PORT", "11444")))
+        p.add_argument("--api-key", default=_env_or_file("STACKD_API_KEY"))
+        p.add_argument("--local", action="store_true",
+                       help="operate on state.json directly, bypassing the daemon "
+                       "(offline/dev only — split-brains a running daemon)")
+        return p
+
+    u = _daemon_client_args(sub.add_parser("use", help="activate a profile (converge to it)"))
     u.add_argument("profile")
-    sub.add_parser("pin", help="hold the active profile up (disable idle self-evict)")
-    sub.add_parser("unpin", help="release a pin")
-    sub.add_parser("evict", help="force the active profile down to the default")
-    sub.add_parser("status", help="what is running right now")
+    _daemon_client_args(sub.add_parser("pin", help="hold the active profile up (disable idle self-evict)"))
+    _daemon_client_args(sub.add_parser("unpin", help="release a pin"))
+    _daemon_client_args(sub.add_parser("evict", help="force the active profile down to the default"))
+    _daemon_client_args(sub.add_parser("status", help="what is running right now"))
     r = sub.add_parser("route", help="resolve an api model name (may trigger a profile entry)")
     r.add_argument("api_name")
     sub.add_parser("tick", help="one supervisor pass: health, crash-restart, idle-evict")
@@ -217,6 +230,12 @@ def _build_parser() -> argparse.ArgumentParser:
     im = sub.add_parser("image", help="inspect / swap / bench the elastic image tier (talks to the daemon)")
     im.add_argument("--sizes", default="1024", help="bench: comma-separated square px (e.g. 1024,1536)")
     im.add_argument("--prompt", default=None, help="bench: generation prompt override")
+    im.add_argument("--gen-timeout", type=float, default=200.0,
+                    help="bench: per-generation cap in seconds before abort (default 200; "
+                    "raise for a big cold model on the iGPU)")
+    im.add_argument("--warmup", type=int, default=1,
+                    help="bench: unmeasured warm-up generations before the measured run "
+                    "(default 1; 0 to measure cold)")
     im.add_argument("--json", action="store_true", help="bench: machine-readable output")
     im.add_argument("--force", action="store_true",
                     help="bench: proceed even if an LLM is co-resident on the target device")
@@ -317,6 +336,113 @@ def _cmd_build(args) -> int:
             print(f"  {'OK  ' if rep.ok else 'FAIL'}  {pname}")
             bad += 0 if rep.ok else 1
         return 1 if bad else 0
+    return 0
+
+
+def _daemon_request(args, method: str, path: str, body=None, *, timeout: float = 900.0):
+    """One HTTP call to the running daemon. Returns (status_code, parsed_json).
+    Propagates urllib.error.URLError when the daemon isn't reachable."""
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    headers = {"content-type": "application/json"}
+    if args.api_key:
+        headers["authorization"] = f"Bearer {args.api_key}"
+    data = None
+    if method == "POST":
+        data = _json.dumps(body if body is not None else {}).encode()
+    req = urllib.request.Request(f"http://{args.host}:{args.port}{path}",
+                                 method=method, headers=headers, data=data)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return getattr(r, "status", 200), _json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            payload = _json.loads(e.read() or b"{}")
+        except Exception:  # noqa: BLE001
+            payload = {}
+        return e.code, payload
+
+
+def _cmd_control(args) -> int:
+    """use / pin / unpin / evict / status — ALWAYS against the running daemon so
+    the dashboard and the CLI never disagree about the active profile. A local
+    Manager (the `--local` escape hatch) writes state.json behind the daemon's
+    back; see the stackctl-use-vs-daemon split-brain notes."""
+    import urllib.error
+
+    verb = args.cmd
+    if getattr(args, "local", False):
+        return _cmd_control_local(args)
+    try:
+        if verb == "status":
+            code, body = _daemon_request(args, "GET", "/status", timeout=30)
+        elif verb == "use":
+            code, body = _daemon_request(args, "POST", f"/profiles/{args.profile}/activate")
+        elif verb == "evict":
+            code, body = _daemon_request(args, "POST", "/profiles/_/evict")
+        elif verb in ("pin", "unpin"):
+            scode, sbody = _daemon_request(args, "GET", "/status", timeout=30)
+            if scode != 200:
+                print(f"{verb} failed: daemon /status returned HTTP {scode}", file=sys.stderr)
+                return 1
+            active = sbody.get("active_profile") or "_"
+            code, body = _daemon_request(args, "POST", f"/profiles/{active}/{verb}")
+        else:  # unreachable — dispatch is gated on the same set
+            print(f"unknown control verb {verb}", file=sys.stderr)
+            return 2
+    except urllib.error.URLError as e:
+        print(f"no daemon reachable on {args.host}:{args.port} ({e.reason}). "
+              f"Re-run with --local to operate on state.json directly (offline/dev "
+              f"only — this split-brains a daemon started afterwards).", file=sys.stderr)
+        return 1
+
+    if code != 200:
+        msg = (body.get("error") or {}).get("message") or body or f"HTTP {code}"
+        print(f"{verb} failed: {msg}", file=sys.stderr)
+        return 1
+    for ev in body.get("events", []):
+        d = f" — {ev['detail']}" if ev.get("detail") else ""
+        print(f"  {ev['action']:<10} {ev['stack']}{d}")
+    sw = body.get("switching")
+    if sw:
+        print(f"  (daemon is converging → {sw.get('to', '?')} — this snapshot is mid-switch)")
+    elif body.get("stale"):
+        print("  (daemon busy — snapshot may be a few seconds stale)")
+    print(_fmt_status(body))
+    return 0
+
+
+def _cmd_control_local(args) -> int:
+    """The pre-daemon behaviour of use/pin/unpin/evict/status: a throwaway
+    Manager driving the Docker runner directly. Only safe with no daemon
+    running. Reached via `--local` or as the last resort when the daemon is
+    down."""
+    try:
+        mgr = _manager(args)
+    except Exception as e:  # noqa: BLE001
+        print(f"config error: {e}", file=sys.stderr)
+        return 2
+    try:
+        if args.cmd == "use":
+            print(f"use {args.profile}:")
+            _emit_events(mgr.use(args.profile))
+            print(_fmt_status(mgr.status()))
+        elif args.cmd == "pin":
+            mgr.pin()
+            print(f"pinned {mgr.state.active_profile}")
+        elif args.cmd == "unpin":
+            mgr.unpin()
+            print(f"unpinned {mgr.state.active_profile}")
+        elif args.cmd == "evict":
+            _emit_events(mgr.evict())
+            print(f"active: {mgr.state.active_profile}")
+        elif args.cmd == "status":
+            print(_fmt_status(mgr.status()))
+    except ManagerError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -464,8 +590,12 @@ def _cmd_image_bench(args, base, headers) -> int:
         print(f"image bench needs the imagegen extra ({e}) — run inside the stackd container", file=sys.stderr)
         return 1
 
-    print(f"→ benching on {endpoint} ({backend}), sizes {sizes} …  (each generation ~10–60s)")
-    out = asyncio.run(bench_image(model, sizes, args.prompt or DEFAULT_PROMPT, endpoint, backend=backend))
+    warm = f", {args.warmup} warm-up" if args.warmup else ""
+    print(f"→ benching on {endpoint} ({backend}), sizes {sizes}{warm} …  "
+          f"(each generation ~10–60s warm; a cold first run can take minutes)")
+    out = asyncio.run(bench_image(model, sizes, args.prompt or DEFAULT_PROMPT, endpoint,
+                                  backend=backend, gen_timeout=args.gen_timeout,
+                                  warmup=args.warmup))
 
     if args.json:
         print(_json.dumps(out, indent=2))
@@ -591,6 +721,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "image":
         return _cmd_image(args)
+
+    if args.cmd in ("use", "pin", "unpin", "evict", "status"):
+        return _cmd_control(args)
 
     # config-only commands don't need a runner/state
     if args.cmd in ("show", "validate", "plan", "probe", "bench", "solve"):
@@ -787,22 +920,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        if args.cmd == "use":
-            print(f"use {args.profile}:")
-            _emit_events(mgr.use(args.profile))
-            print(_fmt_status(mgr.status()))
-        elif args.cmd == "pin":
-            mgr.pin()
-            print(f"pinned {mgr.state.active_profile}")
-        elif args.cmd == "unpin":
-            mgr.unpin()
-            print(f"unpinned {mgr.state.active_profile}")
-        elif args.cmd == "evict":
-            _emit_events(mgr.evict())
-            print(f"active: {mgr.state.active_profile}")
-        elif args.cmd == "status":
-            print(_fmt_status(mgr.status()))
-        elif args.cmd == "route":
+        if args.cmd == "route":
             res = mgr.route(args.api_name)
             line = f"{res.status:<9} {res.model}"
             if res.endpoint:
