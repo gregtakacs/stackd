@@ -124,6 +124,15 @@ def main() -> int:
               b'api("/status").catch(() => null)' in raw
               and b'api("/v1/models").catch(() => null)' in raw
               and b'api("/gpu").catch(() => ({}))' in raw)
+        # The daemon keeps its own 1 s sample ring buffer (/live?since=), so the
+        # seconds the browser loses to background-tab throttling can be refilled
+        # with real data instead of a held line or a hole. On return the grid
+        # tail belongs to the backfill (pump parked) until it has caught up.
+        check("the hidden-tab gap is backfilled from the daemon's 1s buffer",
+              b"async function backfillLive" in raw
+              and b'api("/live?since="' in raw
+              and b"backfillLive().then(() => tick())" in raw
+              and b"if (typeof backfilling !== \"undefined\" && backfilling) return;" in raw)
         # The image ladder is a grid of name/verdict/footprint/action. Reasons are
         # sentences ("host RAM 122 > 64.9 free (vulkan) (unreachable: ...)"); inline,
         # they wrapped each row into a paragraph and knocked the numbers out of

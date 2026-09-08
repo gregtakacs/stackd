@@ -18,6 +18,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from stackd import events
@@ -57,6 +58,38 @@ def _host_stats() -> dict:
         return host_stats()
     except Exception as e:  # noqa: BLE001
         return {"error": str(e)}
+
+
+# ---- 1 s live ring buffer -----------------------------------------------
+# Wall-clock samples of exactly what the dashboard's live charts draw: GPU
+# util/power/VRAM, host CPU/load, and per-engine rates. The daemon samples once
+# a second regardless of who is looking and keeps ~15 min in memory; `GET
+# /live?since=` replays from any timestamp. This exists because the browser
+# throttles its timers while the dashboard tab is hidden, so those seconds used
+# to be simply lost — the chart could only gap or hold across them. Now the
+# dashboard backfills real data the moment the tab regains focus (and seeds the
+# first 10 minutes on page load). Measured cost per tick: gpu_stats ~3 ms
+# (max 26), host_stats ~1 ms, engine fetches run concurrently and cap at their
+# own 1 s HTTP timeout; buffer ≈ 900 samples × ~300 B = a few hundred KB.
+_LIVE_BUF: deque = deque(maxlen=900)
+_LIVE_LOCK = threading.Lock()
+
+
+def _live_trim(gpu: dict, host: dict, engs: dict) -> dict:
+    """Compact each source's raw payload to just the numbers the live charts
+    draw, so the buffer and /live replays stay small."""
+    def dev(d):
+        return ({k: d.get(k) for k in ("util_pct", "power_w", "vram_used_gib")}
+                if isinstance(d, dict) else None)
+    return {
+        "gpu": {k: dev((gpu or {}).get(k)) for k in ("cuda0", "igpu0")},
+        "host": {"cpu_pct": (host or {}).get("cpu_pct"),
+                 "load1": ((host or {}).get("loadavg") or [None])[0]},
+        "eng": {n: {k: t.get(k) for k in ("gen_tok_s", "prompt_tok_s", "mtp_accept_pct",
+                                          "kv_pct", "ctx_tokens")}
+                for n, t in (engs or {}).items()},
+    }
+
 
 _PROXY_READ_TIMEOUT_S = 600.0
 _KEEPALIVE_EVERY_S = 15.0
@@ -231,6 +264,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send_json(200, _gpu_stats())
         if self.path == "/host":
             return self._send_json(200, self._host_payload())
+        if self.path.split("?")[0] == "/live":
+            return self._live()
         if self.path.split("?")[0] == "/history":
             return self._history()
         if self.path == "/profiles":
@@ -671,6 +706,26 @@ class _Handler(BaseHTTPRequestHandler):
                 if tel.get("ctx_max"):
                     tel["kv_pct"] = round(min(100.0, 100.0 * hc / tel["ctx_max"]), 1)
         return self._send_json(200, tel)
+
+    def _live(self):
+        """`GET /live?since=<unix ts>` — replay of the daemon's own 1 s live
+        samples (GPU/host/engine, trimmed to chart shape) newer than `since`,
+        up to the buffer's ~15 min. The dashboard uses it to backfill the
+        seconds the browser throttled away while the tab was hidden, and to
+        seed the first 10 minutes on page load. `next` is the newest sample ts
+        so the caller can ask for exactly what it still lacks."""
+        q = self.path.split("?", 1)[1] if "?" in self.path else ""
+        since = 0.0
+        for kv in q.split("&"):
+            if kv.startswith("since="):
+                try:
+                    since = float(kv[len("since="):])
+                except ValueError:
+                    pass
+        with _LIVE_LOCK:
+            rows = [s for s in _LIVE_BUF if s["ts"] > since]
+        return self._send_json(200, {"samples": rows,
+                                     "next": rows[-1]["ts"] if rows else since})
 
     def _slots(self, stack: str):
         """Reverse-proxy a llama.cpp engine's /slots for the live engine card.
@@ -1467,6 +1522,40 @@ def serve(mgr: Manager, host: str, port: int, api_key: str | None,
                 print(f"[engine-sampler] error: {e}")
 
     threading.Thread(target=_engine_sampler, daemon=True).start()
+
+    def _live_sampler():
+        """Dashboard live-chart feed: one trimmed sample per second into
+        _LIVE_BUF, on the daemon's clock — never the browser's. Sources fan out
+        on a tiny pool so one busy engine (whose fetch caps at its own 1 s HTTP
+        timeout) can't delay the GPU/host readings; anything still unfinished
+        after the wait records as None for that sample, which the dashboard
+        reads as 'no fresh measurement' and handles per-line (daemon lines
+        hold, engine lines gap)."""
+        import concurrent.futures as cf
+        from stackd.telemetry import gpu_stats, host_stats, engine_telemetry
+        with cf.ThreadPoolExecutor(max_workers=8, thread_name_prefix="live") as pool:
+            while not stop.is_set():
+                t0 = time.time()
+                try:
+                    with lock:
+                        targets = [(rt.name, rt.endpoint,
+                                    (mgr.cfg.models.get(rt.name).engine.template
+                                     if mgr.cfg.models.get(rt.name) else ""))
+                                   for rt in mgr.state.stacks.values() if rt.endpoint]
+                    fg, fh = pool.submit(gpu_stats), pool.submit(host_stats)
+                    fe = {n: pool.submit(engine_telemetry, ep, tm) for n, ep, tm in targets}
+                    cf.wait([fg, fh, *fe.values()], timeout=2.5)
+                    gpu = fg.result() if fg.done() and not fg.exception() else {}
+                    host = fh.result() if fh.done() and not fh.exception() else {}
+                    engs = {n: f.result() for n, f in fe.items()
+                            if f.done() and not f.exception()}
+                    with _LIVE_LOCK:
+                        _LIVE_BUF.append({"ts": time.time(), **_live_trim(gpu, host, engs)})
+                except Exception as e:  # noqa: BLE001 — sampler is best-effort
+                    print(f"[live-sampler] error: {e}")
+                stop.wait(max(0.05, 1.0 - (time.time() - t0)))
+
+    threading.Thread(target=_live_sampler, daemon=True, name="live-sampler").start()
 
     for _n in mgr.state.boot_reset():
         print(f"[boot] dropped stale/crashed stack {_n} — will respawn fresh")

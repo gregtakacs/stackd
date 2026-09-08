@@ -1918,48 +1918,95 @@ let LAST_GOOD = { gpu: null, host: null };
 // seconds instead of tearing a hole in the lines
 const LAST_TEL = {}, LAST_TEL_AT = {};
 function snapshot(gpu, host, tel) { SNAP = { at: Date.now(), gpu, host, tel }; }
+function sput(n, v) { const a = SER[n] ||= []; while (a.length < TS.length - 1) a.push(null); a.push(v == null ? null : +v); }
+// Append one {gpu, host, tel}-shaped reading to the sample grid, aligned to the
+// last TS entry. Daemon lines hold the last good reading (see LAST_GOOD): a
+// missed /gpu or /host poll, or a briefly-stale snapshot, keeps the line flat at
+// the last real value instead of blanking. Engine lines stay honest — they gap
+// when there is no reading for that engine, because a gap there means generation
+// actually stopped. Shared by the 1 s grid (sampleLive) and the /live backfill,
+// so a backfilled point and a live point are drawn from identical shapes.
+function feedPoint(s) {
+  const engTel = s.tel || {};
+  const gpu = (s.gpu && (s.gpu.cuda0 || s.gpu.igpu0)) ? s.gpu : LAST_GOOD.gpu;
+  const host = (s.host && s.host.cpu_pct != null) ? s.host : LAST_GOOD.host;
+  if (gpu && (gpu.cuda0 || gpu.igpu0)) LAST_GOOD.gpu = gpu;
+  if (host && host.cpu_pct != null) LAST_GOOD.host = host;
+  sput("gu_cuda0", gpu?.cuda0?.util_pct); sput("gu_igpu0", gpu?.igpu0?.util_pct);
+  sput("gp_cuda0", gpu?.cuda0?.power_w);  sput("gp_igpu0", gpu?.igpu0?.power_w);
+  sput("gv_cuda0", gpu?.cuda0?.vram_used_gib); sput("gv_igpu0", gpu?.igpu0?.vram_used_gib);
+  sput("h_cpu", host?.cpu_pct); sput("h_load", host?.loadavg ? host.loadavg[0] : null);
+  for (const name of ENGINE_NAMES) {                     // every engine, every point
+    const t = engTel[name];                              // absent -> null, not skipped
+    sput("tok_" + name, t && t.gen_tok_s);               // sticky (main line)
+    sput("mtp_" + name, t && t.mtp_accept_pct);
+    sput("kv_" + name, t && t.kv_pct);
+    sput("ctxt_" + name, t && t.ctx_tokens);             // absolute token count, for the caption
+  }
+}
 function sampleLive(now) {
   const t = now / 1000;
   // If the 1s grid was throttled (tab in the background — the browser slows its
   // timers) or the poll stalled, the gap since the last sample is more than a few
   // seconds. For the engine lines that would make uPlot connect the two sides with
-  // a long diagonal "ramp" across the missing time, so on a resume we null the
-  // snapshot: the engine lines break cleanly and the next tick (1s later, once
-  // tick() has refreshed SNAP) is the first real point. The daemon lines are
-  // unaffected — they hold their last good value (see below) and stay flat.
+  // a long diagonal "ramp" across the missing time, so a resume feeds one null
+  // point and the line breaks cleanly. Normally the /live backfill (fired on
+  // visibilitychange) has already refilled the gap by the time the grid resumes
+  // and this break never shows; if the daemon's buffer couldn't cover it, the
+  // next fresh tick is the first real point. The daemon lines are unaffected —
+  // they hold their last good value (see LAST_GOOD) and stay flat.
   const resume = TS.length ? (t - TS[TS.length - 1]) > 3 : false;
   TS.push(t);
   // Past the hold window the snapshot is not a measurement any more, so say so
   // with a gap rather than drawing a held number forever or (worse) interpolating
   // between the two real ones around it.
-  const s = resume || (now - SNAP.at) / 1000 > HOLD_S
-    ? { gpu: null, host: null, tel: {} } : SNAP;
-  const engTel = s.tel;
-  // Daemon lines hold the last good reading (see LAST_GOOD): a missed /gpu or
-  // /host poll, or a briefly-stale snapshot, keeps the line flat at the last real
-  // value instead of blanking. Engine lines below stay honest — they gap when the
-  // engine has no fresh sample, because a gap there means generation actually
-  // stopped.
-  const gpu = (s.gpu && (s.gpu.cuda0 || s.gpu.igpu0)) ? s.gpu : LAST_GOOD.gpu;
-  const host = (s.host && s.host.cpu_pct != null) ? s.host : LAST_GOOD.host;
-  if (gpu && (gpu.cuda0 || gpu.igpu0)) LAST_GOOD.gpu = gpu;
-  if (host && host.cpu_pct != null) LAST_GOOD.host = host;
-  const put = (n, v) => { const a = SER[n] ||= []; while (a.length < TS.length - 1) a.push(null); a.push(v == null ? null : +v); };
-  put("gu_cuda0", gpu?.cuda0?.util_pct); put("gu_igpu0", gpu?.igpu0?.util_pct);
-  put("gp_cuda0", gpu?.cuda0?.power_w);  put("gp_igpu0", gpu?.igpu0?.power_w);
-  put("gv_cuda0", gpu?.cuda0?.vram_used_gib); put("gv_igpu0", gpu?.igpu0?.vram_used_gib);
-  put("h_cpu", host?.cpu_pct); put("h_load", host?.loadavg ? host.loadavg[0] : null);
-  for (const name of ENGINE_NAMES) {                     // every engine, every tick
-    const t = (engTel || {})[name];                      // absent -> null, not skipped
-    put("tok_" + name, t && t.gen_tok_s);                // sticky (main line)
-    put("mtp_" + name, t && t.mtp_accept_pct);
-    put("kv_" + name, t && t.kv_pct);
-    put("ctxt_" + name, t && t.ctx_tokens);              // absolute token count, for the caption
-  }
+  feedPoint(resume || (now - SNAP.at) / 1000 > HOLD_S
+    ? { gpu: null, host: null, tel: {} } : SNAP);
+  trimLive(t);
+}
+function trimLive(tEnd) {
   // trim to 10 min
-  const cut = now / 1000 - 600;
+  const cut = tEnd - 600;
   let i = 0; while (i < TS.length && TS[i] < cut) i++;
   if (i) { TS.splice(0, i); for (const k in SER) SER[k].splice(0, i); }
+}
+// Pull the daemon's own 1 s samples for whatever the browser missed and append
+// them to the grid, so the hidden-tab period reads as real data instead of a
+// held line (daemon metrics) or a hole (engine rates). On first load (empty
+// grid) it seeds the chart with the last 10 minutes from the daemon's buffer.
+// Pumping is parked while this runs so no live point lands *before* the grid's
+// tail and forces the middle samples to be skipped as "already have it".
+let backfilling = false;
+async function backfillLive() {
+  if (backfilling) return;
+  backfilling = true;
+  try {
+    const since = TS.length ? TS[TS.length - 1] : Date.now() / 1000 - 600;
+    let smp = [];
+    try { smp = ((await api("/live?since=" + since)) || {}).samples || []; }
+    catch (e) { return; }                   // unreachable daemon / no such endpoint yet
+    if (!smp.length) return;
+    if (!TS.length) {
+      // Seeding: engine series are written per-name at feed time, so the name
+      // set has to exist BEFORE the history points go in. A later tick re-derives
+      // it from /status; sput pads anything new with nulls for older points.
+      const names = Object.keys(smp[smp.length - 1].eng || {}).sort();
+      if (names.length) ENGINE_NAMES = names;
+    }
+    let added = 0;
+    for (const p of smp) {
+      if (!(p.ts > (TS[TS.length - 1] ?? 0))) continue;   // keep the grid sorted + deduped
+      TS.push(p.ts);
+      feedPoint({ gpu: p.gpu,
+                  host: p.host && p.host.cpu_pct != null
+                    ? { cpu_pct: p.host.cpu_pct, loadavg: [p.host.load1] } : null,
+                  tel: p.eng || {} });
+      added++;
+    }
+    if (added) { trimLive(Date.now() / 1000); renderLive(ENGINE_NAMES); }
+  } finally {
+    backfilling = false;
+  }
 }
 function paintSampleNote() {
   const e = $("#sampleNote"); if (!e) return;
@@ -1973,7 +2020,10 @@ function paintSampleNote() {
   else if (why) e.textContent = `sampling 1s · held (${why})`;
   else e.textContent = age * 1000 > poll * 3 ? `sampling 1s · no data for ${age}s` : "sampling 1s";
 }
-function pumpCharts() { sampleLive(Date.now()); renderLive(ENGINE_NAMES); paintSampleNote(); }
+function pumpCharts() {
+  if (typeof backfilling !== "undefined" && backfilling) return;   // grid tail owned by /live replay
+  sampleLive(Date.now()); renderLive(ENGINE_NAMES); paintSampleNote();
+}
 
 // ---- history charts (usage view) -----------------------------
 function mkHist(id, series, data, opts = {}) {
@@ -2673,13 +2723,16 @@ function schedule() {
 // frozen until the next tick fires.
 $("#refreshRate").addEventListener("blur", () => { paintSampleNote(); tick(); });
 // While the tab is in the background the browser throttles the 1s tick AND the
-// 1s sample grid, so sampling stops and the lines go stale (this is why the
-// dashboard looks "blanked" after alt-tabbing to the chat tab for a while). We
-// can't sample while hidden, but the moment the tab is visible again, refresh
-// immediately instead of waiting up to a second for the next interval — the
-// sampleLive time-jump break keeps the resume from smearing across the gap.
+// 1s sample grid, so browser-side sampling stops and those seconds used to be
+// lost (the "blanked dashboard" after alt-tabbing to the chat tab). The daemon
+// kept sampling on its own clock, so on return: pull the daemon's samples for
+// the gap and append them to the grid FIRST (backfillLive), then run a normal
+// tick once the tail is current — the resume break in sampleLive then never
+// fires, and the chart reads as if the tab had never been hidden.
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) { paintSampleNote(); tick(); }
+  if (document.hidden) return;
+  paintSampleNote();
+  backfillLive().then(() => tick());
 });
 function setView(v) {
   view = v;
@@ -2706,6 +2759,10 @@ async function start() {
     }
   }
   $("#topErr").classList.add("hidden");
+  // Seed the live charts from the daemon's 15 min sample buffer before the
+  // first poll, so the very first paint already shows the last 10 minutes
+  // instead of drawing in from an empty grid second by second.
+  await backfillLive();
   await tick();
   try { renderEvents(await api("/events"), true); } catch (e) {}
   loadProfiles(); loadUsers();
