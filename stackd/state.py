@@ -81,6 +81,10 @@ class RuntimeState:
     pinned: bool = False
     entered_at: float | None = None
     last_switch_at: float | None = None
+    # The profile we switched AWAY from on the most recent transition, so an
+    # in-progress swap can tell a requestor "Model load (from → to) in progress".
+    # Set in Manager._enter on a real switch; cleared when the target is fully up.
+    switch_from: str | None = None
     last_served_at: float | None = None
     stacks: dict[str, StackRuntime] = field(default_factory=dict)
     image: "ImageSlot | None" = None

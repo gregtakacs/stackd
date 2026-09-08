@@ -136,6 +136,33 @@ def _live_trim(gpu: dict, host: dict, engs: dict) -> dict:
 
 _PROXY_READ_TIMEOUT_S = 600.0
 _KEEPALIVE_EVERY_S = 15.0
+# How long a warm that is nearly done may still be waited out inline (so a request
+# landing seconds before a profile finishes loading is served normally instead of
+# being handed the in-progress/ETA response). Beyond this the swap is reported at once.
+_SWAP_PROMPT_GRACE_S = 12.0
+
+
+def _swap_is_long(swap: dict, grace_s: float) -> bool:
+    """Short-circuit (report in-progress) unless the swap is nearly done. A catalog-
+    derived ETA of ``None`` (never benched) still counts as long — we can't claim it
+    will fit in the grace, so we tell the requestor rather than hang the whole window."""
+    eta = swap.get("eta_s")
+    if eta is None:
+        return True
+    return eta > grace_s
+
+
+def _fmt_eta(secs: float) -> str:
+    """Human ETA for the in-progress message: '45s' / '2m10s' / '1h3m'."""
+    s = int(round(secs))
+    if s < 60:
+        return f"{s}s"
+    m, r = divmod(s, 60)
+    if m < 60:
+        return f"{m}m{r:02d}s" if r else f"{m}m"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m"
+
 
 _REGISTER_FALLBACK = (
     b"<!doctype html><meta charset=utf-8><title>stackd \xe2\x80\x94 register</title>"
@@ -1009,15 +1036,27 @@ class _Handler(BaseHTTPRequestHandler):
                 {"retry-after": "10"},
             )
 
-        rr = self._await_ready(rr, model, streaming)
-        if rr is None:  # keepalive stream already closed
+        # An ACTIVE profile swap is the long pole here (teardown + a fresh model
+        # load — a 27B can take minutes), and hanging this request open for the
+        # whole warm window just makes the client time out with nothing useful.
+        # Tell the requestor the swap is underway and when it should land, so it
+        # can back off and retry, instead of dying on a bare "model warming".
+        if rr.status != "ok":
+            with self.lock:
+                swap = self.mgr.swap_status(model)
+            if swap is not None and _swap_is_long(swap, _SWAP_PROMPT_GRACE_S):
+                return self._send_swap_in_progress(swap)
+
+        rr, sse_open = self._await_ready(rr, model, streaming)
+        if rr is None:  # keepalive stream already finalised (client gone / warmed)
             return
         if rr.status != "ok" or not rr.endpoint:
-            return self._send_json(
-                503, {"error": {"message": rr.note or "model warming", "type": "warming"}},
-                {"retry-after": "5"},
-            )
-
+            with self.lock:
+                swap = self.mgr.swap_status(model)
+            # a 200 stream is already open — deliver the status over SSE, not a status line
+            if sse_open:
+                return self._sse_swap_in_progress(swap)
+            return self._send_swap_in_progress(swap, fallback_note=rr.note)
         _apply_preset(body, rr.preset)
         _map_reasoning_effort(body, eff_map)
         if serving_tmpl.startswith("sglang"):
@@ -1031,6 +1070,19 @@ class _Handler(BaseHTTPRequestHandler):
             self._record_usage(model, rr, buf, status, embeddings=is_embeddings,
                                req_body=body)
             _capture_gen(rr.stack, buf, self.store, self.lock)
+
+        # Native-tool-call chat turns go through the validating relay so a truncated
+        # tool call is retried once (with a window-safe bigger output cap) instead of
+        # being forwarded half-written and rejected by the client's zod schema as
+        # `✖ Invalid input`. Only /chat/completions that actually declare `tools` —
+        # everything else (embeddings, plain chat, non-tool clients) stays on _relay.
+        guard = (_TC_RETRY and self.path.endswith("chat/completions")
+                 and isinstance(body.get("tools"), list) and len(body["tools"]) > 0)
+        if guard:
+            return self._relay_validated(
+                rr.endpoint.rstrip("/") + self.path, "POST", body,
+                mml=_ctx_ceiling(_m), streaming=streaming, on_body=_on_body,
+                inject_timings=_INJECT_TIMINGS, alias_token_ids=True)
 
         self._relay(rr.endpoint.rstrip("/") + self.path, "POST",
                     json.dumps(body).encode(), streaming=streaming, on_body=_on_body,
@@ -1070,8 +1122,14 @@ class _Handler(BaseHTTPRequestHandler):
 
     # -- warm wait ----------------------------------------------------------------
     def _await_ready(self, rr, model, streaming):
+        """Poll `model` until it's ready or the warm window closes. Returns
+        ``(rr, sse_open)``: ``rr`` is None once we've already finalised the response
+        ourselves (client-gone, or the post-ready resend frame on an SSE we opened),
+        or the last routing result if the window lapsed; ``sse_open`` tells the caller
+        we already committed a 200 stream, so a further status must go over SSE, not
+        as a fresh JSON status line."""
         if rr.status == "ok":
-            return rr
+            return rr, False
         deadline = time.time() + self.warm_wait_s
         started_sse = False
         last_ka = 0.0
@@ -1088,7 +1146,7 @@ class _Handler(BaseHTTPRequestHandler):
                     self.wfile.write(b": stackd warming\n\n")
                     self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError):
-                    return None
+                    return None, started_sse
                 last_ka = time.time()
             time.sleep(1.0)
             with self.lock:
@@ -1098,15 +1156,65 @@ class _Handler(BaseHTTPRequestHandler):
                     # can't reverse-proxy after committing our own 200; tell the
                     # client to resend (it will, immediately, and hit a warm stack)
                     self._sse_finish_retry()
-                    return None
-                return rr
-        return rr
+                    return None, started_sse
+                return rr, started_sse
+        return rr, started_sse
 
     def _sse_finish_retry(self):
         for line in (
             'data: {"error":{"message":"stack now ready — resend","type":"warmed"}}\n\n',
             "data: [DONE]\n\n",
         ):
+            try:
+                self.wfile.write(line.encode())
+                self.wfile.flush()
+            except OSError:
+                return
+
+    # -- swap-in-progress response ---------------------------------------------------
+    def _send_swap_in_progress(self, swap: dict | None, *, fallback_note: str = ""):
+        """Answer a request that hit an in-flight profile swap. Rather than dying on
+        a bare 'model warming' after hanging the whole warm window, return the actual
+        transition + a catalog-derived ETA and a matching Retry-After so the requestor
+        can back off and resend. `swap` may be None (the target name isn't mid-swap —
+        e.g. a pinned-outrank race cleared it between polls) → fall back to a plain
+        warming status."""
+        if swap is None:
+            return self._send_json(
+                503, {"error": {"message": fallback_note or "model warming", "type": "warming"}},
+                {"retry-after": "5"},
+            )
+        eta = swap.get("eta_s")
+        frm, to = swap["from"], swap["to"]
+        pend = ", ".join(swap.get("pending") or [])
+        if eta is None:
+            msg = f"Model load ({frm} → {to}) is in progress, loading {pend} — ETA pending (model not yet benched)"
+        else:
+            msg = f"Model load ({frm} → {to}) is in progress, loading {pend} — ETA {_fmt_eta(eta)}"
+        payload = {"error": {
+            "message": msg, "type": "warming", "in_progress": True,
+            "switching": {"from": frm, "to": to, "pending": swap.get("pending") or [],
+                          "eta_s": eta},
+        }}
+        # back off for ~the whole ETA (floored/capped), so a client that respects
+        # Retry-After comes back when the model is actually up rather than hammering.
+        retry = 5 if eta is None else max(3, min(int(eta) + 3, 1800))
+        return self._send_json(503, payload, {"retry-after": str(retry)})
+
+    def _sse_swap_in_progress(self, swap: dict | None):
+        """Same message as _send_swap_in_progress but framed over an SSE stream whose
+        200 headers we already committed (so we can't send a 503 status line)."""
+        msg = "model load in progress — resend"
+        eta = None
+        if swap is not None:
+            eta = swap.get("eta_s")
+            frm, to = swap["from"], swap["to"]
+            pend = ", ".join(swap.get("pending") or [])
+            msg = (f"Model load ({frm} → {to}) is in progress, loading {pend}"
+                   + (f" — ETA {_fmt_eta(eta)}" if eta is not None else " — ETA pending"))
+        import json as _json
+        body = _json.dumps({"error": {"message": msg, "type": "warming", "in_progress": True}})
+        for line in (f"data: {body}\n\n", "data: [DONE]\n\n"):
             try:
                 self.wfile.write(line.encode())
                 self.wfile.flush()
@@ -1225,6 +1333,111 @@ class _Handler(BaseHTTPRequestHandler):
             on_body(bytes(keep), up.status, {"prefill_s": prefill_s, "decode_s": decode_s})
 
 
+    def _relay_validated(self, url: str, method: str, body: dict, *, mml: int | None,
+                         streaming: bool, on_body=None, inject_timings: bool = False,
+                         alias_token_ids: bool = False):
+        """A tool-declaring /v1/chat/completions relay that REFUSES to forward a
+        visibly-truncated tool call. Unlike _relay it reads the whole upstream response
+        into memory first (agentic tool-call turns are bounded by the completion budget,
+        so this is small), checks whether any tool call's `arguments` came back cut off /
+        empty with finish_reason="length", and if so re-issues the SAME request once with
+        a temporary, window-safe larger output cap (_retry_body_with_budget). The client's
+        own zod validator is what throws `✖ Invalid input`; we can't fix that, but we can
+        stop shipping it the half-written JSON. Whatever we finally hold — original, or the
+        (possibly-still-truncated) retry — we forward in the framing the client asked for
+        (SSE chunked vs JSON content-length), preserving timing injection. Best-effort: any
+        error in the validation path falls back to forwarding the response as-is, so this
+        can never turn a working request into a broken one."""
+        fwd_ct = self.headers.get("content-type", "application/json")
+        accept = self.headers.get("accept", "*/*")
+
+        def _issue(payload: bytes):
+            req = urllib.request.Request(url, data=payload, method=method,
+                                         headers={"content-type": fwd_ct, "accept": accept})
+            up = urllib.request.urlopen(req, timeout=_PROXY_READ_TIMEOUT_S)
+            return up, up.read()
+
+        t0 = time.monotonic()
+        try:
+            up, data = _issue(json.dumps(body).encode())
+        except urllib.error.HTTPError as e:                 # upstream 4xx/5xx: forward verbatim
+            payload = e.read()
+            self.send_response(e.code)
+            self.send_header("content-type", e.headers.get("content-type", "application/json"))
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            if on_body:
+                on_body(payload, e.code, {})
+            return
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            return self._send_json(502, {"error": {"message": f"upstream unreachable: {e}"}})
+
+        status = up.status
+        # One server-side retry: only if the tool call is truncated AND we can actually
+        # raise the output cap without exceeding the context window (returns None else).
+        if _TC_RETRY and len(data) <= _TC_RETRY_MAX_BYTES and _toolcall_truncated(data):
+            nb = _retry_body_with_budget(body, _extract_usage(data), mml)
+            if nb is not None:
+                try:
+                    up2, data2 = _issue(json.dumps(nb).encode())
+                except Exception:  # noqa: BLE001 — retry failed; keep the original response
+                    up2 = None
+                if up2 is not None:
+                    status = status or up2.status
+                    if _toolcall_truncated(data2):        # retry didn't help → keep the first
+                        up2.close()
+                    else:                                 # retry produced a whole tool call
+                        up.close()
+                        up, data = up2, data2
+        up.close()
+        t_end = time.monotonic()
+
+        # Ledger on the RAW upstream body (pre-rewrite) — matches _relay's on_body.
+        if on_body:
+            on_body(data, status, {"prefill_s": 0.0, "decode_s": t_end - t0})
+
+        if streaming:
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("cache-control", "no-cache")
+            self.send_header("transfer-encoding", "chunked")
+            self.end_headers()
+
+            def _wc(b: bytes) -> None:
+                self.wfile.write(f"{len(b):x}\r\n".encode() + b + b"\r\n")
+                self.wfile.flush()
+
+            merged = False
+            for evt in data.split(b"\n\n"):
+                if not evt:
+                    continue
+                chunk = evt + b"\n\n"
+                if inject_timings and not merged and b'"usage"' in chunk:
+                    m = _merge_usage_evt(chunk, t0, t0, t_end)
+                    if m:
+                        chunk, merged = m, True
+                if inject_timings and chunk.strip() == b"data: [DONE]" and not merged:
+                    _wc(chunk)
+                    extra = _timing_sse_line(data, t0, t0, t_end)
+                    if extra:
+                        _wc(extra)
+                    continue
+                _wc(chunk)
+            self.wfile.write(b"0\r\n\r\n")
+        else:
+            out = data
+            if inject_timings:
+                out = _inject_body_timings(out, t0, t_end) or out
+            if alias_token_ids:
+                out = _alias_response_token_ids(out) or out
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+
+
 # One long-lived prompt-cache estimator per pricing.json path (it holds a rolling
 # per-(user, stack) request history). Rebuilt only if the path changes.
 _PCM: list = [object(), None]  # [pricing_path sentinel, PromptCacheModel|None]
@@ -1258,6 +1471,147 @@ def _extract_usage(buf: bytes) -> dict:
             except json.JSONDecodeError:
                 continue
     return last
+
+
+# --- tool-call truncation guard -----------------------------------------------------
+# Long agentic turns under a reasoning parser (Qwen3 + qwen3_coder) can exhaust the
+# completion budget mid-tool-call: generation stops with finish_reason="length" and
+# the tool-call arguments JSON is cut off (or empty). Native-tool-call clients (Cline/
+# Kilo) zod-validate the tool call and reject it with a bare `✖ Invalid input` — the
+# symptom "sometimes I get {"error":"✖ Invalid input"} on long sessions". The client's
+# validator is fixed; the proxy can, however, refuse to FORWARD a visibly-broken tool
+# call and instead re-issue the one upstream request with more output room. Opt out
+# with STACKD_TC_RETRY=0.
+_TC_RETRY = os.getenv("STACKD_TC_RETRY", "1").lower() not in ("0", "false", "no", "")
+_TC_RETRY_HEADROOM = 512        # leave this many tokens of slack under the ceiling
+_TC_RETRY_DEFAULT = 8192        # explicit cap when the caller sent none and we know no ceiling
+_TC_RETRY_MAX_BYTES = 8 * 1024 * 1024   # buffered-stream cap; past this, passthrough un-buffered
+
+
+def _completion_toolcall_state(buf: bytes):
+    """Scan a chat/completions response (JSON body OR an SSE capture) and rebuild the
+    assistant tool calls. Returns ``(has_tool_calls, finish_reasons, bad_args)`` where
+    ``bad_args`` is True if any tool call's accumulated ``arguments`` is non-empty but
+    not valid JSON (i.e. truncated). Deliberately conservative: never raises, and an
+    empty ``arguments`` (a genuinely argument-less call) is NOT flagged — only unparseable
+    content or a finish_reason of "length" alongside a tool call marks it broken."""
+    finish: set[str] = set()
+    acc: dict[int, list] = {}     # index -> [name, arguments-so-far]
+
+    def _absorb_tools(collection):
+        for tc in (collection or []):
+            if not isinstance(tc, dict):
+                continue
+            i = tc.get("index")
+            if not isinstance(i, int):
+                i = len(acc)
+            fn = tc.get("function") or {}
+            prev = acc.setdefault(i, [None, ""])
+            if fn.get("name"):
+                prev[0] = fn["name"]
+            prev[1] += fn.get("arguments") or ""
+
+    try:
+        obj = json.loads(buf)                       # non-streaming single JSON
+        for ch in (obj.get("choices") or []):
+            if isinstance(ch, dict):
+                if ch.get("finish_reason"):
+                    finish.add(ch["finish_reason"])
+                _absorb_tools((ch.get("message") or {}).get("tool_calls"))
+    except (json.JSONDecodeError, AttributeError):
+        for line in buf.split(b"\n"):               # SSE: fold deltas by tool-call index
+            line = line.strip()
+            if not line.startswith(b"data:"):
+                continue
+            seg = line[5:].strip()
+            if seg == b"[DONE]":
+                continue
+            try:
+                obj = json.loads(seg)
+            except json.JSONDecodeError:
+                continue
+            for ch in (obj.get("choices") or []):
+                if isinstance(ch, dict):
+                    if ch.get("finish_reason"):
+                        finish.add(ch["finish_reason"])
+                    _absorb_tools((ch.get("delta") or {}).get("tool_calls"))
+
+    bad = False
+    for _name, args in acc.values():
+        a = (args or "").strip()
+        if not a:
+            continue
+        try:
+            json.loads(a)
+        except (json.JSONDecodeError, ValueError):
+            bad = True
+    return bool(acc), finish, bad
+
+
+def _toolcall_truncated(buf: bytes) -> bool:
+    has, finish, bad = _completion_toolcall_state(buf)
+    return bool(has) and (("length" in finish) or bad)
+
+
+def _retry_body_with_budget(body: dict, usage: dict, mml: int | None) -> dict | None:
+    """Return a COPY of the request body with a larger output cap for the one retry,
+    or ``None`` when more tokens can't help (the prompt already fills the window). The
+    new cap never exceeds ``mml - prompt - headroom``, so the retry can't itself 400 on
+    context length. Preserves whichever spelling (max_tokens vs max_completion_tokens)
+    the caller used."""
+    prompt = int(usage.get("prompt_tokens") or 0)
+    cur_raw = body.get("max_completion_tokens") or body.get("max_tokens")
+    try:
+        cur = int(cur_raw) if cur_raw is not None else None
+    except (TypeError, ValueError):
+        cur = None
+    key = "max_completion_tokens" if "max_completion_tokens" in body else "max_tokens"
+
+    head = None
+    if mml and prompt:
+        head = mml - prompt - _TC_RETRY_HEADROOM
+        if head <= 0:
+            return None                            # prompt + a tool call won't fit anyway
+
+    if cur is None:
+        want = head if head else _TC_RETRY_DEFAULT
+    else:
+        if head is None:
+            want = int(cur * 2)
+        else:
+            if head <= cur:
+                return None                        # truncation wasn't the completion cap
+            want = min(head, cur * 3)
+        if want <= cur:
+            return None
+
+    nb = dict(body)
+    nb[key] = int(want)
+    return nb
+
+
+def _ctx_ceiling(m) -> int | None:
+    """Configured context ceiling for a model — params first (max_model_len / ctx /
+    context_length / n_ctx), then the raw cmd_extra flags the server actually launches
+    with. Mirrors the priority serve._engine uses for its own ctx_max."""
+    if m is None:
+        return None
+    try:
+        p = m.engine.params
+        for k in ("max_model_len", "ctx", "context_length", "n_ctx", "max_context"):
+            v = p.get(k)
+            if v:
+                return int(v)
+        cmd = list(m.engine.container.cmd_extra or [])
+        for flag in ("--max-model-len", "--context-length", "--max-context", "--ctx-size", "-c"):
+            if flag in cmd:
+                try:
+                    return int(cmd[cmd.index(flag) + 1])
+                except (ValueError, IndexError):
+                    pass
+    except (AttributeError, ValueError):
+        return None
+    return None
 
 
 # proxy-measured per-stack generation stats, keyed by stack — from llama.cpp's

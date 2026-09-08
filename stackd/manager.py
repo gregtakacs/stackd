@@ -224,6 +224,9 @@ class Manager:
         self.runner = runner or default_runner()
         self.min_residency_s = min_residency_s
         self.switch_cooldown_s = switch_cooldown_s
+        # readiness is only noticed on the next reconcile tick; the swap ETA adds this
+        # poll-interval slack so the promised number isn't systematically short.
+        self.swap_poll_s = 2.0
         self._default = next(p.profile for p in self.cfg.profiles.values() if p.default)
         self.state = RuntimeState.load(self.state_path, self._default)
         self.catalog = self._load_catalog()
@@ -282,6 +285,11 @@ class Manager:
 
     # -------------------------------------------------------------- transitions ---
     def _enter(self, name: str, now: float, *, switching: bool) -> None:
+        if switching and name != self.state.active_profile:
+            # remember the profile we're leaving so an in-progress swap can name it
+            self.state.switch_from = self.state.active_profile
+        elif not switching:
+            self.state.switch_from = None
         self.state.active_profile = name
         if switching:
             pr = self.cfg.profiles[name]
@@ -440,11 +448,70 @@ class Manager:
         return RouteResult("outranked", api_name, profile=top,
                            note=f"{top} is not higher priority than active {pr.profile}")
 
+    # ------------------------------------------------------- swap-in-progress view ---
+    def swap_status(self, api_name: str, *, now: float | None = None) -> dict | None:
+        """Describe an in-progress model swap for `api_name`, or ``None`` if this
+        name is not currently mid-swap (nothing pending, or it isn't being swapped
+        toward). Used by the HTTP front to answer a warm request promptly with a real
+        ETA instead of hanging it open for the whole warm window.
+
+        Returns ``{"from", "to", "pending", "eta_s"}`` — ``eta_s`` is ``None`` when
+        the catalog has no measured load time for the pending stack(s) yet (a brand-
+        new model), in which case the caller can't promise a number."""
+        now = time.time() if now is None else now
+        pr = self.cfg.profiles[self.state.active_profile]
+        # only report a swap for a name this profile actually serves
+        if not any(_serves(self.cfg, mn, api_name)[0] for mn in pr.models):
+            return None
+        pending = [mn for mn in pr.models
+                   if mn not in self.state.stacks
+                   or self.state.stacks[mn].state != EngineState.ready]
+        if not pending:
+            return None
+        return {
+            "from": self.state.switch_from or "(cold start)",
+            "to": self.state.active_profile,
+            "pending": pending,
+            "eta_s": self._swap_eta_s(pr, now, pending),
+        }
+
+    def _est_load_s(self, model: str, device: str | None) -> float | None:
+        """Measured EMA load time (seconds) for a model, or None if unbenched."""
+        try:
+            cur = self.catalog.for_model(self.cfg, model, device) if self.catalog else None
+            if cur and cur.timings:
+                v = cur.timings.get("load_s")
+                return float(v) if v else None
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    def _swap_eta_s(self, pr, now: float, pending: list[str]) -> int | None:
+        """Wall-clock seconds until every pending stack in `pr` should be ready —
+        the max remaining load across them (they warm concurrently), plus one poll
+        interval to account for readiness only being noticed on the next tick.
+        ``None`` if the catalog can't price ANY pending stack (never benched)."""
+        remaining = []
+        for mn in pending:
+            rt = self.state.stacks.get(mn)
+            est = self._est_load_s(mn, rt.device if rt else None)
+            if est is None:
+                continue
+            if rt is not None and rt.started_at is not None:
+                est = max(0.0, est - (now - rt.started_at))
+            remaining.append(est)
+        if not remaining:
+            return None
+        return int(max(remaining) + self.swap_poll_s)
+
     # --------------------------------------------------------------------- tick ---
     def tick(self, *, now: float | None = None) -> list:
         now = time.time() if now is None else now
         events = self.rec.tick(self.state, now=now)
         pr = self.cfg.profiles[self.state.active_profile]
+        # swap finished (everything the profile wants is up) — drop the "from" tag
+        if self.state.switch_from is not None and self._profile_loaded_at() is not None:
+            self.state.switch_from = None
         deadline = self._idle_evict_at(now)
         if (deadline is not None and now > deadline
                 and now - (self.state.entered_at or now) > self.min_residency_s):
