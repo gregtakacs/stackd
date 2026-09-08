@@ -77,6 +77,19 @@ def _fmt_status(s: dict) -> str:
     for p in s["pools"]:
         mark = "ok  " if p["ok"] else "FAIL"
         out.append(f"  [{mark}] {p['pool']:<13} {p['used']:>7.1f} / {p['limit']:<6.1f} GiB")
+        # igpu0 owns no memory — its GTT window is booked OUT of this pool, so show
+        # it inline as a slice rather than as a second stack the reader has to add
+        # up (90 + 128 read as 218 GiB on a 128 GiB box). Matches the dashboard's
+        # unified-RAM lane: ceiling is a cap on what the iGPU may claim, not a
+        # reservation; the number shown is what pool_charge actually books.
+        gtt = next((v for k, v in (p.get("breakdown") or {}).items()
+                    if k.startswith("vram:igpu0")), None)
+        if gtt:
+            ceil = next((d.get("budget") for d in (s.get("devices") or [])
+                         if d.get("device") == "igpu0"), None)
+            out.append(f"{'':23}└─ of which igpu0 GTT {gtt:>5.1f}"
+                       + (f" / ≤{ceil:g}" if ceil else "")
+                       + " GiB (cap, not reserved)")
     for f in s["flags"]:
         out.append(f"  ! {f}")
     return "\n".join(out)
