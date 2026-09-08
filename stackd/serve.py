@@ -9,7 +9,7 @@ upstream response incrementally and flushing each chunk.
 from __future__ import annotations
 
 import datetime
-import functools
+import hashlib
 import json
 import os
 import pathlib
@@ -30,17 +30,53 @@ from stackd.store import Store, _utc_day
 _WEB_DIR = pathlib.Path(__file__).resolve().parent / "web"
 _STATIC_TYPES = {".js": "text/javascript", ".css": "text/css", ".html": "text/html"}
 
+# Web assets are memoised by (mtime_ns, size) — deliberately NOT with
+# functools.lru_cache, which reads a file exactly ONCE per process. On this box
+# the source tree is bind-mounted into the container, so lru_cache served
+# whichever dashboard.html was on disk when the daemon booted: a dashboard-only
+# fix committed minutes later never reached a browser, however hard the user
+# reloaded, and read as "the caption fix didn't work". Re-stat on every request
+# (one syscall), re-read only when the file actually changed.
+_WEB_ASSETS: dict[str, tuple[int, int, bytes, str]] = {}
 
-@functools.lru_cache(maxsize=16)
+# The dashboard shell stamps its own build id into WEB_REV (see checkRev in
+# dashboard.html): serve.py rewrites this token with the sha1 of the file it is
+# sending and reports the same id on /health, so a tab left open across a deploy
+# can tell its user it is running an obsolete build.
+_REV_TOKEN = b"__WEB_REV__"
+
+
+def _asset_rev(raw: bytes) -> str:
+    return hashlib.sha1(raw).hexdigest()[:16]
+
+
+def _dash_rev() -> str | None:
+    """Build id of the dashboard shell currently on disk (None if missing)."""
+    hit = _web_file("dashboard.html")
+    return _asset_rev(hit[0]) if hit else None
+
+
 def _web_file(name: str) -> tuple[bytes, str] | None:
-    """Read a bundled web asset once. `name` is a bare filename (no path
-    separators); dashboard.html sits in web/, vendored libs in web/vendor/."""
+    """Return (bytes, content-type) for a bundled web asset — `name` is a bare
+    filename (no path separators); dashboard.html sits in web/, vendored libs in
+    web/vendor/. Bytes are reused until the file's mtime/size change."""
     if "/" in name or "\\" in name or name.startswith("."):
         return None
     for cand in (_WEB_DIR / name, _WEB_DIR / "vendor" / name):
-        if cand.is_file():
-            ctype = _STATIC_TYPES.get(cand.suffix, "application/octet-stream")
-            return cand.read_bytes(), ctype
+        try:
+            st = cand.stat()
+        except OSError:
+            continue
+        key, ctype = str(cand), _STATIC_TYPES.get(cand.suffix, "application/octet-stream")
+        hit = _WEB_ASSETS.get(key)
+        if hit is not None and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
+            return hit[2], hit[3]
+        try:
+            raw = cand.read_bytes()
+        except OSError:
+            continue
+        _WEB_ASSETS[key] = (st.st_mtime_ns, st.st_size, raw, ctype)
+        return raw, ctype
     return None
 
 
@@ -202,16 +238,29 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
-    def _send_bytes(self, code: int, raw: bytes, ctype: str, cache_s: int = 0):
+    def _send_bytes(self, code: int, raw: bytes, ctype: str, cache_s: int = 0,
+                    etag: str | None = None):
         self.send_response(code)
-        self.send_header("content-type", ctype + ("; charset=utf-8" if ctype.startswith("text/") else ""))
-        self.send_header("content-length", str(len(raw)))
+        if code != 304:                       # a 304 carries no body, no length
+            self.send_header("content-type", ctype + ("; charset=utf-8" if ctype.startswith("text/") else ""))
+            self.send_header("content-length", str(len(raw)))
+        if etag:
+            self.send_header("etag", etag)
         if cache_s < 0:
             self.send_header("cache-control", "no-cache")   # always revalidate
         elif cache_s:
             self.send_header("cache-control", f"max-age={cache_s}")
         self.end_headers()
-        self.wfile.write(raw)
+        if code != 304:
+            self.wfile.write(raw)
+
+    def _send_asset(self, raw: bytes, ctype: str, cache_s: int = 0, etag: str | None = None):
+        """Serve a web asset with a content ETag, so the browser's mandated
+        revalidation of a `no-cache` page is a 304 instead of a full body."""
+        etag = etag or '"' + _asset_rev(raw) + '"'
+        if self.headers.get("if-none-match") == etag:
+            return self._send_bytes(304, b"", ctype, cache_s=cache_s, etag=etag)
+        return self._send_bytes(200, raw, ctype, cache_s=cache_s, etag=etag)
 
     def _authed(self) -> bool:
         if not self.api_key:
@@ -228,11 +277,13 @@ class _Handler(BaseHTTPRequestHandler):
     # -- GET --------------------------------------------------------------------
     def do_GET(self):
         if self.path == "/health":
-            return self._send_json(200, {"status": "ok"})
+            # web_rev lets an already-open dashboard notice that the daemon is
+            # serving a different build than the one it loaded (checkRev).
+            return self._send_json(200, {"status": "ok", "web_rev": _dash_rev()})
         if self.path == "/register":  # self-service bootstrap — no auth
             hit = _web_file("register.html")
-            raw = hit[0] if hit else _REGISTER_FALLBACK
-            return self._send_bytes(200, raw, "text/html")
+            raw, ctype = (hit[0], hit[1]) if hit else (_REGISTER_FALLBACK, "text/html")
+            return self._send_asset(raw, ctype)
         if self.path.startswith("/register/users"):
             return self._users_get()
         # --- web UI: the shell + vendored assets are unauthenticated (no secrets;
@@ -241,17 +292,23 @@ class _Handler(BaseHTTPRequestHandler):
             hit = _web_file("dashboard.html")
             if not hit:
                 return self._send_json(404, {"error": {"message": "dashboard not bundled"}})
+            # Stamp the build id into the shell so the page can compare it with
+            # /health later (see checkRev). The rev is of the file as stored, so
+            # it stays stable across the substitution.
+            rev = _asset_rev(hit[0])
+            raw = hit[0].replace(_REV_TOKEN, rev.encode())
             # The shell is the whole app (inline JS) and it changes on every image
-            # rebuild. With no validator at all, browsers reapply a heuristic
-            # freshness window — a "hard" reload then quietly keeps running the old
-            # dashboard, which reads as the fix "not working". Revalidate always;
-            # the file is a few hundred KB and 304s are nearly free.
-            return self._send_bytes(200, hit[0], hit[1], cache_s=-1)
+            # rebuild or (bind-mounted) source edit. With no validator at all,
+            # browsers reapply a heuristic freshness window — a "hard" reload then
+            # quietly keeps running the old dashboard, which reads as the fix "not
+            # working". Revalidate always, with an ETag so the revalidation costs a
+            # 304 rather than the whole 150 KB body.
+            return self._send_asset(raw, hit[1], cache_s=-1, etag=f'"{rev}"')
         if self.path.startswith("/static/"):
             hit = _web_file(self.path[len("/static/"):].split("?")[0])
             if not hit:
                 return self._send_json(404, {"error": {"message": "no such asset"}})
-            return self._send_bytes(200, hit[0], hit[1], cache_s=86400)
+            return self._send_asset(hit[0], hit[1], cache_s=86400)
         if not self._authed():
             return self._send_json(401, {"error": {"message": "unauthorized"}})
         if self.path.split("?")[0] == "/savings":

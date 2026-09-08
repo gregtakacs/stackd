@@ -364,6 +364,10 @@
     <button class="sm" id="btnLogout">Log out</button>
   </div>
   <div id="topErr" class="flag hidden" style="margin-bottom:12px;"></div>
+  <div id="webStale" class="flag hidden" style="margin-bottom:12px;">
+    <span id="webStaleMsg"></span>
+    <button class="sm" id="webStaleGo" style="margin-left:10px;">Reload now</button>
+  </div>
 
   <!-- ============ MAIN VIEW ============ -->
   <div id="viewMain">
@@ -459,6 +463,11 @@
 const $ = s => document.querySelector(s);
 const el = (t, c, txt) => { const e = document.createElement(t); if (c) e.className = c; if (txt != null) e.textContent = txt; return e; };
 const KEY = () => localStorage.getItem("stackd_key") || "";
+// Build stamp. serve.py rewrites the token below to the sha1 of the shell it is
+// actually sending and reports the same id on /health. A tab left open across a
+// deploy otherwise runs the old build forever — which is exactly what makes a
+// shipped dashboard fix look like it never shipped. checkRev() watches for it.
+const WEB_REV = "__WEB_REV__";
 const fmtGib = v => (v == null ? "–" : (Math.round(v * 10) / 10).toLocaleString() + " GiB");
 const rnd1 = v => (v == null ? "–" : (Math.round(v * 10) / 10).toLocaleString());
 const fmtNum = v => (v == null ? "–" : Number(v).toLocaleString());
@@ -1887,11 +1896,22 @@ function renderLive(engineNames) {
   const isActive = n => !!(SNAP.tel && SNAP.tel[n] && SNAP.tel[n].active);
   let e0 = engineNames[0] || null;
   if (!engineNames.some(isActive) && engineNames.length > 1) {
-    const cnt = n => ((SER["tok_" + n] || []).filter(v => v != null).length
-                    + (SER["mtp_" + n] || []).filter(v => v != null).length);
-    e0 = engineNames.slice().sort((a, b) => cnt(b) - cnt(a))[0];
+    // Nothing is generating right now -> the engine with the most real samples
+    // owns the corner. Counted over the last ~30 s FIRST (that is the session the
+    // user just watched), then over the whole buffer — otherwise an engine that
+    // generated 9 minutes ago outranks one that generated 10 seconds ago.
+    const cnt = (n, from) => {
+      let c = 0; const a = SER["tok_" + n] || [], b = SER["mtp_" + n] || [];
+      for (let i = from; i < a.length; i++) { if (a[i] != null) c++; if (b[i] != null) c++; }
+      return c;
+    };
+    const tail = Math.max(0, TS.length - 30);
+    e0 = engineNames.slice().sort((a, b) =>
+      (cnt(b, tail) - cnt(a, tail)) || (cnt(b, 0) - cnt(a, 0)))[0];
   } else for (const n of engineNames) if (isActive(n)) { e0 = n; break; }
-  const e0pre = engineNames.length > 1 && e0 ? e0 + "  " : "";
+  // With more than one engine on the page a bare number is ambiguous, so the
+  // caption names whose numbers they are (upper case, like the legend below).
+  const e0pre = engineNames.length > 1 && e0 ? e0.toUpperCase() + " " : "";
   // caption: latest (sticky) value · 10-min per-request average (idle excluded)
   const capReq = (id, series, key, suf) => {
     const e = $(".lv-" + id); if (!e) return;
@@ -2762,6 +2782,43 @@ function setView(v) {
   if (v === "usage") loadUsage();
 }
 
+// ---- build stamp check --------------------------------------
+// The daemon stamps the sha1 of the shell it served into WEB_REV and reports the
+// id it is serving NOW on /health. When the two differ this tab is running an old
+// build — it was loaded before the last deploy and has no way to notice on its
+// own, which is exactly how a shipped dashboard fix ends up looking unfixed.
+// Always say so; reload by itself only while the page is genuinely idle, so no
+// one loses a form mid-edit or a click mid-flight.
+let lastInputAt = Date.now(), staleRev = null;
+for (const ev of ["pointerdown", "keydown", "wheel"])
+  document.addEventListener(ev, () => { lastInputAt = Date.now(); },
+                            { passive: true, capture: true });
+async function checkRev() {
+  if (document.hidden || !/^[0-9a-f]{16}$/.test(WEB_REV)) return;  // unstamped shell (tests, file://)
+  let live = null;
+  try { live = (await api("/health", { cache: "no-store" })).web_rev; } catch (e) { return; }
+  if (!live || live === WEB_REV) {
+    if (staleRev) { staleRev = null; $("#webStale").classList.add("hidden"); }
+    return;
+  }
+  if (!staleRev) {
+    staleRev = live;
+    $("#webStaleMsg").textContent =
+      `newer dashboard on the server (build ${live.slice(0, 7)}, this tab ${WEB_REV.slice(0, 7)}) ` +
+      "— this page is running the old one";
+    $("#webStale").classList.remove("hidden");
+  }
+  const idle = document.visibilityState === "visible" && !uiLocked()
+    && !tick._busy && Date.now() - lastInputAt > 15000;
+  // sessionStorage guard: one attempt per build id, so an intermediary that keeps
+  // handing back the old shell can't set off a reload loop.
+  if (idle && sessionStorage.getItem("stackd_reloaded") !== live) {
+    sessionStorage.setItem("stackd_reloaded", live);
+    location.reload();
+  }
+}
+$("#webStaleGo").onclick = () => location.reload();
+
 // ---- boot -----------------------------------------------
 async function start() {
   $("#gate").classList.add("hidden"); $("#app").classList.remove("hidden");
@@ -2789,6 +2846,8 @@ async function start() {
   setInterval(pumpCharts, SAMPLE_MS);   // the chart grid: 1 s regardless of poll rate
   setInterval(loadProfiles, 15000);
   setInterval(paintIdle, 1000);
+  setInterval(checkRev, 20000);         // notice a deploy this tab predates
+  checkRev();
 }
 
 $("#gateGo").onclick = () => { localStorage.setItem("stackd_key", $("#gateKey").value.trim());

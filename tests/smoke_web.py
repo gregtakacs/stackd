@@ -16,7 +16,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 import _env  # noqa: F401,E402
 
-from stackd import events, telemetry  # noqa: E402
+from stackd import events, serve, telemetry  # noqa: E402
 from stackd.manager import Manager  # noqa: E402
 from stackd.runner import FakeRunner  # noqa: E402
 from stackd.serve import make_server  # noqa: E402
@@ -53,6 +53,20 @@ def _json_req(url, **kw):
         return code, json.loads(raw or b"{}")
     except json.JSONDecodeError:
         return code, {"_text": raw.decode(errors="replace")}
+
+
+def _raw_req(url, *, token=None, extra=None):
+    """Like _req but returns the response HEADERS too — the caching checks need
+    the ETag / cache-control a response carried, which _req throws away."""
+    h = dict(extra or {})
+    if token:
+        h["authorization"] = f"Bearer {token}"
+    r = urllib.request.Request(url, headers=h, method="GET")
+    try:
+        with urllib.request.urlopen(r, timeout=10) as resp:
+            return resp.status, resp.headers, resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers, e.read()
 
 
 def main() -> int:
@@ -137,10 +151,45 @@ def main() -> int:
         # the one with the most real data, and name themselves when >1 engine
         # shares the page. (engineNames[0] pinned captions to the alphabetical
         # first — a mostly-idle autocomplete — so they read frozen or blank
-        # while the working engine's lines were live.)
+        # while the working engine's lines were live.) The "fullest" count is
+        # windowed to the last ~30 samples so the session that just ended beats
+        # one that ended 9 minutes ago.
         check("engine captions follow the active/fullest engine and name it",
-              b"const isActive = n =>" in raw and b"cnt(b) - cnt(a)" in raw
-              and b"e0pre" in raw)
+              b"const isActive = n =>" in raw
+              and b"cnt(b, tail) - cnt(a, tail)" in raw and b"cnt(b, 0) - cnt(a, 0)" in raw
+              and b"e0pre" in raw and b'e0.toUpperCase() + " "' in raw)
+        # ...and a caption fix is worthless if it never reaches the browser.
+        # _web_file used to be functools.lru_cached: with the source tree
+        # bind-mounted, the daemon kept serving the dashboard it booted with
+        # while the fixed file sat on disk (the "still nothing in the corners"
+        # report). Now the shell carries a build id, /health reports the live
+        # one, and the page says so when they differ.
+        check("shell is stamped with a build id (token replaced)",
+              re.search(rb'const WEB_REV = "[0-9a-f]{16}"', raw) and b"__WEB_REV__" not in raw)
+        code, hd, _body = _raw_req(f"{base}/")
+        code2, _hd2, body2 = _raw_req(f"{base}/", extra={"if-none-match": hd.get("etag", "")})
+        check("shell revalidates: no-cache + ETag, and a matching If-None-Match is a 304",
+              code == 200 and bool(hd.get("etag")) and "no-cache" in (hd.get("cache-control") or "")
+              and code2 == 304 and body2 == b"")
+        hcode, hj = _json_req(f"{base}/health")
+        check("/health publishes the same build id the shell was stamped with",
+              hcode == 200 and hj.get("web_rev")
+              and f'const WEB_REV = "{hj["web_rev"]}"'.encode() in raw)
+        check("a tab that predates the deploy notices and reloads when idle",
+              b"async function checkRev" in raw and b'setInterval(checkRev, 20000)' in raw
+              and b'idle && sessionStorage.getItem("stackd_reloaded") !== live' in raw
+              and b'id="webStale"' in raw and b'!uiLocked()' in raw)
+        web_bak = serve._WEB_DIR
+        (tmp / "web").mkdir()
+        serve._WEB_DIR = tmp / "web"
+        (serve._WEB_DIR / "dashboard.html").write_bytes(b"<title>stackd asset v1</title>")
+        _c1, _h1, b1 = _raw_req(f"{base}/")
+        time.sleep(0.02)
+        (serve._WEB_DIR / "dashboard.html").write_bytes(b"<title>stackd asset version two</title>")
+        _c2, _h2, b2 = _raw_req(f"{base}/")
+        serve._WEB_DIR = web_bak
+        check("web assets are re-read when the file changes (bind-mounted edit, no restart)",
+              b"v1" in b1 and b"version two" in b2)
         # The engine card must not reflow when a generation finishes: "(live)" ->
         # "(last session)" and "context" -> "peak context · 130.4k / 131k" wrapped
         # the stat row and visibly grew the card on every session end. Equal-length
