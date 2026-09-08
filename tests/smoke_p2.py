@@ -847,6 +847,75 @@ def t_image_unsafe_bench_bypass() -> None:
           r2["ok"] and "already resident" in (r2.get("note") or ""))
 
 
+def t_ladder_verdicts_match_scheduler() -> None:
+    """GET /image's per-candidate verdict must BE the scheduler's verdict.
+
+    2026-09-08: the dashboard showed flux2-dev-turbo as loadable on the iGPU
+    ("would load on igpu0" plus an enabled Load button) because the client judged
+    fit from footprint_gib vs device headroom alone. On the real box its
+    host_ram_gib (122) exceeds MemTotal (124.4) once the tier margin is added, so
+    the scheduler refuses it outright — the UI advertised a load that can never be
+    permitted, exactly as every CUDA row correctly says "won't fit" while coding
+    owns that VRAM. The verdict is now computed server-side by
+    Reconciler._backend_fit, the same call _pick_image makes."""
+    from stackd import telemetry
+    from stackd.solver import headroom
+
+    m = mgr(FakeRunner(ready_after=1))
+    m.use("chat", now=0)
+    ready_all(m)
+    m.set_image(model="flux2-klein", backend="vulkan", now=5)
+    ready_all(m, now_start=5)
+    m.rec._real_host_ram_avail = lambda tier_, profile_: 30.0        # deterministic
+    real_host_stats = telemetry.host_stats
+    telemetry.host_stats = lambda: {"mem_total_gib": 100.0, "mem_available_gib": 34.0}
+    try:
+        tier = m.cfg.media["image"]
+        kl = next(l for l in tier.prefer if l.active_model == "flux2-klein")
+        dt = next(l for l in tier.prefer if l.active_model == "flux2-dev-turbo")
+        dt.backends = ["cuda", "vulkan"]
+        dt.footprint_gib = {"cuda": 8.0, "vulkan": 8.0}
+        dt.host_ram_gib = {"cuda": 98.0, "vulkan": 98.0}   # unreachable on a 100-GiB box
+        kl.host_ram_gib = {"cuda": 42.0, "vulkan": 42.0}
+
+        v = m.image_status()
+        rows = {r["active_model"]: r for r in v["prefer"]}
+        dtv = rows["flux2-dev-turbo"]
+        check("unsatisfiable candidate is reported refused, not loadable",
+              dtv["fits"] is False and dtv["would_load_on"] is None)
+        check("reason names host RAM and that the figure is unreachable",
+              "host RAM 98" in dtv["fit"]["vulkan"]["reason"]
+              and "unreachable" in dtv["fit"]["vulkan"]["reason"])
+        check("cross-backend credit shows up in the arithmetic",
+              dtv["fit"]["cuda"]["credit_gib"] == 42.0
+              and "98 > 72.0 free" in dtv["fit"]["cuda"]["reason"])
+        check("same-backend route earns no credit",
+              dtv["fit"]["vulkan"]["credit_gib"] == 0.0)
+        check("declared host RAM per backend is finally in the payload",
+              dtv["host_ram_gib"]["vulkan"] == 98.0)
+        check("host RAM + MemTotal published for the ladder header",
+              v["host_ram_avail_gib"] == 30.0 and v["mem_total_gib"] == 100.0)
+
+        # verdicts and scheduler must not disagree: first fitting row == the pick,
+        # with the same teardown credit and the same host-RAM reading both use
+        credit, credit_backend = m.rec._teardown_credit(m.state, tier)
+        hr = headroom(m.cfg, "chat", m.catalog, reserve_gib=tier.margin_gib)
+        pick = m.rec._pick_image(tier, hr, host_ram_avail=30.0,
+                                 freed_gib=credit, freed_backend=credit_backend)
+        first_fit = next(r for r in v["prefer"] if r["fits"])
+        check("verdicts and scheduler agree on the pick",
+              pick is not None and first_fit["active_model"] == pick[2].active_model)
+
+        # an affordable figure flips the same row to fits, device named
+        dt.host_ram_gib = {"cuda": 20.0, "vulkan": 20.0}
+        v2 = {r["active_model"]: r for r in m.image_status()["prefer"]}
+        check("affordable figure flips the row back to fits with a device",
+              v2["flux2-dev-turbo"]["fits"] is True
+              and v2["flux2-dev-turbo"]["would_load_on"] is not None)
+    finally:
+        telemetry.host_stats = real_host_stats
+
+
 def t_image_none_survives_pin() -> None:
     """`image: none` means "don't AUTO-fill" — it must not tear down a slot a
     human/bench explicitly pinned there moments ago. Regression for the
@@ -932,6 +1001,7 @@ def main() -> int:
         t_image_host_ram_guard,
         t_image_teardown_credit_and_refusals,
         t_image_unsafe_bench_bypass,
+        t_ladder_verdicts_match_scheduler,
         t_image_none_survives_pin,
         t_reload_config,
         t_reactive_entry_refused_when_not_outranking,

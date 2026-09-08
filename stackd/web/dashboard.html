@@ -181,6 +181,11 @@
     background:var(--bg); border:1px solid var(--border); }
   .rung.here { border-color:var(--purple); }
   .rung.toobig { opacity:.5; }
+  /* A candidate the scheduler would refuse before start: shown, greyed, and its
+     Load button disabled, so "available" is never implied by its presence. */
+  .rung.refused { opacity:.5; border-left:2px solid var(--red); }
+  .rung button:disabled { opacity:.45; cursor:not-allowed; }
+  .pill.deny { color:var(--red); border-color:var(--red); }
   .toobig-inline { color:var(--red); }
 
   /* events */
@@ -1502,42 +1507,55 @@ function renderImage(img) {
   const hr = el("div", "row"); hr.style.margin = "8px 0";
   for (const [dv, g] of Object.entries(img.headroom_gib || {}))
     hr.append(el("span", "pill", `${dv} headroom ${fmtGib(g)}`));
+  // The axis the ladder verdicts are actually gated on: device VRAM is rarely the
+  // binding constraint for image models — the shared host-RAM pool is, and a
+  // Vulkan engine's working set lives there (including GTT pages charged to
+  // /proc/meminfo that no cgroup reading shows). Without this pill the card read
+  // "igpu0 headroom 83.5" next to a model needing 122 and looked loadable.
+  if (img.host_ram_avail_gib != null)
+    hr.append(el("span", "pill", `host RAM ${fmtGib(img.host_ram_avail_gib)} free of ${fmtGib(img.mem_total_gib)}`));
+  if (img.teardown_credit_gib > 0)
+    hr.append(el("span", "pill muted", `+${fmtGib(img.teardown_credit_gib)} credited to a cross-backend swap`));
   box.append(hr);
   const ladder = el("div", "ladder");
-  const devFor = be => be === "cuda" ? "cuda0" : "igpu0";
   for (const p of img.prefer || []) {
     const here = res && res.active_model === p.active_model;
-    // Per-backend footprints, each tagged with whether THIS model would land
-    // there right now (first backend, in the model's own listed order, whose
-    // device has enough headroom) — not the resident model's backend applied
-    // to every row, which showed the wrong device's number for every
-    // non-resident candidate and never said which GPU it'd actually occupy.
-    let landsOn = null;
-    const perBackend = (p.backends || []).map(be => {
-      const dv = devFor(be);
-      const fp = p.footprint_gib[be];
-      const head4 = (img.headroom_gib || {})[dv];
-      const fits = fp == null || head4 == null || fp <= head4;
-      if (fits && landsOn == null) landsOn = dv;
-      return { be, dv, fp, fits };
-    });
-    const toobig = !here && landsOn == null;
-    const rung = el("div", "rung" + (here ? " here" : "") + (toobig ? " toobig" : ""));
+    // Verdicts come from the SERVER (`fit`: Reconciler._backend_fit — host RAM
+    // first, then device VRAM, teardown credit already applied). The client used
+    // to derive this itself from footprint_gib vs device headroom alone, which
+    // advertised flux2-dev-turbo on the iGPU with an enabled Load button while
+    // the scheduler refuses it outright: its host_ram_gib alone (122) exceeds the
+    // whole box (124.4), so no free-RAM figure can ever make it fit.
+    const fit = p.fit || {};
+    const refused = !here && p.fits === false;
+    const rung = el("div", "rung" + (here ? " here" : "") + (refused ? " refused" : ""));
     rung.append(el("span", "dot " + (here ? "ready" : "")));
     rung.append(el("b", null, p.active_model));
     const bd = el("span", "muted");
-    bd.append(...perBackend.map((b, i) => {
-      const dv = here && res.backend === b.be ? res.device : b.dv;
-      const txt = `${b.be}:${fmtGib(b.fp)} → ${dv}` + (b.fits ? "" : " (won't fit)");
-      return el("span", b.fits ? "" : "toobig-inline", (i ? "  ·  " : "") + txt);
-    }));
+    (p.backends || []).forEach((be, i) => {
+      const v = fit[be] || {};
+      const fp = (p.footprint_gib || {})[be];
+      const hp = (p.host_ram_gib || {})[be];
+      const dv = (here && res.backend === be) ? res.device
+        : (v.device || (be === "cuda" ? "cuda0" : "igpu0"));
+      const txt = `${be}:${fmtGib(fp)} vram/${fmtGib(hp)} host → ${dv}`
+        + (v.fits === false ? ` — ${v.reason}` : "");
+      bd.append(el("span", v.fits === false ? "toobig-inline" : "", (i ? "  ·  " : "") + txt));
+    });
     rung.append(bd);
-    if (!here && landsOn) rung.append(el("span", "pill", "would load on " + landsOn));
+    if (!here && p.would_load_on)
+      rung.append(el("span", "pill", "would load on " + p.would_load_on[0]));
+    if (refused) rung.append(el("span", "pill deny", "refused before start"));
     rung.append(el("span", "muted", (p.capabilities || []).join(" ")));
     rung.append(el("div", "spacer"));
     if (!here) {
-      const b = el("button", "sm", "Load");
-      b.onclick = () => swapImage("model", p.active_model);
+      const b = el("button", "sm" + (refused ? " deny" : ""), refused ? "Blocked" : "Load");
+      if (refused) {
+        b.disabled = true;
+        b.title = "Would be refused: " + (p.backends || [])
+          .map(be => (fit[be] || {}).reason).filter(Boolean).join("; ")
+          + " — to bench it anyway: stackctl image bench --unsafe";
+      } else b.onclick = () => swapImage("model", p.active_model);
       rung.append(b);
     }
     ladder.append(rung);

@@ -244,6 +244,87 @@ class Reconciler:
         d = self.cfg.devices.get(dev)
         return bool(d) and d.backend.value == "cuda"
 
+    def _backend_fit(self, ld, backend: str, hr: dict[str, float], host_avail: float, *,
+                     margin_gib: float = 0.0, mem_total_gib: float | None = None):
+        """(ok, device, reason) for ONE (candidate, backend), in the order that
+        matters: the shared host-RAM pool first, then the device's own VRAM. This
+        is the single implementation of "would it fit" — `_pick_image()` and the
+        `/image` ladder verdicts both call it, so the dashboard can never claim a
+        model is loadable when the scheduler would refuse it (2026-09-08: the
+        ladder checked device VRAM only, so flux2-dev-turbo advertised itself on
+        the iGPU while its host_ram_gib figure alone exceeded the box).
+
+        `host_avail` is what the candidate may actually use, credit already added
+        in (see `_teardown_credit`). The reason is deliberately a short clause the
+        UI can show verbatim."""
+        fp = ld.footprint_gib.get(backend)
+        if fp is None:
+            return False, None, f"no {backend} footprint on record"
+        host_fp = ld.host_ram_gib.get(backend)
+        if host_fp is not None and host_fp > host_avail + 1e-6:
+            note = (f" (unreachable: {host_fp:.0f} + {margin_gib:.0f} margin exceeds "
+                    f"MemTotal {mem_total_gib:.1f})") if (mem_total_gib
+                    and host_fp + margin_gib > mem_total_gib) else ""
+            return False, None, (f"host RAM {host_fp:.0f} > {host_avail:.1f} free ({backend})"
+                                 + note)
+        devs = [d for d in self.cfg.devices
+                if self.cfg.devices[d].backend.value == backend]
+        for dev in sorted(devs, key=lambda d: -hr.get(d, 0.0)):
+            if hr.get(dev, 0.0) + 1e-6 >= fp:
+                return True, dev, ""
+        if not devs:
+            return False, None, f"no {backend} device configured"
+        best = max(devs, key=lambda d: hr.get(d, 0.0))
+        return False, None, f"VRAM {fp:.0f} > {hr.get(best, 0.0):.1f} free on {best}"
+
+    def _teardown_credit(self, state: RuntimeState, tier: MediaTier):
+        """(GiB of host RAM freed, backend it is pinned to) if a swap destroys the
+        RESIDENT image model's container first — see `_pick_image` for why a
+        same-backend swap earns nothing. One helper because the ladder verdicts
+        must credit exactly what `swap_image()` will."""
+        slot = state.image
+        if slot is None or slot.state not in (EngineState.warming, EngineState.ready):
+            return 0.0, None
+        rl = self._loadable(tier, slot.active_model)
+        rh = (rl.host_ram_gib or {}).get(slot.backend) if rl else None
+        return (float(rh), slot.backend) if rh else (0.0, None)
+
+    def image_verdicts(self, state: RuntimeState, profile: str) -> dict:
+        """The `prefer:` ladder as a click would experience it RIGHT NOW: same
+        headroom, same live host-RAM reading, same teardown credit the scheduler
+        uses. Consumed by GET /image; every row carries fits + why-not."""
+        tier = self.cfg.media.get("image")
+        if tier is None:
+            return {"headroom_gib": {}, "prefer": []}
+        hr = headroom(self.cfg, profile, self.catalog, reserve_gib=tier.margin_gib)
+        avail = self._real_host_ram_avail(tier, profile)
+        credit, credit_backend = self._teardown_credit(state, tier)
+        from stackd.telemetry import host_stats
+        total = host_stats().get("mem_total_gib")
+        prefer = []
+        for ld in tier.prefer:
+            fit, any_fit, lands_on = {}, False, None
+            for backend in ld.backends:
+                credit_b = credit if (credit > 0 and backend != credit_backend) else 0.0
+                ok, dev, reason = self._backend_fit(
+                    ld, backend, hr, avail + credit_b,
+                    margin_gib=tier.margin_gib, mem_total_gib=total)
+                fit[backend] = {"device": dev, "fits": ok, "reason": reason,
+                                "credit_gib": round(credit_b, 1)}
+                if ok:
+                    any_fit = True
+                    lands_on = lands_on or (dev, backend)
+            prefer.append({"active_model": ld.active_model,
+                           "capabilities": list(ld.capabilities),
+                           "backends": list(ld.backends), "fit": fit,
+                           "fits": any_fit,
+                           "would_load_on": list(lands_on) if lands_on else None})
+        return {"headroom_gib": {k: round(v, 1) for k, v in hr.items()},
+                "host_ram_avail_gib": round(avail, 1),
+                "mem_total_gib": total,
+                "teardown_credit_gib": round(credit, 1) if credit else 0.0,
+                "prefer": prefer}
+
     def _pick_image(self, tier: MediaTier, hr: dict[str, float], *,
                     need_caps: list[str] | None = None, want_model: str | None = None,
                     host_ram_avail: float = float("inf"), want_backend: str | None = None,
@@ -284,30 +365,13 @@ class Reconciler:
             for backend in backends:
                 if backend not in ld.backends:
                     continue
-                fp = ld.footprint_gib.get(backend)
-                if fp is None:
-                    if reasons is not None:
-                        reasons.append(f"{ld.active_model}: no {backend} footprint on record")
-                    continue
                 credit = freed_gib if (freed_gib > 0 and backend != freed_backend) else 0.0
-                host_avail = host_ram_avail + credit
-                host_fp = ld.host_ram_gib.get(backend)
-                if host_fp is not None and host_fp > host_avail + 1e-6:
-                    if reasons is not None:
-                        reasons.append(f"host RAM {host_fp:.0f} > {host_avail:.1f} free ({backend}"
-                                       + (f", incl. {credit:.0f} freeing)" if credit else ")"))
-                    continue
-                devs = [d for d in self.cfg.devices
-                        if self.cfg.devices[d].backend.value == backend]
-                for dev in sorted(devs, key=lambda d: -hr.get(d, 0.0)):
-                    if hr.get(dev, 0.0) + 1e-6 >= fp:
-                        return dev, backend, ld
+                ok, dev, reason = self._backend_fit(ld, backend, hr, host_ram_avail + credit,
+                                                    margin_gib=tier.margin_gib)
+                if ok:
+                    return dev, backend, ld
                 if reasons is not None:
-                    if devs:
-                        best = max(devs, key=lambda d: hr.get(d, 0.0))
-                        reasons.append(f"VRAM {fp:.0f} > {hr.get(best, 0.0):.1f} free on {best}")
-                    else:
-                        reasons.append(f"no {backend} device configured")
+                    reasons.append(reason + (f" (+{credit:.0f} freeing)" if credit else ""))
         return None
 
     def _refusal_detail(self, reasons: list[str]) -> str:
@@ -413,14 +477,9 @@ class Reconciler:
         # the new one spawns — so refusing a candidate over memory this very swap
         # is about to free is wrong (2026-09-08: a resident klein blocked
         # dev-turbo's cuda route on host RAM while klein was the thing being
-        # replaced). Both sides use declared estimates, so the comparison stays
-        # self-consistent with the figures that block it in the first place.
-        freed_gib, freed_backend = 0.0, None
-        if live:
-            rl = self._loadable(tier, slot.active_model)
-            rh = (rl.host_ram_gib or {}).get(slot.backend) if rl else None
-            if rh:
-                freed_gib, freed_backend = float(rh), slot.backend
+        # replaced). Shared with `image_verdicts()` via `_teardown_credit()` so the
+        # dashboard's verdict and this decision can never disagree.
+        freed_gib, freed_backend = self._teardown_credit(state, tier)
         reasons: list[str] = []
         pick = self._pick_image(tier, hr, need_caps=need_caps, want_model=model,
                                 host_ram_avail=host_ram_avail, want_backend=backend,

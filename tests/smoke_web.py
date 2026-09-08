@@ -141,6 +141,33 @@ def main() -> int:
               code == 200 and j.get("template", "").startswith("vllm")
               and "gen_tok_s" in j and "mtp_accept_pct" in j)
 
+        # --- /image: the ladder must ship a verdict, not raw numbers for the
+        # client to guess with. It used to publish only footprint_gib, so the
+        # dashboard compared that to device headroom and offered
+        # flux2-dev-turbo on the iGPU — a model whose host_ram_gib (122) alone
+        # exceeds this box's MemTotal, i.e. a load the scheduler refuses.
+        code, j = _json_req(f"{base}/image", token="admin")
+        rows = j.get("prefer", []) if code == 200 else []
+        check("/image verdicts every backend of every candidate",
+              code == 200 and rows and all(
+                  set(r["backends"]) == set(r["fit"]) and all(
+                      isinstance(f["fits"], bool) and isinstance(f["reason"], str)
+                      for f in r["fit"].values()) for r in rows))
+        check("/image publishes both axes it judged against",
+              all("footprint_gib" in r and "host_ram_gib" in r for r in rows)
+              and isinstance(j.get("host_ram_avail_gib"), (int, float))
+              and j["mem_total_gib"] > 0)
+        _bad = [r for r in rows if not r["fits"]]
+        _good = [r for r in rows if r["fits"]]
+        check("refused rows name no device and spell out every reason",
+              all(r["would_load_on"] is None and all(f["reason"] for f in r["fit"].values())
+                  for r in _bad))
+        check("rows that do fit name the device + backend they would land on",
+              all(r["would_load_on"] is not None and r["would_load_on"][0] in j["headroom_gib"]
+                  for r in _good))
+        check("a verdict of `fits` never comes with a reason",
+              all(not f["reason"] for r in _good for f in r["fit"].values() if f["fits"]))
+
         _json_req(f"{base}/profiles/chat/activate", token="admin", method="POST", body={})
 
         # --- /host -----------------------------------------------------------

@@ -484,19 +484,28 @@ class Manager:
 
     def image_status(self) -> dict:
         """State of the elastic image tier: what's resident, the free VRAM it has
-        to work with under the active profile, and the load-order catalog."""
-        from stackd.solver import headroom
+        to work with under the active profile, and the load-order catalog with a
+        server-side fit verdict per candidate per backend. The verdict comes from
+        the scheduler's own `_backend_fit()` — the client used to derive it from
+        `footprint_gib` vs device headroom alone, which advertised
+        flux2-dev-turbo on the iGPU while its `host_ram_gib` (122) alone exceeded
+        the box's MemTotal (124.4): 'would load on igpu0' + a Load button on a
+        load that can never be permitted."""
         tier = self.cfg.media.get("image")
         slot = self.state.image
-        hr = (headroom(self.cfg, self.state.active_profile, self.catalog,
-                       reserve_gib=tier.margin_gib) if tier else {})
+        v = self.rec.image_verdicts(self.state, self.state.active_profile)
+        declared = {l.active_model: l for l in (tier.prefer if tier else [])}
         return {
             "resident": self._slot_entry(slot) if slot is not None else None,
-            "headroom_gib": {k: round(v, 1) for k, v in hr.items()},
+            "headroom_gib": v["headroom_gib"],
+            "host_ram_avail_gib": v.get("host_ram_avail_gib"),
+            "mem_total_gib": v.get("mem_total_gib"),
+            "teardown_credit_gib": v.get("teardown_credit_gib", 0.0),
             "prefer": [
-                {"active_model": l.active_model, "capabilities": list(l.capabilities),
-                 "backends": list(l.backends), "footprint_gib": dict(l.footprint_gib)}
-                for l in (tier.prefer if tier else [])
+                {**row,
+                 "footprint_gib": dict(declared[row["active_model"]].footprint_gib),
+                 "host_ram_gib": dict(declared[row["active_model"]].host_ram_gib)}
+                for row in v["prefer"]
             ],
         }
 
