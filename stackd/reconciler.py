@@ -9,6 +9,7 @@ anyway, and the box is memory-tight).
 from __future__ import annotations
 
 import copy
+import os
 import threading
 import time
 from dataclasses import asdict, dataclass, field
@@ -56,7 +57,13 @@ class Reconciler:
         """Fold a measured swap-phase duration (load_s / teardown_s) into the
         model's catalog entry, EMA-smoothed and persisted to the overlay dir.
         This is the passive half of "automated benchmarking" — every real switch
-        refines the numbers `stackctl bench` seeds. Best-effort, never raises."""
+        refines the numbers `stackctl bench` seeds. Best-effort, never raises.
+
+        Set STACKD_PASSIVE_TIMINGS=0 to freeze the catalog `timings` blocks
+        (they then only change via an explicit `stackctl bench`) — avoids the
+        git churn on the tracked overlay dir from routine profile switches."""
+        if os.getenv("STACKD_PASSIVE_TIMINGS", "1").strip().lower() in ("0", "false", "no", "off", ""):
+            return
         try:
             if not getattr(self, "catalog", None) or secs is None or secs <= 0 or secs > 3600:
                 return

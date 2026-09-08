@@ -35,5 +35,13 @@
       ]
     ]
   },
-  "notes": "MEASURED 2026-09-03 via `docker run --entrypoint llama-server <a cuda llama.cpp image>` with the production flags (-ctk q8_0 -ctv q4_0, --flash-attn on, --kv-unified, --mmproj, --spec-type draft-mtp). nvidia-smi total VRAM at health-ready+1 warm request; card otherwise idle. 262144 pt reproduced the live proxy's 30558 vs 31046 MiB."
+  "notes": "MEASURED 2026-09-03 via `docker run --entrypoint llama-server <a cuda llama.cpp image>` with the production flags (-ctk q8_0 -ctv q4_0, --flash-attn on, --kv-unified, --mmproj, --spec-type draft-mtp). nvidia-smi total VRAM at health-ready+1 warm request; card otherwise idle. 262144 pt reproduced the live proxy's 30558 vs 31046 MiB.",
+  "timings": {
+    "teardown_s": 0.0,
+    "last_teardown_s": 0.0,
+    "n": 146,
+    "measured_at": "2026-09-08T01:28:35+00:00",
+    "load_s": 5.0,
+    "last_load_s": 5
+  }
 }

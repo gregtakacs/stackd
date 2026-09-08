@@ -25,6 +25,10 @@ from dataclasses import dataclass, field
 
 from stackd.config.models import Config
 
+# A passively-measured load_s/teardown_s beyond this multiple of the established
+# EMA is treated as a one-off (cold JIT compile, cache-cold disk) and not folded.
+_OUTLIER_FACTOR = 2.5
+
 
 def primary_device(cfg: Config, model_name: str) -> str:
     """The device a model's curve is keyed on — its first placement preference,
@@ -236,10 +240,20 @@ class Catalog:
             base.setdefault("points", {"vram": [], "ram": []})
             base.setdefault("notes", "")
             t = dict(base.get("timings") or {})
+            n_prev = int(t.get("n", 0))
+            folded = 0
             for k, v in samples.items():
-                t[k] = round(v if k not in t else alpha * v + (1 - alpha) * t[k], 1)
                 t["last_" + k] = round(v, 1)
-            t["n"] = int(t.get("n", 0)) + 1
+                # Reject a gross outlier once there's an established EMA: a cold
+                # FlashInfer/JIT compile or a cache-cold disk read can be 3-5x a
+                # warm load and would otherwise poison the estimate for many
+                # subsequent switches (EMA alpha 0.4). Kept visible as last_<k>.
+                if k in t and n_prev >= 3 and v > _OUTLIER_FACTOR * t[k]:
+                    continue
+                t[k] = round(v if k not in t else alpha * v + (1 - alpha) * t[k], 1)
+                folded += 1
+            if folded:
+                t["n"] = n_prev + 1
             t["measured_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
             base["timings"] = t
             tmp = out.with_suffix(".json.tmp")

@@ -1,0 +1,20 @@
+{
+  "key": "llamacpp-vulkan|igpu0|Qwen2.5-Coder-1.5B.Q8_0|p2",
+  "model": "Qwen2.5-Coder-1.5B.Q8_0",
+  "engine": "llamacpp-vulkan",
+  "device": "igpu0",
+  "source": "measured",
+  "points": {
+    "vram": [],
+    "ram": []
+  },
+  "notes": "",
+  "timings": {
+    "teardown_s": 0.0,
+    "last_teardown_s": 0.0,
+    "n": 275,
+    "measured_at": "2026-09-08T01:28:35+00:00",
+    "load_s": 6.2,
+    "last_load_s": 5
+  }
+}

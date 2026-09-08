@@ -61,6 +61,17 @@ def main() -> int:
     check("estimate @ 262144 == 40", approx(cur.estimate(262144)[0], 40.0, 0.1))
     check("max_x inverts the line", approx(cur.vram.max_x(31.0), 163840, 2000))
 
+    # --- update_timings: EMA fold + gross-outlier rejection --------------------
+    tk = curve_key(cfg, "chat", "cuda0")
+    for _ in range(4):
+        fc.update_timings(tk, load_s=260.0)          # establish EMA ~260, n=4
+    t = fc.update_timings(tk, load_s=1005.0)         # cold JIT compile — must NOT fold
+    check("outlier not folded into the EMA", 250.0 < t["load_s"] < 275.0)
+    check("outlier still visible as last_load_s", t["last_load_s"] == 1005.0)
+    check("outlier does not bump n", t["n"] == 4)
+    t = fc.update_timings(tk, load_s=360.0)          # 1.38x — a slow-but-plausible load, folds
+    check("in-band sample folds", 275.0 < t["load_s"] < 330.0 and t["n"] == 5)
+
     # --- validator prefers the catalog + reports source/delta -------------------
     base = validate_profile(cfg, "chat")
     withcat = validate_profile(cfg, "chat", catalog=cat)
