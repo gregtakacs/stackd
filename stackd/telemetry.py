@@ -421,6 +421,19 @@ def _wall_rate(a: dict | None, b: dict, key: str):
     return None
 
 
+def _slot_decoded(s: dict):
+    """tokens DECODED by one slot: the counter that moves only during
+    generation. Newer llama.cpp builds moved it into the slot's
+    ``next_token`` list; older ones expose it at the top level."""
+    v = s.get("n_decoded")
+    if v is not None:
+        return v
+    nt = s.get("next_token")
+    if isinstance(nt, list) and nt and isinstance(nt[0], dict):
+        return nt[0].get("n_decoded", 0) or 0
+    return 0
+
+
 def engine_telemetry(endpoint: str, template: str) -> dict:
     """Normalised live stats for one engine. All keys may be None.
 
@@ -472,11 +485,19 @@ def engine_telemetry(endpoint: str, template: str) -> dict:
             dr_t = m.get("llamacpp:spec_decode_num_draft_tokens_total")
             d["mtp_accepted_total"], d["mtp_drafted_total"] = acc_t, dr_t
 
-            # context position of the processing slot(s) — grows with each decoded
-            # token, so a poll-to-poll delta is a real live rate
+            # live per-slot signals. The context position grows during prefill
+            # AND decode, so on its own it reads the prefill rate as the
+            # generation rate (context loading showing up as tok/s of output).
+            # n_decoded moves only during generation and
+            # n_prompt_tokens_processed only while the prompt is evaluated, so
+            # each is a clean phase-specific rate.
             proc_pos = sum((s.get("n_past") or s.get("n_prompt_tokens", 0))
                            for s in slots if s.get("is_processing"))
+            proc_dec = sum(_slot_decoded(s) for s in slots if s.get("is_processing"))
+            proc_pref = sum((s.get("n_prompt_tokens_processed") or 0)
+                            for s in slots if s.get("is_processing"))
             cur = {"ts": now, "running": running, "pos": proc_pos,
+                   "dec": proc_dec, "pref": proc_pref,
                    "pred_tok": m.get("llamacpp:tokens_predicted_total"),
                    "pred_s": m.get("llamacpp:tokens_predicted_seconds_total"),
                    "prompt_tok": m.get("llamacpp:prompt_tokens_total"),
@@ -524,12 +545,27 @@ def engine_telemetry(endpoint: str, template: str) -> dict:
             if active:
                 base = prev if (prev and prev.get("running", 0) > 0) else st["sess_start"]
                 g = m.get("llamacpp:predicted_tokens_seconds")
-                # live slot-position rate — a real ~2s-window delta during
-                # generation; counter/gauge only move at request end (fallback)
-                live = _wall_rate(base_wall if (base_wall and base_wall.get("running", 0) > 0) else None, cur, "pos")
+                # live rates from the phase-specific slot counters (~2s window
+                # delta; the /metrics counters only move at request end).
+                bw = base_wall if (base_wall and base_wall.get("running", 0) > 0) else None
+                live = _wall_rate(bw, cur, "dec")
+                if live is None and bw is not None:
+                    # builds without an n_decoded field: position growth with
+                    # the prefill growth netted out is the decode growth —
+                    # but only while the prefill counter is quiet, otherwise
+                    # the net is just sampling lag between the two counters.
+                    if _wall_rate(bw, cur, "pref") is None:
+                        net = (cur["pos"] - bw["pos"]) - (cur["pref"] - bw["pref"])
+                        dt = cur["ts"] - bw["ts"]
+                        if dt > 0.5 and 0 < net < 1e6:
+                            live = round(net / dt, 1)
                 d["gen_tok_s"] = live or _win_rate(base, cur, "pred_tok", "pred_s") \
                     or (round(g, 1) if g else None) or ls.get("gen_tok_s")
-                d["prompt_tok_s"] = _win_rate(base, cur, "prompt_tok", "prompt_s") or ls.get("prompt_tok_s")
+                # prompt rate: the slot counter while the context loads (the
+                # /metrics prompt counters only jump at request end), then the
+                # session number until the next request.
+                d["prompt_tok_s"] = _wall_rate(bw, cur, "pref") \
+                    or _win_rate(base, cur, "prompt_tok", "prompt_s") or ls.get("prompt_tok_s")
                 d["mtp_accept_pct"] = _win_mtp(base, cur) or ls.get("mtp_accept_pct") or life_mtp
             else:
                 d["gen_tok_s"] = ls.get("gen_tok_s")
