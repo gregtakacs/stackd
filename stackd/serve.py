@@ -270,6 +270,30 @@ class _Handler(BaseHTTPRequestHandler):
                     for m in cat
                 ],
             })
+        if self.path in ("/v1/model/info", "/model/info"):
+            # LiteLLM-proxy-shaped model metadata. Clients that speak the LiteLLM
+            # provider dialect (Cline) read the context window + capability flags
+            # from here instead of making the user type them in. Same catalog as
+            # /v1/models; pricing fields are omitted on purpose (self-hosted, no
+            # per-token cost — and Cline's LiteLLM refresh ignores them anyway).
+            with self.lock:
+                cat = self.mgr.models_catalog()
+            return self._send_json(200, {
+                "data": [
+                    {
+                        "model_name": m["id"],
+                        "litellm_params": {"model": m["id"]},
+                        "model_info": {
+                            "max_input_tokens": m["context_length"],
+                            "max_output_tokens": m.get("max_output_tokens"),
+                            "supports_vision": m.get("supports_vision", False),
+                            "supports_prompt_caching": False,
+                            "supports_reasoning": m.get("supports_reasoning", False),
+                        },
+                    }
+                    for m in cat
+                ],
+            })
         if self.path == "/capabilities":
             with self.lock:
                 return self._send_json(200, self.mgr.capabilities())

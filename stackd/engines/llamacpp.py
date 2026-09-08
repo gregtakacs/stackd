@@ -19,6 +19,10 @@ class LlamacppParams:
     n_gpu_layers: int = 99
     extra_args: list[str] = field(default_factory=list)
     sampling: dict[str, Any] = field(default_factory=dict)
+    # Explicit multimodal flag for the model catalog / `/v1/model/info`. Usually
+    # unnecessary for llama.cpp (a `--mmproj` in extra_args is picked up by the
+    # heuristic); set it to override, or to `false` to force-hide vision.
+    vision: bool | None = None
 
 
 class _LlamacppBase(EngineAdapter):

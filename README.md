@@ -3,8 +3,9 @@
 A single daemon that is three things for a small multi-GPU host:
 
 - **an OpenAI-compatible proxy** — `POST /v1/chat/completions`, `/v1/completions`,
-  `/v1/embeddings`, `GET /v1/models`, with bearer auth, per-model presets, streaming
-  reverse-proxy, and a usage/cost ledger
+  `/v1/embeddings`, `GET /v1/models` (plus `GET /v1/model/info`, a LiteLLM-shaped
+  metadata view so clients like Cline auto-pick the context window + capabilities),
+  with bearer auth, per-model presets, streaming reverse-proxy, and a usage/cost ledger
 - **a two-device model orchestrator** — you declare the models you want and group them
   into *profiles*; a fit-solver places each on the GPU it fits (dedicated VRAM **and**
   shared/unified RAM are both balanced), and stackd creates / starts / stops the engine

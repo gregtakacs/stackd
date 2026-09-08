@@ -17,6 +17,12 @@ class VllmParams:
     backend_url: str | None = None       # override; default http://<container>:<port>
     gpu_memory_utilization: float = 0.9
     max_model_len: int | None = None
+    # Explicit multimodal flag for the model catalog / `/v1/model/info`. vLLM
+    # auto-detects vision from the checkpoint's config.json (no CLI flag), so the
+    # arg-sniffing heuristic can't see it — set this when the served checkpoint
+    # carries a vision tower. `false` force-hides it; omit to fall back to the
+    # heuristic (which, for vLLM, always says no).
+    vision: bool | None = None
     # {caller_effort: engine_effort} — the HTTP front rewrites a request's
     # `reasoning_effort` through this before forwarding, so a client using the
     # OpenAI vocabulary (none/minimal/low/medium/high) lands on whatever this

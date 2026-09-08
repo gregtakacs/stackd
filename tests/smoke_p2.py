@@ -234,6 +234,29 @@ def t_catalog_advertises_answering_ctx() -> None:
           cat["assistant"]["context_length"] == 262144
           and cat["assistant"]["context_provider"] == "chat")
 
+    # manual_only profile must NOT win the catalog home: reactive entry (route())
+    # filters manual_only out, so the advertised ctx has to come from the profile
+    # a request would actually load (mirrors coding-long vs coding).
+    from stackd.config.models import ProfileSpec, ServedEntry
+    m3 = mgr(FakeRunner(ready_after=1), switch_cooldown_s=0)
+    xl = copy.deepcopy(m3.cfg.models["coding"])
+    xl.name = "coding-xl"
+    xl.engine.container.cmd_extra[xl.engine.container.cmd_extra.index("--max-model-len") + 1] = "524288"
+    xl.serves = [ServedEntry(api_name="assistant-coder")]
+    m3.cfg.models["coding-xl"] = xl
+    m3.cfg.profiles["coding-xl"] = ProfileSpec(profile="coding-xl", priority=999,
+                                               manual_only=True, models=["coding-xl"])
+    m3.state.active_profile = "chat"
+    cat = {e["id"]: e for e in m3.models_catalog()}
+    check("manual_only profile demoted: coder name advertises `coding` (262144), not manual coding-xl",
+          cat["assistant-coder"]["context_length"] == 262144
+          and cat["assistant-coder"]["context_provider"] == "coding")
+    m3.state.active_profile = "coding-xl"
+    cat = {e["id"]: e for e in m3.models_catalog()}
+    check("...but when the manual_only profile IS active, it wins",
+          cat["assistant-coder"]["context_length"] == 524288
+          and cat["assistant-coder"]["context_provider"] == "coding-xl")
+
     # model_context_length resolution: params, then extra_args, then cmd_extra
     check("helper: llama.cpp params ctx",
           model_context_length(m.cfg, "chat") == 262144)
@@ -247,6 +270,22 @@ def t_catalog_advertises_answering_ctx() -> None:
     check("helper: vllm max_model_len via params OR cmd_extra",
           model_context_length(m.cfg, "coding") == 131072)
 
+    # vision: explicit params.vision is authoritative; heuristic is the fallback
+    from stackd.manager import model_supports_vision
+
+    check("vision heuristic: llama.cpp --mmproj in extra_args -> True",
+          model_supports_vision(m.cfg, "chat") is True)
+    check("vision heuristic: vllm with no flag -> False",
+          model_supports_vision(m.cfg, "coding") is False)
+    cv = copy.deepcopy(m.cfg.models["coding"])
+    cv.engine.params["vision"] = True
+    check("vision: explicit params.vision=true overrides the (blind) vllm heuristic",
+          model_supports_vision(_cfg_with(m, "coding", cv), "coding") is True)
+    ch = copy.deepcopy(m.cfg.models["chat"])
+    ch.engine.params["vision"] = False
+    check("vision: explicit params.vision=false force-hides despite --mmproj",
+          model_supports_vision(_cfg_with(m, "chat", ch), "chat") is False)
+
 
 def _cfg_with(m, name, model_spec):
     """A shallow clone of m.cfg with one model swapped in (for helper tests)."""
@@ -257,9 +296,10 @@ def _cfg_with(m, name, model_spec):
 
 def t_preset_translation() -> None:
     from stackd.manager import _translate_preset
-    check("llamacpp reasoning:off",
+    check("llamacpp reasoning:off -> enable_thinking:false (+ native knobs)",
           _translate_preset({"reasoning": "off"}, "llamacpp-cuda")
-          == {"reasoning_effort": "none", "reasoning_budget": 0})
+          == {"reasoning_effort": "none", "reasoning_budget": 0,
+              "chat_template_kwargs": {"enable_thinking": False}})
     check("llamacpp effort+budget",
           _translate_preset({"reasoning": {"effort": "low", "budget": 4096}}, "llamacpp-cuda")
           == {"reasoning_effort": "low", "reasoning_budget": 4096})

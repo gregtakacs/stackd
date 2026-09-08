@@ -108,6 +108,22 @@ def main() -> int:
         check("/v1/models carries real context_length",
               ids.get("assistant", {}).get("context_length") == 262144)
 
+        code, mi = _req(f"{base}/v1/model/info")
+        check("/v1/model/info without token -> 401", code == 401)
+        code, mi = _req(f"{base}/v1/model/info", token="secret")
+        info = {e["model_name"]: e for e in mi.get("data", [])}
+        a = info.get("assistant", {})
+        check("/v1/model/info is LiteLLM-shaped",
+              code == 200 and a.get("litellm_params", {}).get("model") == "assistant"
+              and a["model_info"]["max_input_tokens"] == 262144)
+        check("/v1/model/info: chat (llama.cpp, --mmproj, -n 32768) flags",
+              a["model_info"]["supports_vision"] is True
+              and a["model_info"]["supports_reasoning"] is True
+              and a["model_info"]["max_output_tokens"] == 32768
+              and a["model_info"]["supports_prompt_caching"] is False)
+        check("/model/info alias also served",
+              _req(f"{base}/model/info", token="secret")[0] == 200)
+
         code, res = _req(f"{base}/v1/chat/completions", token="secret",
                          body={"model": "assistant-xhigh", "messages": [{"role": "user", "content": "hi"}]})
         check("chat -> 200", code == 200)

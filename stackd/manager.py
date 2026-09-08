@@ -94,14 +94,71 @@ def model_context_length(cfg: Config, model_name: str) -> int | None:
         return None
 
 
+# multimodal projector / image-processor flags, and generation-cap flags, as
+# they appear in a rendered engine command (llama.cpp `extra_args` + vLLM/SGLang
+# `cmd_extra`). Used to fill the capability hints on the model catalog.
+_VISION_FLAGS = ("--mmproj", "--image-processor-backend")
+_OUT_FLAGS = ("-n", "--n-predict", "--predict", "--max-tokens", "--max-new-tokens")
+_REASONING_HINTS = ("--reasoning", "reasoning-parser", "reasoning_parser")
+
+
+def _rendered_args(cfg: Config, model_name: str) -> list[str]:
+    """Flattened engine arg list: llama.cpp params.extra_args then cmd_extra
+    (same sources model_context_length scans), stringified."""
+    e = cfg.models[model_name].engine
+    src = list(e.params.get("extra_args") or []) + list(e.container.cmd_extra or [])
+    return [str(a) for a in src]
+
+
+def model_supports_vision(cfg: Config, model_name: str) -> bool:
+    """True when the endpoint accepts image input. An explicit ``params.vision``
+    (true/false) is authoritative — needed for vLLM, which auto-detects vision
+    from the checkpoint with no CLI flag for the heuristic to see. Otherwise fall
+    back to sniffing the rendered command for a projector / image processor
+    (llama.cpp --mmproj, SGLang --image-processor-backend)."""
+    p = cfg.models[model_name].engine.params
+    if p.get("vision") is not None:
+        return bool(p["vision"])
+    if p.get("mmproj"):
+        return True
+    return any(a in _VISION_FLAGS for a in _rendered_args(cfg, model_name))
+
+
+def model_supports_reasoning(cfg: Config, model_name: str) -> bool:
+    """True when the engine runs a reasoning/thinking parser (every current
+    TakacsAI stack is a Qwen3 thinker)."""
+    if cfg.models[model_name].engine.params.get("reasoning_effort_map"):
+        return True
+    args = _rendered_args(cfg, model_name)
+    return any(h in a for a in args for h in _REASONING_HINTS)
+
+
+def model_max_output_tokens(cfg: Config, model_name: str) -> int | None:
+    """Explicit generation cap if the command sets one (llama.cpp -n), else a
+    sane ceiling bounded by the context window."""
+    args = _rendered_args(cfg, model_name)
+    for i, a in enumerate(args):
+        if a in _OUT_FLAGS and i + 1 < len(args):
+            try:
+                return int(args[i + 1])
+            except ValueError:
+                pass
+    ctx = model_context_length(cfg, model_name)
+    return min(ctx, 32768) if ctx else None
+
+
 def _translate_preset(raw: dict, template: str) -> dict:
     """Expand stackd's engine-agnostic ``reasoning:`` preset key into the request
     dialect of the engine that will actually serve the call. Everything else
     passes through untouched, so raw ``reasoning_effort`` / ``chat_template_kwargs``
     presets still work.
 
-      reasoning: off                        -> llamacpp: reasoning_effort=none, reasoning_budget=0
-                                               vllm/sglang: chat_template_kwargs.enable_thinking=false
+      reasoning: off  -> all: chat_template_kwargs.enable_thinking=false
+                         llamacpp additionally: reasoning_effort=none, reasoning_budget=0
+                           (a Qwen3 GGUF only honors enable_thinking in current
+                            llama.cpp builds — its reasoning_effort/reasoning_budget
+                            request fields do NOT gate thinking; the extra fields
+                            are a harmless fallback for a non-Qwen reasoning GGUF)
       reasoning: low | {effort: low}        -> all:      reasoning_effort=low
       reasoning: {effort: low, budget: N}   -> llamacpp: + reasoning_budget=N   (vllm/sglang have no per-request budget)
 
@@ -115,11 +172,13 @@ def _translate_preset(raw: dict, template: str) -> dict:
     spec = raw["reasoning"]
     is_qwen3_dialect = template.startswith(("vllm", "sglang"))
     if spec in ("off", False, None):
-        if is_qwen3_dialect:
-            ctk = dict(out.get("chat_template_kwargs") or {})
-            ctk["enable_thinking"] = False
-            out["chat_template_kwargs"] = ctk
-        else:
+        ctk = dict(out.get("chat_template_kwargs") or {})
+        ctk["enable_thinking"] = False
+        out["chat_template_kwargs"] = ctk
+        if not is_qwen3_dialect:
+            # llama.cpp's own knobs too — harmless if the (non-Qwen) GGUF
+            # ignores chat_template_kwargs; the Qwen3 GGUF template gates
+            # thinking on enable_thinking, not on these.
             out["reasoning_effort"] = "none"
             out["reasoning_budget"] = 0
         return out
@@ -487,7 +546,17 @@ class Manager:
         pr_active = self.cfg.profiles[self.state.active_profile]
         running = set(self.state.stacks)
         seen: dict[str, dict] = {}
-        for pr in sorted(self.cfg.profiles.values(), key=lambda p: -p.priority):
+        # Attribute each name's home to the profile that would ACTUALLY answer a
+        # request for it: the active profile first (native / stand-in), then the
+        # highest-priority NON-manual_only profile (what reactive entry in
+        # route() would switch to — it filters manual_only out), and only then a
+        # manual_only profile as a last resort. Without the manual_only demotion
+        # the catalog advertises e.g. coding-long's 524K window for
+        # TakacsAI-Coding-* while `coding` (262K) is what a reactive request
+        # loads — a real advertised-vs-delivered mismatch.
+        _order = lambda p: (p.profile != self.state.active_profile,
+                            p.manual_only, -p.priority)
+        for pr in sorted(self.cfg.profiles.values(), key=_order):
             for mn in pr.models:
                 m = self.cfg.models[mn]
                 for se in m.serves:
@@ -526,6 +595,11 @@ class Manager:
                         "native": exact_here,
                         "standin": glob_here and not exact_here,
                         "ready": (exact_here or glob_here) and up,
+                        # capability hints (also from the answering stack) — for
+                        # clients that read model metadata off /v1/model/info
+                        "max_output_tokens": model_max_output_tokens(self.cfg, provider),
+                        "supports_vision": model_supports_vision(self.cfg, provider),
+                        "supports_reasoning": model_supports_reasoning(self.cfg, provider),
                     }
         return list(seen.values())
 
