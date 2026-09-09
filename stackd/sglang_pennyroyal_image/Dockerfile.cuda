@@ -28,30 +28,36 @@
 FROM nvidia/cuda:13.3.1-devel-ubuntu24.04@sha256:4ff859525f99de5782aa73607ce24219b07dddd48d12b97c1c301d7e1cfb0a87
 
 ARG SGLANG_FORK_REPO=https://github.com/jpezzulli/sglang-rtxpro6000.git
-# Pinned to release tag pennyroyal-v2.3.1.1 (commit
-# ccabd15479a5d46ffef6d1dd28a6e1f01aa05199, released 2026-09-07). Bumped
-# 2026-09-07 from pennyroyal-v2.3.1 (55c44438ab6bc50e3fc0f7b797356b8c0b92efe3);
+# Pinned to release tag pennyroyal-v2.4.0 (commit
+# 94324164715b45386de1789070ceb258333d08cc, released 2026-09-09). Bumped
+# 2026-09-09 from pennyroyal-v2.3.1.1 (ccabd15479a5d46ffef6d1dd28a6e1f01aa05199);
 # rollback lever: set SGLANG_FORK_REF back to that tag.
-#   v2.3   — Flash-Next FR-Spec: 65,536-token draft map + launcher/map-builder.
-#            Decode-throughput win for the Flash-Next profile, but ONLY if the
-#            launch config switches to the FR-Spec launcher (coding-long.yaml
-#            still uses --speculative-algorithm NEXTN — not yet updated).
-#   v2.3.1 — GDN gate-rounding correctness fix on the Triton verify path used by
-#            27B FP8/DFlash2. Flash-Next's FlashInfer/WY path is UNCHANGED.
-#   v2.3.1.1 — bundles the Froggeric v22.5 chat template (an unmodified copy of
-#            froggeric/Qwen-Fixed-Chat-Templates: folds the OpenAI effort
-#            vocabulary onto xhigh/medium/low, no raise_exception, default
-#            medium) at configs/pennyroyal/templates/, and the launchers add
-#            --image-processor-backend pil for a near-full-VRAM heavy-vision
-#            case. BUILD.md: "no runtime rebuild needed" — the SGLang executable
-#            (commit 739aff3dc5) is UNCHANGED from v2.3.1, only launchers/
-#            template/docs differ. coding-long.yaml points --chat-template at
-#            the baked /opt/pennyroyal/configs/pennyroyal/templates path.
-# BUILD.md @ v2.3.1.1 qualifies the same toolchain this Dockerfile already uses
-# (Python 3.12.13, CUDA 13.3, GCC 15.3.1, PyTorch 2.13.0+cu130) and the same
-# NIXL_REF below — no dependency changes. The git-checkout layer changes, so a
-# from-scratch ~20 min sm120 rebuild (produces the same wheel as v2.3.1).
-ARG SGLANG_FORK_REF=pennyroyal-v2.3.1.1
+#   v2.3     — Flash-Next FR-Spec: 65,536-token draft map + launcher/map-builder.
+#   v2.3.1   — GDN gate-rounding correctness fix on the 27B FP8/DFlash2 Triton
+#              verify path. Flash-Next's FlashInfer/WY path UNCHANGED.
+#   v2.3.1.1 — bundles the Froggeric v22.5 chat template at
+#              configs/pennyroyal/templates/; launchers add
+#              --image-processor-backend pil. Executable unchanged from v2.3.1.
+#   v2.4.0   — 11 fork commits on top of v2.3.1.1, NO upstream rebase, same
+#              dependency stack + launch settings (BUILD.md: "Existing model
+#              weights, dependency versions and launch settings do not need
+#              changing"). Runtime changes: (a) qwen3_coder phantom tool-call
+#              fix — adapts our upstream PR sgl-project/sglang#38624 (wrapper
+#              gate + declared-name check), so the local
+#              patches/qwen3-coder-streaming-phantom-toolcall.patch is RETIRED
+#              here; (b) release abandoned streaming work + request resources on
+#              client disconnect / cancel-around-dispatch; (c) explicit Chat
+#              reasoning_effort now wins over the launcher default (stackd's
+#              front already sends it in chat_template_kwargs — no change
+#              needed); (d) QSA prefill reuse + short-extend bounds; (e) MoE
+#              zero-bias routing removal + PDL input fence. RUN.md: the source
+#              selects a FRESH NIXL namespace — coding-long.yaml /
+#              chat-next.yaml SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR bumped
+#              (-v4 -> -v5) so stale prefix pages aren't served.
+# BUILD.md @ v2.4.0 keeps the toolchain this Dockerfile uses (Python 3.12,
+# CUDA 13.3, GCC 15, PyTorch 2.13.0+cu130) and the same NIXL_REF below. The
+# git-checkout layer changes, so a from-scratch ~20 min sm120 rebuild.
+ARG SGLANG_FORK_REF=pennyroyal-v2.4.0
 # NIXL commit from the fork's BUILD.md (POSIX FILE plugin for the HiCache
 # storage backend). Only needed once phase-2 NIXL persistence is turned on, but
 # built now so the image is complete.
@@ -181,6 +187,15 @@ COPY nixl-posix.toml /etc/pennyroyal/nixl-posix.toml
 
 COPY entrypoint.sh /usr/local/bin/pennyroyal-entrypoint
 RUN chmod +x /usr/local/bin/pennyroyal-entrypoint
+
+# The qwen3_coder phantom tool-call hotfix that lived here (a local git-apply of
+# patches/qwen3-coder-streaming-phantom-toolcall.patch, our upstream PR
+# sgl-project/sglang#38624) is RETIRED as of the v2.4.0 fork bump above: v2.4.0
+# carries "Validate qwen3_coder wrappers and tool names without losing prose"
+# (fork commits dba83fad2 / 7f3c4bf48), an adaptation of #38624. Verified the
+# tag's qwen3_coder_detector.py has the is_inside_tool_call gate + _is_declared_tool
+# + SGLANG_FORWARD_UNKNOWN_TOOLS handling. If a future fork bump drops it, restore
+# the patch from git history + AI-STACK/scripts/tool-call-probes/.
 
 EXPOSE 8001
 # stackd's SglangPennyroyalAdapter passes the whole arg list as the container

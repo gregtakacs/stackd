@@ -48,8 +48,10 @@ services:
     build:
       context: stackd/sglang_pennyroyal_image
       dockerfile: Dockerfile.cuda
-    # pinned via Dockerfile ARG SGLANG_FORK_REF=pennyroyal-v2.3.1.1
-    # (jpezzulli/sglang-rtxpro6000 @ ccabd15479a5d46ffef6d1dd28a6e1f01aa05199)
+    # pinned via Dockerfile ARG SGLANG_FORK_REF=pennyroyal-v2.4.0
+    # (jpezzulli/sglang-rtxpro6000 @ 94324164715b45386de1789070ceb258333d08cc)
+    # v2.4.0 carries the qwen3_coder phantom tool-call fix (adapts our upstream
+    # PR sgl-project/sglang#38624), so the former local patch is retired.
 
   # config/media/image.yaml containers.cuda.image -- plain vendor pull.
   # Current value: AI-STACK/.env COMFYUI_CUDA_IMAGE
