@@ -1,0 +1,17 @@
+[Unit]
+Description=Check for a pending NVIDIA driver update stackd's dashboard should flag
+Documentation=man:systemd.service(5)
+
+[Service]
+Type=oneshot
+# %%h/... resolves to your home dir. The two paths below must both be true of
+# your deployment:
+#   1. this repo is checked out where the ExecStart line expects it
+#   2. the directory the second argument names is bind-mounted into the running
+#      stackd container (see docker-compose.yml's stackd service: a plain host
+#      directory you own, NOT the stackd_data named volume -- that one is
+#      root-owned by Docker and a --user unit can't write into it without
+#      sudo). STACKD_HOST_STATUS_DIR in stackd's own env must point at the same
+#      path INSIDE the container.
+ExecStart=%h/docker/Projects/LLM-Tools/stackd/deploy/nvidia-update-check.sh %h/docker/state/stackd-host
+NoNewPrivileges=yes

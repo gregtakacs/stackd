@@ -47,6 +47,15 @@ class Reconciler:
     cuda_drain_timeout_s: float = 90.0
     cuda_drain_poll_s: float = 3.0
     cuda_drain_settle_reads: int = 2
+    # Two GPU processes cold-starting on the SAME device at the same instant is a
+    # real contention hazard on this box — code-autocomplete (Vulkan) exit-0'd
+    # within a second of comfyui-rocm both landing on igpu0 during a boot converge
+    # (2026-09-12, self-healed by the crash-restart backoff 20s later, but a known
+    # condition doesn't need to page through a crash to recover). A short gap
+    # between same-device spawns costs nothing when nothing shares a device, and
+    # only ever fires more than once per converge on a box that puts more than one
+    # engine on one physical GPU.
+    same_device_spawn_stagger_s: float = 3.0
     events: list[ReconcileEvent] = field(default_factory=list)
 
     # ------------------------------------------------------------------ helpers ---
@@ -217,6 +226,16 @@ class Reconciler:
             time.sleep(self.cuda_drain_poll_s)
         self._emit("-", "drain", f"cuda drain timed out after {self.cuda_drain_timeout_s:.0f}s — proceeding")
         return True
+
+    def _stagger_device(self, device: str, avoid_devices: set[str]) -> None:
+        """Sleep briefly if `device` already had something spawned onto it earlier
+        in this same converge — see same_device_spawn_stagger_s. A no-op (and free)
+        whenever nothing shares a device, which is most boxes most of the time."""
+        if device in avoid_devices:
+            self._emit("-", "stagger",
+                       f"{device} already spawning this converge — "
+                       f"{self.same_device_spawn_stagger_s:.0f}s gap before piling on")
+            time.sleep(self.same_device_spawn_stagger_s)
 
     # -------------------------------------------------------------- image tier ---
     def _image_identity(self, tier: MediaTier, backend: str, active_model: str, device: str) -> list:
@@ -596,7 +615,7 @@ class Reconciler:
         state.image = None
 
     def _reconcile_image(self, state: RuntimeState, profile: str, *, now: float,
-                         repick: bool) -> None:
+                         repick: bool, avoid_devices: set[str] = frozenset()) -> None:
         tier = self.cfg.media.get("image")
         if tier is None:
             if state.image is not None:
@@ -643,6 +662,7 @@ class Reconciler:
                                             want_model=slot.active_model, want_backend=slot.backend)
                 if pin_pick is not None:
                     dev, backend, ld = pin_pick
+                    self._stagger_device(dev, avoid_devices)
                     self._spawn_image(state, tier, dev, backend, ld, now, pinned_by="user")
                     return
             # Pinned model no longer fits (or is gone from the tier) -> fall through.
@@ -663,6 +683,7 @@ class Reconciler:
             return
         if slot is not None:
             self._teardown_image(state, now)
+        self._stagger_device(dev, avoid_devices)
         self._spawn_image(state, tier, dev, backend, ld, now)
 
     def _image_tick(self, state: RuntimeState, now: float) -> None:
@@ -778,6 +799,12 @@ class Reconciler:
                     self._emit("-", "unplaced", ", ".join(pl.unplaced))
                 return   # card wedging — don't pile the image tier on top either
 
+        # Cold-starting two GPU processes onto the SAME device in the same instant
+        # is a real contention hazard, not just a theoretical one — see
+        # same_device_spawn_stagger_s. Tracked per-converge (not persisted): a
+        # crash-restart's own backoff already staggers a later respawn plenty.
+        started_devices: set[str] = set()
+
         for n in adopt_changed:
             rt = state.stacks[n]
             cn = rt.container or (self.cfg.models[n].engine.container.name or f"stackd-{n}")
@@ -786,14 +813,19 @@ class Reconciler:
                 rt.owner_profile = owner_of(n)
                 self._emit(n, "reload", "adopt identity updated in place")
             else:
+                self._stagger_device(want[n].device, started_devices)
+                started_devices.add(want[n].device)
                 self._start(state, want[n], owner_of(n), now)
         for n in spawn + reload_:
+            self._stagger_device(want[n].device, started_devices)
+            started_devices.add(want[n].device)
             self._start(state, want[n], owner_of(n), now)
 
         # The elastic image tier fills whatever VRAM is left. repick when the LLM
         # set moved (choose afresh for the new headroom); otherwise only act if the
         # slot is missing/unhealthy or its container spec changed under a reload.
-        self._reconcile_image(state, target, now=now, repick=llm_changed)
+        self._reconcile_image(state, target, now=now, repick=llm_changed,
+                              avoid_devices=started_devices)
 
         # Backstop: any adopt-model container from *another* profile that is not
         # wanted here — stop it (compose may have auto-started it; e.g. the two
@@ -949,13 +981,26 @@ class Reconciler:
     def _schedule_restart(self, rt: StackRuntime, now: float, why: str) -> None:
         if rt.restarts >= self.max_restarts:
             rt.backoff_until = None
-            self._emit(rt.name, "give-up", f"{why}; {rt.restarts} restarts exhausted")
+            # The rich OCI/runtime error (e.g. an nvidia-container-cli NVML mismatch)
+            # only matters once we're done retrying — it's what a human needs to fix
+            # the actual cause, and Manager.tick() folds it into the profile's dead
+            # mark so a caller sees WHY, not just "still warming" forever.
+            detail = f"{why}; {rt.restarts} restarts exhausted"
+            if rt.last_error:
+                detail += f" — {rt.last_error}"
+            self._emit(rt.name, "give-up", detail)
             return
         rt.backoff_until = now + self._backoff(rt.restarts + 1)
         self._emit(rt.name, "restart", f"{why}; retry in {rt.backoff_until - now:.0f}s")
 
     def _handle_exit(self, rt: StackRuntime, code: int, now: float) -> None:
-        self._emit(rt.name, "crash", f"exit {code}")
+        # Grab the OCI/runtime error (if any) BEFORE emitting "crash" — a bare
+        # "exit 0" told us nothing about the 2026-09-12 code-autocomplete boot
+        # race; whatever it actually was belongs in the log the instant it
+        # happens, not just once (if ever) the restart budget is exhausted.
+        rt.last_error = self.runner.last_error(rt.handle) if rt.handle else None
+        detail = f"exit {code}" + (f" — {rt.last_error}" if rt.last_error else "")
+        self._emit(rt.name, "crash", detail)
         rt.state = EngineState.error
         rt.handle = None
         self._schedule_restart(rt, now, f"exit {code}")
@@ -970,6 +1015,7 @@ class Reconciler:
         rt.backoff_until = None
         rt.unhealthy_ticks = 0
         rt.health_ticks = 0
+        rt.last_error = None
         rt.live_health_url = spec.live_health_url
         rt.deep_health_every = spec.deep_health_every
         rt.restarts += 1

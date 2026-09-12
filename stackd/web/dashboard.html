@@ -364,6 +364,8 @@
     <button class="sm" id="btnLogout">Log out</button>
   </div>
   <div id="topErr" class="flag hidden" style="margin-bottom:12px;"></div>
+  <div id="nvidiaUpdate" style="margin-bottom:12px;"></div>
+  <div id="deadBanners" style="margin-bottom:12px;"></div>
   <div id="webStale" class="flag hidden" style="margin-bottom:12px;">
     <span id="webStaleMsg"></span>
     <button class="sm" id="webStaleGo" style="margin-left:10px;">Reload now</button>
@@ -1411,6 +1413,53 @@ function mmss(s) {
   s = Math.max(0, Math.round(s));
   return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
 }
+function renderDead(st) {
+  // A profile that exhausted its restart budget: shown as a standing banner,
+  // not just a dot, because Manager.tick() evicts back to the default profile
+  // within a second or two — without this the failure is invisible by the
+  // time anyone looks at the dashboard, which is the "quiet die" this exists
+  // to fix. Stays until `stackctl use <profile>` (or the Retry button here,
+  // same call) clears it.
+  const box = $("#deadBanners");
+  box.innerHTML = "";
+  for (const [name, d] of Object.entries(st.dead || {})) {
+    const b = el("div", "flag");
+    b.style.marginBottom = "6px";
+    const age = Math.max(0, Math.round(Date.now() / 1000 - d.since));
+    b.append(document.createTextNode(
+      `⚠ ${name} gave up (${d.stack}, ${mmss(age)} ago) — ${d.reason} — `));
+    const retry = el("button", "sm", "Retry");
+    retry.onclick = () => ctl(name, "activate");
+    b.append(retry);
+    box.append(b);
+  }
+}
+
+function renderNvidiaUpdate(st) {
+  // Dismissible ONCE PER VERSION: dismissing "610.60.02" hides it until a
+  // check reports a version that isn't THAT one, per Manager._read_nvidia_update
+  // (nvidia_update.dismissed is computed server-side from the persisted
+  // dismissal, so a stale client tab agrees with a fresh one).
+  const box = $("#nvidiaUpdate");
+  const u = st.nvidia_update;
+  if (!u || u.dismissed) { box.innerHTML = ""; return; }
+  if (box.dataset.version === u.version) return;  // already rendered, don't fight focus
+  box.dataset.version = u.version;
+  box.innerHTML = "";
+  const b = el("div", "flag");
+  b.append(document.createTextNode(
+    `⚠ NVIDIA driver update available: ${u.package || "nvidia-driver"} → ${u.version}. ` +
+    `A reboot is needed to actually load it — see the 2026-09-12 incident notes. `));
+  const dismiss = el("button", "sm", "Dismiss");
+  dismiss.onclick = async () => {
+    try { await api("/nvidia_update/dismiss", { method: "POST", body: JSON.stringify({ version: u.version }) }); }
+    catch (e) { toast("dismiss failed: " + e.message, true); return; }
+    box.innerHTML = ""; box.dataset.version = "";
+  };
+  b.append(dismiss);
+  box.append(b);
+}
+
 function renderHeader(st, cleaner) {
   const warmEntries = Object.entries(st.stacks || {}).filter(([, v]) => v.state === "warming");
   const loading = warmEntries.map(([k]) => k);
@@ -2815,6 +2864,8 @@ async function tick() {
     $("#topErr").classList.add("hidden");
     if (st) {
       renderHeader(st, cleaner);
+      renderDead(st);
+      renderNvidiaUpdate(st);
       // keep the profile selector's loading chips in step with reality: refresh
       // it whenever something is warming or a switch is mid-flight, plus one
       // trailing refresh the tick after it clears — otherwise the 15s interval

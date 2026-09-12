@@ -91,6 +91,7 @@ class Runner(Protocol):
     def spawn(self, spec: LaunchSpec) -> str: ...
     def stop(self, handle: str, *, remove: bool = False, timeout: int = 30) -> None: ...
     def poll(self, handle: str) -> int | None: ...          # None=running, int=exit code, -1=gone
+    def last_error(self, handle: str) -> str | None: ...    # OCI/runtime failure text, if any
     def http_ok(self, url: str, timeout: float = 2.0) -> bool: ...
     def probe_accelerator(self, backend: str) -> bool: ...
     def gpu_free_mib(self) -> int | None: ...               # MiB free on cuda0; None = nvidia-smi unresponsive
@@ -245,6 +246,16 @@ class DockerApiRunner:
         st = info.get("State", {})
         return None if st.get("Running") else int(st.get("ExitCode", 0))
 
+    def last_error(self, handle: str) -> str | None:
+        # `State.Error` carries the OCI/runtime failure text (e.g. "nvidia-
+        # container-cli: initialization error: nvml error: driver/library
+        # version mismatch") when the container never got a process running at
+        # all — the case a bare exit code can't explain. Empty when the process
+        # started and exited on its own (a real app-level crash — see its logs).
+        info = self._exists(handle)
+        err = (info or {}).get("State", {}).get("Error") or ""
+        return err or None
+
     def http_ok(self, url: str, timeout: float = 2.0) -> bool:
         try:
             with urllib.request.urlopen(url, timeout=timeout) as r:
@@ -328,6 +339,12 @@ class LocalRunner:
         running, _, code = r.stdout.strip().partition(" ")
         return None if running == "true" else int(code or 0)
 
+    def last_error(self, handle: str) -> str | None:
+        r = subprocess.run(["docker", "inspect", "-f", "{{.State.Error}}", handle],
+                           capture_output=True, text=True)
+        err = r.stdout.strip() if r.returncode == 0 else ""
+        return err or None
+
     def http_ok(self, url: str, timeout: float = 2.0) -> bool:
         return DockerApiRunner.http_ok(self, url, timeout)  # type: ignore[arg-type]
 
@@ -346,6 +363,7 @@ class _FakeC:
     spec: LaunchSpec
     running: bool = True
     exit_code: int | None = None
+    error: str | None = None
 
 
 class FakeRunner:
@@ -369,7 +387,7 @@ class FakeRunner:
         d = json.loads(self._persist.read_text())
         self.containers = {
             n: _FakeC(LaunchSpec(**{**c["spec"], "mounts": [Mount(**m) for m in c["spec"].get("mounts", [])]}),
-                      c["running"], c["exit_code"])
+                      c["running"], c["exit_code"], c.get("error"))
             for n, c in d.get("containers", {}).items()
         }
         self._hits = d.get("hits", {})
@@ -381,7 +399,8 @@ class FakeRunner:
         self._persist.parent.mkdir(parents=True, exist_ok=True)
         self._persist.write_text(json.dumps({
             "containers": {n: {"spec": asdict(c.spec), "running": c.running,
-                               "exit_code": c.exit_code} for n, c in self.containers.items()},
+                               "exit_code": c.exit_code, "error": c.error}
+                          for n, c in self.containers.items()},
             "hits": self._hits, "probe_calls": self.probe_calls,
         }))
 
@@ -406,6 +425,10 @@ class FakeRunner:
             return -1
         return None if c.running else (c.exit_code if c.exit_code is not None else 0)
 
+    def last_error(self, handle: str) -> str | None:
+        c = self.containers.get(handle)
+        return c.error if c else None
+
     def http_ok(self, url: str, timeout: float = 2.0) -> bool:
         self._hits[url] = self._hits.get(url, 0) + 1
         self._save()
@@ -420,10 +443,11 @@ class FakeRunner:
         return self.gpu_free_values.pop(0) if len(self.gpu_free_values) > 1 else self.gpu_free_values[0]
 
     # test helpers
-    def crash(self, handle: str, exit_code: int = 139) -> None:
+    def crash(self, handle: str, exit_code: int = 139, error: str | None = None) -> None:
         c = self.containers[handle]
         c.running = False
         c.exit_code = exit_code
+        c.error = error
 
     def reset_health(self, url: str) -> None:
         self._hits.pop(url, None)

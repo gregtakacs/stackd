@@ -46,6 +46,20 @@ class StackRuntime:
     backoff_until: float | None = None
     unhealthy_ticks: int = 0
     intentional_stop: bool = False
+    last_error: str | None = None        # OCI/runtime failure text from the last crash, if any
+
+
+@dataclass
+class DeadMark:
+    """A profile whose engine exhausted its restart budget and was evicted back
+    to the default profile. Stays until someone manually retries it (`use()`
+    with `manual=True` clears the mark before converging) — reactive routing
+    (`route()`) refuses to re-enter a dead profile on its own, so a caller gets
+    a clear error instead of stackd silently re-running the same doomed 5-attempt
+    crash loop on every request while the GPU keeps drawing power for nothing."""
+    stack: str
+    reason: str
+    since: float
 
 
 @dataclass
@@ -95,6 +109,12 @@ class RuntimeState:
     # profile, since the resident model in the key changes — see
     # Reconciler._maybe_warm_image.
     warmed_for: str | None = None
+    # profile name -> DeadMark, for a profile evicted after its engine gave up.
+    dead: dict[str, DeadMark] = field(default_factory=dict)
+    # the nvidia driver package version a human has already acknowledged on the
+    # dashboard (see Manager._read_nvidia_update) — showing again only once a
+    # NEWER version shows up is the "once per version" part of that banner.
+    nvidia_update_dismissed: str | None = None
 
     # --- persistence -------------------------------------------------------------
     @classmethod
@@ -112,6 +132,11 @@ class RuntimeState:
             k: StackRuntime(**{**{kk: vv for kk, vv in v.items() if kk in _sr},
                                "state": EngineState(v.get("state", "down"))})
             for k, v in raw.get("stacks", {}).items()
+        }
+        _dm = {f.name for f in fields(DeadMark)}
+        raw["dead"] = {
+            k: DeadMark(**{kk: vv for kk, vv in v.items() if kk in _dm})
+            for k, v in raw.get("dead", {}).items()
         }
         raw["stacks"] = stacks
         img = raw.get("image")
@@ -137,8 +162,13 @@ class RuntimeState:
         * stacks that look up (warming/ready with a handle) are kept, with their
           crash bookkeeping zeroed; tick re-verifies them against the real
           container.
+        * a persisted `dead` mark is cleared too — a fresh process gets a fresh
+          chance, same reasoning as the restart-budget reset above (the fault
+          that killed it, e.g. a driver mismatch, may be exactly what the
+          restart fixed).
 
         Returns the dropped names."""
+        self.dead.clear()
         dropped = []
         for name, rt in list(self.stacks.items()):
             if rt.handle is None or rt.state in (EngineState.error, EngineState.down):

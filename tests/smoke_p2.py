@@ -112,6 +112,44 @@ def t_crash_restart_with_backoff() -> None:
         EngineState.warming, EngineState.ready))
 
 
+def t_giveup_marks_dead_and_blocks_reactive_entry() -> None:
+    """2026-09-12 incident: a broken NVIDIA driver crash-looped `coding` until it
+    gave up. Manager.tick() should evict back to the default profile AND mark
+    it dead so route() refuses to silently re-run the same doomed spawn cycle on
+    the next request; only a manual `use()` (stackctl use / the dashboard Retry
+    button) should clear it."""
+    fake = FakeRunner(ready_after=1)
+    m = mgr(fake)
+    m.use("coding", now=0)
+    ready_all(m)
+    reason = "nvidia-container-cli: initialization error: nvml error: driver/library version mismatch"
+    now = 0.0
+    for _ in range(6):  # 5 respawns + the crash that exhausts the budget
+        if "coding" not in m.state.stacks:
+            break
+        h = m.state.stacks["coding"].handle
+        fake.crash(h, exit_code=128, error=reason)
+        now += 1
+        m.tick(now=now)
+        rt = m.state.stacks.get("coding")
+        if rt is not None and rt.backoff_until is not None:
+            now = rt.backoff_until + 1
+            m.tick(now=now)
+
+    check("coding marked dead", "coding" in m.state.dead)
+    check("dead reason captures the real failure", reason in m.state.dead.get("coding").reason)
+    check("evicted back to the default profile", m.state.active_profile == "chat")
+
+    rr = m.route("assistant-coder", now=now + 1)
+    check("route refuses to re-enter a dead profile", rr.status == "dead")
+    check("dead route note names the reason", reason in rr.note)
+    check("dead route does not spawn a fresh coding stack",
+          "coding" not in m.state.stacks)
+
+    m.use("coding", manual=True, now=now + 2)
+    check("manual use clears the dead mark", "coding" not in m.state.dead)
+
+
 def t_idle_self_evict() -> None:
     m = mgr(FakeRunner(ready_after=1), min_residency_s=60)
     m.use("chat", now=0)
@@ -431,6 +469,27 @@ def t_tick_sweeps_stray_stacks() -> None:
     check("tick swept the stray coding", "coding" not in m.state.stacks)
     check("chat reconverged after sweep",
           {"chat", "code-autocomplete"} <= set(m.state.stacks))
+
+
+def t_same_device_spawn_is_staggered() -> None:
+    """2026-09-12: code-autocomplete (igpu0/vulkan) and the image tier both cold-
+    spawning onto igpu0 in the same converge is exactly the boot-time collision
+    that exit-0'd code-autocomplete once (self-healed by the crash-restart backoff,
+    but a known contention hazard shouldn't need a crash to recover from). converge()
+    should stagger the second spawn onto a shared device instead of firing both in
+    the same instant."""
+    fake = FakeRunner(ready_after=1)
+    m = mgr(fake)
+    # Manager() zeroes this for FakeRunner (tests shouldn't pay real sleeps) — put a
+    # small real one back so the stagger path actually executes here.
+    m.rec.same_device_spawn_stagger_s = 0.05
+    m.use("coding", now=0)   # cold entry: code-autocomplete + the image tier both
+                              # want igpu0 from a standing start
+    check("code-autocomplete spawned", "code-autocomplete" in m.state.stacks)
+    check("image tier landed on igpu0 (the shared device)",
+          m.state.image is not None and m.state.image.device == "igpu0")
+    check("stagger fired for the shared device",
+          any(e.action == "stagger" for e in m.rec.events))
 
 
 def t_image_tier_is_stackd_created() -> None:
@@ -982,12 +1041,14 @@ def main() -> int:
         t_switch_to_coding_is_a_delta,
         t_cuda_teardown_uses_kill_and_probe,
         t_crash_restart_with_backoff,
+        t_giveup_marks_dead_and_blocks_reactive_entry,
         t_idle_self_evict,
         t_pin_blocks_self_evict,
         t_idle_evict_counts_from_load_not_activation,
         t_no_timer_profile_autopins_on_entry,
         t_shutdown_engines_tears_down_everything,
         t_reactive_entry_and_standin,
+        t_same_device_spawn_is_staggered,
         t_catalog_advertises_answering_ctx,
         t_preset_translation,
         t_sglang_pennyroyal_adapter,

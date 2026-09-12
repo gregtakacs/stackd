@@ -62,6 +62,10 @@ def _fmt_report(r: FitReport) -> str:
 
 def _fmt_status(s: dict) -> str:
     out = [f"active   : {s['active_profile']}" + ("  (pinned)" if s["pinned"] else "")]
+    for name, d in (s.get("dead") or {}).items():
+        age = int(time.time() - d["since"])
+        out.append(f"DEAD     : {name} ({d['stack']}, {age}s ago) — {d['reason']}")
+        out.append(f"           not retried automatically — `stackctl use {name}` to retry")
     if s["missing"]:
         out.append(f"missing  : {', '.join(s['missing'])}")
     out.append("stacks:")

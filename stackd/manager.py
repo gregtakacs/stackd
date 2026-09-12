@@ -5,6 +5,8 @@ lives in the reconciler; placement lives in the solver."""
 from __future__ import annotations
 
 import fnmatch
+import json
+import os
 import pathlib
 import time
 from dataclasses import dataclass, field
@@ -16,7 +18,7 @@ from stackd.engines.registry import adapter_for
 from stackd.reconciler import Reconciler
 from stackd.runner import Runner, default_runner
 from stackd.solver import solve
-from stackd.state import RuntimeState
+from stackd.state import DeadMark, RuntimeState
 from stackd.util import parse_duration
 from stackd.validator import validate_profile
 
@@ -31,7 +33,7 @@ class Outranked(ManagerError):
 
 @dataclass
 class RouteResult:
-    status: str  # ok | warming | outranked | unknown
+    status: str  # ok | warming | outranked | unknown | dead
     model: str
     endpoint: str | None = None
     profile: str | None = None
@@ -235,6 +237,7 @@ class Manager:
         # real sleeps between polls.
         if hasattr(self.runner, "gpu_free_values"):
             self.rec.cuda_drain_poll_s = 0.0
+            self.rec.same_device_spawn_stagger_s = 0.0
 
     def _load_catalog(self):
         import os
@@ -334,6 +337,11 @@ class Manager:
             raise ManagerError(f"unknown profile {name!r}")
         active = self.cfg.profiles[self.state.active_profile]
         target = self.cfg.profiles[name]
+        if manual:
+            # A human (stackctl use / the dashboard) asking for this profile by
+            # name IS the manual retry the dead mark is waiting on — give it a
+            # fresh chance instead of requiring a separate "clear" action.
+            self.state.dead.pop(name, None)
         if not manual:
             if target.manual_only:
                 raise Outranked(f"{name} is manual-only — load it by hand")
@@ -375,6 +383,32 @@ class Manager:
 
     def unpin(self) -> None:
         self.state.pinned = False
+        self._save()
+
+    # ------------------------------------------------------- host nvidia-update ---
+    def _read_nvidia_update(self) -> dict | None:
+        """A pending NVIDIA driver update, or None. stackd itself has no host
+        apt/dpkg visibility (scoped socket-proxy, unprivileged) — this reads a
+        small JSON file a HOST-side systemd --user timer drops for us (see
+        deploy/systemd/stackd-nvidia-check.* + deploy/nvidia-update-check.sh).
+        Best-effort: no mount configured, no file yet, or a malformed file all
+        just mean "nothing to show", not an error."""
+        d = os.environ.get("STACKD_HOST_STATUS_DIR")
+        if not d:
+            return None
+        try:
+            raw = json.loads((pathlib.Path(d) / "nvidia_update.json").read_text())
+        except (OSError, ValueError):
+            return None
+        version = raw.get("version")
+        if not version:
+            return None
+        return {"package": raw.get("package"), "version": version,
+                "checked_at": raw.get("checked_at"),
+                "dismissed": version == self.state.nvidia_update_dismissed}
+
+    def dismiss_nvidia_update(self, version: str) -> None:
+        self.state.nvidia_update_dismissed = version
         self._save()
 
     # -------------------------------------------------------------------- route ---
@@ -437,6 +471,18 @@ class Manager:
                     "outranked", api_name, profile=top,
                     note=(f"{api_name!r} is served by profile {top!r}, but the active "
                           f"profile {pr.profile!r} is pinned — unpin it or switch by hand"),
+                )
+            dead = self.state.dead.get(top)
+            if dead is not None:
+                # `top` just exhausted its restart budget — don't silently re-run the
+                # same doomed spawn cycle on every request (burning GPU power each
+                # time for nothing an agent can see coming). Fail loudly instead;
+                # `stackctl use <profile>` (or the dashboard) clears this deliberately.
+                return RouteResult(
+                    "dead", api_name, profile=top,
+                    note=(f"{top} gave up and is not being retried automatically: "
+                          f"{dead.reason} — run `stackctl use {top}` once the cause "
+                          f"is fixed"),
                 )
             try:
                 self.use(top, manual=False, now=now)
@@ -512,6 +558,21 @@ class Manager:
         # swap finished (everything the profile wants is up) — drop the "from" tag
         if self.state.switch_from is not None and self._profile_loaded_at() is not None:
             self.state.switch_from = None
+        # An engine the active profile needs gave up retrying (backoff exhausted) —
+        # fall back to the default profile instead of leaving active_profile pointed
+        # at a dead engine forever with no route back out. Without this, `route()`'s
+        # reactive-switch only fires for a *higher*-priority profile than whatever is
+        # (nominally) active, so once the active profile itself is the one that died,
+        # nothing ever retries it again.
+        gave_up_events = [e for e in events if e.action == "give-up" and e.stack in pr.models]
+        if gave_up_events and not pr.default:
+            evicted = self.state.active_profile
+            reason = "; ".join(f"{e.stack}: {e.detail}" for e in gave_up_events)
+            self.state.dead[evicted] = DeadMark(
+                stack=gave_up_events[0].stack, reason=reason, since=now)
+            self.evict(now=now)
+            events.append(_Evt(evicted, "evict-on-give-up", reason))
+            pr = self.cfg.profiles[self.state.active_profile]
         deadline = self._idle_evict_at(now)
         if (deadline is not None and now > deadline
                 and now - (self.state.entered_at or now) > self.min_residency_s):
@@ -758,6 +819,13 @@ class Manager:
             "pinned": self.state.pinned,
             "idle_evict": pr.idle_evict,
             "idle_evict_in_s": idle_evict_in,
+            # profiles that exhausted their restart budget and are NOT being
+            # retried automatically — the dashboard shows these as a standing
+            # banner (not just a dot that quietly reverts to the default
+            # profile) until `stackctl use <profile>` clears them.
+            "dead": {name: {"stack": d.stack, "reason": d.reason, "since": d.since}
+                    for name, d in self.state.dead.items()},
+            "nvidia_update": self._read_nvidia_update(),
             "placement": report.placement,
             "unplaced": report.unplaced,
             "stacks": {

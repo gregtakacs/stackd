@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily check for a pending NVIDIA driver update
+
+[Timer]
+OnCalendar=daily
+# Stagger a bit after the day's boot/apt-update churn rather than racing it,
+# and don't require the box to have been up at exactly midnight.
+RandomizedDelaySec=1800
+Persistent=true
+Unit=stackd-nvidia-check.service
+
+[Install]
+WantedBy=timers.target

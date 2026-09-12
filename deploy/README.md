@@ -302,6 +302,44 @@ published ports — those shape the compose file itself, not just stackd's confi
   route is the GGUF already on disk (20 GiB), not the fp8mixed file — the same
   place the #10896 reporter landed, for the same reason.
 
+## NVIDIA driver update banner (optional)
+
+2026-09-12 incident: unattended-upgrades silently bumped the nvidia driver packages
+while engines were running; the loaded kernel module didn't match the new userspace
+libs until a reboot, so every new CUDA container spawn failed with an NVML "driver/
+library version mismatch" — invisibly, until a model swap crash-looped. Two independent
+fixes:
+
+1. **Stop the silent drift.** Add an `nvidia` entry to
+   `Unattended-Upgrade::Package-Blacklist` in `/etc/apt/apt.conf.d/50unattended-
+   upgrades` — driver bumps then only happen via a deliberate `apt upgrade` + reboot.
+2. **Get told when one is due**, since a blacklist just trades "silently broken" for
+   "silently stale". stackd's own container can't check apt itself (scoped socket-
+   proxy, unprivileged, no host dpkg/apt visibility by design) — a HOST-side systemd
+   `--user` timer does it instead and drops a small JSON file for the dashboard to read:
+
+   ```bash
+   mkdir -p ~/docker/state/stackd-host        # plain user-owned dir, NOT the stackd_data
+                                               # named volume (that one is Docker/root-owned)
+   cp deploy/systemd/stackd-nvidia-check.{service,timer} ~/.config/systemd/user/
+   # edit the .service's ExecStart paths for your checkout + status dir if they differ
+   systemctl --user daemon-reload
+   systemctl --user enable --now stackd-nvidia-check.timer
+   ```
+
+   Then bind-mount that same directory read-only into the `stackd` service in
+   `docker-compose.yml` and point `STACKD_HOST_STATUS_DIR` at where you mounted it:
+
+   ```yaml
+   environment:
+     - STACKD_HOST_STATUS_DIR=/host-status
+   volumes:
+     - ~/docker/state/stackd-host:/host-status:ro
+   ```
+
+   No mount configured, no file yet, or a stale/malformed file all just mean the
+   dashboard shows nothing — this is entirely optional and fails soft.
+
 ## Notes
 
 - `docker-api` (tecnativa/docker-socket-proxy) is **privileged** and holds the docker

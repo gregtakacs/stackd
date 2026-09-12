@@ -472,6 +472,18 @@ class _Handler(BaseHTTPRequestHandler):
             self.cleaner.set_enabled(self.path.endswith("/on"))
             return self._send_json(200, self.cleaner.status())
 
+        if self.path == "/nvidia_update/dismiss":
+            try:
+                body = json.loads(self._read_body() or b"{}")
+            except json.JSONDecodeError:
+                return self._send_json(400, {"error": {"message": "invalid JSON"}})
+            version = (body.get("version") or "").strip()
+            if not version:
+                return self._send_json(400, {"error": {"message": "missing 'version'"}})
+            with self.lock:
+                self.mgr.dismiss_nvidia_update(version)
+            return self._send_json(200, {"dismissed": version})
+
         if self.path in ("/v1/chat/completions", "/v1/completions", "/v1/embeddings"):
             return self._completions()
 
@@ -1034,6 +1046,14 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send_json(
                 503, {"error": {"message": rr.note, "type": "outranked"}},
                 {"retry-after": "10"},
+            )
+        if rr.status == "dead":
+            # The engine already exhausted its restart budget — say so plainly
+            # instead of stringing the caller along with a fake ETA on a spawn
+            # that isn't going to be retried until a human clears it.
+            return self._send_json(
+                503, {"error": {"message": rr.note, "type": "dead"}},
+                {"retry-after": "60"},
             )
 
         # An ACTIVE profile swap is the long pole here (teardown + a fresh model
