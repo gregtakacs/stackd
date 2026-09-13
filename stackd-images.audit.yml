@@ -48,10 +48,14 @@ services:
     build:
       context: stackd/sglang_pennyroyal_image
       dockerfile: Dockerfile.cuda
-    # pinned via Dockerfile ARG SGLANG_FORK_REF=pennyroyal-v2.4.0
-    # (jpezzulli/sglang-rtxpro6000 @ 94324164715b45386de1789070ceb258333d08cc)
-    # v2.4.0 carries the qwen3_coder phantom tool-call fix (adapts our upstream
-    # PR sgl-project/sglang#38624), so the former local patch is retired.
+    # pinned via Dockerfile ARG SGLANG_FORK_REF=pennyroyal-v2.5.0
+    # (jpezzulli/sglang-rtxpro6000, released 2026-09-12; skips v2.4.1, a pure
+    # maintenance release folded into v2.5.0's lineage). Adds optional online
+    # FP8 (SGLANG_SM120_ONLINE_MXFP8) and NVMe-backed PLE (PENNY_PLE_BACKEND),
+    # both opt-in via model YAML container.env -- see Dockerfile.cuda's
+    # changelog comment. v2.4.0 carries the qwen3_coder phantom tool-call fix
+    # (adapts our upstream PR sgl-project/sglang#38624), so the former local
+    # patch stays retired.
 
   # config/media/image.yaml containers.cuda.image -- plain vendor pull.
   # Current value: AI-STACK/.env COMFYUI_CUDA_IMAGE

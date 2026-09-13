@@ -28,10 +28,11 @@
 FROM nvidia/cuda:13.3.1-devel-ubuntu24.04@sha256:4ff859525f99de5782aa73607ce24219b07dddd48d12b97c1c301d7e1cfb0a87
 
 ARG SGLANG_FORK_REPO=https://github.com/jpezzulli/sglang-rtxpro6000.git
-# Pinned to release tag pennyroyal-v2.4.0 (commit
-# 94324164715b45386de1789070ceb258333d08cc, released 2026-09-09). Bumped
-# 2026-09-09 from pennyroyal-v2.3.1.1 (ccabd15479a5d46ffef6d1dd28a6e1f01aa05199);
-# rollback lever: set SGLANG_FORK_REF back to that tag.
+# Pinned to release tag pennyroyal-v2.5.0 (released 2026-09-12). Bumped
+# 2026-09-12 from pennyroyal-v2.4.0 (94324164715b45386de1789070ceb258333d08cc);
+# rollback lever: set SGLANG_FORK_REF back to that tag. Skips the intervening
+# v2.4.1 (pure maintenance, no rebase, "no urgent need to update" per its own
+# CHANGES.md) — v2.5.0's lineage is a strict superset of it.
 #   v2.3     — Flash-Next FR-Spec: 65,536-token draft map + launcher/map-builder.
 #   v2.3.1   — GDN gate-rounding correctness fix on the 27B FP8/DFlash2 Triton
 #              verify path. Flash-Next's FlashInfer/WY path UNCHANGED.
@@ -39,25 +40,50 @@ ARG SGLANG_FORK_REPO=https://github.com/jpezzulli/sglang-rtxpro6000.git
 #              configs/pennyroyal/templates/; launchers add
 #              --image-processor-backend pil. Executable unchanged from v2.3.1.
 #   v2.4.0   — 11 fork commits on top of v2.3.1.1, NO upstream rebase, same
-#              dependency stack + launch settings (BUILD.md: "Existing model
-#              weights, dependency versions and launch settings do not need
-#              changing"). Runtime changes: (a) qwen3_coder phantom tool-call
-#              fix — adapts our upstream PR sgl-project/sglang#38624 (wrapper
-#              gate + declared-name check), so the local
-#              patches/qwen3-coder-streaming-phantom-toolcall.patch is RETIRED
-#              here; (b) release abandoned streaming work + request resources on
+#              dependency stack + launch settings. Runtime changes: (a)
+#              qwen3_coder phantom tool-call fix — adapts our upstream PR
+#              sgl-project/sglang#38624 (wrapper gate + declared-name check),
+#              so the local patches/qwen3-coder-streaming-phantom-toolcall.patch
+#              was RETIRED (deleted, see git history if it ever needs restoring);
+#              (b) release abandoned streaming work + request resources on
 #              client disconnect / cancel-around-dispatch; (c) explicit Chat
-#              reasoning_effort now wins over the launcher default (stackd's
-#              front already sends it in chat_template_kwargs — no change
-#              needed); (d) QSA prefill reuse + short-extend bounds; (e) MoE
-#              zero-bias routing removal + PDL input fence. RUN.md: the source
-#              selects a FRESH NIXL namespace — coding-long.yaml /
-#              chat-next.yaml SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR bumped
-#              (-v4 -> -v5) so stale prefix pages aren't served.
-# BUILD.md @ v2.4.0 keeps the toolchain this Dockerfile uses (Python 3.12,
+#              reasoning_effort now wins over the launcher default; (d) QSA
+#              prefill reuse + short-extend bounds; (e) MoE zero-bias routing
+#              removal + PDL input fence.
+#   v2.4.1   — maintenance only (grammar-history GC, streaming alt-token probs,
+#              pinned-host async transfer buffers, PLE hash/lookup combine).
+#              SKIPPED here — folded into v2.5.0's lineage, no separate build.
+#   v2.5.0   — SAME dependency stack + launch settings as v2.4.0/.1 (BUILD.md:
+#              no PyTorch/sglang-kernel/FlashInfer/NIXL rebuild needed for a
+#              native update — this Dockerfile still does a full checkout+
+#              install since each image build starts clean). Two NEW opt-in
+#              Flash-Next capabilities, both OFF unless a model YAML's
+#              container.env sets them:
+#              (a) SGLANG_SM120_ONLINE_MXFP8=true — online FP8: converts
+#                  eligible BF16 transformer projections + HyperConnection mix
+#                  weights + output head to MXFP8/row-wise FP8 at load time.
+#                  NVFP4 experts/PLE/FP8 KV/BF16 GDN state untouched. Vendor
+#                  numbers: +28.3%/+26.5%/+15.8% decode at short/128K/490K
+#                  context, and MORE free VRAM post-graph-capture (not less).
+#              (b) PENNY_PLE_BACKEND=nvme + PENNY_PLE_NVME_MODEL=<path> —
+#                  streams the ~47.68 GiB PLE table from a prepared local-NVMe
+#                  overlay instead of pinning it in RAM. Needs the isolated
+#                  Rust/Cargo-built reader below plus a one-time
+#                  prepare_ple_nvme.py snapshot (see AI-STACK's coding-img.yaml
+#                  for the overlay path). Vendor's own A/B: ~14% aggregate
+#                  decode-throughput cost vs RAM PLE on their fast NVMe — a
+#                  real tradeoff, not a free win; only worth it to shrink host
+#                  RAM enough for iGPU image-gen co-residency (coding-img).
+#              Also: structured-output startup warmup, a PLE-loader GC leak
+#              fix, explicit MAX_TOTAL_TOKENS overrides. RUN.md: a source
+#              change always selects a fresh NIXL namespace — bump
+#              SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR in every model YAML that
+#              changed cmd_extra/env identity (coding-long -v5->-v6; coding-img
+#              is new, starts at -v1).
+# BUILD.md @ v2.5.0 keeps the toolchain this Dockerfile uses (Python 3.12,
 # CUDA 13.3, GCC 15, PyTorch 2.13.0+cu130) and the same NIXL_REF below. The
 # git-checkout layer changes, so a from-scratch ~20 min sm120 rebuild.
-ARG SGLANG_FORK_REF=pennyroyal-v2.4.0
+ARG SGLANG_FORK_REF=pennyroyal-v2.5.0
 # NIXL commit from the fork's BUILD.md (POSIX FILE plugin for the HiCache
 # storage backend). Only needed once phase-2 NIXL persistence is turned on, but
 # built now so the image is complete.
@@ -96,6 +122,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ARG UV_VERSION=0.9.2
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
 ENV PATH=/root/.local/bin:${PATH}
+
+# --- Rust/Cargo (pinned) — only needed to build the optional NVMe PLE reader
+# (tools/ple_nvme, an attributed adaptation of ai-dynamo/nixl-adjacent SSD
+# Stream; see NVME-PLE.md). Built unconditionally so both coding-long (RAM PLE,
+# unused) and coding-img (NVMe PLE) share one image; PENNY_PLE_BACKEND stays
+# unset for coding-long so the plugin is never imported (per NVME-PLE.md:
+# "imported only in NVMe mode").
+ARG RUST_VERSION=1.97.1
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal
+ENV PATH=/root/.cargo/bin:${PATH}
 
 # --- compiler / build-parallelism env (from the fork's serve-*.sh) ---------
 ENV CUDA_HOME=/usr/local/cuda \
@@ -153,6 +190,17 @@ RUN ldconfig \
       > /opt/pennyroyal/.venv/lib/python3.12/site-packages/_nixl_system.pth \
     && uv pip install --no-deps /opt/nixl/build/src/bindings/python/nixl-meta/nixl-*-py3-none-any.whl \
     && /opt/pennyroyal/.venv/bin/python -c "from nixl._api import nixl_agent, nixl_agent_config; print('nixl venv import OK')"
+
+# --- optional NVMe PLE reader (v2.5.0, tools/ple_nvme) ----------------------
+# Isolated Rust/Cargo build, separate from the main venv per NVME-PLE.md ("does
+# not alter the main environment"). Baked into the image at a fixed path so
+# runtime doesn't depend on build-time CWD. CARGO_BUILD_JOBS throttled to 4 for
+# the same reason as the FlashInfer JIT settings below (this box OOM'd a
+# 24-parallel compile once already, see coding-long.yaml history) even though
+# this build is much lighter than the CUDA kernel JIT.
+ENV PENNY_PLE_PLUGIN_DIR=/opt/pennyroyal/.ple-nvme
+RUN CARGO_BUILD_JOBS=4 PYTHON=/opt/pennyroyal/.venv/bin/python \
+      bash tools/ple_nvme/install.sh
 
 # Late runtime deps kept out of the ~20 min sm120 build cache above:
 #  * ffmpeg    — torchcodec dlopen's libavutil.so.* at import; without it every
