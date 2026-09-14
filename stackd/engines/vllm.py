@@ -29,6 +29,13 @@ class VllmParams:
     # build actually accepts. A value not listed here passes through untouched;
     # omit the whole key to disable rewriting. See serve._map_reasoning_effort.
     reasoning_effort_map: dict[str, str] | None = None
+    # Stackd-side-only override for the model's documented native output ceiling
+    # — vLLM has no CLI output-length flag either (max_tokens is per-request
+    # only), so without this, /model/info reports the generic min(ctx, 32768)
+    # fallback, which a native-tool-calling client (Cline's LiteLLM provider)
+    # then uses as its own request's max_tokens. See manager.model_max_output_
+    # tokens and serve._ToolCallGate.
+    max_output_tokens: int | None = None
 
 
 class VllmCudaAdapter(EngineAdapter):

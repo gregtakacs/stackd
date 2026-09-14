@@ -26,6 +26,13 @@ class SglangParams:
     # already accepts any value, so this is usually left unset; provided for
     # symmetry / an explicit identity map. See serve._map_reasoning_effort.
     reasoning_effort_map: dict[str, str] | None = None
+    # Stackd-side-only override for the model's documented native output ceiling
+    # — SGLang has no CLI output-length flag at all (unlike llama.cpp's -n), so
+    # without this, /model/info reports the generic min(ctx, 32768) fallback,
+    # which a native-tool-calling client (Cline's LiteLLM provider) then uses as
+    # its own request's max_tokens. See manager.model_max_output_tokens and
+    # serve._ToolCallGate.
+    max_output_tokens: int | None = None
 
 
 class SglangPennyroyalAdapter(EngineAdapter):

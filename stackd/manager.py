@@ -136,8 +136,23 @@ def model_supports_reasoning(cfg: Config, model_name: str) -> bool:
 
 
 def model_max_output_tokens(cfg: Config, model_name: str) -> int | None:
-    """Explicit generation cap if the command sets one (llama.cpp -n), else a
-    sane ceiling bounded by the context window."""
+    """Explicit generation cap, in priority order:
+
+    1. engine.params.max_output_tokens — a stackd-side-only override, for a model
+       whose own documented native output ceiling should be reported via /model/info
+       even though its engine takes no CLI output-length flag at all (SGLang has no
+       equivalent of llama.cpp's -n; the cap is purely a per-request field). Native
+       tool-calling clients (Cline's LiteLLM provider) read this from /model/info and
+       use it as their own request's max_tokens when the user hasn't set one — the
+       generic 32768 fallback below undershoots badly for a model documented to
+       generate coherently much further (e.g. Qwen3.8-Flash-Next's 131072), which
+       starves real tool calls of room before they can finish.
+    2. Whatever the launch command itself sets (llama.cpp -n / --n-predict / etc).
+    3. A sane ceiling bounded by the context window, absent either of the above.
+    """
+    override = cfg.models[model_name].engine.params.get("max_output_tokens")
+    if override:
+        return int(override)
     args = _rendered_args(cfg, model_name)
     for i, a in enumerate(args):
         if a in _OUT_FLAGS and i + 1 < len(args):

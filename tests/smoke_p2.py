@@ -324,6 +324,20 @@ def t_catalog_advertises_answering_ctx() -> None:
     check("vision: explicit params.vision=false force-hides despite --mmproj",
           model_supports_vision(_cfg_with(m, "chat", ch), "chat") is False)
 
+    # max_output_tokens: an explicit stackd-side override (for an engine like
+    # SGLang/vLLM that takes no CLI output-length flag at all) beats the generic
+    # min(ctx, 32768) fallback — see the tool-call-truncation redesign, where
+    # stackd's own /model/info self-report was the actual cause of Cline
+    # capping every tool-declaring request at a too-small 32768.
+    from stackd.manager import model_max_output_tokens
+
+    check("max_output_tokens: no override, no launch flag -> min(ctx, 32768) fallback",
+          model_max_output_tokens(m.cfg, "coding") == min(131072, 32768))
+    co = copy.deepcopy(m.cfg.models["coding"])
+    co.engine.params["max_output_tokens"] = 98304
+    check("max_output_tokens: explicit override wins over the generic fallback",
+          model_max_output_tokens(_cfg_with(m, "coding", co), "coding") == 98304)
+
 
 def _cfg_with(m, name, model_spec):
     """A shallow clone of m.cfg with one model swapped in (for helper tests)."""

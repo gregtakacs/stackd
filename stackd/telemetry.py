@@ -687,21 +687,28 @@ def engine_telemetry(endpoint: str, template: str) -> dict:
             d["kv_pool_tokens"] = int(pool) if pool else None
             d["ctx_max"] = (int(m["sglang:context_len"]) if m.get("sglang:context_len")
                             else d["kv_pool_tokens"])
-            # sglang:token_usage / kv_used_tokens are fills of the *whole KV pool*
-            # (max_total_num_tokens ~= 1.6x the context window here, shared across
-            # --max-running-requests and inclusive of retained radix/HiCache prefix
-            # pages) -- NOT a single request's position in its window. Derive the
-            # live fill in tokens, then express the "context" meter window-relative
-            # (matches the ctx_tokens/ctx_max caption + serve._engine's idle path).
-            frac = m.get("sglang:token_usage")          # 0..1 fill of the KV pool
+            # kv_used_tokens is a fill of the *whole KV pool* (max_total_num_tokens
+            # ~= 1.6x the context window here, shared across --max-running-requests
+            # and inclusive of retained radix/HiCache prefix pages) -- NOT a single
+            # request's position in its window. ctx_tokens and kv_pct must both be
+            # relative to that SAME pool, and both computed from the same token
+            # counts: sglang:token_usage looked like it should already be that
+            # fraction (it's even named "token usage"), but it is NOT
+            # kv_used_tokens / max_total_num_tokens — caught live with
+            # kv_used_tokens=32640, max_total_num_tokens=1126656 (2.9% of the pool)
+            # while token_usage read 0.5. It tracks something else internally
+            # (looks like scheduler/admission headroom, not a literal pool fill)
+            # and swings independently of the real token count, which is what
+            # made the live chart's kv% line jump around while the token count
+            # climbed steadily. Always derive kv_pct from the real counts instead.
             used = m.get("sglang:kv_used_tokens")
+            frac = m.get("sglang:token_usage")           # fallback only, see above
             if used:
                 d["ctx_tokens"] = int(used)
             elif frac is not None and d["kv_pool_tokens"]:
                 d["ctx_tokens"] = round(frac * d["kv_pool_tokens"])
-            d["kv_pool_pct"] = round(100.0 * frac, 1) if frac is not None else None
-            if d.get("ctx_tokens") is not None and d.get("ctx_max"):
-                d["kv_pct"] = round(min(100.0, 100.0 * d["ctx_tokens"] / d["ctx_max"]), 1)
+            if d.get("ctx_tokens") is not None and d.get("kv_pool_tokens"):
+                d["kv_pct"] = round(min(100.0, 100.0 * d["ctx_tokens"] / d["kv_pool_tokens"]), 1)
             elif frac is not None:
                 d["kv_pct"] = round(100.0 * frac, 1)
 

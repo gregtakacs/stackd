@@ -269,6 +269,26 @@
   .pdot.busy { background:var(--green); border-color:#2c5138; }
   .pdot.queued { background:var(--yellow); border-color:#5c5222; animation:pulse 1.4s infinite; }
 
+  /* per-session context bar: one stacked segment per concurrent request, sized
+     against the engine's known KV-pool ceiling — absolute tokens, not percent
+     (percent hides how close a pool that itself changes size, e.g. with an
+     engine option like online FP8, actually is to its ceiling). */
+  .ctxbar { margin-top:10px; }
+  .ctxbar-label { font-size:.72rem; color:var(--dim); margin-bottom:4px; }
+  .ctxbar-track { display:flex; height:10px; border-radius:4px; overflow:hidden;
+    background:var(--surface2,#23283a); border:1px solid var(--border); }
+  .ctxbar-seg { height:100%; min-width:2px; border-right:1px solid var(--bg); }
+  .ctxbar-seg:last-child { border-right:none; }
+  .ctxbar-seg.seg-idle { background:var(--accent-dim); }
+  .ctxbar-seg.seg-0 { background:var(--accent); }
+  .ctxbar-seg.seg-1 { background:var(--purple); }
+  .ctxbar-seg.seg-2 { background:var(--orange); }
+  .ctxbar-seg.seg-3 { background:var(--yellow); }
+  .ctxbar-seg.seg-4 { background:var(--green); }
+  .ctxbar-seg.seg-5 { background:var(--red); }
+  .ctxbar-seg.seg-6 { background:#38bdf8; }
+  .ctxbar-seg.seg-7 { background:#f472b6; }
+
   /* charts */
   .chartwrap { width:100%; min-width:0; overflow:hidden; }
   /* uPlot legend: static (live:false) + wrapping + centered so a changing
@@ -1747,15 +1767,23 @@ function engineSkeleton(names) {
     r.append(el("span", "pill e-live hidden", "generating"));
     card.append(r);
     const sr = el("div", "statrow"); sr.style.marginTop = "10px";
-    for (const [k, lbl] of [["gen","tok/s gen"],["pp","tok/s prefill"],["kv","context"],["req","in-flight"],["mtp","MTP accept"]]) {
+    for (const [k, lbl] of [["gen","tok/s gen"],["pp","tok/s prefill"],["kv","ctx / slot"],["req","in-flight"],["mtp","MTP accept"]]) {
       const s = el("div", "stat");
       s.append(el("b", "e-" + k, "–")); s.append(el("span", "e-" + k + "-lbl", lbl));
       sr.append(s);
     }
     card.append(sr);
     const sd = el("div", "slotdots e-slots hidden");
-    card.append(sd); box.append(card);
+    card.append(sd);
+    const cb = el("div", "ctxbar e-ctxbar hidden");
+    card.append(cb);
+    box.append(card);
   }
+}
+// tokens as "12.3k" (or the bare int under 1000) — shared by the context bar
+// and its tooltips so the label and the hover text never disagree.
+function fmtTok(v) {
+  return v >= 1000 ? (v / 1000).toFixed(1) + "k" : String(Math.round(v));
 }
 function fillEngine(name, rt, tel) {
   const card = $(`#engineCards .card[data-stack="${CSS.escape(name)}"]`);
@@ -1769,29 +1797,88 @@ function fillEngine(name, rt, tel) {
   if (!tel || tel.error) {
     ["gen","pp","kv","req","mtp"].forEach(k => set(".e-"+k, "–"));
     card.querySelector(".e-slots").classList.add("hidden");
+    card.querySelector(".e-ctxbar").classList.add("hidden");
     return;
   }
   const active = !!tel.active;
   card.querySelector(".e-live").classList.toggle("hidden", !active);
   const n1 = v => v == null ? "–" : (+v).toFixed(1);
   const n0 = v => v == null ? "–" : (+v).toFixed(0);
-  // active -> live number; idle -> last completed session's average (sticky)
-  set(".e-gen", n1(tel.gen_tok_s));
+  // prefill keeps the old sticky-last-session behavior (not in scope here);
+  // gen tok/s, MTP accept and context window blank out the instant nothing is
+  // generating instead of holding the last session's number — a sticky "47.2
+  // tok/s" sitting on an idle card reads as a live measurement, not history.
+  set(".e-gen", active ? n1(tel.gen_tok_s) : "–");
   set(".e-pp",  n0(tel.prompt_tok_s));
-  set(".e-mtp", tel.mtp_accept_pct != null ? n0(tel.mtp_accept_pct) + "%" : "–");
+  set(".e-mtp", active && tel.mtp_accept_pct != null ? n0(tel.mtp_accept_pct) + "%" : "–");
   // Label widths must NOT depend on state or the numbers: when a generation
   // stopped, "(live)" -> "(last session)" and "context" -> "peak context ·
   // 130.4k / 131k" wrapped the stat row and the whole card visibly grew
   // (reflow on every finish). Suffixes are now equal-length, the long peak
   // string lives in the tooltip, and the value already shows the live/peak pct.
-  set(".e-gen-lbl", active ? "tok/s gen (live)" : "tok/s gen (last)");
+  set(".e-gen-lbl", active ? "tok/s gen (live)" : "tok/s gen (idle)");
   set(".e-pp-lbl",  active ? "tok/s prefill (live)" : "tok/s prefill (last)");
-  set(".e-mtp-lbl", active ? "MTP accept (live)" : "MTP accept (last)");
-  set(".e-kv",  tel.kv_pct != null ? n1(tel.kv_pct) + "%" : "–");
-  const km = tel.ctx_tokens != null && tel.ctx_max
-    ? `${active ? "context" : "peak"} · ${(tel.ctx_tokens/1000).toFixed(1)}k of ${(tel.ctx_max/1000).toFixed(0)}k tok window` : "";
-  set(".e-kv-lbl", active ? "context (live)" : "context (last)", km);
+  set(".e-mtp-lbl", active ? "MTP accept (live)" : "MTP accept (idle)");
+  // Every slot's own live value, not one aggregate "ctx window" number — a
+  // single figure here hid exactly the thing this corner exists to show:
+  // which of the engine's concurrency slots are doing how much work right
+  // now. scaledSlotValues is the SAME rescaling the live chart's per-slot
+  // fill uses (see its comment), so this card and that chart always agree.
+  // Idle slots are omitted rather than padded with 0s — a slot with no
+  // session in it has nothing to show, and listing it as "0" for every
+  // unused slot just to preserve a fixed-width row buried the ones that
+  // actually mattered.
+  const slotVals = active ? scaledSlotValues(tel) : {};
+  const slotEntries = Object.entries(slotVals).map(([i, v]) => [+i, v]).sort((a, b) => a[0] - b[0]);
+  set(".e-kv", slotEntries.length ? slotEntries.map(([, v]) => fmtTok(v)).join(" / ") : "–");
+  const km = slotEntries.length
+    ? slotEntries.map(([i, v]) => `slot ${i}: ${Math.round(v)} tok`).join(", ")
+      + (tel.kv_pool_tokens ? ` — pool ${tel.kv_pool_tokens} tok` : "")
+    : "";
+  set(".e-kv-lbl", active ? "ctx / slot (live)" : "ctx / slot (idle)", km);
   set(".e-req", (tel.running ?? 0) + (tel.waiting ? " +" + tel.waiting + " queued" : ""));
+
+  // per-session stacked context bar — one segment per concurrent request,
+  // proportioned against the SHARED KV POOL ceiling (sglang:max_total_num_tokens,
+  // exposed as kv_pool_tokens — typically well over the single-request context
+  // window above, e.g. ~1.12M pool vs a 524K window on Flash-Next w/ FR-Spec).
+  // Falls back to ctx_max for engines with no separate pool concept (vLLM/
+  // llama.cpp already set kv_pool_tokens == ctx_max there — see telemetry.py).
+  // Hidden outright with nothing in flight — no idle/last-known fallback here
+  // either; a bar showing a stale figure with no request behind it is exactly
+  // the "arbitrary value" complaint this whole corner was rebuilt to fix.
+  const cb = card.querySelector(".e-ctxbar");
+  const sessions = tel.inflight || [];
+  const ctxMax = tel.kv_pool_tokens || tel.ctx_max;
+  // Same scaledSlotValues rescaling as .e-kv above and the live chart's
+  // per-slot fill — raw per-session ctx_tokens is just the proxy's own
+  // byte-count/SSE-tick guess (it can't see retained HiCache/radix prefix
+  // pages), so segment widths built from it disagreed with the engine's
+  // real reported total by a large margin (each segment reading ~20k while
+  // the true total sat far lower). Scaled here too so every number on this
+  // card tells the same story.
+  const barVals = scaledSlotValues(tel);
+  if (cb) {
+    if (ctxMax && sessions.length) {
+      cb.classList.remove("hidden");
+      cb.innerHTML = "";
+      const totalUsed = tel.ctx_tokens ?? sessions.reduce((s, x) => s + (barVals[x.slot] ?? 0), 0);
+      const label = el("div", "ctxbar-label",
+        `${sessions.length} session${sessions.length > 1 ? "s" : ""} · `
+        + `${fmtTok(totalUsed)} / ${fmtTok(ctxMax)} tok KV pool`);
+      const track = el("div", "ctxbar-track");
+      sessions.forEach((s, i) => {
+        const v = barVals[s.slot] ?? 0;
+        const seg = el("span", "ctxbar-seg seg-" + (i % 8));
+        seg.style.width = Math.max(0.3, 100 * v / ctxMax) + "%";
+        seg.title = `session ${i + 1}, slot ${s.slot}: ${fmtTok(v)} tok, ${s.age_s.toFixed(0)}s old`;
+        track.append(seg);
+      });
+      cb.append(label, track);
+    } else {
+      cb.classList.add("hidden");
+    }
+  }
   // concurrency lights: one square per slot, lit = a request occupies it.
   // slot count unknown for vLLM idle -> fall back to running+waiting.
   const sd = card.querySelector(".e-slots");
@@ -1817,15 +1904,20 @@ function liveCell(id, title) {
   const box = el("div", "chartwrap"); box.id = "lchart_" + id;
   c.append(cap, box); return c;
 }
-function ensureLiveGrid(engineNames) {
+function ensureLiveGrid(engineNames, maxSlots, poolCeiling) {
   const want = ["gpuutil","gpupow","vram","kv","tokps","mtp"];
-  if (!unchanged("livecells", [want, engineNames])) {
+  // maxSlots and poolCeiling ride in the cache key so switching to a profile
+  // with a different concurrency cap, or to a story engine with a different
+  // pool size, rebuilds the chart (and its fixed y-axis range) instead of
+  // quietly keeping the old one's — mkLive's options are only applied on
+  // creation, not on the setData()-only path a cache hit takes.
+  if (!unchanged("livecells", [want, engineNames, maxSlots, poolCeiling])) {
     const g = $("#liveGrid"); g.innerHTML = "";
     for (const k of Object.keys(LC)) { LC[k].destroy(); delete LC[k]; }
     g.append(liveCell("gpuutil", "GPU utilization % · host CPU / load"));
     g.append(liveCell("gpupow", "GPU power W"));
     g.append(liveCell("vram", "VRAM used GiB"));
-    g.append(liveCell("kv", "Context · KV cache %"));
+    g.append(liveCell("kv", "Context: concurrent tokens by slot (fill) · KV cache % (line)"));
     g.append(liveCell("tokps", "Generation tok/s"));
     g.append(liveCell("mtp", "MTP acceptance %"));
   }
@@ -1837,9 +1929,12 @@ function mkLive(id, series, opts = {}) {
   const xseries = { value: (u, v) => v == null ? "" : hms(v) };   // hover readout: hh:mm:ss, no date
   const o = {
     width: box.clientWidth || 320, height: 120,
-    legend: { show: series.length > 2, live: false },   // live:false -> legend can't reflow on hover
+    // live:false -> legend can't reflow on hover. A legend naming N identical-
+    // color slot series would just list "slot 0, slot 1, ..." with no way to
+    // tell them apart anyway — opts.legend:false drops it outright there.
+    legend: { show: opts.legend === false ? false : series.length > 2, live: false },
     cursor: { points: { size: 4 } },
-    plugins: [hoverTip(hms, (v) => (Math.round(v * 10) / 10).toLocaleString())],
+    plugins: [hoverTip(hms, (v) => (Math.round(v * 10) / 10).toLocaleString(), opts.tooltipOnlyLast)],
     scales: { x: { time: true }, ...(opts.scales || {}) },
     axes: [
       { stroke: "#8b8fa3", grid: { stroke: "#23283a" }, ticks: { stroke: "#23283a" }, space: 62,
@@ -1847,13 +1942,24 @@ function mkLive(id, series, opts = {}) {
       { stroke: "#8b8fa3", grid: { stroke: "#23283a" }, ticks: { stroke: "#23283a" }, size: 42,
         values: (u, sp) => sp.map(v => fmtSI(v)) },
       ...(opts.axis2 ? [{ stroke: "#8b8fa3", side: 1, scale: opts.axis2, size: 38, grid: { show: false },
-        values: (u, sp) => sp.map(v => fmtSI(v)) }] : []),
+        values: (u, sp) => sp.map(opts.axis2Fmt || fmtSI) }] : []),
     ],
     series: [xseries, ...series.slice(1)],
+    // Stacked-area fills (the per-slot context chart): uPlot fills the true
+    // region BETWEEN two data series rather than relying on paint order and
+    // opacity to fake it, so it stays correct regardless of series order.
+    ...(opts.bands ? { bands: opts.bands } : {}),
   };
   LC[id] = new uPlot(o, [TS.slice(), ...series.slice(1).map(s => col(s._n))], box);
 }
 const PAL = ["#3987e5", "#d95926", "#199e70", "#a855f7", "#facc15", "#f87171", "#38bdf8"];
+// This box always keeps a small model loaded alongside whatever the "real"
+// one is (code-autocomplete, a llama.cpp FIM completer) — it's not part of
+// the story any of the context/generation/MTP live charts are telling, and
+// including it caused real bugs (its tiny always-on activity won a "which
+// engine matters right now" pick meant for the big model). Excluded outright
+// rather than just deprioritized.
+const CTX_EXCLUDE = new Set(["code-autocomplete"]);
 // smooth (Catmull-Rom) interpolation for the live charts — the 3 s sample cadence
 // makes straight segments look jagged. undefined if the vendored uPlot lacks it.
 const SPLINE = (window.uPlot && uPlot.paths && uPlot.paths.spline) ? uPlot.paths.spline() : undefined;
@@ -1861,7 +1967,7 @@ const SPLINE = (window.uPlot && uPlot.paths && uPlot.paths.spline) ? uPlot.paths
 // shared uPlot hover tooltip — attached to <body> as position:fixed so no
 // ancestor `overflow:hidden` (or the chart title) can clip it; pointer-events:none
 // so it can't steal the cursor; only moves on mousemove.
-function hoverTip(fmtX, fmtVal) {
+function hoverTip(fmtX, fmtVal, onlyLast) {
   let tip;
   const hide = () => { if (tip) tip.style.display = "none"; };
   return {
@@ -1876,7 +1982,17 @@ function hoverTip(fmtX, fmtVal) {
         const { left, top, idx } = u.cursor;
         if (idx == null || left == null || left < 0) { hide(); return; }
         const parts = [`<b>${fmtX(u.data[0][idx])}</b>`];
-        for (let s = 1; s < u.series.length; s++) {
+        // onlyLast: for a stack of CUMULATIVE series (the per-slot context
+        // fill on the merged kv chart), listing every series here would show
+        // running sums, not each slot's own share — "slot 0: 500, slot 1:
+        // 1800, slot 2: 2100" makes a reader do the subtraction by hand. An
+        // explicit array names exactly which series indices are real numbers
+        // worth showing (the top cumulative slot + the kv% line); `true`
+        // alone falls back to just the last series.
+        const range = Array.isArray(onlyLast) ? onlyLast
+          : onlyLast ? [u.series.length - 1]
+          : Array.from({ length: u.series.length - 1 }, (_, i) => i + 1);
+        for (const s of range) {
           const ser = u.series[s];
           if (ser.show === false) continue;
           const v = u.data[s][idx];
@@ -1923,7 +2039,55 @@ function genWinMean(engineNames, key, tEnd, winS, maxAgeS = 120, out = null) {
   return Math.round(sum / n * 10) / 10;
 }
 function renderLive(engineNames) {
-  ensureLiveGrid(engineNames);
+  // code-autocomplete (the always-on FIM completer) never belongs in any of
+  // these charts or captions — see CTX_EXCLUDE.
+  const chartEngines = engineNames.filter(n => !CTX_EXCLUDE.has(n));
+  const isActive = n => !!(SNAP.tel && SNAP.tel[n] && SNAP.tel[n].active);
+  // "Story" engine: the one every per-engine chart, caption, and the merged
+  // kv/slot chart on this page describes — one shared pick so the numbers
+  // never disagree with each other. An engine currently active with the
+  // largest live context wins outright (that's the generation actually
+  // happening right now, and it's also the engine feedPoint chose for the
+  // per-slot fill, so the fill and the kv% line always describe the same
+  // engine). With nothing active, the engine with the most recent real
+  // samples wins instead — counted over the last ~30 s first (the session
+  // just watched), then the whole buffer — so an idle stretch keeps
+  // pointing at the engine that was last doing something rather than an
+  // arbitrary alphabetical pick or going blank.
+  let storyName = null, storyTotal = -1;
+  for (const n of chartEngines) {
+    const t = SNAP.tel && SNAP.tel[n];
+    if (t && t.active && t.ctx_tokens != null && t.ctx_tokens > storyTotal) {
+      storyName = n; storyTotal = t.ctx_tokens;
+    }
+  }
+  if (!storyName && chartEngines.length) {
+    const cnt = (n, from) => {
+      let c = 0; const a = SER["tok_" + n] || [], b = SER["mtp_" + n] || [];
+      for (let i = from; i < a.length; i++) { if (a[i] != null) c++; if (b[i] != null) c++; }
+      return c;
+    };
+    const tail = Math.max(0, TS.length - 30);
+    storyName = chartEngines.slice().sort((a, b) =>
+      (cnt(b, tail) - cnt(a, tail)) || (cnt(b, 0) - cnt(a, 0)))[0];
+  }
+  // Real concurrency cap (tel.slots — --max-running-requests etc.) of the
+  // story engine. Falls back to whichever engine has ANY known slots, then
+  // 4, before telemetry has arrived at all.
+  let slotsFallback = null;
+  for (const n of chartEngines) {
+    const t = SNAP.tel && SNAP.tel[n];
+    if (t && t.slots) { slotsFallback = t.slots; break; }
+  }
+  const storyT = storyName && SNAP.tel[storyName];
+  const maxSlots = (storyT && storyT.slots) || slotsFallback || 4;
+  // Real pool ceiling for the story engine, so the merged chart's token axis
+  // can be pinned to it instead of autoscaling — see the comment where it's
+  // consumed below. Falls back to the per-request window for engines with no
+  // separate pool concept (vLLM/llama.cpp set kv_pool_tokens == ctx_max — see
+  // telemetry.py), then to auto-scaling if neither is known yet.
+  const poolCeiling = (storyT && (storyT.kv_pool_tokens || storyT.ctx_max)) || null;
+  ensureLiveGrid(chartEngines, maxSlots, poolCeiling);
   // spanGaps:false — with it on, uPlot bridges every null with a curve, so an
   // idle stretch (or a paused poll) drew a long smooth arc between the last value
   // before the silence and the first after it. The sample grid (sampleLive) now
@@ -1935,52 +2099,118 @@ function renderLive(engineNames) {
     dash: [6, 4], spanGaps: false, points: { show: false } });
 
   // rolling avg lines from the per-request points only (10-min trailing window)
-  SER["tok_roll"] = TS.map(t => genWinMean(engineNames, "gen", t, 600));
-  SER["mtp_roll"] = TS.map(t => genWinMean(engineNames, "mtp", t, 600));
+  SER["tok_roll"] = TS.map(t => genWinMean(chartEngines, "gen", t, 600));
+  SER["mtp_roll"] = TS.map(t => genWinMean(chartEngines, "mtp", t, 600));
+
+  // Merged context chart: concurrent tokens by slot (blue fill, stacked) with
+  // the engine's own KV cache % (thick orange line) drawn over it. feedPoint
+  // already rescaled the raw per-slot numbers so they sum to the same engine's
+  // real reported ctx_tokens total, and kv_pct (see telemetry.py) is now
+  // computed against that SAME pool ceiling — so the fill's top edge and the
+  // kv% line are exact proportional twins of one another, not just similarly
+  // shaped. The left (token) axis is pinned to the real pool ceiling rather
+  // than autoscaled to whatever's on screen, which is what makes that true
+  // visually too: a fill autoscaled to its own local max would always look
+  // "full" regardless of how close to the real ceiling it actually is.
+  const CTX_COLOR = "#3987e5";
+  const KV_COLOR = "#d95926";
+  // A synthetic always-zero series anchors the bottom of the stack. uPlot's
+  // bands option only paints a fill for the UPPER member of a [lower, upper]
+  // pair — the bottom slot has no series beneath it to be the upper member
+  // of, so without this it silently rendered with no fill at all (its own
+  // plain `.fill` property is ignored once it's referenced as a band's lower
+  // member). Banding every slot against a real neighbor, including this one,
+  // makes the fill logic uniform instead of a special case for slot 0.
+  SER["zero"] = TS.map(() => 0);
+  const zeroSeries = { _n: "zero", label: "zero", stroke: "transparent", width: 0, points: { show: false } };
+  let ctxRunning = TS.map(() => 0);
+  const slotSeries = [];
+  for (let i = 0; i < maxSlots; i++) {
+    const raw = col("slot" + i);
+    ctxRunning = ctxRunning.map((v, t) => v + (raw[t] || 0));
+    SER["ctxcum" + i] = ctxRunning.slice();
+    // Only the TOP series is ever actually shown (in the hover tooltip, via
+    // mkLive's tooltipOnlyLast) — it's the true total by construction (the
+    // last cumulative sum), so label it as such rather than "slot N", which
+    // would be a confusing thing to see labeled on what reads as one number.
+    const isTop = i === maxSlots - 1;
+    slotSeries.push({ _n: "ctxcum" + i, label: isTop ? "concurrent tokens" : "slot " + i,
+      stroke: CTX_COLOR, width: 1, spanGaps: false, points: { show: false }, paths: SPLINE });
+  }
+  // Bottom-to-top opacity gradient: the base of the stack (always the first
+  // slot filled) reads as the darkest layer, each slot piled on top of it a
+  // little lighter — so the eye can tell how many layers are stacked without
+  // needing the legend/colors this chart deliberately doesn't have.
+  const bandAlpha = (i, n) => {
+    const lo = 0x20, hi = 0x95;
+    const a = n <= 1 ? hi : Math.round(hi - (hi - lo) * i / (n - 1));
+    return a.toString(16).padStart(2, "0");
+  };
+  // zeroSeries sits at array index 1 (index 0 is the x-series), so slot i's
+  // own cumulative line is at index 2+i; each band's lower edge is the
+  // previous slot's cumulative (or the zero baseline for i=0, at index 1).
+  const ctxBands = [];
+  for (let i = 0; i < maxSlots; i++)
+    ctxBands.push({ series: [1 + i, 2 + i], fill: CTX_COLOR + bandAlpha(i, maxSlots), dir: 1 });
+  // The kv% line is always the SAME engine as the slot fill beneath it
+  // (storyName, picked above) — a different engine's percent sharing this
+  // axis with this engine's token stack would be two unrelated numbers drawn
+  // as if related. Bound to its own "pct" scale (fixed 0-100) so it reads
+  // against the right-hand axis while the fill reads against the left
+  // (absolute tokens) one.
+  const kvLine = { _n: "kv_" + (storyName || ""), label: "KV cache %", stroke: KV_COLOR,
+    width: 3, spanGaps: false, points: { show: false }, paths: SPLINE, scale: "pct" };
+  const kvSeries = [zeroSeries, ...slotSeries, kvLine];
+  // Tooltip only needs two real numbers out of this stack: the top slot's
+  // cumulative sum (the true concurrent-token total) and the kv% line —
+  // every series between them (including the zero baseline) is either a
+  // partial cumulative sum or a drawing aid, not a number anyone reads
+  // directly.
+  const kvTipIdx = [maxSlots + 1, maxSlots + 2];
 
   const defs = {
-    gpuutil: [{}, line("gu_cuda0","cuda0 GPU",0), line("gu_igpu0","igpu0 GPU",1),
-                  line("h_cpu","host CPU",2), line("h_load","load 1m",3,"load")],
-    gpupow:  [{}, line("gp_cuda0","cuda0",0), line("gp_igpu0","igpu0",1)],
-    vram:    [{}, line("gv_cuda0","cuda0",0), line("gv_igpu0","igpu0",1)],
-    kv:      [{}, ...engineNames.map((n,i) => line("kv_" + n, n, i))],
-    tokps:   [{}, ...engineNames.map((n,i) => line("tok_" + n, n, i)), avgLine("tok_roll")],
-    mtp:     [{}, ...engineNames.map((n,i) => line("mtp_" + n, n, i)), avgLine("mtp_roll")],
+    gpuutil:  [{}, line("gu_cuda0","cuda0 GPU",0), line("gu_igpu0","igpu0 GPU",1),
+                   line("h_cpu","host CPU",2), line("h_load","load 1m",3,"load")],
+    gpupow:   [{}, line("gp_cuda0","cuda0",0), line("gp_igpu0","igpu0",1)],
+    vram:     [{}, line("gv_cuda0","cuda0",0), line("gv_igpu0","igpu0",1)],
+    kv:       [{}, ...kvSeries],
+    tokps:    [{}, ...chartEngines.map((n,i) => line("tok_" + n, n, i)), avgLine("tok_roll")],
+    mtp:      [{}, ...chartEngines.map((n,i) => line("mtp_" + n, n, i)), avgLine("mtp_roll")],
   };
+  // The pct scale doesn't get its own fixed [0,100] range: it mirrors
+  // whatever range uPlot auto-picks for the token axis (scaled by
+  // 100/poolCeiling), so the kv% line and the token fill are ALWAYS drawn at
+  // the exact same normalized height — kv_pct is 100*ctx_tokens/poolCeiling
+  // by construction (see telemetry.py), so a point at height h on the token
+  // axis is at height h on the pct axis too, whatever window uPlot chose to
+  // autoscale to. A fixed 0-100% range broke that: at typical (low) pool
+  // utilization the token fill autoscaled to fill most of the chart while
+  // the pct line sat pinned near true zero, so the two looked unrelated even
+  // though the numbers agreed.
+  const pctScale = poolCeiling
+    ? { range: (u) => {
+        const ymin = u.scales.y.min ?? 0, ymax = u.scales.y.max ?? poolCeiling;
+        return [100 * ymin / poolCeiling, 100 * ymax / poolCeiling];
+      } }
+    : { range: [0, 100] };   // no known pool yet — plain 0-100 until it arrives
   for (const [id, series] of Object.entries(defs)) {
-    const opts = id === "gpuutil" ? { axis2: "load", scales: { load: {} } } : {};
+    const opts = id === "gpuutil" ? { axis2: "load", scales: { load: {} } }
+               : id === "kv" ? { bands: ctxBands, legend: false, tooltipOnlyLast: kvTipIdx,
+                                  axis2: "pct", axis2Fmt: v => (Math.round(v * 10) / 10) + "%",
+                                  scales: { pct: pctScale } }
+               : {};
     if (!LC[id]) mkLive(id, series, opts);
     else LC[id].setData([TS.slice(), ...series.slice(1).map(s => col(s._n))]);
   }
   const rnd = v => v == null ? null : Math.round(v * 10) / 10;
   const last = n => { const a = SER[n] || []; for (let i = a.length-1; i>=0; i--) if (a[i]!=null) return a[i]; return null; };
   const cap = (id, v, suf) => { const e = $(".lv-" + id); if (e) e.textContent = v==null ? "" : rnd(v) + (suf||""); };
-  // Caption engine: the ACTIVE engine if one is generating (that's the story
-  // the corner is telling); otherwise the one with the most real data. Index
-  // freshness cannot rank engines — feedPoint stamps every engine's sticky
-  // value at every second, so all names tie on index and a strict > silently
-  // keeps the alphabetically-first one (the original bug). And with more than
-  // one engine on the page, a bare number is ambiguous, so the name is
-  // prefixed into the caption.
-  const isActive = n => !!(SNAP.tel && SNAP.tel[n] && SNAP.tel[n].active);
-  let e0 = engineNames[0] || null;
-  if (!engineNames.some(isActive) && engineNames.length > 1) {
-    // Nothing is generating right now -> the engine with the most real samples
-    // owns the corner. Counted over the last ~30 s FIRST (that is the session the
-    // user just watched), then over the whole buffer — otherwise an engine that
-    // generated 9 minutes ago outranks one that generated 10 seconds ago.
-    const cnt = (n, from) => {
-      let c = 0; const a = SER["tok_" + n] || [], b = SER["mtp_" + n] || [];
-      for (let i = from; i < a.length; i++) { if (a[i] != null) c++; if (b[i] != null) c++; }
-      return c;
-    };
-    const tail = Math.max(0, TS.length - 30);
-    e0 = engineNames.slice().sort((a, b) =>
-      (cnt(b, tail) - cnt(a, tail)) || (cnt(b, 0) - cnt(a, 0)))[0];
-  } else for (const n of engineNames) if (isActive(n)) { e0 = n; break; }
-  // With more than one engine on the page a bare number is ambiguous, so the
-  // caption names whose numbers they are (upper case, like the legend below).
-  const e0pre = engineNames.length > 1 && e0 ? e0.toUpperCase() + " " : "";
+  // Caption engine: the same story engine the merged kv chart and the
+  // per-slot fill above are drawn from — see the comment where storyName is
+  // picked. With more than one engine on the page a bare number is
+  // ambiguous, so the name is prefixed into the caption.
+  const e0 = storyName || chartEngines[0] || null;
+  const e0pre = chartEngines.length > 1 && e0 ? e0.toUpperCase() + " " : "";
   // caption: latest (sticky) value · 10-min per-request average (idle excluded)
   const capReq = (id, series, key, suf) => {
     const e = $(".lv-" + id); if (!e) return;
@@ -2002,8 +2232,12 @@ function renderLive(engineNames) {
   { const e = $(".lv-vram");
     if (e) e.textContent = `cuda0 ${dash(last("gv_cuda0"))} GiB · igpu0 ${dash(last("gv_igpu0"))} GiB`; }
   { const e = $(".lv-kv"), pct = e0 ? last("kv_" + e0) : null, ct = e0 ? last("ctxt_" + e0) : null;
+    let sessions = 0;
+    for (const name of chartEngines)
+      sessions += ((SNAP.tel && SNAP.tel[name] && SNAP.tel[name].inflight) || []).length;
     if (e) e.textContent = pct == null ? e0pre + "–"
-      : e0pre + (ct != null ? fmtSI(ct) + " tok · " : "") + rnd(pct) + "%"; }
+      : e0pre + (ct != null ? fmtSI(ct) + " tok · " : "") + rnd(pct) + "%"
+        + (sessions ? ` · ${sessions} concurrent session${sessions > 1 ? "s" : ""}` : ""); }
   if (e0) { capReq("tokps", "tok_" + e0, "gen", ""); capReq("mtp", "mtp_" + e0, "mtp", "%"); }
   else { cap("tokps", null); cap("mtp", null); }
 }
@@ -2047,6 +2281,26 @@ function sput(n, v) { const a = SER[n] ||= []; while (a.length < TS.length - 1) 
 // when there is no reading for that engine, because a gap there means generation
 // actually stopped. Shared by the 1 s grid (sampleLive) and the /live backfill,
 // so a backfilled point and a live point are drawn from identical shapes.
+// Given one engine's telemetry, scale its raw per-session ctx_tokens
+// estimates (the proxy's own byte-count/SSE-tick guess — only trustworthy as
+// a RELATIVE split between concurrent sessions, never as an absolute number:
+// it can't see retained HiCache/radix prefix pages) so they sum to that same
+// engine's real reported ctx_tokens total. Shared by feedPoint (the live
+// chart's per-slot stack) and fillEngine (the engine card's per-slot
+// numbers) so the two always show the exact same figures for the same
+// engine, rather than two independent estimates that happen to disagree.
+// Returns {slotIndex: scaledTokens}, one entry per slot with an active
+// session — a slot with nothing in it just doesn't appear.
+function scaledSlotValues(tel) {
+  const raw = {};
+  for (const row of (tel && tel.inflight) || [])
+    if (row && typeof row.slot === "number") raw[row.slot] = row.ctx_tokens || 0;
+  const rawTotal = Object.values(raw).reduce((a, b) => a + b, 0);
+  const scale = (tel && tel.ctx_tokens && rawTotal > 0) ? tel.ctx_tokens / rawTotal : 0;
+  const out = {};
+  for (const [slot, v] of Object.entries(raw)) out[slot] = v * scale;
+  return out;
+}
 function feedPoint(s) {
   const engTel = s.tel || {};
   const gpu = (s.gpu && (s.gpu.cuda0 || s.gpu.igpu0)) ? s.gpu : LAST_GOOD.gpu;
@@ -2059,11 +2313,43 @@ function feedPoint(s) {
   sput("h_cpu", host?.cpu_pct); sput("h_load", host?.loadavg ? host.loadavg[0] : null);
   for (const name of ENGINE_NAMES) {                     // every engine, every point
     const t = engTel[name];                              // absent -> null, not skipped
-    sput("tok_" + name, t && t.gen_tok_s);               // sticky (main line)
-    sput("mtp_" + name, t && t.mtp_accept_pct);
-    sput("kv_" + name, t && t.kv_pct);
-    sput("ctxt_" + name, t && t.ctx_tokens);             // absolute token count, for the caption
+    // gen_tok_s/kv_pct/ctx_tokens drop to 0, and mtp_accept_pct to 100, the
+    // instant the engine isn't active — not null/gap. A gap read as "no
+    // data" when the honest answer is "zero, because nothing is running":
+    // 0 tok/s and 0 context are real, current facts, not missing
+    // measurements. mtp_accept_pct is the one exception at 100 rather than
+    // 0 — with no draft tokens proposed there's nothing to have REJECTED
+    // either, and 0% reads as "acceptance is failing" which isn't what idle
+    // means. Applies regardless of which path fed this point in: the /live
+    // backfill already carries the server's own _live_trim version of this,
+    // but this same function also receives points from the live per-tab
+    // poll (GET /engine/<name>, straight off the wire) — that path is NOT
+    // pre-trimmed, so doing it here too is what actually stops the old
+    // sticky-last-session value from showing on a page you're watching live.
+    // prompt_tok_s (prefill) stays sticky on purpose, unchanged.
+    const live = !!(t && t.active);
+    sput("tok_" + name, live ? t.gen_tok_s : 0);
+    sput("mtp_" + name, live ? t.mtp_accept_pct : 100);
+    sput("kv_" + name, live ? t.kv_pct : 0);
+    sput("ctxt_" + name, live ? t.ctx_tokens : 0);       // absolute token count, for the caption
   }
+  // Per-slot stacked context — see scaledSlotValues for the rescaling (also
+  // used by fillEngine's engine-card numbers, so the two agree). This must
+  // come from exactly ONE engine, not merged across every co-resident one:
+  // CTX_EXCLUDE already drops code-autocomplete by name, but even among the
+  // rest, picking the engine with the LARGEST active context is a simple,
+  // effective proxy for "the one actually being watched".
+  const N_SLOTS = 8;                     // storage headroom; the chart itself trims to tel.slots
+  let storyName = null, storyTotal = -1;
+  for (const name of ENGINE_NAMES) {
+    if (CTX_EXCLUDE.has(name)) continue;
+    const t = engTel[name];
+    if (t && t.active && t.ctx_tokens != null && t.ctx_tokens > storyTotal) {
+      storyName = name; storyTotal = t.ctx_tokens;
+    }
+  }
+  const slotVals = storyName ? scaledSlotValues(engTel[storyName]) : {};
+  for (let i = 0; i < N_SLOTS; i++) sput("slot" + i, slotVals[i] || 0);
 }
 function sampleLive(now) {
   const t = now / 1000 + CLK_OFF;   // push on the daemon's timeline, not the browser's

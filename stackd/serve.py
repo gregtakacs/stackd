@@ -113,24 +113,51 @@ _LIVE_BUF: deque = deque(maxlen=900)
 _LIVE_LOCK = threading.Lock()
 
 
-def _live_trim(gpu: dict, host: dict, engs: dict) -> dict:
+def _live_trim(gpu: dict, host: dict, engs: dict, inflight: dict | None = None) -> dict:
     """Compact each source's raw payload to just the numbers the live charts
-    draw, so the buffer and /live replays stay small."""
+    draw, so the buffer and /live replays stay small.
+
+    `inflight` is {stack: _inflight_snapshot(stack)} taken at the same instant
+    as `engs` (see _live_sampler) — carried through per-engine so the dashboard's
+    per-slot stacked chart has real history, not just the current instant."""
     def dev(d):
         return ({k: d.get(k) for k in ("util_pct", "power_w", "vram_used_gib")}
                 if isinstance(d, dict) else None)
+
+    def eng(name: str, t: dict) -> dict:
+        active = t.get("active")
+        # gen_tok_s/kv_pct/ctx_tokens drop to 0, mtp_accept_pct to 100, the
+        # instant the engine isn't active — not null. A null reads as "no
+        # data"; the honest state here is "zero, because nothing is running",
+        # a real fact rather than a missing measurement. mtp_accept_pct is
+        # the one exception at 100 rather than 0: with no draft tokens
+        # proposed there's nothing to have been REJECTED either, and 0% reads
+        # as "acceptance is failing", not "idle". Without this gating at all,
+        # these leaked raw /metrics values that persist through idle: SGLang's
+        # gen_throughput/spec_accept_rate gauges hold their last setting, and
+        # token_usage/kv_used_tokens count the WHOLE KV pool including
+        # retained HiCache/radix prefix pages from past requests — a real,
+        # nonzero number with nothing currently running (the "1.7% on a dead
+        # engine" report). prompt_tok_s (prefill) is intentionally left sticky
+        # here, unchanged from before.
+        return {
+            "active": active,
+            "gen_tok_s": t.get("gen_tok_s") if active else 0,
+            "prompt_tok_s": t.get("prompt_tok_s"),
+            "mtp_accept_pct": t.get("mtp_accept_pct") if active else 100,
+            "kv_pct": t.get("kv_pct") if active else 0,
+            "ctx_tokens": t.get("ctx_tokens") if active else 0,
+            "inflight": (inflight or {}).get(name) or [],
+        }
+
     return {
         "gpu": {k: dev((gpu or {}).get(k)) for k in ("cuda0", "igpu0")},
         "host": {"cpu_pct": (host or {}).get("cpu_pct"),
                  "load1": ((host or {}).get("loadavg") or [None])[0]},
         # `active` is not drawn by any chart — it rides along because /live also
         # derives the request corners' history from this buffer (see
-        # _genhist_from_live), and a rate sample is only a *measurement* while a
-        # request is generating: engines stick their session average on the gauges
-        # once idle, which without this flag would be re-timestamped forever.
-        "eng": {n: {k: t.get(k) for k in ("active", "gen_tok_s", "prompt_tok_s",
-                                         "mtp_accept_pct", "kv_pct", "ctx_tokens")}
-                for n, t in (engs or {}).items()},
+        # _genhist_from_live).
+        "eng": {n: eng(n, t) for n, t in (engs or {}).items()},
     }
 
 
@@ -838,6 +865,9 @@ class _Handler(BaseHTTPRequestHandler):
                 tel["ctx_tokens"] = hc
                 if tel.get("ctx_max"):
                     tel["kv_pct"] = round(min(100.0, 100.0 * hc / tel["ctx_max"]), 1)
+        # Per-session breakdown for the dashboard's stacked context bar — see
+        # _inflight_snapshot. Empty (not missing) when nothing is running.
+        tel["inflight"] = _inflight_snapshot(stack)
         return self._send_json(200, tel)
 
     def _live(self):
@@ -1086,28 +1116,53 @@ class _Handler(BaseHTTPRequestHandler):
 
         is_embeddings = self.path.endswith("embeddings")
 
+        # Live in-flight tracking for the dashboard's per-session context bar (see
+        # _inflight_start's docstring) — a real request is about to go out, so this
+        # is the one place to start the clock regardless of which relay path it takes.
+        inflight_rid = _inflight_start(rr.stack, len(raw) // 4) if (rr.stack and not is_embeddings) else None
+
         def _on_body(buf: bytes, status: int, meta: dict | None = None) -> None:
             self._record_usage(model, rr, buf, status, embeddings=is_embeddings,
                                req_body=body)
             _capture_gen(rr.stack, buf, self.store, self.lock)
+            if inflight_rid is not None:
+                _inflight_finish(rr.stack, inflight_rid)
 
-        # Native-tool-call chat turns go through the validating relay so a truncated
-        # tool call is retried once (with a window-safe bigger output cap) instead of
-        # being forwarded half-written and rejected by the client's zod schema as
-        # `✖ Invalid input`. Only /chat/completions that actually declare `tools` —
-        # everything else (embeddings, plain chat, non-tool clients) stays on _relay.
-        guard = (_TC_RETRY and self.path.endswith("chat/completions")
-                 and isinstance(body.get("tools"), list) and len(body["tools"]) > 0)
-        if guard:
-            return self._relay_validated(
-                rr.endpoint.rstrip("/") + self.path, "POST", body,
-                mml=_ctx_ceiling(_m), streaming=streaming, on_body=_on_body,
-                inject_timings=_INJECT_TIMINGS, alias_token_ids=True)
-
-        self._relay(rr.endpoint.rstrip("/") + self.path, "POST",
-                    json.dumps(body).encode(), streaming=streaming, on_body=_on_body,
-                    inject_timings=_INJECT_TIMINGS and not is_embeddings,
-                    alias_token_ids=not is_embeddings)
+        # Native-tool-call chat turns get a tool-call-aware relay: everything
+        # before a tool call starts (reasoning, prose) streams live exactly
+        # like any other request; only the tool call's own construction is
+        # held back, and only until it either closes cleanly or the model
+        # stops without finishing it. A call that never closes gets swallowed
+        # — dropped — and replaced with a clean finish_reason=length turn
+        # carrying no tool_calls, instead of forwarding half-written JSON a
+        # client's own validator would reject. There is no retry: the model
+        # is already asked for its full native output length up front (see
+        # each model's max_output_tokens config), so there's no bigger number
+        # left to ask for on a second attempt — and a second generation
+        # can't safely replace content already streamed to the client anyway
+        # (SSE is append-only; a retry's reasoning need not match what a
+        # non-deterministic first attempt already sent). Applies to every
+        # client that declares `tools`, OpenWebUI included — the buffering
+        # window is now just the tool call itself, not the whole response.
+        toolcall_safe_model = (
+            body.get("model") if (self.path.endswith("chat/completions")
+                                   and isinstance(body.get("tools"), list)
+                                   and len(body["tools"]) > 0) else None)
+        on_chunk = (lambda: _inflight_tick(rr.stack, inflight_rid)) if inflight_rid is not None else None
+        try:
+            self._relay(rr.endpoint.rstrip("/") + self.path, "POST",
+                        json.dumps(body).encode(), streaming=streaming, on_body=_on_body,
+                        inject_timings=_INJECT_TIMINGS and not is_embeddings,
+                        alias_token_ids=not is_embeddings, on_chunk=on_chunk,
+                        toolcall_safe_model=toolcall_safe_model)
+        finally:
+            # Safety net: on_body (above) is the normal finish path, but a couple of
+            # _relay's error branches (upstream unreachable/timeout) return without
+            # ever calling it. Without this, a request that never got a response
+            # would sit in _INFLIGHT forever — a ghost session on the dashboard that
+            # never clears. _inflight_finish is a no-op if on_body already popped it.
+            if inflight_rid is not None:
+                _inflight_finish(rr.stack, inflight_rid)
 
     # -- ledger ------------------------------------------------------------------------
     def _record_usage(self, requested_model, rr, buf: bytes, status: int, *,
@@ -1243,7 +1298,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     # -- reverse proxy ----------------------------------------------------------------
     def _relay(self, url: str, method: str, body: bytes | None, *, streaming: bool,
-               on_body=None, inject_timings: bool = False, alias_token_ids: bool = False):
+               on_body=None, inject_timings: bool = False, alias_token_ids: bool = False,
+               on_chunk=None, toolcall_safe_model: str | None = None):
         """Forward one request upstream and relay the response. `streaming` chunk-
         relays a response with no content-length (SSE); otherwise buffers and sends
         with a real content-length. `on_body(bytes, status)` gets the full response
@@ -1263,7 +1319,19 @@ class _Handler(BaseHTTPRequestHandler):
 
         `on_body` is also handed a small `meta` dict: {prefill_s, decode_s} —
         the proxy wall-clock split (first upstream byte ~= prefill done), for the
-        ledger's tok/s when the engine reports no timings of its own."""
+        ledger's tok/s when the engine reports no timings of its own.
+
+        `on_chunk` (streaming only): called once per relayed SSE event (excluding
+        the final `[DONE]` line) — a cheap per-token-ish tick for the dashboard's
+        live in-flight context bar (_inflight_tick). Not called for a non-streamed
+        response, since there's nothing incremental to tick. Fires for every event
+        RECEIVED from upstream even when `toolcall_safe_model` is holding it back
+        from the client — this drives stackd's own in-flight tracking, which cares
+        about real generation progress, not what's been forwarded yet.
+
+        `toolcall_safe_model` (chat/completions only): when set (to the model name,
+        for event-log labeling), gate a tool call through _ToolCallGate instead of
+        relaying it live — see that class for the hold/flush/swallow behavior."""
         fwd_ct = self.headers.get("content-type", "application/json")
         req = urllib.request.Request(
             url, data=body, method=method,
@@ -1312,6 +1380,7 @@ class _Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 lb = b""            # line buffer — relay whole SSE events (\n\n-delimited)
                 usage_merged = False
+                gate = _ToolCallGate(toolcall_safe_model) if toolcall_safe_model else None
                 while True:
                     chunk = up.read(8192)
                     if not chunk:
@@ -1323,22 +1392,27 @@ class _Handler(BaseHTTPRequestHandler):
                     while b"\n\n" in lb:
                         evt, lb = lb.split(b"\n\n", 1)
                         evt += b"\n\n"
-                        if inject_timings:
-                            if not usage_merged and b'"usage"' in evt:
-                                merged = _merge_usage_evt(evt, t0, t_first, time.monotonic())
-                                if merged:
-                                    evt, usage_merged = merged, True
-                            if evt.strip() == b"data: [DONE]" and not usage_merged:
-                                extra = _timing_sse_line(bytes(tail), t0, t_first, time.monotonic())
-                                if extra:
-                                    _wc(extra)
-                        _wc(evt)
+                        if on_chunk and evt.strip() != b"data: [DONE]":
+                            on_chunk()
+                        for oe in (gate.handle(evt) if gate else (evt,)):
+                            if inject_timings:
+                                if not usage_merged and b'"usage"' in oe:
+                                    merged = _merge_usage_evt(oe, t0, t_first, time.monotonic())
+                                    if merged:
+                                        oe, usage_merged = merged, True
+                                if oe.strip() == b"data: [DONE]" and not usage_merged:
+                                    extra = _timing_sse_line(bytes(tail), t0, t_first, time.monotonic())
+                                    if extra:
+                                        _wc(extra)
+                            _wc(oe)
                 if lb:
                     _wc(lb)
                 self.wfile.write(b"0\r\n\r\n")
             else:
                 data = up.read()
                 _tee(data)
+                if toolcall_safe_model:
+                    data = _sanitize_toolcall_body(data, toolcall_safe_model) or data
                 if inject_timings:
                     data = _inject_body_timings(data, t0, time.monotonic()) or data
                 if alias_token_ids:
@@ -1352,110 +1426,6 @@ class _Handler(BaseHTTPRequestHandler):
             decode_s = (t_end - t_first) if t_first else (t_end - t0)
             on_body(bytes(keep), up.status, {"prefill_s": prefill_s, "decode_s": decode_s})
 
-
-    def _relay_validated(self, url: str, method: str, body: dict, *, mml: int | None,
-                         streaming: bool, on_body=None, inject_timings: bool = False,
-                         alias_token_ids: bool = False):
-        """A tool-declaring /v1/chat/completions relay that REFUSES to forward a
-        visibly-truncated tool call. Unlike _relay it reads the whole upstream response
-        into memory first (agentic tool-call turns are bounded by the completion budget,
-        so this is small), checks whether any tool call's `arguments` came back cut off /
-        empty with finish_reason="length", and if so re-issues the SAME request once with
-        a temporary, window-safe larger output cap (_retry_body_with_budget). The client's
-        own zod validator is what throws `✖ Invalid input`; we can't fix that, but we can
-        stop shipping it the half-written JSON. Whatever we finally hold — original, or the
-        (possibly-still-truncated) retry — we forward in the framing the client asked for
-        (SSE chunked vs JSON content-length), preserving timing injection. Best-effort: any
-        error in the validation path falls back to forwarding the response as-is, so this
-        can never turn a working request into a broken one."""
-        fwd_ct = self.headers.get("content-type", "application/json")
-        accept = self.headers.get("accept", "*/*")
-
-        def _issue(payload: bytes):
-            req = urllib.request.Request(url, data=payload, method=method,
-                                         headers={"content-type": fwd_ct, "accept": accept})
-            up = urllib.request.urlopen(req, timeout=_PROXY_READ_TIMEOUT_S)
-            return up, up.read()
-
-        t0 = time.monotonic()
-        try:
-            up, data = _issue(json.dumps(body).encode())
-        except urllib.error.HTTPError as e:                 # upstream 4xx/5xx: forward verbatim
-            payload = e.read()
-            self.send_response(e.code)
-            self.send_header("content-type", e.headers.get("content-type", "application/json"))
-            self.send_header("content-length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
-            if on_body:
-                on_body(payload, e.code, {})
-            return
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
-            return self._send_json(502, {"error": {"message": f"upstream unreachable: {e}"}})
-
-        status = up.status
-        # One server-side retry: only if the tool call is truncated AND we can actually
-        # raise the output cap without exceeding the context window (returns None else).
-        if _TC_RETRY and len(data) <= _TC_RETRY_MAX_BYTES and _toolcall_truncated(data):
-            nb = _retry_body_with_budget(body, _extract_usage(data), mml)
-            if nb is not None:
-                try:
-                    up2, data2 = _issue(json.dumps(nb).encode())
-                except Exception:  # noqa: BLE001 — retry failed; keep the original response
-                    up2 = None
-                if up2 is not None:
-                    status = status or up2.status
-                    if _toolcall_truncated(data2):        # retry didn't help → keep the first
-                        up2.close()
-                    else:                                 # retry produced a whole tool call
-                        up.close()
-                        up, data = up2, data2
-        up.close()
-        t_end = time.monotonic()
-
-        # Ledger on the RAW upstream body (pre-rewrite) — matches _relay's on_body.
-        if on_body:
-            on_body(data, status, {"prefill_s": 0.0, "decode_s": t_end - t0})
-
-        if streaming:
-            self.send_response(200)
-            self.send_header("content-type", "text/event-stream")
-            self.send_header("cache-control", "no-cache")
-            self.send_header("transfer-encoding", "chunked")
-            self.end_headers()
-
-            def _wc(b: bytes) -> None:
-                self.wfile.write(f"{len(b):x}\r\n".encode() + b + b"\r\n")
-                self.wfile.flush()
-
-            merged = False
-            for evt in data.split(b"\n\n"):
-                if not evt:
-                    continue
-                chunk = evt + b"\n\n"
-                if inject_timings and not merged and b'"usage"' in chunk:
-                    m = _merge_usage_evt(chunk, t0, t0, t_end)
-                    if m:
-                        chunk, merged = m, True
-                if inject_timings and chunk.strip() == b"data: [DONE]" and not merged:
-                    _wc(chunk)
-                    extra = _timing_sse_line(data, t0, t0, t_end)
-                    if extra:
-                        _wc(extra)
-                    continue
-                _wc(chunk)
-            self.wfile.write(b"0\r\n\r\n")
-        else:
-            out = data
-            if inject_timings:
-                out = _inject_body_timings(out, t0, t_end) or out
-            if alias_token_ids:
-                out = _alias_response_token_ids(out) or out
-            self.send_response(200)
-            self.send_header("content-type", "application/json")
-            self.send_header("content-length", str(len(out)))
-            self.end_headers()
-            self.wfile.write(out)
 
 
 # One long-lived prompt-cache estimator per pricing.json path (it holds a rolling
@@ -1493,19 +1463,21 @@ def _extract_usage(buf: bytes) -> dict:
     return last
 
 
-# --- tool-call truncation guard -----------------------------------------------------
+# --- tool-call truncation handling ---------------------------------------------------
 # Long agentic turns under a reasoning parser (Qwen3 + qwen3_coder) can exhaust the
 # completion budget mid-tool-call: generation stops with finish_reason="length" and
-# the tool-call arguments JSON is cut off (or empty). Native-tool-call clients (Cline/
-# Kilo) zod-validate the tool call and reject it with a bare `✖ Invalid input` — the
-# symptom "sometimes I get {"error":"✖ Invalid input"} on long sessions". The client's
-# validator is fixed; the proxy can, however, refuse to FORWARD a visibly-broken tool
-# call and instead re-issue the one upstream request with more output room. Opt out
-# with STACKD_TC_RETRY=0.
-_TC_RETRY = os.getenv("STACKD_TC_RETRY", "1").lower() not in ("0", "false", "no", "")
-_TC_RETRY_HEADROOM = 512        # leave this many tokens of slack under the ceiling
-_TC_RETRY_DEFAULT = 8192        # explicit cap when the caller sent none and we know no ceiling
-_TC_RETRY_MAX_BYTES = 8 * 1024 * 1024   # buffered-stream cap; past this, passthrough un-buffered
+# the tool-call arguments JSON is cut off (or empty) — or, if reasoning alone ran long
+# enough, no tool call is ever even started. Native-tool-call clients (Cline/Kilo)
+# zod-validate a truncated call and reject it with a bare `✖ Invalid input`. The
+# client's validator is fixed; the proxy instead refuses to forward a visibly-broken
+# call at all: _ToolCallGate (streaming) / _sanitize_toolcall_body (non-streaming) drop
+# it and report a clean finish_reason="length" turn with no tool_calls — the same shape
+# a client already handles as "ran out of room" (Cline: throws a specific, readable
+# error instead of a bare validation failure). No retry: each tool-capable model is
+# configured with its own full native max_output_tokens (see manager.model_max_output_
+# tokens), so there is no bigger number left to ask for on a second attempt, and a
+# second generation could not safely replace content already streamed to the client
+# anyway (SSE is append-only, and generation is not deterministic run to run).
 
 
 def _completion_toolcall_state(buf: bytes):
@@ -1573,65 +1545,113 @@ def _toolcall_truncated(buf: bytes) -> bool:
     return bool(has) and (("length" in finish) or bad)
 
 
-def _retry_body_with_budget(body: dict, usage: dict, mml: int | None) -> dict | None:
-    """Return a COPY of the request body with a larger output cap for the one retry,
-    or ``None`` when more tokens can't help (the prompt already fills the window). The
-    new cap never exceeds ``mml - prompt - headroom``, so the retry can't itself 400 on
-    context length. Preserves whichever spelling (max_tokens vs max_completion_tokens)
-    the caller used."""
-    prompt = int(usage.get("prompt_tokens") or 0)
-    cur_raw = body.get("max_completion_tokens") or body.get("max_tokens")
-    try:
-        cur = int(cur_raw) if cur_raw is not None else None
-    except (TypeError, ValueError):
-        cur = None
-    key = "max_completion_tokens" if "max_completion_tokens" in body else "max_tokens"
-
-    head = None
-    if mml and prompt:
-        head = mml - prompt - _TC_RETRY_HEADROOM
-        if head <= 0:
-            return None                            # prompt + a tool call won't fit anyway
-
-    if cur is None:
-        want = head if head else _TC_RETRY_DEFAULT
-    else:
-        if head is None:
-            want = int(cur * 2)
-        else:
-            if head <= cur:
-                return None                        # truncation wasn't the completion cap
-            want = min(head, cur * 3)
-        if want <= cur:
-            return None
-
-    nb = dict(body)
-    nb[key] = int(want)
-    return nb
+def _clean_toolcall_finish(doc: dict) -> dict:
+    """A copy of one terminal chat/completions.chunk `doc`, stripped of any
+    tool_calls and forced to finish_reason="length" — the swallow shape both
+    _ToolCallGate and _sanitize_toolcall_body emit in place of a broken call."""
+    out = dict(doc)
+    choices = []
+    for ch in (doc.get("choices") or []):
+        if not isinstance(ch, dict):
+            continue
+        ch = dict(ch)
+        ch["delta"] = {}
+        ch["finish_reason"] = "length"
+        choices.append(ch)
+    out["choices"] = choices or [{"index": 0, "delta": {}, "finish_reason": "length"}]
+    return out
 
 
-def _ctx_ceiling(m) -> int | None:
-    """Configured context ceiling for a model — params first (max_model_len / ctx /
-    context_length / n_ctx), then the raw cmd_extra flags the server actually launches
-    with. Mirrors the priority serve._engine uses for its own ctx_max."""
-    if m is None:
+class _ToolCallGate:
+    """Per-response streaming state machine for one tools-declaring chat/completions
+    call. Passes SSE events through live until the first delta carrying `tool_calls`
+    appears, then holds every event from that point on — nothing about the call reaches
+    the client until it's known to be whole. At the terminal (finish_reason-bearing)
+    event: if the held tool call closed with valid JSON, flush everything held, in
+    order, as if it had streamed normally (just delayed by however long the call itself
+    took to generate). If it didn't — cut off by the output limit, or invalid for any
+    other reason — discard everything held and emit one synthetic _clean_toolcall_finish
+    event instead. Either way, events after the decision (a trailing `usage` chunk,
+    `[DONE]`) relay live again untouched; nothing about them needed to be buffered.
+
+    Also logs (without altering anything) the sibling failure mode this same terminal
+    event can reveal: reasoning alone ran the whole budget out before any tool call
+    began, so there was never anything to hold in the first place."""
+
+    def __init__(self, model_name: str):
+        self.model_name = model_name
+        self.holding = False
+        self.resolved = False
+        self.pending: list[bytes] = []
+
+    def handle(self, evt: bytes) -> tuple[bytes, ...]:
+        """Feed one raw `\\n\\n`-terminated SSE event. Returns the events to relay to
+        the client right now — empty while still holding, 0-or-more at a decision."""
+        if self.resolved:
+            return (evt,)
+        stripped = evt.strip()
+        doc = None
+        if stripped.startswith(b"data:") and stripped != b"data: [DONE]":
+            try:
+                doc = json.loads(stripped[len(b"data:"):].strip())
+            except (json.JSONDecodeError, ValueError):
+                doc = None
+        has_tc = False
+        finish_reason = None
+        if isinstance(doc, dict):
+            for ch in (doc.get("choices") or []):
+                if not isinstance(ch, dict):
+                    continue
+                if (ch.get("delta") or {}).get("tool_calls"):
+                    has_tc = True
+                if ch.get("finish_reason"):
+                    finish_reason = ch["finish_reason"]
+        if not self.holding and not has_tc:
+            if finish_reason == "length":
+                events.record("toolcall-unstarted-length", stack=self.model_name,
+                              detail="hit the output limit before any tool call began")
+            return (evt,)
+        self.holding = True
+        self.pending.append(evt)
+        if finish_reason is None:
+            return ()                                  # still accumulating the call
+        self.resolved = True
+        held, self.pending = self.pending, []
+        has, finish, bad = _completion_toolcall_state(b"".join(held))
+        if has and (("length" in finish) or bad):
+            events.record("toolcall-swallowed", stack=self.model_name,
+                          detail=f"finish_reason={finish_reason}")
+            return (b"data: " + json.dumps(_clean_toolcall_finish(doc)).encode() + b"\n\n",)
+        return tuple(held)
+
+
+def _sanitize_toolcall_body(data: bytes, model_name: str) -> bytes | None:
+    """Non-streamed counterpart to _ToolCallGate: if the (already complete, in hand)
+    response has a tool call that never became valid JSON, log it and return a
+    rewritten body with tool_calls cleared and finish_reason forced to "length" instead
+    of forwarding the broken call. Also logs the reasoning-ran-out-the-budget sibling
+    case, unchanged. None if nothing needs to change."""
+    has, finish, bad = _completion_toolcall_state(data)
+    if not has:
+        if "length" in finish:
+            events.record("toolcall-unstarted-length", stack=model_name,
+                          detail="hit the output limit before any tool call began")
         return None
-    try:
-        p = m.engine.params
-        for k in ("max_model_len", "ctx", "context_length", "n_ctx", "max_context"):
-            v = p.get(k)
-            if v:
-                return int(v)
-        cmd = list(m.engine.container.cmd_extra or [])
-        for flag in ("--max-model-len", "--context-length", "--max-context", "--ctx-size", "-c"):
-            if flag in cmd:
-                try:
-                    return int(cmd[cmd.index(flag) + 1])
-                except (ValueError, IndexError):
-                    pass
-    except (AttributeError, ValueError):
+    if not (("length" in finish) or bad):
         return None
-    return None
+    events.record("toolcall-swallowed", stack=model_name,
+                  detail=f"finish_reason={sorted(finish)}")
+    try:
+        doc = json.loads(data)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return None
+    if not isinstance(doc, dict) or not isinstance(doc.get("choices"), list):
+        return None
+    for ch in doc["choices"]:
+        if isinstance(ch, dict) and isinstance(ch.get("message"), dict):
+            ch["message"]["tool_calls"] = []
+            ch["finish_reason"] = "length"
+    return json.dumps(doc).encode()
 
 
 # proxy-measured per-stack generation stats, keyed by stack — from llama.cpp's
@@ -1649,6 +1669,79 @@ _GEN_SEQ = [0]
 # chart treats as a rate datapoint); only serve._engine's idle ctx fallback
 # reads this.
 _LAST_CTX: dict = {}
+
+# --- live per-request context tracking, for the dashboard's per-session stacked
+# view (each concurrent request as its own segment, not one pool-wide aggregate).
+# {stack: {req_id: {"start": float, "prompt_est": int, "decode_live": int}}}.
+# prompt_est is a byte-count/4 approximation: vLLM/SGLang don't report real
+# prompt_tokens until the response completes, and by then the request is no
+# longer "in flight" (see _inflight_finish, called from the same on_body hook
+# that already fires exactly once per request). decode_live is a per-SSE-event
+# counter, not an exact token count — roughly 1 event ~= 1 token with the
+# default stream_interval, close enough for a live bar, not the ledger. This is
+# intentionally NOT the ledger's source of truth (see _record_usage) and NOT
+# persisted — a daemon restart just starts every card back at zero in-flight,
+# which is correct (nothing was actually in flight across the restart).
+_INFLIGHT: dict = {}
+_INFLIGHT_LOCK = threading.Lock()
+_INFLIGHT_SEQ = [0]
+
+
+def _inflight_start(stack: str, prompt_est: int) -> int:
+    with _INFLIGHT_LOCK:
+        _INFLIGHT_SEQ[0] += 1
+        rid = _INFLIGHT_SEQ[0]
+        bucket = _INFLIGHT.setdefault(stack, {})
+        # Stable slot index (lowest free non-negative int) — not the request id,
+        # which only ever climbs. The dashboard's per-slot stacked chart needs a
+        # small, reused identity: "slot 2" should mean the same visual lane
+        # across whichever request happens to occupy it over time, not a
+        # different series for every single request that ever ran.
+        used = {d["slot"] for d in bucket.values()}
+        slot = 0
+        while slot in used:
+            slot += 1
+        bucket[rid] = {
+            "start": time.time(), "prompt_est": max(int(prompt_est), 0),
+            "decode_live": 0, "slot": slot,
+        }
+    return rid
+
+
+def _inflight_tick(stack: str, rid: int) -> None:
+    with _INFLIGHT_LOCK:
+        d = _INFLIGHT.get(stack, {}).get(rid)
+        if d is not None:
+            d["decode_live"] += 1
+
+
+def _inflight_finish(stack: str, rid: int) -> None:
+    with _INFLIGHT_LOCK:
+        bucket = _INFLIGHT.get(stack)
+        if bucket is not None:
+            bucket.pop(rid, None)
+
+
+def _inflight_snapshot(stack: str) -> list:
+    """Current in-flight sessions for `stack` — each an approximate {prompt_tokens,
+    decode_tokens, ctx_tokens, age_s, slot}, newest first. `slot` is the stable
+    lane index from _inflight_start, for the dashboard's per-slot stacked chart
+    (the /live sampler sends this same shape into history — see _live_trim).
+    Empty list if nothing is
+    running (the common case; callers should treat that as "nothing to stack",
+    not as an error)."""
+    now = time.time()
+    with _INFLIGHT_LOCK:
+        rows = list(_INFLIGHT.get(stack, {}).values())
+    out = [
+        {"age_s": round(now - r["start"], 1), "prompt_tokens": r["prompt_est"],
+         "decode_tokens": r["decode_live"], "ctx_tokens": r["prompt_est"] + r["decode_live"],
+         "slot": r["slot"]}
+        for r in rows
+    ]
+    out.sort(key=lambda r: r["age_s"])
+    return out
+
 
 # The caches above (and telemetry._eng_state's sticky `last_sess`) are in-memory,
 # so a daemon restart wiped them and every idle engine card showed "–" until the
@@ -2176,8 +2269,12 @@ def serve(mgr: Manager, host: str, port: int, api_key: str | None,
                     host = fh.result() if fh.done() and not fh.exception() else {}
                     engs = {n: f.result() for n, f in fe.items()
                             if f.done() and not f.exception()}
+                    # In-process, no I/O — cheap enough to take alongside the
+                    # network fan-out above rather than needing its own future.
+                    inflight = {n: _inflight_snapshot(n) for n, _, _ in targets}
                     with _LIVE_LOCK:
-                        _LIVE_BUF.append({"ts": time.time(), **_live_trim(gpu, host, engs)})
+                        _LIVE_BUF.append({"ts": time.time(),
+                                          **_live_trim(gpu, host, engs, inflight)})
                 except Exception as e:  # noqa: BLE001 — sampler is best-effort
                     print(f"[live-sampler] error: {e}")
                 stop.wait(max(0.05, 1.0 - (time.time() - t0)))
