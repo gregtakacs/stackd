@@ -734,6 +734,7 @@ class _Handler(BaseHTTPRequestHandler):
         return self._send_json(200, out)
 
     def _profiles_list(self):
+        from stackd.manager import model_context_length
         from stackd.planner import plan_transition
         from stackd.validator import validate_profile
         got = self.lock.acquire(timeout=0.5)
@@ -763,6 +764,26 @@ class _Handler(BaseHTTPRequestHandler):
                         would_evict = plan_transition(cfg, active, name, cat).teardown
                     except Exception:  # noqa: BLE001
                         would_evict = []
+                # A quick-reference digest of each model's own YAML for the profile
+                # card's hover — the placement the solver already worked out (even
+                # for a profile that isn't active right now) picks which device's
+                # catalog curve prices the load-time estimate.
+                model_info = {}
+                for mn in pr.models:
+                    ms = cfg.models.get(mn)
+                    if ms is None:
+                        continue
+                    try:
+                        ctx = model_context_length(cfg, mn)
+                    except Exception:  # noqa: BLE001
+                        ctx = None
+                    model_info[mn] = {
+                        "served": [s.api_name for s in ms.serves],
+                        "context_length": ctx,
+                        "engine_model": ms.engine.model,
+                        "template": ms.engine.template,
+                        "est_load_s": self.mgr.est_load_s(mn, rep.placement.get(mn)),
+                    }
                 out.append({
                     "name": name, "priority": pr.priority, "default": pr.default,
                     "manual_only": pr.manual_only,
@@ -771,7 +792,7 @@ class _Handler(BaseHTTPRequestHandler):
                     "fits": rep.ok, "unplaced": rep.unplaced, "flags": rep.flags,
                     "placement": rep.placement, "resident": [m for m in rep.resident if m in running],
                     "states": {m: run_state.get(m) for m in pr.models},  # ready|warming|... per model
-                    "would_evict": would_evict,
+                    "would_evict": would_evict, "model_info": model_info,
                 })
             converging = any(s == "warming" for s in run_state.values())
             result = {"active": active, "pinned": pinned,

@@ -536,8 +536,9 @@ class Manager:
             "eta_s": self._swap_eta_s(pr, now, pending),
         }
 
-    def _est_load_s(self, model: str, device: str | None) -> float | None:
-        """Measured EMA load time (seconds) for a model, or None if unbenched."""
+    def est_load_s(self, model: str, device: str | None) -> float | None:
+        """Measured EMA load time (seconds) for a model, or None if unbenched. Public:
+        also used outside a swap (the profiles list's per-model hover detail)."""
         try:
             cur = self.catalog.for_model(self.cfg, model, device) if self.catalog else None
             if cur and cur.timings:
@@ -555,7 +556,7 @@ class Manager:
         remaining = []
         for mn in pending:
             rt = self.state.stacks.get(mn)
-            est = self._est_load_s(mn, rt.device if rt else None)
+            est = self.est_load_s(mn, rt.device if rt else None)
             if est is None:
                 continue
             if rt is not None and rt.started_at is not None:

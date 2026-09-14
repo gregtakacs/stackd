@@ -256,6 +256,25 @@ def main() -> int:
         check("fold: no-op when the request carries no reasoning_effort",
               "chat_template_kwargs" not in b4)
 
+        # /profiles' per-model digest for the dashboard's profile hover card —
+        # served names, context, the real checkpoint, and the engine, straight
+        # from the model's own YAML (est_load_s is None here: no catalog bench).
+        code, profs = _req(f"{base}/profiles", token="secret")
+        check("profiles: 200", code == 200)
+        chat_pr = next((p for p in profs["profiles"] if p["name"] == "chat"), None)
+        check("profiles: chat profile present", chat_pr is not None)
+        info = (chat_pr or {}).get("model_info", {}).get("chat", {})
+        check("profiles: model_info served names include the bare name",
+              "assistant" in (info.get("served") or []))
+        check("profiles: model_info context_length from the model's own ctx",
+              info.get("context_length") == 262144)
+        check("profiles: model_info engine_model is the real checkpoint",
+              info.get("engine_model") == "Qwen3.8-27B-UD-Q4_K_XL")
+        check("profiles: model_info template is the engine that drives it",
+              info.get("template") == "llamacpp-cuda")
+        check("profiles: model_info always carries est_load_s (None if unbenched)",
+              "est_load_s" in info)
+
         code, st = _req(f"{base}/profiles/chat/activate", token="secret", body={})
         check("control: /profiles/chat/activate -> 200", code == 200)
         check("control: active profile is chat", mgr.state.active_profile == "chat")

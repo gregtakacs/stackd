@@ -7,7 +7,7 @@
 #   node first (needs the container to see /dev/dri + the always-mounted /sys),
 #   with rocm-smi installed below as a fallback. Neither works unless the compose
 #   service grants /dev/kfd + /dev/dri and the video/render groups.
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl gnupg tini \
