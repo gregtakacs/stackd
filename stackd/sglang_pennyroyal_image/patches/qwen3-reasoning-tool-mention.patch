@@ -1,0 +1,140 @@
+--- a/python/sglang/srt/parser/reasoning_parser.py
++++ b/python/sglang/srt/parser/reasoning_parser.py
+@@ -139,19 +139,21 @@
+             and self.think_end_token not in self.previous_content
+         ):
+             # Check for tool_start_token interruption
+-            if (
+-                in_reasoning
+-                and self.tool_start_token is not None
+-                and self.tool_start_token in processed_text
+-            ):
+-                # Find the first occurrence of tool_start_token and split there
+-                tool_idx = processed_text.find(self.tool_start_token)
+-                reasoning_text = processed_text[:tool_idx]
+-                # Preserve tool_start_token in normal text
+-                normal_text = processed_text[tool_idx:]
+-                return StreamingParseResult(
+-                    normal_text=normal_text, reasoning_text=reasoning_text
++            if in_reasoning and self.tool_start_token is not None:
++                tool_idx, confirmed = self._find_confirmed_tool_start(
++                    processed_text
+                 )
++                # A one-shot call sees the whole text already, so an
++                # undecided verdict (not enough text after the token to tell)
++                # can never be resolved by waiting -- treat it the same as
++                # "not a real tool call" and fall through below.
++                if tool_idx != -1 and confirmed:
++                    reasoning_text = processed_text[:tool_idx]
++                    # Preserve tool_start_token in normal text
++                    normal_text = processed_text[tool_idx:]
++                    return StreamingParseResult(
++                        normal_text=normal_text, reasoning_text=reasoning_text
++                    )
+             # Assume reasoning was truncated before end token
+             return StreamingParseResult(reasoning_text=processed_text)
+ 
+@@ -228,16 +230,26 @@
+         if self._in_reasoning:
+             # Check for tool_start_token interruption. Streaming cannot see a
+             # think_end_token that has not arrived yet; see the chunk_dependent test.
+-            if self.tool_start_token and self.tool_start_token in current_text:
+-                tool_idx = current_text.find(self.tool_start_token)
+-                reasoning_text = current_text[:tool_idx]
+-                # Preserve tool_start_token in normal text
+-                normal_text = current_text[tool_idx:]
+-                self._buffer = ""
+-                self._in_reasoning = False
+-                return StreamingParseResult(
+-                    normal_text=normal_text, reasoning_text=reasoning_text
+-                )
++            if self.tool_start_token:
++                tool_idx, confirmed = self._find_confirmed_tool_start(current_text)
++                if confirmed:
++                    reasoning_text = current_text[:tool_idx]
++                    # Preserve tool_start_token in normal text
++                    normal_text = current_text[tool_idx:]
++                    self._buffer = ""
++                    self._in_reasoning = False
++                    return StreamingParseResult(
++                        normal_text=normal_text, reasoning_text=reasoning_text
++                    )
++                if confirmed is None and tool_idx != -1:
++                    # The token sits right at the edge of what has arrived so
++                    # far and can't be judged yet -- hold everything from it
++                    # onward and wait for more text instead of guessing.
++                    reasoning_text = current_text[:tool_idx]
++                    self._buffer = current_text[tool_idx:]
++                    if reasoning_text:
++                        return StreamingParseResult(reasoning_text=reasoning_text)
++                    return StreamingParseResult()
+             if self.stream_reasoning:
+                 # Minus any trailing slice that could be a token split across chunks.
+                 holdback_tokens = [self.think_end_token]
+@@ -264,6 +276,44 @@
+ 
+         return StreamingParseResult()
+ 
++    def _tool_start_confirmed(self, remainder: str) -> Optional[bool]:
++        """Whether `remainder` (the buffered text starting at an occurrence of
++        `tool_start_token`) is really the start of a tool call, as opposed to
++        the model merely quoting or mentioning the literal tag while
++        reasoning in prose (e.g. narrating a system prompt's own tool-call
++        formatting rule). Returns True/False when confident, or None when not
++        enough text has arrived yet after the token to tell -- the streaming
++        caller should keep buffering rather than guess either way.
++
++        The base implementation always confirms, preserving every existing
++        detector's historical behavior; override this in a subclass once its
++        paired tool-call wire format is known well enough to validate against.
++        """
++        return True
++
++    def _find_confirmed_tool_start(self, text: str) -> Tuple[int, Optional[bool]]:
++        """Scan `text` for the first occurrence of `tool_start_token` this
++        detector actually confirms opens a real tool call, skipping any
++        earlier occurrence it rejects (quoted/mentioned in prose) and
++        continuing the search past it -- so a genuine tool call later in the
++        same buffer, including a second of several parallel calls, is still
++        found. Returns:
++          (-1, None)  -- no occurrence found at all.
++          (idx, True) -- a confirmed real tool-call start at idx.
++          (idx, None) -- an occurrence at idx that can't be judged yet because
++                         not enough text has arrived after it; only the LAST
++                         occurrence in `text` can ever come back this way.
++        """
++        search_from = 0
++        while True:
++            idx = text.find(self.tool_start_token, search_from)
++            if idx == -1:
++                return -1, None
++            verdict = self._tool_start_confirmed(text[idx:])
++            if verdict or verdict is None:
++                return idx, verdict
++            search_from = idx + len(self.tool_start_token)
++
+     def _strip_leading_think_start(self, text: str) -> str:
+         think_start_text = self.think_start_token + self.think_start_self_label
+         if text.startswith(think_start_text):
+@@ -398,6 +448,21 @@
+             force_nonempty_content=force_nonempty_content,
+         )
+ 
++    def _tool_start_confirmed(self, remainder: str) -> Optional[bool]:
++        # A genuine ``<tool_call>`` opening is always immediately followed
++        # (mod whitespace) by the paired tool-call parser's own wire syntax --
++        # ``<function=...>`` for qwen3_coder, or a bare ``{...}`` for a plain
++        # Hermes-JSON caller -- never by ordinary prose. Observed in the wild:
++        # the model quoting this exact tag while narrating a system prompt's
++        # tool-call formatting rule ("... the <tool_call> block IMMEDIATELY
++        # after thinking ..."), which the unguarded base check let end
++        # reasoning mode permanently and leaked the real closing </think>
++        # into visible content afterwards.
++        after = remainder[len(self.tool_start_token) :].lstrip(" \t\r\n")
++        if not after:
++            return None
++        return after[0] in "<{"
++
+ 
+ class KimiDetector(BaseReasoningFormatDetector):
+     """

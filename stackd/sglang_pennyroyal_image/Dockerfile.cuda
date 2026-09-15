@@ -152,6 +152,36 @@ RUN git clone --recursive ${SGLANG_FORK_REPO} . \
     && git checkout ${SGLANG_FORK_REF} \
     && git submodule update --init --recursive
 
+# TEMPORARY local hotfix, same shape as the retired qwen3_coder phantom
+# tool-call patch above (v2.4.0 note): patches/qwen3-reasoning-tool-mention.patch
+# fixes python/sglang/srt/parser/reasoning_parser.py's `Qwen3Detector` (and its
+# `<tool_call>`-sharing subclasses). Root cause: `BaseReasoningFormatDetector`'s
+# tool_start_token interruption does a bare `"<tool_call>" in buffer` substring
+# match with no validation -- so the model merely QUOTING that literal tag while
+# reasoning about tool-call formatting (observed live: narrating a system
+# prompt's own "output the <tool_call> block IMMEDIATELY after thinking" rule)
+# permanently flips `_in_reasoning` off, and the real closing `</think>` a few
+# paragraphs later sails through unstripped into visible content. Verified this
+# is upstream sglang code, byte-identical in the affected region on this pin
+# (not a pennyroyal-introduced bug): sgl-project/sglang main's
+# python/sglang/srt/parser/reasoning_parser.py matches this fork through the
+# whole BaseReasoningFormatDetector + Qwen3Detector region. Patch adds a
+# `_tool_start_confirmed` hook (default True, zero behavior change for every
+# OTHER detector) and overrides it on Qwen3Detector to require the text right
+# after the tag look like real tool-call syntax (`<function=...>` /  `{...}`)
+# instead of ordinary prose; verified against upstream's own
+# test/registered/unit/parser/test_reasoning_parser.py (134 tests, zero
+# regressions) plus 3 new cases covering the quoted-tag failure, a genuine
+# no-</think> tool call, and parallel tool calls. Filed as
+# jpezzulli/sglang-rtxpro6000#6 with the patch attached, asking it be folded
+# into the fork (as v2.4.0 did for the qwen3_coder sibling bug) until sglang's
+# own ~4k-PR backlog gets to a fix upstream. REMOVE this block once either
+# lands and this fork's pin carries it natively -- re-verify the same way v2.4.0
+# was (grep the built image's reasoning_parser.py for `_tool_start_confirmed`).
+COPY patches/qwen3-reasoning-tool-mention.patch /tmp/patches/
+RUN git apply /tmp/patches/qwen3-reasoning-tool-mention.patch \
+    && rm -rf /tmp/patches
+
 RUN uv python install ${PYTHON_VERSION} \
     && uv venv --python ${PYTHON_VERSION} .venv
 ENV VIRTUAL_ENV=/opt/pennyroyal/.venv PATH=/opt/pennyroyal/.venv/bin:${PATH}
