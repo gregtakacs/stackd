@@ -42,9 +42,27 @@ def comfyui_endpoint() -> tuple[str | None, str]:
 
 def image_capability() -> dict | None:
     """The `image` entry of `Manager.capabilities()` (or None): {stack, active_model,
-    endpoint, serveable, state, capabilities, ...}."""
+    engine, endpoint, serveable, state, capabilities, ...}. The `engine` field
+    ("comfyui" | "sdcpp") is what the MCP verbs branch on to pick their client."""
     with RT.lock:
         return RT.mgr.capabilities().get("image")
+
+
+def resident_engine() -> str:
+    """Which engine serves the resident image model right now: "comfyui" (default)
+    or "sdcpp". The MCP reads this to route a verb to comfyui_client vs sdcpp_client
+    -- a peer selection, not a fork: the two share the tier, the ladder, and these
+    very tools, differing only in how the request is submitted and the image fetched."""
+    return (image_capability() or {}).get("engine") or "comfyui"
+
+
+def sdcpp_endpoint() -> tuple[str | None, str]:
+    """(endpoint, note) for the resident sd.cpp sd-server, same shape as
+    comfyui_endpoint() (both read Manager.comfyui_target(), which is engine-agnostic:
+    it just returns the resident image slot's endpoint). None + a human note when the
+    engine is warming / nothing serveable."""
+    with RT.lock:
+        return RT.mgr.comfyui_target()
 
 
 def request_capability(verb: str) -> dict:

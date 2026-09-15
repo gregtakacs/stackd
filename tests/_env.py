@@ -38,6 +38,7 @@ _FALLBACK = {
     "COMFYUI_ROCM_IMAGE": "comfyui-rocm:local",
     "COMFYUI_ROCM_BASE": "rocm/pytorch:rocm7.14.1_ubuntu24.04_py3.12_pytorch_release_2.12.0",
     "COMFYUI_ROCM_REF": "master",
+    "SDCPP_ROCM_IMAGE": "sdcpp-rocm:local",
     "STACKD_SRC": "/opt/stackd",
 }
 

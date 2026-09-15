@@ -1,0 +1,56 @@
+#0 building with "default" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile.sdcpp-rocm
+#1 transferring dockerfile: 9.78kB done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/rocm/dev-ubuntu-24.04:7.2.4-complete
+#2 DONE 0.1s
+
+#3 [internal] load .dockerignore
+#3 transferring context:
+#3 transferring context: 2B done
+#3 DONE 0.0s
+
+#4 [1/9] FROM docker.io/rocm/dev-ubuntu-24.04:7.2.4-complete@sha256:92f309c51b52cef8762867848f1529dee821624f23cd5df38455e819538f762f
+#4 resolve docker.io/rocm/dev-ubuntu-24.04:7.2.4-complete@sha256:92f309c51b52cef8762867848f1529dee821624f23cd5df38455e819538f762f 0.0s done
+#4 DONE 0.0s
+
+#5 [2/9] RUN apt-get update  && apt-get install -y --no-install-recommends         git cmake ninja-build ca-certificates kmod libomp-dev         rocm-llvm hip-dev rocblas-dev hipblas-dev hipfft-dev rocm-smi-lib         procps rocm-core rocminfo  && rm -rf /var/lib/apt/lists/*
+#5 CACHED
+
+#6 [6/9] RUN export PATH=/opt/rocm/bin:/opt/rocm/lib/llvm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin  && cmake -B build -G Ninja       -DCMAKE_C_COMPILER=/opt/rocm/lib/llvm/bin/clang       -DCMAKE_CXX_COMPILER=/opt/rocm/lib/llvm/bin/clang++       -DSD_HIPBLAS=ON       -DSD_BUILD_EXAMPLES=ON       -DSD_WEBP=OFF -DSD_WEBM=OFF       -DCMAKE_BUILD_TYPE=Release       -DGPU_TARGETS=gfx1151 -DAMDGPU_TARGETS=gfx1151       -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON       -DCMAKE_INSTALL_RPATH='$$ORIGIN'       -DCMAKE_POSITION_INDEPENDENT_CODE=ON  && cmake --build build --config Release --parallel "$(nproc)"
+#6 CACHED
+
+#7 [3/9] RUN test -x /opt/rocm/lib/llvm/bin/clang++  && command -v rocminfo  && ls /opt/rocm/lib/libhipblas.so* /opt/rocm/lib/librocblas.so*  && /opt/rocm/lib/llvm/bin/clang++ --version | head -2
+#7 CACHED
+
+#8 [4/9] RUN git clone https://github.com/leejet/stable-diffusion.cpp /opt/sd.cpp  && cd /opt/sd.cpp  && git checkout "07a85c7"  && git submodule update --init --recursive ggml
+#8 CACHED
+
+#9 [5/9] WORKDIR /opt/sd.cpp
+#9 CACHED
+
+#10 [7/9] RUN export LD_LIBRARY_PATH=/opt/rocm/lib:/opt/sd.cpp/build/bin  && for d in /usr/lib/llvm-*/lib; do cp -av "$d"/libomp.so* /opt/sd.cpp/build/bin/ 2>/dev/null || true; done  && echo '--- sd-server ldd ---'  && ldd /opt/sd.cpp/build/bin/sd-server  && ! (ldd /opt/sd.cpp/build/bin/sd-server | grep -q 'not found')
+#10 CACHED
+
+#11 [8/9] RUN env LD_LIBRARY_PATH=/opt/rocm/lib:/opt/sd.cpp/build/bin       /opt/sd.cpp/build/bin/sd-server --version  && env LD_LIBRARY_PATH=/opt/rocm/lib:/opt/sd.cpp/build/bin       /opt/sd.cpp/build/bin/sd-cli --list-devices || true
+#11 0.689 stable-diffusion.cpp version master-869-07a85c7, commit 07a85c7
+#11 0.723 ggml_cuda_init: failed to initialize ROCm: no ROCm-capable device is detected
+#11 0.729 CPU	AMD RYZEN AI MAX+ 395 w/ Radeon 8060S
+#11 DONE 0.7s
+
+#12 [9/9] WORKDIR /work
+#12 DONE 0.0s
+
+#13 exporting to image
+#13 exporting layers
+#13 exporting layers 10.3s done
+#13 exporting manifest sha256:88405fac260fada4bdc06d73c72d7355e7dbb0bae4796be65330e9a8e123c9a6 done
+#13 exporting config sha256:c03090588d362ef0b7b7862b4546909a4d521488c753db240a85273a93f55b32 done
+#13 exporting attestation manifest sha256:01d959e2c689937389d84be326dcdd5d492423ab033ba81b4a141dbcf90edfbd 0.0s done
+#13 exporting manifest list sha256:c3535dc5aeb7c8a8bc6b902c82f2df7a7b513e75b3e8b02b4ce1cf09ff8ce07c done
+#13 naming to docker.io/library/sdcpp-spike:hipblas done
+#13 unpacking to docker.io/library/sdcpp-spike:hipblas
+#13 unpacking to docker.io/library/sdcpp-spike:hipblas 2.3s done
+#13 DONE 12.6s

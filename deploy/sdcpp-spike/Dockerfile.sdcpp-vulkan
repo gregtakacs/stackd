@@ -1,0 +1,53 @@
+# Phase-0 spike image, VULKAN path -- FIXED userspace.
+#
+# Why this file exists: the upstream prebuilt
+# ghcr.io/leejet/stable-diffusion.cpp:master-vulkan image loads its Vulkan backend and
+# then reports `ggml_vulkan: No devices found` on this box, silently falling back to
+# libggml-cpu (observed: `Found 1 backend devices: #0: CPU`, `VRAM 0.00MB`). That image's
+# runtime stage installs mesa-vulkan-drivers from Ubuntu 24.04, whose RADV predates
+# Strix Halo (gfx1151 / Radeon 8060S), so vkEnumeratePhysicalDevices returns zero.
+# The HOST works because it carries mesa 26.0.8 (llama.cpp's server-vulkan container
+# runs code-autocomplete on this iGPU today). So the fix is the driver stack, not sd.cpp.
+#
+# Built by re-layering the ALREADY-BUILT upstream binaries onto a release that ships a
+# RADV new enough to see the device. No compilation, so this build is minutes, not the
+# ~30 min a from-source HIPBLAS build costs -- which is why this is the fast path to a
+# real GPU number while the ROCm path (Dockerfile.sdcpp-rocm) is still being sorted:
+# rocm/pytorch turns out to be a pip-wheel ROCm (no /opt/rocm, no rocm-llvm, no hipBLAS
+# dev packages), so docs/build.md's clang recipe cannot run on it as written.
+#
+# Known cost of choosing Vulkan over HIPBLAS, both from upstream docs:
+#   * performance.md limits --diffusion-fa to "cpu, cuda/rocm, metal" -> no flash attn
+#     here, so peak memory is worse than the ROCm path would give.
+#   * int8_convrot.md: "Vulkan and other GPU backends do not currently have dedicated
+#     INT8 kernels ... fall back to CPU, which is expected to be substantially slower."
+#     The fp8mixed UNET is f8_e4m3, not convrot-int8 -- how it behaves on Vulkan is one
+#     of the things this image is here to find out.
+ARG UBUNTU_VERSION=26.04
+FROM ubuntu:$UBUNTU_VERSION
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        libvulkan1 mesa-vulkan-drivers libstdc++6 libgomp1 ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# The upstream image builds with SD_BUILD_SHARED_LIBS + GGML_BACKEND_DL and $ORIGIN
+# rpath, so the whole bin/ dir (sd-server, sd-cli, libggml-*.so) must move together.
+COPY --from=ghcr.io/leejet/stable-diffusion.cpp:master-vulkan /sd.cpp/bin /sd.cpp/bin
+RUN printf '#!/bin/sh\nexec /sd.cpp/bin/sd-server "$@"\n' > /sd-server \
+ && printf '#!/bin/sh\nexec /sd.cpp/bin/sd-cli "$@"\n' > /sd-cli \
+ && chmod +x /sd-server /sd-cli
+
+# Fail loudly at startup rather than silently on CPU: if RADV cannot enumerate the
+# device, the spike's numbers would be meaningless. Checked by run-spike.sh too, but
+# having the tool present makes `docker exec ... vulkaninfo` a one-liner.
+# Do NOT hardcode VK_ICD_FILENAMES. The upstream image's ICD is radeon_icd.json (no
+# .x86_64 suffix); pointing the var at a nonexistent file makes the Vulkan loader see
+# zero devices and silently fall back to CPU -- which reproduces the exact failure this
+# image exists to fix, and does so convincingly enough that the numbers look plausible.
+# Letting the loader scan /usr/share/vulkan/icd.d is both correct and self-maintaining
+# across mesa versions. Verify with: sd-cli --list-devices.
+ENV PATH=/sd.cpp/bin:$PATH
+
+WORKDIR /work
+ENTRYPOINT ["/sd.cpp/bin/sd-server"]

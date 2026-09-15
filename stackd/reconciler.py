@@ -238,22 +238,46 @@ class Reconciler:
             time.sleep(self.same_device_spawn_stagger_s)
 
     # -------------------------------------------------------------- image tier ---
+    def _tier_container(self, tier: MediaTier, backend: str, active_model: str):
+        """(ContainerSpec, key) for the container an active_model should actually
+        launch on this backend. Normally key == backend (the historical 1:1
+        backend->container coupling). A ladder entry may override it via
+        MediaLoadable.container so TWO engines can share ONE device backend — e.g.
+        comfyui-rocm and sd.cpp both live on the iGPU whose stackd backend is
+        "vulkan"; only the container *recipe* differs, while the backend key keeps
+        driving device_profiles / footprint lookup. Falls back to the backend block
+        when the entry is unknown to the tier (defensive: identity is also recomputed
+        for a slot whose model was since dropped from prefer:)."""
+        ld = self._loadable(tier, active_model)
+        key = (ld.container or backend) if (ld and ld.container) else backend
+        return tier.containers[key], key
+
     def _image_identity(self, tier: MediaTier, backend: str, active_model: str, device: str) -> list:
-        return [active_model, backend, device, asdict(tier.containers[backend])]
+        cont, key = self._tier_container(tier, backend, active_model)
+        ld = self._loadable(tier, active_model)
+        # engine is part of the identity: a config edit that repoints the SAME
+        # active_model from comfyui to sdcpp (or flips its container override) must
+        # read as "container spec changed" and bounce, not relabel in place.
+        return [active_model, backend, device, getattr(ld, "engine", "comfyui"), key, asdict(cont)]
 
     def _synth_image_model(self, tier: MediaTier, backend: str, active_model: str,
                            caps: list[str]) -> ModelSpec:
-        """A throwaway ModelSpec so the ComfyUI engine adapter builds the LaunchSpec
-        the same way it does for any container — the checkpoint is chosen at
-        runtime, not declared."""
+        """A throwaway ModelSpec so the engine adapter (comfyui OR sdcpp, chosen by the
+        ladder entry's `engine`) builds the LaunchSpec the same way it does for any
+        container — the checkpoint is chosen at runtime, not declared. The container
+        recipe comes from _tier_container, which lets an entry override backend->
+        container so two engines share one device backend."""
+        ld = self._loadable(tier, active_model)
+        engine = getattr(ld, "engine", "comfyui") or "comfyui"
+        cont, _key = self._tier_container(tier, backend, active_model)
         return ModelSpec(
             name=f"image:{active_model}",
             engine=EngineSpec(
-                template="comfyui",
+                template=engine,
                 model=active_model,
                 params={"active_model": active_model, "kind": tier.kind,
                         "capabilities": list(caps), "port": 8188},
-                container=copy.deepcopy(tier.containers[backend]),
+                container=copy.deepcopy(cont),
             ),
             budget=Budget(),
             placement=Placement(),
@@ -550,14 +574,21 @@ class Reconciler:
                     "downgraded_from": downgraded_from,
                     "note": note or "already resident", "headroom": hr_r}
 
-        # Same container, different checkpoint -> no bounce. One ComfyUI image runs
-        # every pipeline for its backend; the MCP picks the graph per request from
-        # `active_model`, and ComfyUI swaps the checkpoint itself. Just relabel the
-        # slot (the fit was already checked by _pick_image).
-        if (live and slot.backend == backend and slot.device == dev
-                and slot.container == tier.containers[backend].name):
+        # Same container, different checkpoint -> no bounce — but ONLY for ComfyUI.
+        # One ComfyUI image runs every pipeline for its backend; the MCP picks the
+        # graph per request from `active_model`, and ComfyUI swaps the checkpoint
+        # itself inside the running process. sd.cpp selects its weights at SERVER
+        # START (no runtime checkpoint swap), so switching pipeline — and switching
+        # engine at all, comfyui<->sdcpp on the same device — must tear down and
+        # respawn, never relabel the slot in place.
+        cont, _cont_key = self._tier_container(tier, backend, ld.active_model)
+        _ld_engine = getattr(ld, "engine", "comfyui") or "comfyui"
+        if (_ld_engine == "comfyui" and live and slot.engine == "comfyui"
+                and slot.backend == backend and slot.device == dev
+                and slot.container == cont.name):
             slot.active_model = ld.active_model
             slot.capabilities = list(ld.capabilities)
+            slot.engine = _ld_engine
             slot.since = now
             slot.pinned_by = pinned_by
             slot.identity = self._image_identity(tier, backend, ld.active_model, dev)
@@ -590,6 +621,7 @@ class Reconciler:
             since = state.image.since or now
         state.image = ImageSlot(
             active_model=ld.active_model, kind=tier.kind, backend=backend, device=device,
+            engine=synth.engine.template,
             container=spec.name, handle=handle, endpoint=adapter.endpoint(8188),
             health_url=spec.health_url, state=EngineState.warming,
             capabilities=list(ld.capabilities), started_at=now,

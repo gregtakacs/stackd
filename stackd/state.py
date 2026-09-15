@@ -73,6 +73,13 @@ class ImageSlot:
     kind: str = "image"
     backend: str = ""
     device: str = ""
+    # Which engine serves this resident model: "comfyui" (default) or "sdcpp".
+    # Set at spawn from the ladder entry's MediaLoadable.engine and carried in the
+    # slot identity, so a comfyui<->sdcpp repoint is seen as a container change and
+    # bounced rather than relabelled (sd.cpp picks weights at server start; it has no
+    # runtime checkpoint swap like ComfyUI). The MCP reads it via capabilities() to
+    # route a verb to the matching client (comfyui_client vs sdcpp_client).
+    engine: str = "comfyui"
     container: str | None = None
     handle: str | None = None
     endpoint: str | None = None

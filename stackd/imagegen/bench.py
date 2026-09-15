@@ -20,7 +20,7 @@ import time
 import urllib.request
 
 from stackd.imagegen.comfyui_client import get_json, post_json, submit_workflow
-from stackd.imagegen import workflows
+from stackd.imagegen import sdcpp_client, sdcpp_pipelines, workflows
 
 GEN_TIMEOUT_S = 200.0   # default per-generation cap — abort rather than hang.
 # A cold first generation on a big model (Flux.2-dev on the Vulkan iGPU stages
@@ -197,8 +197,47 @@ async def _abort_queue(base: str) -> None:
             pass
 
 
+async def _one_generation_sdcpp(model: str, px: int, prompt: str, base: str,
+                                timeout_s: float = GEN_TIMEOUT_S) -> float:
+    """sd.cpp bench generation: the flat /sdcpp/v1/img_gen body the manifest encodes,
+    polled to a terminal job state. Decodes nothing -- the sampler only needs the
+    elapsed wall time + that it completed, so the base64 payload is discarded."""
+    seed = int(time.time() * 1000) % (2 ** 31 - 1)
+    sp = sdcpp_pipelines.sample_params(model, "generate")
+    body: dict = {"prompt": prompt, "width": px, "height": px, "seed": seed,
+                  "output_format": "png", "sample_params": sp["sample_params"]}
+    if sp.get("lora"):
+        body["lora"] = sp["lora"]
+    t0 = time.monotonic()
+    job = await sdcpp_client.submit(body, base)
+    b = base.rstrip("/")
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            j = await get_json(f"{b}/sdcpp/v1/jobs/{job}", timeout=15)
+        except Exception:  # noqa: BLE001
+            j = {}
+        status = j.get("status")
+        if status in ("completed", "failed", "cancelled"):
+            if status != "completed":
+                raise BenchAborted(
+                    f"{px}px sd.cpp job {status}: {j.get('error') or status}")
+            return round(time.monotonic() - t0, 1)
+        if time.monotonic() > deadline:
+            raise BenchAborted(
+                f"{px}px sd.cpp generation exceeded {timeout_s:.0f}s — the model may be "
+                f"thrashing weight reloads under host-RAM pressure (check `docker logs`).")
+        await asyncio.sleep(1.0)
+
+
 async def _one_generation(model: str, px: int, prompt: str, base: str,
                           timeout_s: float = GEN_TIMEOUT_S) -> float:
+    # sd.cpp engine: submit the flat generate body the manifest encodes (turbo
+    # LoRA + 8-step custom_sigmas, no init_image for a t2i bench) and poll the
+    # job to a terminal state. Same peak/baseline contract as the ComfyUI path --
+    # only submit/poll differs, which is the whole point of the peer design.
+    if model in sdcpp_pipelines.model_names():
+        return await _one_generation_sdcpp(model, px, prompt, base, timeout_s=timeout_s)
     _name, graph, nodes, _entry = workflows.load_model("generate", model)
     seed = int(time.time() * 1000) % (2 ** 31 - 1)
     nid = nodes.get("positive") or nodes.get("prompt")

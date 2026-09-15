@@ -1,0 +1,43 @@
+Traceback (most recent call last):
+  File "/home/greg/docker/Projects/LLM-Tools/stackd/deploy/sdcpp-spike/./spike.py", line 259, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/home/greg/docker/Projects/LLM-Tools/stackd/deploy/sdcpp-spike/./spike.py", line 214, in main
+    emit(run_gate("a", {"prompt": GEN_PROMPT, "width": W, "height": H, "seed": a.seed,
+         ~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                        "sample_params": sp, "lora": lora, "output_format": "png"},
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                  a.out, a.timeout))
+                  ^^^^^^^^^^^^^^^^^
+  File "/home/greg/docker/Projects/LLM-Tools/stackd/deploy/sdcpp-spike/./spike.py", line 156, in run_gate
+    j = wait(jid, timeout)
+  File "/home/greg/docker/Projects/LLM-Tools/stackd/deploy/sdcpp-spike/./spike.py", line 72, in wait
+    j = _get(path)
+  File "/home/greg/docker/Projects/LLM-Tools/stackd/deploy/sdcpp-spike/./spike.py", line 59, in _get
+    with urllib.request.urlopen(BASE + path, timeout=timeout) as r:
+         ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/urllib/request.py", line 187, in urlopen
+    return opener.open(url, data, timeout)
+           ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/urllib/request.py", line 487, in open
+    response = self._open(req, data)
+  File "/usr/lib/python3.14/urllib/request.py", line 504, in _open
+    result = self._call_chain(self.handle_open, protocol, protocol +
+                              '_open', req)
+  File "/usr/lib/python3.14/urllib/request.py", line 464, in _call_chain
+    result = func(*args)
+  File "/usr/lib/python3.14/urllib/request.py", line 1350, in http_open
+    return self.do_open(http.client.HTTPConnection, req)
+           ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.14/urllib/request.py", line 1325, in do_open
+    r = h.getresponse()
+  File "/usr/lib/python3.14/http/client.py", line 1459, in getresponse
+    response.begin()
+    ~~~~~~~~~~~~~~^^
+  File "/usr/lib/python3.14/http/client.py", line 336, in begin
+    version, status, reason = self._read_status()
+                              ~~~~~~~~~~~~~~~~~^^
+  File "/usr/lib/python3.14/http/client.py", line 305, in _read_status
+    raise RemoteDisconnected("Remote end closed connection without"
+                             " response")
+http.client.RemoteDisconnected: Remote end closed connection without response

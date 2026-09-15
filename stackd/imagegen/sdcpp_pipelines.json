@@ -1,0 +1,49 @@
+{
+  "_comment": "Pipeline registry for the stable-diffusion.cpp (sd-server) engine -- the sdcpp analog of workflow_graphs/models.json. Keyed by the SAME active_model string a media/image.yaml prefer[] entry uses with engine: sdcpp, so config/models.py::_check_media_tier can cross-check each declared capability against a `tools` entry here (via sdcpp_pipelines.tools_for). Paths are RELATIVE to the container's models mount (models_dir, default /comfyui-models -- the same read-only tree comfyui uses; NOT bare /models, which is already claimed globally for the LLM checkpoint tree -- reusing it made Docker refuse the container outright with 'Duplicate mount point: /models', found live 2026-09-15). Unlike ComfyUI, sd.cpp selects its weights at SERVER START (no per-request checkpoint swap), so which pipeline is resident is a launch decision: engines/sdcpp.py::SdcppAdapter.render_args reads diffusion_model/vae/text_encoder/lora_model_dir from the entry named by the resident active_model. The per-verb blocks under `tools` carry the SAMPLING recipe the MCP sends to POST /sdcpp/v1/img_gen. custom_sigmas is the fal/FLUX.2-dev-Turbo published pre-shifted 8-step schedule -- supplied for generate (t2i), OMITTED (null) for stylize/edit because sd.cpp derives its own strength-based schedule for img2img and forcing the t2i sigmas onto it fights that derivation and ghosted the 1024^2/0.75 stylize into a double exposure (README trap 14). A verb whose block is absent makes the config loader reject that capability for this model.",
+  "default": "flux2-dev-turbo-sdcpp",
+  "models": {
+    "flux2-dev-turbo-sdcpp": {
+      "label": "Flux.2 dev -- fp8mixed base + fal FLUX.2-dev-Turbo LoRA, 8-step, on the Strix Halo iGPU via stable-diffusion.cpp HIPBLAS (generate + stylize + edit)",
+      "validated": true,
+      "models_dir": "/comfyui-models",
+      "diffusion_model": "diffusion_models/flux2_dev_fp8mixed.safetensors",
+      "vae": "vae/flux2-vae.safetensors",
+      "text_encoder": "text_encoders/mistral_3_small_flux2_bf16.safetensors",
+      "lora_model_dir": "loras",
+      "prompt_rewrite": {
+        "system": "flux2_enhance.txt",
+        "default": true,
+        "json": false
+      },
+      "tools": {
+        "generate": {
+          "lora": "Flux_2-Turbo-LoRA_comfyui.safetensors",
+          "sample_method": "euler",
+          "sample_steps": 8,
+          "custom_sigmas": [1.0, 0.6509, 0.4374, 0.2932, 0.1893, 0.1108, 0.0495, 0.00031],
+          "txt_cfg": 1.0,
+          "guidance": 4.0
+        },
+        "stylize": {
+          "lora": "Flux_2-Turbo-LoRA_comfyui.safetensors",
+          "sample_method": "euler",
+          "sample_steps": 8,
+          "custom_sigmas": null,
+          "txt_cfg": 1.0,
+          "guidance": 4.0,
+          "strength": 0.75
+        },
+        "edit": {
+          "lora": "Flux_2-Turbo-LoRA_comfyui.safetensors",
+          "sample_method": "euler",
+          "sample_steps": 8,
+          "custom_sigmas": null,
+          "txt_cfg": 1.0,
+          "guidance": 4.0,
+          "strength": 1.0,
+          "ref_image_args": "preset=flux2"
+        }
+      }
+    }
+  }
+}

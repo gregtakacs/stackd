@@ -1,0 +1,161 @@
+# stable-diffusion.cpp with the ROCm/HIPBLAS backend, built for the Strix Halo
+# iGPU (gfx1151) on this box.
+#
+# PROMOTED 2026-09-15 from deploy/sdcpp-spike/Dockerfile.sdcpp-rocm (byte-identical
+# otherwise) now that the Phase-0 feasibility gate passed -- see
+# deploy/sdcpp-spike/README.md for the five questions it had to answer, and
+# stackd/engines/sdcpp.py for the EngineAdapter this image serves. Lives here
+# rather than under deploy/ (which .dockerignore excludes wholesale) so
+# `stackctl build image:sdcpp_vulkan` -- config/media/image.yaml's
+# containers.sdcpp_vulkan.build.context -- can actually find it, matching every
+# other engine's convention (llamacpp_image/, sglang_pennyroyal_image/,
+# imagegen/comfyui_image/). Nothing here COPYs from the build context (sd.cpp's
+# own source is git-cloned below), so the move is a pure relocation.
+#
+# Base: deb-based ROCm, NOT rocm/pytorch. Tried rocm/pytorch:rocm7.14.1 first (same pin
+# comfyui_image/Dockerfile.igpu validated on this box) and it CANNOT build sd.cpp's HIPBLAS
+# path: that image is a pip-wheel ROCm -- `hipcc` is a /opt/venv shim, there is no
+# /opt/rocm/lib/llvm, and dpkg lists only libclang-cpp18/libllvm18 with no rocm-dev,
+# rocBLAS or hipBLAS packages. cmake dies at "The C compiler identification is unknown".
+# rocm/dev-ubuntu-24.04 ships the deb stack docs/build.md assumes.
+#
+# ROCm 7.2.4 vs the host's 7.14 userspace is not the mismatch it looks like: the HIPBLAS
+# path needs NO kernel AIBs (docs/backend.md: "The HIPBLAS backend does not require
+# ggml-runtime and ggml-aio"), and the amdgpu KFD interface is provided by the host
+# driver, not the container. Do not "fix" this by layering wheels on top -- mixing pip
+# ROCm with apt ROCm is how you get a hang rather than an error.
+ARG ROCM_BASE=rocm/dev-ubuntu-24.04:7.2.4-complete
+FROM ${ROCM_BASE}
+
+# Pinned, never `master`: sd.cpp cut ~10 releases in the two days this plan was being
+# written and the flux2 path is only months old. 07a85c7 == release master-869, the
+# newest tag as of 2026-09-14. Bump it deliberately, the same way COMFYUI_REF is pinned.
+ARG SD_CPP_REF=07a85c7
+# Strix Halo / Radeon 8060S. Same device HSA_GFX_VERSION=11.5.1 describes in AI-STACK/.env.
+# Hardcoded rather than rocminfo-detected because rocminfo inside a container can miss
+# the iGPU, and a wrong arch here fails at kernel-launch time, not build time.
+ARG GFX_NAME=gfx1151
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        git cmake ninja-build ca-certificates kmod libomp-dev \
+        rocm-llvm hip-dev rocblas-dev hipblas-dev hipfft-dev rocm-smi-lib \
+        procps rocm-core rocminfo \
+ && rm -rf /var/lib/apt/lists/*
+# NB: no rocm-device-info -- that name does not exist in repo.radeon.com/apt/7.2.4, and
+# apt aborts the WHOLE transaction (exit 100) for one unresolvable name, which is what
+# killed the first attempt. Same reason there is no libvulkan-dev here: this target
+# builds the HIPBLAS backend only.
+
+# Fail the BUILD, not a 20-minute load, if the toolchain did not actually land.
+# rocminfo is required and not cosmetic: docs/build.md discovers the target arch via
+# `rocminfo | awk '/ *Name: +gfx[1-9]/ ...'` and hard-errors ("Error: Couldn't detect
+# GPU!") without it. Inside a container rocminfo frequently cannot see the iGPU, which
+# is exactly why that same doc says to set $GFX_NAME manually -- so we pass
+# -DGPU_TARGETS/-DAMDGPU_TARGETS=gfx1151 explicitly in the next layer and keep rocminfo
+# only as the presence check. Verified against this host: the container must also be
+# given /dev/kfd + the amdgpu render node (see run-spike.sh amd_render_node).
+RUN test -x /opt/rocm/lib/llvm/bin/clang++ \
+ && command -v rocminfo \
+ && ls /opt/rocm/lib/libhipblas.so* /opt/rocm/lib/librocblas.so* \
+ && /opt/rocm/lib/llvm/bin/clang++ --version | head -2
+
+# Only the `ggml` submodule is fetched. A blanket `--init --recursive` also drags in
+# examples/server/frontend (the sdcpp-webui repo, which we never use — the web UI is
+# not part of the MCP path) and thirdparty/libwebp + libwebm (SD_WEBP/SD_WEBM are OFF
+# below). Those two clones were what stalled the first build attempt.
+RUN git clone https://github.com/leejet/stable-diffusion.cpp /opt/sd.cpp \
+ && cd /opt/sd.cpp \
+ && git checkout "${SD_CPP_REF}" \
+ && git submodule update --init --recursive ggml
+
+WORKDIR /opt/sd.cpp
+
+# Flags, and why each one:
+#  SD_HIPBLAS=ON        docs/build.md "Build with HipBLAS". Chosen OVER Vulkan because
+#                       two upstream docs price Vulkan out for this model: performance.md
+#                       limits --diffusion-fa to "cpu, cuda/rocm, metal" (no vulkan), and
+#                       int8_convrot.md says vulkan has no INT8 kernels and "fall[s] back
+#                       to CPU, which is expected to be substantially slower". Vulkan is
+#                       the documented fallback if gfx1151 + hipBLAS will not initialize.
+#  SD_BUILD_EXAMPLES=ON builds bin/sd-cli AND bin/sd-server (examples/CMakeLists.txt
+#                       adds cli + server unconditionally once examples are on).
+#  SD_WEBP/WEBM=OFF     we only ever move PNG over HTTP; skips two vendored submodules.
+#  SERVER_BUILD_FRONTEND is left ON (its default): without pnpm it degrades to a
+#                       warning rather than a failure, and we never touch the web UI.
+#  GPU/AMDGPU_TARGETS   set manually per docs/build.md, which prescribes exactly this
+#                       for an off-default arch.
+#  INSTALL_RPATH        must be set EXPLICITLY, and note the doubled `$$`: docker
+#                       interpolates `$ORIGIN` to empty, so a single `$` silently
+#                       embeds an empty rpath. With BUILD_WITH_INSTALL_RPATH=ON and no
+#                       INSTALL_RPATH value, the binary cannot find its own sibling
+#                       libomp.so and dies at exit 127 -- which looks identical to
+#                       "libomp missing" and cost a full rebuild cycle to untangle.
+#                       Upstream's docker/Dockerfile sets the same pair together.
+# Compiler paths are ABSOLUTE, not bare `clang`, and this is not style: rocm-llvm
+# installs ROCm's clang-22 only under /opt/rocm/lib/llvm/bin and puts NOTHING on PATH
+# (`command -v clang` -> nothing, verified against rocm/dev-ubuntu-24.04:7.2.4-complete),
+# so `-DCMAKE_C_COMPILER=clang` dies with "The C compiler identification is unknown" --
+# which is the identical failure rocm/pytorch gave, and would have looked like "HIPBLAS
+# does not work on this box" if I had stopped at the first error message. docs/build.md
+# itself uses absolute compiler paths for MUSA, so this is the house style for off-default
+# toolchains. /opt/rocm/bin + lib/llvm/bin go on PATH for hipcc/rocminfo during the build.
+RUN export PATH=/opt/rocm/bin:/opt/rocm/lib/llvm/bin:$PATH \
+ && cmake -B build -G Ninja \
+      -DCMAKE_C_COMPILER=/opt/rocm/lib/llvm/bin/clang \
+      -DCMAKE_CXX_COMPILER=/opt/rocm/lib/llvm/bin/clang++ \
+      -DSD_HIPBLAS=ON \
+      -DSD_BUILD_EXAMPLES=ON \
+      -DSD_WEBP=OFF -DSD_WEBM=OFF \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DGPU_TARGETS=${GFX_NAME} -DAMDGPU_TARGETS=${GFX_NAME} \
+      -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+      -DCMAKE_INSTALL_RPATH='$$ORIGIN' \
+      -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+ && cmake --build build --config Release --parallel "$(nproc)"
+
+# Separate layer on purpose: the 258-target compile above is the expensive one, so
+# iterating on packaging/diagnostics below must not invalidate it.
+#
+# ggml-hip links LLVM's OpenMP, and rocm-llvm ships no libomp under /opt/rocm at all
+# (verified: `find /opt/rocm -name 'libomp.so*'` is empty), so without this sd-server
+# dies at exit 127 "error while loading shared libraries: libomp.so" even though every
+# target compiled -- a failure that reads like a broken GPU backend. libomp-dev puts
+# BOTH libomp.so and libomp.so.5 in /usr/lib/llvm-18/lib; copying both next to the
+# binary is what makes the image relocatable ($ORIGIN rpath resolves them).
+#
+# The ldd assertion prints before it fails: asserting silently meant three rebuilds
+# chasing "exit 1" with no idea WHICH library was missing.
+RUN export LD_LIBRARY_PATH=/opt/rocm/lib:/opt/sd.cpp/build/bin \
+ && for d in /usr/lib/llvm-*/lib; do cp -av "$d"/libomp.so* /opt/sd.cpp/build/bin/ 2>/dev/null || true; done \
+ && echo '--- sd-server ldd ---' \
+ && ldd /opt/sd.cpp/build/bin/sd-server \
+ && ! (ldd /opt/sd.cpp/build/bin/sd-server | grep -q 'not found')
+
+# Smoke test in the SAME environment the container actually runs in: ENV is not applied
+# to RUN layers, so testing here without LD_LIBRARY_PATH exercises a code path the
+# server will never take, and the failure it reports (exit 127 on libomp.so) is an
+# artifact of the test, not of the image. The vendored libomp.so sits in
+# /opt/sd.cpp/build/bin, which is exactly what the ENV below puts on the path.
+RUN env LD_LIBRARY_PATH=/opt/rocm/lib:/opt/sd.cpp/build/bin \
+      /opt/sd.cpp/build/bin/sd-server --version \
+ && env LD_LIBRARY_PATH=/opt/rocm/lib:/opt/sd.cpp/build/bin \
+      /opt/sd.cpp/build/bin/sd-cli --list-devices || true
+
+# LD_LIBRARY_PATH carries the shared ggml/sd libs (CMAKE_BUILD_WITH_INSTALL_RPATH gives
+# $ORIGIN rpath, so bin/ finds its own siblings; /opt/rocm/lib for the HIP runtime).
+# libomp.so is VENDORED into build/bin by the layer above rather than relied on from the
+# image: ggml-hip links LLVM's OpenMP, and rocm-llvm ships no libomp under /opt/rocm at
+# all (verified: `find /opt/rocm -name 'libomp.so*'` is empty), so without the copy step
+# sd-server dies at exit 127 / "error while loading shared libraries: libomp.so" even
+# though all 258 targets compiled fine -- a failure that reads like a broken backend.
+# Keeping it beside the binary is also what makes the image relocatable.
+ENV PATH=/opt/sd.cpp/build/bin:/opt/rocm/bin:$PATH \
+    LD_LIBRARY_PATH=/opt/rocm/lib:/opt/sd.cpp/build/bin \
+    HSA_OVERRIDE_GFX_VERSION=11.5.1 \
+    HIP_VISIBLE_DEVICES=0
+
+# /work is where the spike bind-mounts scratch; weights come from the SAME shared
+# models dir comfyui uses, mounted READ-ONLY by the runner (see run-spike.sh).
+WORKDIR /work
+ENTRYPOINT ["/opt/sd.cpp/build/bin/sd-server"]

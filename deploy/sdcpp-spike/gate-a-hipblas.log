@@ -1,0 +1,33 @@
+{"gate": "a", "ok": true, "secs": 136.7, "file": "/home/greg/docker/Projects/LLM-Tools/stackd/deploy/sdcpp-spike/out/gate_a.png", "bytes": 502448, "images": 1}
+
+=== summary ===
+{
+  "capabilities_features": {
+    "cache": true,
+    "cancel_generating": false,
+    "cancel_queued": true,
+    "control_image": true,
+    "hires": true,
+    "init_image": true,
+    "ip_adapter_image": true,
+    "lora": true,
+    "mask_image": true,
+    "ref_images": true,
+    "vae_tiling": true
+  },
+  "container_peak_ram_gib": 9.28,
+  "requested_gates": [
+    "a"
+  ],
+  "gates": [
+    {
+      "gate": "a",
+      "ok": true,
+      "secs": 136.7,
+      "file": "/home/greg/docker/Projects/LLM-Tools/stackd/deploy/sdcpp-spike/out/gate_a.png",
+      "bytes": 502448,
+      "images": 1
+    }
+  ],
+  "ALL_THREE_PASS": false
+}

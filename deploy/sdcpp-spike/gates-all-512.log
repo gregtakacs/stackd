@@ -1,0 +1,61 @@
+{"gate": "a", "ok": true, "secs": 204.4, "file": "/home/greg/docker/Projects/LLM-Tools/stackd/deploy/sdcpp-spike/out/gate_a.png", "bytes": 505511, "images": 1}
+{"gate": "b", "ok": true, "secs": 161.4, "file": "/home/greg/docker/Projects/LLM-Tools/stackd/deploy/sdcpp-spike/out/gate_b.png", "bytes": 556469, "images": 1}
+/home/greg/docker/Projects/LLM-Tools/stackd/deploy/sdcpp-spike/spike.py:125: DeprecationWarning: Image.Image.getdata is deprecated and will be removed in Pillow 14 (2027-10-15). Use get_flattened_data instead.
+  pa, pb, pm = list(a.getdata()), list(b.getdata()), list(m.getdata())
+outside-mask fidelity: {"outside_pixels": 196608, "mean_abs_sum_diff": 6.85, "max_abs_sum_diff": 235}
+{"gate": "c", "ok": true, "secs": 323.8, "file": "/home/greg/docker/Projects/LLM-Tools/stackd/deploy/sdcpp-spike/out/gate_c.png", "bytes": 481746, "images": 1, "outside_mask_fidelity": {"outside_pixels": 196608, "mean_abs_sum_diff": 6.85, "max_abs_sum_diff": 235}}
+
+=== summary ===
+{
+  "capabilities_features": {
+    "cache": true,
+    "cancel_generating": false,
+    "cancel_queued": true,
+    "control_image": true,
+    "hires": true,
+    "init_image": true,
+    "ip_adapter_image": true,
+    "lora": true,
+    "mask_image": true,
+    "ref_images": true,
+    "vae_tiling": true
+  },
+  "container_peak_ram_gib": 11.69,
+  "requested_gates": [
+    "a",
+    "b",
+    "c"
+  ],
+  "gates": [
+    {
+      "gate": "a",
+      "ok": true,
+      "secs": 204.4,
+      "file": "/home/greg/docker/Projects/LLM-Tools/stackd/deploy/sdcpp-spike/out/gate_a.png",
+      "bytes": 505511,
+      "images": 1
+    },
+    {
+      "gate": "b",
+      "ok": true,
+      "secs": 161.4,
+      "file": "/home/greg/docker/Projects/LLM-Tools/stackd/deploy/sdcpp-spike/out/gate_b.png",
+      "bytes": 556469,
+      "images": 1
+    },
+    {
+      "gate": "c",
+      "ok": true,
+      "secs": 323.8,
+      "file": "/home/greg/docker/Projects/LLM-Tools/stackd/deploy/sdcpp-spike/out/gate_c.png",
+      "bytes": 481746,
+      "images": 1,
+      "outside_mask_fidelity": {
+        "outside_pixels": 196608,
+        "mean_abs_sum_diff": 6.85,
+        "max_abs_sum_diff": 235
+      }
+    }
+  ],
+  "ALL_THREE_PASS": true
+}

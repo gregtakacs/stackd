@@ -610,6 +610,7 @@ class Manager:
         return {
             "stack": f"image:{slot.active_model}", "kind": slot.kind,
             "active_model": slot.active_model,
+            "engine": slot.engine,
             "capabilities": list(slot.capabilities),
             "state": slot.state.value,
             "serveable": slot.state == EngineState.ready and not codev,

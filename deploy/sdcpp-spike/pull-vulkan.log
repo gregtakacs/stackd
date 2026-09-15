@@ -1,0 +1,15 @@
+master-vulkan: Pulling from leejet/stable-diffusion.cpp
+e93707c19579: Pulling fs layer
+faa27d02ce0d: Pulling fs layer
+cada7d449c48: Pulling fs layer
+faa27d02ce0d: Download complete
+44136fa355b3: Already exists
+cada7d449c48: Download complete
+f9be74a5a9aa: Download complete
+e93707c19579: Download complete
+e93707c19579: Pull complete
+faa27d02ce0d: Pull complete
+cada7d449c48: Pull complete
+Digest: sha256:7c419dfb582077ace2c723c8c859a79821ff8420023ee0f8204c39949d4ce6d4
+Status: Downloaded newer image for ghcr.io/leejet/stable-diffusion.cpp:master-vulkan
+ghcr.io/leejet/stable-diffusion.cpp:master-vulkan

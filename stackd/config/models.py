@@ -236,6 +236,24 @@ class MediaLoadable:
     # a backend missing here skips the host-RAM fit check for that pick, same
     # as an un-benched footprint_gib falls back to no VRAM check.
     host_ram_gib: dict[str, float] = field(default_factory=dict)
+    # Which engine serves this pipeline. This is what makes a second image engine
+    # (stable-diffusion.cpp) a selectable PEER of ComfyUI rather than a fork: the
+    # ladder row chooses it, the fit-check still places it on a device backend, and
+    # the container it spawns + the verbs manifest its capabilities are validated
+    # against both follow from this key. "comfyui" (default) loads the backend's
+    # ComfyUI container and cross-checks each capability against a workflow graph
+    # in imagegen/workflow_graphs/models.json; "sdcpp" loads an sd-server
+    # (stable-diffusion.cpp HIPBLAS/Vulkan) and cross-checks against
+    # imagegen/sdcpp_pipelines.json instead. Must be a stackd engine template
+    # (see engines/registry.TEMPLATES); validated at load in _check_media_tier.
+    engine: str = "comfyui"
+    # Which tier.containers key to launch. Defaults to the device backend the entry
+    # lands on (the historical 1:1 backend->container coupling). Set it when two
+    # DIFFERENT engines want the SAME device backend — comfyui-rocm and sd.cpp both
+    # run on the iGPU, whose stackd backend is "vulkan": giving the sd.cpp row
+    # container: sdcpp_vulkan lets the two coexist in one tier.containers map while
+    # the backend key keeps driving device_profiles / footprint / host_ram lookup.
+    container: str | None = None
 
 
 @dataclass
@@ -277,22 +295,60 @@ def _check_comfyui_capabilities(m: ModelSpec) -> None:
 
 
 def _check_media_tier(tier: MediaTier) -> None:
+    from stackd.engines.registry import TEMPLATES
+
     for i, ld in enumerate(tier.prefer):
         where = f"media/{tier.kind}: prefer[{i}] {ld.active_model!r}"
         if not ld.backends:
             raise ConfigError(f"{where} lists no backends")
+        if ld.engine not in TEMPLATES:
+            raise ConfigError(
+                f"{where} names unknown image engine {ld.engine!r} "
+                f"(known: {', '.join(sorted(TEMPLATES))})"
+            )
         for b in ld.backends:
-            if b not in tier.containers:
-                raise ConfigError(f"{where} needs backend {b!r} but there is no containers.{b} block")
+            # The container to launch is `ld.container` when set (lets a second
+            # engine share one device backend, e.g. sd.cpp + comfyui both on the
+            # iGPU's "vulkan"), else the backend block itself (the historical
+            # 1:1 coupling). footprint stays keyed on the DEVICE backend.
+            cont = ld.container or b
+            if cont not in tier.containers:
+                raise ConfigError(f"{where} needs container {cont!r} but there is no containers.{cont} block")
             if b not in ld.footprint_gib:
                 raise ConfigError(f"{where} is missing footprint_gib.{b}")
         if tier.kind == "image":
-            missing = _missing_graphs(ld.active_model, ld.capabilities)
+            missing = _missing_capability_sources(ld.engine, ld.active_model, ld.capabilities)
             if missing:
                 raise ConfigError(
-                    f"{where} capabilities {missing} have no workflow graph "
-                    f"(imagegen/workflow_graphs/models.json)"
+                    f"{where} capabilities {missing} have no workflow graph / pipeline "
+                    f"for engine {ld.engine!r} (imagegen/workflow_graphs/models.json "
+                    f"or imagegen/sdcpp_pipelines.json)"
                 )
+
+
+def _missing_capability_sources(engine: str, active_model: str,
+                               caps: list[str]) -> list[str] | None:
+    """The verbs in ``caps`` an engine can't actually serve for ``active_model``,
+    dispatching on the engine's own single-source-of-truth manifest. Returns None
+    when the manifest can't be imported (core stackd without the ``[imagegen]``
+    extra still validates), same contract as :func:`_missing_graphs`.
+
+    comfyui -> a workflow graph per verb in workflow_graphs/models.json;
+    sdcpp   -> a pipeline entry per verb in imagegen/sdcpp_pipelines.json."""
+    if engine == "comfyui":
+        return _missing_graphs(active_model, caps)
+    if engine == "sdcpp":
+        if not caps:
+            return []
+        try:
+            from stackd.imagegen.sdcpp_pipelines import tools_for as sdcpp_tools_for
+        except Exception:
+            return None
+        have = sdcpp_tools_for(active_model or "")
+        return [c for c in caps if c not in have]
+    # Any other engine template: no image-gen manifest to check against here —
+    # the adapter's own Params/capabilities validation governs it.
+    return []
 
 
 @dataclass

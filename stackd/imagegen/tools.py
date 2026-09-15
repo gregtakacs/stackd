@@ -63,8 +63,27 @@ from stackd.imagegen import (
     openwebui_client,
     prompt_llm,
     runtime,
+    sdcpp_client,
+    sdcpp_dispatch,
+    sdcpp_pipelines,
     workflows,
 )
+
+
+# -----------------------------------------------------------------------------
+# Engine dispatch: which client serves a verb is chosen by the RESIDENT image
+# engine (ImageSlot.engine, surfaced through capabilities()["image"]["engine"]),
+# not by the tool. comfyui and sdcpp are peers on one elastic tier and one ladder;
+# both share this file's dimension resolution, prompt rewrite, Open WebUI source/
+# save, timing and response formatting -- they differ ONLY in how the request is
+# submitted and the image fetched (comfyui_client POSTs a patched graph to /prompt;
+# sdcpp_client POSTs a flat body to /sdcpp/v1/img_gen). Each tool checks
+# runtime.resident_engine() right after the tier has brought the model resident and,
+# for sdcpp, delegates to stackd.imagegen.sdcpp_dispatch (which imports back into
+# this module lazily, so the two share every engine-agnostic helper without a
+# module-load cycle). The ComfyUI path below each guard is byte-for-byte unchanged.
+# -----------------------------------------------------------------------------
+
 
 logger = logging.getLogger("stackd.imagegen")
 
@@ -855,6 +874,10 @@ async def generate_image(
     try:
         profile, verb_note = await _resident_model_for("generate")
         model_note = model_note or verb_note
+        if runtime.resident_engine() == "sdcpp":
+            return await sdcpp_dispatch.generate(
+                profile, ctx, prompt, aspect_ratio, width, height, seed,
+                rewrite_prompt, model_note, t0)
         model_name, graph, nodes, entry = workflows.load_model("generate", profile)
     except (workflows.UnknownModel, workflows.ToolUnsupported) as e:
         return json.dumps({"error": str(e)})
@@ -1134,6 +1157,10 @@ async def edit_image(
         model_note = model_note or verb_note
     except (workflows.UnknownModel, workflows.ToolUnsupported) as e:
         return json.dumps({"error": str(e)})
+    if runtime.resident_engine() == "sdcpp":
+        return await sdcpp_dispatch.edit(
+            model_name, ctx, prompt, target_region, aspect_ratio, width, height, seed,
+            edit_strength, rewrite_prompt, model_note, t0)
     _n, model_meta = workflows.model_entry(model_name)
     edit_spec = ((model_meta.get("tools") or {}).get("edit")) or {}
 
@@ -1376,6 +1403,10 @@ async def stylize_image(
     try:
         profile, verb_note = await _resident_model_for("stylize")
         model_note = model_note or verb_note
+        if runtime.resident_engine() == "sdcpp":
+            return await sdcpp_dispatch.stylize(
+                profile, ctx, style, color_treatment, season, time_of_day, weather,
+                upscale_by, seed, model_note, t0)
         model_name, graph, nodes, model_meta = workflows.load_model("stylize", profile)
     except (workflows.UnknownModel, workflows.ToolUnsupported) as e:
         return json.dumps({"error": str(e)})

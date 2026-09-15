@@ -1,0 +1,31 @@
+{"gate": "a", "ok": false, "error": "completed with no image", "secs": 201.4}
+
+=== summary ===
+{
+  "capabilities_features": {
+    "cache": true,
+    "cancel_generating": false,
+    "cancel_queued": true,
+    "control_image": true,
+    "hires": true,
+    "init_image": true,
+    "ip_adapter_image": true,
+    "lora": true,
+    "mask_image": true,
+    "ref_images": true,
+    "vae_tiling": true
+  },
+  "container_peak_ram_gib": 8.08,
+  "requested_gates": [
+    "a"
+  ],
+  "gates": [
+    {
+      "gate": "a",
+      "ok": false,
+      "error": "completed with no image",
+      "secs": 201.4
+    }
+  ],
+  "ALL_THREE_PASS": false
+}
