@@ -116,24 +116,40 @@
      def _strip_leading_think_start(self, text: str) -> str:
          think_start_text = self.think_start_token + self.think_start_self_label
          if text.startswith(think_start_text):
-@@ -398,6 +448,21 @@
+@@ -398,6 +448,37 @@
              force_nonempty_content=force_nonempty_content,
          )
  
++    # A genuine ``<tool_call>`` opening is always immediately followed (mod
++    # whitespace) by qwen3_coder's own wire syntax, ``<function=...>`` -- never
++    # by ordinary prose. Checked as a full prefix, NOT by first-character alone:
++    # a first cut here matched on bare ``after[0] in "<{"``, which a model
++    # quoting the *whole pair* -- literally ``<tool_call></tool_call>`` -- still
++    # satisfies, since ``</tool_call>`` also starts with ``<``. Observed in the
++    # wild twice: first quoting the opening tag alone while narrating a system
++    # prompt's tool-call formatting rule, then again quoting the full empty
++    # pair from the same rule. Both left the unguarded base check thinking a
++    # real tool call had started, permanently ending reasoning mode and leaking
++    # the true closing </think> into visible content afterwards.
++    _REAL_TOOL_CALL_PREFIX = "<function="
++
 +    def _tool_start_confirmed(self, remainder: str) -> Optional[bool]:
-+        # A genuine ``<tool_call>`` opening is always immediately followed
-+        # (mod whitespace) by the paired tool-call parser's own wire syntax --
-+        # ``<function=...>`` for qwen3_coder, or a bare ``{...}`` for a plain
-+        # Hermes-JSON caller -- never by ordinary prose. Observed in the wild:
-+        # the model quoting this exact tag while narrating a system prompt's
-+        # tool-call formatting rule ("... the <tool_call> block IMMEDIATELY
-+        # after thinking ..."), which the unguarded base check let end
-+        # reasoning mode permanently and leaked the real closing </think>
-+        # into visible content afterwards.
 +        after = remainder[len(self.tool_start_token) :].lstrip(" \t\r\n")
 +        if not after:
 +            return None
-+        return after[0] in "<{"
++        if after.startswith("{"):
++            return True
++        prefix = self._REAL_TOOL_CALL_PREFIX
++        n = min(len(after), len(prefix))
++        if after[:n] != prefix[:n]:
++            # Diverges from "<function=" already -- e.g. "</tool_call>"
++            # diverges at index 1 ('/' != 'f'), same for any other tag.
++            return False
++        if len(after) < len(prefix):
++            # Matches "<function=" as far as it goes, but not enough of it
++            # has arrived yet to be sure -- e.g. just "<fun" so far.
++            return None
++        return True
 +
  
  class KimiDetector(BaseReasoningFormatDetector):

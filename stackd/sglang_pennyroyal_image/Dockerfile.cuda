@@ -168,12 +168,17 @@ RUN git clone --recursive ${SGLANG_FORK_REPO} . \
 # whole BaseReasoningFormatDetector + Qwen3Detector region. Patch adds a
 # `_tool_start_confirmed` hook (default True, zero behavior change for every
 # OTHER detector) and overrides it on Qwen3Detector to require the text right
-# after the tag look like real tool-call syntax (`<function=...>` /  `{...}`)
-# instead of ordinary prose; verified against upstream's own
+# after the tag match qwen3_coder's real opening, `<function=`, character by
+# character (or a bare `{` for a plain Hermes-JSON caller) -- NOT a first-
+# character-only check: v1 of this patch checked `after[0] in "<{"`, which a
+# model quoting the WHOLE empty pair together, `<tool_call></tool_call>`,
+# still satisfied (`</tool_call>` also starts with `<`) -- caught live in the
+# same Cline session a second time, quoting the same system-prompt rule a
+# different way. verified against upstream's own
 # test/registered/unit/parser/test_reasoning_parser.py (134 tests, zero
-# regressions) plus 3 new cases covering the quoted-tag failure, a genuine
-# no-</think> tool call, and parallel tool calls. Filed as
-# jpezzulli/sglang-rtxpro6000#6 with the patch attached, asking it be folded
+# regressions) plus 4 targeted cases: both quoted-tag failures (bare tag,
+# empty pair), a genuine no-</think> tool call, and parallel tool calls.
+# Filed as jpezzulli/sglang-rtxpro6000#6 with the patch attached, asking it be folded
 # into the fork (as v2.4.0 did for the qwen3_coder sibling bug) until sglang's
 # own ~4k-PR backlog gets to a fix upstream. REMOVE this block once either
 # lands and this fork's pin carries it natively -- re-verify the same way v2.4.0
