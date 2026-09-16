@@ -99,9 +99,16 @@ Fixed today:
 - Blend blankness has a browser mutant (`--mutate blendblank`) faithful to the shipped
   defect — it reverts BOTH halves (old `select()` and the bare-value caller), since either
   half alone still labels correctly — and it goes red on exactly `no blank options`.
+- **The painted mask reached the graph with inverted polarity (2026-09-16, 3rd pass).** The
+  server marks the selection 255 = edit-here (what the preview + coverage show), but
+  `VAEEncodeForInpaint` / `ImageCompositeMasked` edit where the mask is **0** (the CLIPSeg
+  convention the canonical path relies on). So painting a person replaced the *background*.
+  Invisible in Edit mode, glaring in Replace. `engine._graph_mask` flips the alpha at the
+  graph boundary (not in `normalize`, so preview/coverage are unaffected and the scaffold is
+  untouched); the invert toggle composes on top. Verified on a live split-source render.
 
-Counts after the 2nd pass: offline **298/298** (the +3 are the functional proof that
-`replace` rewires the graph and `edit` keeps it). The `/tmp/tbtest` browser suite still
+
+Counts after the 3rd pass: offline **299/299**. The `/tmp/tbtest` browser suite still
 asserts the OLD "same repaint graph" disclosure text, so re-point that one assertion at the
 new Edit/Replace note before running it — the shipped code itself is unchanged in that respect.
 
