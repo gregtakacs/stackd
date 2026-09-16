@@ -145,6 +145,30 @@ def _apply_mode(graph: dict, spec: dict) -> None:
     graph.pop(wf.MASK_FULL_ENCODE_NODE, None)
 
 
+def _graph_mask(mask: bytes) -> bytes:
+    """Invert the painted mask's alpha for the ComfyUI graph -- a polarity adapter, not a
+    mask change. The server represents the selection as 255 = edit-here (masks.
+    extract_coverage), which is what the preview and the coverage the user sees are built
+    from. But the graph's mask convention is the OPPOSITE: VAEEncodeForInpaint and
+    ImageCompositeMasked edit where the mask is 0 -- the convention the canonical CLIPSeg
+    path relies on (OWUI's edit_image removes the segmented object, which is the 0 side).
+    Feeding the server's 255=edit mask straight in makes the graph edit the COMPLEMENT of
+    the paint: the user paints a person and the background is replaced instead. In Edit
+    mode that inversion is invisible (the background is regenerated to look like the
+    background); in Replace mode it is glaring.
+
+    Flip the alpha HERE, at the graph boundary, not in masks.normalize -- the preview and
+    coverage keep their correct 255=edit-here meaning, and the guarded graph scaffold is
+    untouched. The editor's invert toggle composes on top: it inverts the server mask
+    first, so "edit everything outside the paint" still selects the complement."""
+    from PIL import Image
+    import io
+    im = Image.open(io.BytesIO(mask)).convert("RGBA")
+    im.putalpha(im.getchannel("A").point(lambda p: 255 - p))
+    out = io.BytesIO(); im.save(out, format="PNG")
+    return out.getvalue()
+
+
 def comfy_render(job: dict, source: bytes, mask: bytes, *, on_prompt_id=None):
     """jobs.JobQueue render seam. Returns (artifact_png_b64, "image/png") after ALSO
     saving the result to the calling user's OWU (so the chat/standalone mounts have a
@@ -191,7 +215,9 @@ def comfy_render(job: dict, source: bytes, mask: bytes, *, on_prompt_id=None):
         # (confirmed in comfyui_client's own comment). Same rule applies to source+mask.
         src_b = _prepare_source(source, w, h)
         src_name = await comfyui_client.upload_to_comfy(src_b, "toolbox_src", base=base)
-        msk_name = await comfyui_client.upload_to_comfy(mask, "toolbox_mask", base=base)
+        # _graph_mask flips the alpha to the graph's mask convention (edit where mask is 0);
+        # see that function for why the server mask and the graph mask are opposite.
+        msk_name = await comfyui_client.upload_to_comfy(_graph_mask(mask), "toolbox_mask", base=base)
         _patch_graph(graph, spec, source_filename=src_name, mask_filename=msk_name,
                      w=w, h=h, seed=seed)
         prompt_id = await comfyui_client.submit_workflow(graph, base=base)

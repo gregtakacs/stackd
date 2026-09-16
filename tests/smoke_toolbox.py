@@ -1050,6 +1050,31 @@ def test_graphs():
           WF.MASK_POSITIVE_NODE in rep_g and WF.MASK_REGION_REFLATENT_NODE in rep_g
           and isinstance(_json.dumps(rep_g), str))
 
+    # Mask polarity: the graph edits where the mask is 0 (the CLIPSeg convention the
+    # canonical path relies on), but the server mask is 255 = edit-here (what the preview
+    # and coverage the user sees are built from). engine._graph_mask flips the alpha at the
+    # graph boundary to reconcile the two. If this ever stops inverting, the paint is
+    # re-inverted and the user paints a person but the BACKGROUND is replaced instead --
+    # verified on a live render (painted half vs its complement). Guard the flip here.
+    from stackd.toolbox import engine as _eng
+    from PIL import Image as _Img
+    import io as _io
+    _im = _Img.new("RGBA", (8, 8), (255, 255, 255, 0))
+    for _x in range(4):
+        for _y in range(8):
+            _im.putpixel((_x, _y), (255, 255, 255, 255))
+    _b = _io.BytesIO(); _im.save(_b, "PNG"); _src_mask = _b.getvalue()
+
+    def _alpha_mean(png, x0, x1):
+        _a = _Img.open(_io.BytesIO(png)).convert("RGBA").getchannel("A")
+        _px = _a.load()
+        return sum(_px[x, y] for y in range(_a.height) for x in range(x0, x1)) / (_a.height * (x1 - x0))
+
+    _inv = _eng._graph_mask(_src_mask)
+    check("graph mask flips the alpha (server 255=edit-here -> graph edit-where-0)",
+          _alpha_mean(_src_mask, 0, 4) > 200 and _alpha_mean(_src_mask, 4, 8) < 60
+          and _alpha_mean(_inv, 0, 4) < 60 and _alpha_mean(_inv, 4, 8) > 200)
+
 
 def main() -> int:
     test_tokens()
