@@ -142,3 +142,6 @@ stackd-images.audit.yml   compose-shaped manifest (NOT a real compose file) list
 for t in tests/smoke*.py; do python3 "$t"; done   # ~280 checks, stdlib only
 pytest                                             # test_validator.py, if available
 ```
+
+Outstanding work and known gaps are tracked in [TODO.md](TODO.md).
+

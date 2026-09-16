@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
+import logging
 import os
 import pathlib
 import re
@@ -263,6 +264,66 @@ def _fold_reasoning_effort_into_ctk(body: dict) -> None:
     body["chat_template_kwargs"] = ctk
 
 
+def _toolbox_dispatch(handler) -> bool:
+    """Delegate a /toolbox/* request to the mounted Toolbox. Kept as a module function
+    rather than a _Handler method so the whole toolbox stays behind ONE seam in the giant
+    front-end handler: serve.py owns nothing about toolbox routes beyond 'if the path is
+    /toolbox/, hand it over'. The Toolbox is imported lazily so `import stackd.serve` — and
+    the stdlib smoke suite — never pull toolbox deps; if it is not importable the surface
+    simply is not mounted and /toolbox/* falls through to the normal 404. Returns True when
+    the toolbox handled the request (a /toolbox/ route), False otherwise."""
+    tb = getattr(handler, "toolbox", None)
+    if tb is None:
+        return False
+    try:
+        return tb.dispatch(handler)
+    except Exception as e:  # noqa: BLE001 — the shared front must survive a toolbox crash
+        print(f"[toolbox] dispatch failed for {getattr(handler, 'path', '?')}: {e!r}")
+        try:
+            handler._send_json(500, {"error": f"toolbox error: {e.__class__.__name__}"})
+        except Exception:  # noqa: BLE001 — already broken, don't compound it
+            pass
+        return True
+
+
+def _secret_or_file(name: str) -> str:
+    """A secret's value: the contents of the file at ``<name>_FILE`` (Docker-secrets
+    convention, stripped) if that env var is set and the file exists, else the plain
+    ``<name>`` env var. Mirrors stackd/cli.py's _env_or_file and imagegen/config.py's _env
+    so STACKD_TOOLBOX_SECRET works the same way STACKD_API_KEY / MCP_API_KEY already do on
+    this host (``..._FILE=/run/secrets/...``). Empty string (not None) when neither is set,
+    so callers can ``or``-chain the api_key fallback cleanly."""
+    fp = os.environ.get(f"{name}_FILE")
+    if fp:
+        try:
+            p = pathlib.Path(fp)
+            if p.is_file():
+                return p.read_text().strip()
+        except OSError:
+            pass
+    return os.environ.get(name) or ""
+
+
+def _toolbox_db_path(store) -> str:
+    """Where the toolbox job queue's sqlite lives. It deliberately does NOT share the
+    ledger DB file (jobs.py's whole argument): same DIRECTORY as the ledger so one data dir
+    backs up both, but a separate file so a toolbox bug's blast radius is 'renders fail',
+    never 'savings numbers are wrong'. Falls back to the state-file directory (the same
+    XDG dir the ledger uses when --db is unset), and to a relative name if even that fails."""
+    # The Store holds only a connection, not the path, so derive the directory the same way
+    # cli._db_path does rather than reaching into the connection.
+    try:
+        from stackd.state import default_state_path
+        d = default_state_path().parent
+    except Exception:  # noqa: BLE001
+        d = pathlib.Path(".")
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        d = pathlib.Path(".")
+    return str(d / "toolbox_jobs.db")
+
+
 class _Handler(BaseHTTPRequestHandler):
     server_version = "stackd/0.2"
     protocol_version = "HTTP/1.1"
@@ -276,6 +337,7 @@ class _Handler(BaseHTTPRequestHandler):
     owu_base_url: str | None = None
     pricing_path: str | None = None
     cleaner = None  # stackd.cleaner.Cleaner | None
+    toolbox = None  # stackd.toolbox.api.Toolbox | None — the /toolbox/* surface (see _toolbox_dispatch)
     # --- shared, read-mostly caches so GET /status and GET /profiles never
     # block for the full ~40s a converge holds `lock` (dashboard would freeze
     # on the pre-switch snapshot). Refreshed whenever the lock IS free.
@@ -338,6 +400,14 @@ class _Handler(BaseHTTPRequestHandler):
 
     # -- GET --------------------------------------------------------------------
     def do_GET(self):
+        # The Comfy Toolbox surface is mounted AHEAD of the _authed() gate: every
+        # /toolbox/* route carries its own HMAC launch token (tokens.py), never a cookie and
+        # never the admin bearer key, because the in-chat mount is an opaque-origin frame
+        # that can neither set a cookie nor be trusted with the admin key. dispatch()
+        # returns False for anything that is not /toolbox/*, so this is a cheap no-op for
+        # every existing route and keeps the toolbox out of the main route table entirely.
+        if self.path.startswith("/toolbox/") and _toolbox_dispatch(self):
+            return
         if self.path == "/health":
             # web_rev lets an already-open dashboard notice that the daemon is
             # serving a different build than the one it loaded (checkRev).
@@ -476,6 +546,10 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/register":  # self-service bootstrap — no auth
             return self._register_submit()
+        # Comfy Toolbox job/preview writes: their own HMAC token, ahead of the admin
+        # bearer gate (see do_GET). Only reached when a toolbox is mounted.
+        if self.path.startswith("/toolbox/") and _toolbox_dispatch(self):
+            return
         if not self._authed():
             return self._send_json(401, {"error": {"message": "unauthorized"}})
 
@@ -532,6 +606,15 @@ class _Handler(BaseHTTPRequestHandler):
                 gone = self.store.delete_user(email) if self.store else False
             return self._send_json(200 if gone else 404, {"deleted": gone, "email": email})
         return self._send_json(404, {"error": {"message": f"no route for {self.path}"}})
+
+    def do_OPTIONS(self):
+        # The toolbox is the only surface a browser may preflight (the in-chat mount is an
+        # opaque-origin cross-origin fetch); its _route answers OPTIONS for every path with
+        # the full CORS set. Everything else has no browser caller, so a bare 405 rather
+        # than implying the proxy speaks OPTIONS.
+        if self.path.startswith("/toolbox/") and _toolbox_dispatch(self):
+            return
+        return self._send_json(405, {"error": {"message": f"{self.path} does not serve OPTIONS"}})
 
     # -- user key registration ----------------------------------------------------
     def _register_submit(self):
@@ -2345,11 +2428,12 @@ def _alias_response_token_ids(data: bytes) -> bytes | None:
 def make_server(mgr: Manager, host: str, port: int, api_key: str | None,
                 warm_wait_s: float = 120.0, *, store: Store | None = None,
                 owu_base_url: str | None = None,
-                pricing_path: str | None = None, cleaner=None) -> ThreadingHTTPServer:
+                pricing_path: str | None = None, cleaner=None,
+                toolbox=None) -> ThreadingHTTPServer:
     handler = type("_BoundHandler", (_Handler,), {
         "mgr": mgr, "lock": threading.Lock(), "api_key": api_key, "warm_wait_s": warm_wait_s,
         "store": store, "owu_base_url": owu_base_url, "pricing_path": pricing_path,
-        "cleaner": cleaner,
+        "cleaner": cleaner, "toolbox": toolbox,
     })
     srv = ThreadingHTTPServer((host, port), handler)
     handler.httpd = srv          # so POST /shutdown can stop serve_forever()
@@ -2365,9 +2449,50 @@ def serve(mgr: Manager, host: str, port: int, api_key: str | None,
     cleaner = Cleaner(cc.scratch_dir, file_ttl_min=cc.file_ttl_min,
                       interval_s=cc.interval_s, enabled=cc.enabled)
 
+    # The Comfy Toolbox: the mask editor + real edit engine. Built only when its module
+    # imports (it is stdlib-only itself, so this never needs the imagegen extra to be
+    # importable — only the LIVE render inside engine.py pulls httpx, and it does that
+    # lazily, so a plain host can mount the editor surface and run the spike path). The
+    # launch-token HMAC secret is a dedicated env, falling back to the proxy api_key so a
+    # single shared secret gates the whole daemon; with neither set the toolbox still
+    # mounts but every token route 403s (health reports tokens:false) rather than minting
+    # forgery-friendly tokens.
+    toolbox = None
+    jobs_q = None
+    try:
+        from stackd.toolbox import api as _tb_api
+        from stackd.toolbox import engine as _tb_engine
+        from stackd.toolbox import jobs as _tb_jobs
+        # The toolbox HMAC secret honours the same <name>_FILE Docker-secrets convention as
+        # STACKD_API_KEY / MCP_API_KEY on this host (see _secret_or_file). Falls back to the
+        # proxy api_key so a single shared secret gates the whole daemon; with neither set the
+        # toolbox still mounts but every token route 403s (health reports tokens:false).
+        tb_secret = _secret_or_file("STACKD_TOOLBOX_SECRET") or (api_key or "")
+        tb_db = os.environ.get("STACKD_TOOLBOX_DB") or _toolbox_db_path(store)
+        jobs_q = _tb_jobs.JobQueue(
+            _tb_jobs.JobStore(tb_db),
+            render=_tb_engine.comfy_render, cancel=_tb_engine.comfy_cancel,
+            logger=logging.getLogger("stackd.toolbox"),
+        )
+        jobs_q.start()      # sweeps orphaned queued/running rows from a prior run first
+        toolbox = _tb_api.Toolbox(
+            secret=tb_secret, spike_enabled=False,
+            source=_tb_engine.make_source(),
+            image_engine_up=_tb_engine.image_engine_up,
+            worker=jobs_q, prewarm=_tb_engine.prewarm_edit,
+            logger=logging.getLogger("stackd.toolbox"),
+        )
+        print(f"comfy toolbox mounted at /toolbox/* (queue {tb_db}, "
+              f"tokens {'on' if tb_secret else 'OFF — set STACKD_TOOLBOX_SECRET'})")
+    except ImportError as e:
+        print(f"[toolbox] not mounted ({e})")
+    except Exception as e:  # noqa: BLE001 — never let the image surface sink the daemon
+        print(f"[toolbox] failed to start, not mounting: {e}")
+        toolbox = jobs_q = None
+
     httpd = make_server(mgr, host, port, api_key, warm_wait_s, store=store,
                         owu_base_url=owu_base_url, pricing_path=pricing_path,
-                        cleaner=cleaner)
+                        cleaner=cleaner, toolbox=toolbox)
     lock = httpd.RequestHandlerClass.lock  # type: ignore[attr-defined]
     stop = threading.Event()
     last_energy = [time.time()]
@@ -2615,4 +2740,9 @@ def serve(mgr: Manager, host: str, port: int, api_key: str | None,
     finally:
         stop.set()
         httpd.shutdown()
+        if jobs_q is not None:
+            try:
+                jobs_q.stop()
+            except Exception:  # noqa: BLE001
+                pass
         print("\nstopped")

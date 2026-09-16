@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<!-- M0 feasibility harness ONLY — not the product. Loaded by GET /toolbox/spike.
+     Two panels run the byte-identical editor document from EMBED_URL and differ in
+     exactly one variable, which is the fork the plan needed settled:
+       A. same-origin iframe, no sandbox   -> the control. If the editor is broken it is
+                                              broken here too, and Open WebUI is
+                                              exonerated before we go blaming it.
+       B. srcdoc + sandbox="allow-scripts" -> Open WebUI's real embed conditions
+                                              (verified in the 0.11.3 bundle:
+                                              allow-scripts yes, allow-same-origin
+                                              never). Opaque origin, so every fetch out
+                                              of the frame is cross-origin and cookieless.
+     A green and B red == the sandbox/CORS is the blocker: the in-chat mount dies and the
+     standalone lab page lives. Both red == an editor bug, and nothing was learned about
+     Open WebUI. Probe numbers come from web/probe.js, which the server injects into the
+     document for this route only (embed_document(probe=True)). -->
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Comfy Toolbox — M0 spike</title>
+<style>
+body{font:14px/1.5 system-ui,sans-serif;margin:0;background:#0f0f11;color:#e8e8ea;padding:12px}
+/* Same gutter reservation as the embed document, for the same reason one level up: when the
+ * spike page itself needs a vertical scrollbar, that bar steals ~15px of page width, the two
+ * flex panels no longer fit side by side, and the whole page grows a horizontal scrollbar that
+ * then steals height back. Reserving the gutter keeps the fitted width constant so the panels
+ * stop chasing each other's scrollbars. overflow-x:clip on html is the backstop. */
+html{scrollbar-gutter:stable;overflow-x:clip}
+h1{font-size:16px;margin:0 0 2px}h2{font-size:13px;margin:14px 0 4px;color:#9a9aa2}
+.lead{color:#9a9aa2;font-size:12px;margin:0 0 10px}
+.panels{display:flex;flex-wrap:wrap;gap:12px}
+/* The 290px floor is safe against sideways overflow because every long unbreakable string
+ * (the JWT in the "token" cell, an api URL) lives inside a .kv div, which sets
+ * overflow-wrap:anywhere and so can wrap narrower than its content. min-width on the panel
+ * only ever bites below ~290px viewports, which are not the phones here. max-width:100%
+ * keeps a single wrapped panel from exceeding the gutter-reserved page width. */
+.panel{flex:1 1 340px;min-width:290px;max-width:100%}
+iframe{width:100%;max-width:100%;border:1px solid #34343b;border-radius:10px;background:#17171a;min-height:240px;box-sizing:border-box;display:block}
+
+#log{background:#141416;border:1px solid #2c2c33;border-radius:8px;padding:8px;
+     font:11px/1.45 ui-monospace,monospace;max-height:240px;overflow:auto;white-space:pre-wrap}
+.kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:6px;margin:8px 0}
+.kv div{background:#1a1a1e;border-radius:6px;padding:6px 8px;overflow-wrap:anywhere}
+.kv b{display:block;color:#9a9aa2;font-size:11px;font-weight:600}
+h2.sec{font-size:13px;margin:14px 0 0;color:#c8c8d0}
+code{font:11px ui-monospace,monospace;background:#1a1a1e;padding:1px 4px;border-radius:4px}
+.verdict{border-radius:8px;padding:8px 10px;margin:10px 0;font-weight:600}
+.pass{background:#173a23;color:#8ce99a}.fail{background:#3a1717;color:#ffa8a8}.wait{background:#1a1a1e;color:#9a9aa2}
+button{background:#26262b;color:#e8e8ea;border:1px solid #34343b;border-radius:7px;
+       padding:9px 12px;font:inherit;cursor:pointer;margin:4px 6px 0 0;min-height:38px}
+</style></head><body>
+<h1>Comfy Toolbox — M0 spike</h1>
+<p class="lead">Paint in <b>both</b> panels, then press <b>Preview mask</b> in each.
+Panel A is the control; panel B is exactly what Open WebUI does to an embed.</p>
+<div class="kv">
+<div><b>api target</b>__TB_API__</div>
+<div><b>signed in as</b>__TB_EMAIL__</div>
+<div><b>token</b>__TB_TOKEN__</div>
+</div>
+<h2 class="sec">Panel A — same-origin control (if this is broken, Open WebUI is innocent)</h2>
+<div class="kv">
+<div><b>A events seen</b><span id="cnta">0</span></div>
+<div><b>A canvas got events</b><span id="canvasa">?</span></div>
+<div><b>A height reported</b><span id="ha">?</span></div>
+<div><b>A internal scrollbar</b><span id="scrolla">?</span></div>
+<div><b>A export self-test</b><span id="exporta">?</span></div>
+<div><b>A server round-trip</b><span id="servera">?</span></div>
+</div>
+<h2 class="sec">Panel B — srcdoc + sandbox="allow-scripts" (exactly what Open WebUI does)</h2>
+<div class="kv">
+<div><b>B events seen</b><span id="cnt">0</span></div>
+<div><b>B canvas got events</b><span id="canvas">?</span></div>
+<div><b>B height reported</b><span id="h">?</span></div>
+<div><b>B internal scrollbar</b><span id="scrollb">?</span></div>
+<div><b>B export self-test</b><span id="export">?</span></div>
+<div><b>B server round-trip</b><span id="server">?</span></div>
+<div><b>B document fetch</b><span id="netb">…</span></div>
+</div>
+<p class="lead">Read the verdict as a pair: <b>internal scrollbar</b> must say
+<b>no (fits)</b> in both. If A fits and B does not, the sandbox is clamping the height.
+If neither fits, the editor under-reports its own height and that is a bug in
+<code>toolbox.js</code>, not in Open WebUI.</p>
+<div class="verdict wait" id="verdict">waiting for the frames to report…</div>
+<div class="panels">
+<div class="panel"><h2>A — same-origin, no sandbox (control)</h2><iframe id="fa" title="control"></iframe></div>
+<div class="panel"><h2>B — srcdoc + sandbox=allow-scripts (Open WebUI conditions)</h2>
+<iframe id="fb" title="sandboxed" sandbox="allow-scripts"></iframe></div>
+</div>
+<h2>probe log</h2><div id="log">waiting…</div>
+<button id="t-all">Synthetic stroke into A (+Preview)</button>
+<button id="t-a">Stroke A</button>
+<button id="t-b">Stroke B (tells you why it can't be scripted)</button>
+<button id="reload">Reload both panels</button>
+<!-- Bare placeholder on purpose, and do not wrap it in tags here: harness_document()
+     wraps it in a script element itself, because wrapping owned by server code is covered
+     by the test suite while wrapping owned by a hand-editable template is not. An earlier
+     revision of this line lost its script tags, the controller became body text, nothing
+     executed, and both panels rendered blank while the whole suite stayed green. -->
+__TB_SCRIPT__
+</body></html>

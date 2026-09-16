@@ -286,6 +286,20 @@ def _build_parser() -> argparse.ArgumentParser:
     im.add_argument("--host", default=os.environ.get("STACKD_HOST", "127.0.0.1"))
     im.add_argument("--port", type=int, default=int(os.environ.get("STACKD_PORT", "11444")))
     im.add_argument("--api-key", default=_env_or_file("STACKD_API_KEY"))
+
+    tb = sub.add_parser("toolbox-token",
+                        help="mint a Comfy Toolbox launch token (pure local HMAC sign — "
+                             "needs the same secret the daemon runs with, no daemon contact)")
+    tb.add_argument("email", help="the OWU user the edit is attributed to (their own "
+                                  "registered key saves the artifact — they must be at /register)")
+    tb.add_argument("--image-id", default=None,
+                    help="OWU file path to bind (e.g. /api/v1/files/<id>/content); the render's source")
+    tb.add_argument("--ttl", type=int, default=None,
+                    help="token lifetime seconds (default: the launch scope's TTL)")
+    tb.add_argument("--secret", default=None,
+                    help="HMAC secret (default: STACKD_TOOLBOX_SECRET[_FILE], else STACKD_API_KEY)")
+    tb.add_argument("--base-url", default=os.environ.get("STACKD_TOOLBOX_BASE_URL"),
+                    help="if set, also print the full <base>/toolbox/embed?token=... URL to open")
     return ap
 
 
@@ -729,6 +743,47 @@ def _cmd_image(args) -> int:
     return 1
 
 
+def _cmd_toolbox_token(args) -> int:
+    """Mint a Comfy Toolbox launch token locally (pure HMAC sign — no daemon contact).
+    The daemon must be running with the SAME secret (STACKD_TOOLBOX_SECRET[_FILE]); the
+    token is bound to `email` and optionally the `image_id`, and is single-use for job
+    creation (REDEEM_ON_CREATE). This is the escape hatch for mounting the standalone
+    `lab.<domain>` page without going through the /toolbox/launch forward-auth path, and
+    for scripting an end-to-end render test. Run it the same way the daemon reads its
+    secret — on the host, or via `docker exec stackd stackctl toolbox-token ...`."""
+    import urllib.parse
+    try:
+        from stackd.toolbox import tokens as _tokens
+    except ImportError as e:  # the toolbox is stdlib-only; a failure here is an install issue
+        print(f"error: stackd.toolbox not importable ({e})", file=sys.stderr)
+        return 1
+    secret = args.secret or _env_or_file("STACKD_TOOLBOX_SECRET") or _env_or_file("STACKD_API_KEY")
+    if not secret:
+        print("error: no HMAC secret — set STACKD_TOOLBOX_SECRET[_FILE] (must match the "
+              "daemon) or pass --secret", file=sys.stderr)
+        return 1
+    email = (args.email or "").strip().lower()
+    if "@" not in email:
+        print(f"error: {args.email!r} is not a plausible email", file=sys.stderr)
+        return 1
+    try:
+        token = _tokens.mint(secret, scope="launch", email=email, ttl_s=args.ttl,
+                             image_id=(args.image_id or None))
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    print(token)
+    if args.base_url:
+        q = "/toolbox/embed?token=" + urllib.parse.quote(token, safe="")
+        if args.image_id:
+            q += "&image_id=" + urllib.parse.quote(args.image_id, safe="")
+        print(f"\nopen in a browser:\n  {args.base_url.rstrip('/')}{q}")
+    else:
+        print(f"\nopen in a browser (add your Traefik host + the token above):\n"
+              f"  https://<stackd-host>/toolbox/embed?token={token[:16]}…   (paste the full token)")
+    return 0
+
+
 def _manager(args) -> Manager:
     state = pathlib.Path(args.state or default_state_path())
     runner = (
@@ -754,6 +809,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "image":
         return _cmd_image(args)
+
+    if args.cmd == "toolbox-token":
+        return _cmd_toolbox_token(args)
 
     if args.cmd in ("use", "pin", "unpin", "evict", "status"):
         return _cmd_control(args)

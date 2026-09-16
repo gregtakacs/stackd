@@ -30,6 +30,11 @@ include = ["stackd*"]
 
 [tool.setuptools.package-data]
 "stackd" = ["web/*.html", "web/vendor/*"]
+# The toolbox editor is served by stackd itself (see stackd/toolbox/web.py), so its
+# assets must ship inside the wheel like the dashboard's do — the daemon reads them from
+# the package directory, and a missing entry here means a 404 embed in the container that
+# works fine on a bind-mounted checkout.
+"stackd.toolbox" = ["web/*.html", "web/*.js", "web/*.css"]
 "stackd.imagegen" = [
     "workflow_graphs/**/*.json", "tool_docs/*.md", "prompts/*.txt",
     "comfyui_image/*",

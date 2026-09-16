@@ -1,0 +1,155 @@
+/* Comfy Toolbox editor. Deliberately inlined into the embed document (stackd/toolbox/
+ * web.py): a srcdoc iframe has an opaque origin, so a relative stylesheet URL would not
+ * resolve there, and a CDN import would break the offline-first rule this whole stack
+ * keeps (see stackd/web/vendor). No framework, no build step.
+ *
+ * Touch targets are sized for a phone on purpose even in the chat embed — the whole
+ * reason mask authoring became the critical path is that a user has to be able to do
+ * this with a thumb. */
+/* The embed document is its own top-level page inside the iframe, so the UA default
+ * 8px body margin applies. That margin sits OUTSIDE the element whose height the editor
+ * reports, which is how a frame sized to its reported height ends up a few pixels short
+ * and grows an internal scrollbar — fatal on a phone, where fighting a nested scroll
+ * container to draw is unusable. Zeroing it makes reported height == real height. */
+html, body { margin: 0; padding: 0; background: #17171a; }
+
+/* The vertical/horizontal scrollbar feedback loop, and the reason a frame can sprout a
+ * sideways bar it has no right to need. A classic (non-overlay) vertical scrollbar takes
+ * ~15px out of the viewport WIDTH. The canvas and every control are laid out at exactly
+ * 100%, so the moment the vertical bar appears the whole page is 15px too wide and gains a
+ * horizontal scrollbar, which takes 15px back out of the height the host just fitted us to
+ * — so the vertical bar never goes away and the two chase each other. Observed on the spike
+ * and it will hit the real mount identically.
+ *   scrollbar-gutter: stable  reserves the vertical gutter permanently, so appearing/
+ *                             disappearing never changes our content width — no reflow,
+ *                             no sideways overflow, and (critically) the height we report is
+ *                             measured at the SAME width the frame ends up rendering at.
+ *   overflow-x: clip          the last line of defence: content may not scroll sideways at
+ *                             all. clip (not hidden) so it does not itself mint a scroll
+ *                             container that would re-introduce a scrollbar to reserve. */
+html {
+  scrollbar-gutter: stable;
+  overflow-x: clip;
+  overflow-wrap: break-word;
+}
+/* A wide control must shrink, never push the page sideways: a grid/flex child only refuses
+ * to shrink below its content when min-width is auto, which is how a long unbroken token
+ * (a job id, a data: URL in an error) blows out the width on a 320px phone. */
+.tb, .tb-stage, .tb-out, .tb-row, .tb-grid, .tb-ctl, .tb-actions, .tb-tools { min-width: 0; }
+/* Note: .tb-num is deliberately NOT given min-width:0 here. Its own rule further down owns
+ * that floor (and wins at equal specificity), so a claim here would be a comment that lies
+ * about behaviour — the horizontal-overflow fix lives with the real rules, near .tb-grid. */
+.tb img, .tb-out img, .tb canvas { max-width: 100%; }
+.tb {
+  font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  color: #e8e8ea; background: #17171a; border-radius: 10px;
+  padding: 10px; box-sizing: border-box; max-width: 100%;
+}
+.tb *, .tb *::before, .tb *::after { box-sizing: border-box; }
+/* The stage is the scroll/zoom viewport: when zoomed past 1 the canvas is larger than the
+ * stage and pans via overflow:auto. max-height keeps a portrait photo (or a zoomed one)
+ * from making the whole iframe enormous — critical inside a chat bubble.
+ *   scrollbar-gutter: stable reserves the vertical gutter permanently. Without it the bar
+ * appearing steals ~15px of width, which is what made a 'Fit' view gain a horizontal bar it
+ * had no right to need, and the two bars then chase each other (see the html rule above).
+ *   min-height stops an empty stage from collapsing to nothing before the photo decodes. */
+.tb-stage {
+  position: relative; background: #0d0d0f; border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  overflow: auto; scrollbar-gutter: stable; min-height: 120px;
+  max-height: 70vh; -webkit-overflow-scrolling: touch;
+}
+/* The photo and the cursor ring share one box so the ring lands exactly on the brush
+ * footprint at any zoom. The box owns the size (fluid width at 'Fit', px when zoomed) and
+ * aspect-ratio owns the height, so the two canvases are pure 100%/100% overlays and nothing
+ * has to be measured in pixels — which is what keeps zoom clear of the scrollbar loop.
+ * flex:0 0 auto: a flex item shrinks by default, which would silently undo a zoom. */
+.tb-canvasbox {
+  position: relative; display: block; flex: 0 0 auto;
+  max-width: none; line-height: 0;
+}
+#tb_view { display: block; width: 100%; height: 100%; max-width: none; cursor: crosshair; }
+#tb_ring {
+  position: absolute; left: 0; top: 0; width: 100%; height: 100%; max-width: none;
+  pointer-events: none;      /* the ring must never eat the pointer it is describing */
+}
+.tb-zoom { display: flex; align-items: center; gap: 6px; margin: 6px 0 2px; }
+.tb-zoom .tb-btn { padding: 6px 10px; min-height: 32px; }
+.tb-zoom .tb-hint { margin-left: auto; }
+.tb-status {
+  min-height: 20px; padding: 5px 8px; margin: 8px 0; border-radius: 6px;
+  background: #202024; color: #a8c7fa; font-variant-numeric: tabular-nums;
+}
+.tb-status.tb-ok { color: #8ce99a; }
+.tb-status.tb-bad { color: #ffa8a8; }
+.tb-status.tb-warn { color: #ffe066; }
+.tb-row { display: block; margin: 6px 0; }
+.tb-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(150px, 100%), 1fr)); gap: 6px; }
+.tb-inline { display: inline-flex !important; align-items: center; gap: 6px; }
+.tb-ctl {
+  display: flex; align-items: center; gap: 6px; padding: 3px 6px;
+  background: #202024; border-radius: 6px;
+}
+.tb-lbl { color: #9a9aa2; flex: 0 0 auto; font-size: 12px; }
+/* THESE two rules are what put a horizontal scrollbar on the whole page (the readouts sat
+ * 31px past a 485px viewport): inside a ~155px grid track, label + slider + readout can
+ * never fit while the slider floor is 54px and the readout floor is 3.2em, and a flex item
+ * will not shrink below its own min-width. Lowering both floors is the fix — and it has to
+ * be HERE, not in the min-width:0 block above, because these rules are later in the file
+ * and win at equal specificity. tabular-nums keeps the number from jittering as it shrinks. */
+.tb-num { color: #d0d0d6; min-width: 2em; text-align: right; font-variant-numeric: tabular-nums; }
+.tb input[type=range] { flex: 1 1 40px; min-width: 0; height: 30px; accent-color: #e83e3e; }
+.tb input[type=number], .tb input[type=text], .tb textarea, .tb select {
+  background: #26262b; color: #e8e8ea; border: 1px solid #34343b;
+  border-radius: 6px; padding: 7px 8px; font: inherit; width: 100%;
+}
+.tb textarea { resize: vertical; min-height: 42px; }
+.tb input[type=checkbox] { width: 20px; height: 20px; accent-color: #e83e3e; }
+.tb-tools { display: flex; flex-wrap: wrap; gap: 5px; }
+.tb-btn {
+  background: #26262b; color: #d8d8de; border: 1px solid #34343b;
+  border-radius: 7px; padding: 9px 11px; font: inherit; cursor: pointer;
+  min-height: 38px;      /* thumb-reachable, even inside a chat bubble */
+}
+.tb-btn:hover { background: #303038; }
+.tb-btn.tb-on { background: #e83e3e; border-color: #e83e3e; color: #fff; }
+.tb-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.tb-btn.tb-key { background: #2f4a6b; border-color: #3b5c85; color: #fff; }
+.tb-btn.tb-go { background: #2b6b3f; border-color: #35844c; color: #fff; font-weight: 600; }
+.tb-out { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.tb-out img { max-width: 100%; border-radius: 8px; border: 1px solid #34343b; }
+.tb-hint { color: #7a7a82; font-size: 12px; margin-top: 6px; }
+
+
+
+/* ---- per-object inspector -------------------------------------------------------
+   Appears only while the Select tool holds an object. It is the visible half of the
+   per-object mask-params model: global sliders are defaults for the NEXT object, this
+   panel edits the one you already placed. Sized for thumbs because it is the primary
+   mobile affordance for fixing a shape without redrawing it. */
+.tb-inspect {
+  margin: 8px 0 2px; padding: 8px 10px;
+  border: 1px solid #3b5c85; border-left: 3px solid #3ba7ff;
+  border-radius: 7px; background: #1e2430;
+}
+.tb-inspect-h { color: #9ec9ff; font-size: 12px; font-weight: 600; margin-bottom: 6px; }
+.tb-inspect .tb-lab { display: flex; align-items: center; gap: 8px; margin: 4px 0; font-size: 12px; }
+.tb-inspect .tb-num { display: flex; align-items: center; gap: 6px; flex: 1 1 auto; min-width: 0; }
+.tb-inspect input[type=range] { flex: 1 1 auto; width: auto; min-width: 0; }
+.tb-inspect .tb-v { min-width: 2em; text-align: right; color: #d8d8de; font-variant-numeric: tabular-nums; }
+/* A brush's feather is deliberately unavailable; showing it greyed with the reason is
+   more honest than hiding it, which would read as a missing feature. */
+.tb-inspect input[type=range]:disabled { opacity: .35; cursor: not-allowed; }
+.tb-inspect .tb-hint { display: block; width: 100%; margin-left: 6px; }
+
+/* Panel controls disabled as "planned, not wired" (DEAD_KNOBS in toolbox.js). Mirrors the
+   inspector's greyed brush-feather: the control stays visible so the feature reads as
+   planned rather than missing, and is unmistakably inert. */
+.tb-ctl input:disabled, .tb-ctl select:disabled { opacity: .35; cursor: not-allowed; }
+.tb-deadnote { color: #9aa4b2; }
+
+/* The "this shrink is too big for this object" notice. Same muted hint as the rest of the
+   panel, but amber rather than grey, because this is the one value that can delete the
+   selection outright instead of merely reshaping it. The server clamps it either way
+   (masks._erode_with_cap keeps >= 10% of the selection); this warns rather than surprises. */
+.tb-inspect .tb-hint.tb-warn { color: #e8a33e; }

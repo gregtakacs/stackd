@@ -71,6 +71,12 @@ services:
       - OPENWEBUI_BASE_URL=http://open-webui:8080
       - LLAMA_PROXY_REGISTER_URL=http://localhost:11444/register
       - TIMEOUT_S=600
+      # Comfy Toolbox (/toolbox/* on this same :11444 front). The HMAC secret signs the
+      # single-use launch/job tokens; leave it unset and every token route 403s (deny by
+      # default) rather than mint forgery-friendly tokens. The job queue owns its own sqlite
+      # file, deliberately NOT the cost ledger, so a toolbox bug can never skew savings.
+      - STACKD_TOOLBOX_SECRET=${STACKD_TOOLBOX_SECRET:-${STACKD_API_KEY}}
+      - STACKD_TOOLBOX_DB=/data/toolbox_jobs.db
       - LLM_BASE_URL=http://localhost:11444/v1     # self-loop for image-prompt rewriting
       - LLM_MODEL=${LLM_REWRITE_MODEL:-assistant}   # a pass-through name; prompt_llm.py forces no-think
       - LLM_API_KEY=${STACKD_API_KEY}
