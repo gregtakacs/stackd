@@ -922,27 +922,31 @@ def test_contract():
           "strength" in dead,
           "a live slider labelled edit-strength that nothing reads makes every "
           "erase look like a no-op -- keep it disabled until it is wired")
-    # --- the mode dropdown is cosmetic -------------------------------------
-    # Pin BOTH halves of that claim: the premise (engine does not read kind, so all
-    # five modes are one graph) and the disclosure (the panel says so in words). When
-    # kind is eventually wired up, the premise check fails and the labels get revisited
-    # deliberately instead of drifting back into promising an effect that is not there.
-    check("engine does not read spec kind (the five modes really are one graph)",
-          not re.search(r'get\(\s*"kind"|spec\[\s*"kind"|kind\s*==', eng))
-    check("the mode dropdown discloses that modes are not differentiated",
-          'same repaint graph' in js)
-    # The original darkroom label claimed deterministic tone ops on the CPU while the
-    # only path that has ever existed is the GPU Klein inpaint -- a user picking it to
-    # save GPU time would have been billed for it. Scoped to the MODE LABELS rather than
-    # the whole file: 'no GPU' legitimately appears elsewhere (the mask preview really
-    # is CPU-side), and an invariant that fires on true statements gets deleted rather
-    # than fixed.
-    km = re.search(r"select\('kind',\s*\[(.*?)\]\]", js, re.S)
+    # --- the mode dropdown is LIVE: engine reads kind and rewires the graph -------
+    # The mode is a real control now (engine._apply_mode): 'edit' keeps the scene-referenced
+    # KSampler conditioning, 'replace' drops it so the prompt can do a genuine identity-level
+    # swap of the masked region. Pin both halves: that engine actually reads kind (the knob
+    # is not theatre -- the converse of the old "engine ignores kind" premise), and that the
+    # labels describe the two real paths rather than promising effects that are not there.
+    # The functional proof that 'replace' rewires the graph lives in test_graphs.
+    check("engine reads spec kind to select the conditioning mode",
+          re.search(r'get\(\s*"kind"|spec\[\s*"kind"', eng) is not None,
+          "kind is a live mode control -- engine._apply_mode must read it and rewire the graph")
+    check("the mode disclosure describes what Edit vs Replace do",
+          "reimagine" in js and "Replace" in js and "same repaint graph" not in js)
+    # Scoped to the MODE LABELS rather than the whole file: 'GPU' legitimately appears
+    # elsewhere (the mask preview really is CPU-side), and an invariant that fires on true
+    # statements gets deleted rather than fixed.
+    km = re.search(r"select\('kind',\s*\[(.*?)\]\)\)", js, re.S)
     check("the mode dropdown is present to be checked", km is not None)
     modes = km.group(1) if km else ""
     check("no mode LABEL claims a CPU / accelerated path that does not exist",
           'GPU' not in modes and 'AI' not in modes, modes[:70].replace("\n", " "))
-    check("darkroom is labelled as not implemented", 'not implemented' in modes)
+    check("the two real modes are the only ones offered (no theatre left behind)",
+          "'edit'" in modes and "'replace'" in modes
+          and "retouch" not in modes and "darkroom" not in modes
+          and "localize_stylize" not in modes and "inpaint" not in modes,
+          modes[:90].replace("\n", " "))
     # --- token-threading: the seam that burned a live render. The server requires poll +
     # cancel to authenticate with the JOB-scope token create minted (the launch token is
     # spent by the create, and polling must not be able to redeem anything). If the editor
@@ -1022,6 +1026,29 @@ def test_graphs():
     import json as _json
     check("graph is JSON-serialisable (what gets POSTed to /prompt)",
           isinstance(_json.dumps(painted), str))
+
+    # The mode is a live control, not theatre: engine._apply_mode must rewire the KSampler
+    # conditioning so 'edit' and 'replace' are genuinely different graphs. 'edit' keeps the
+    # scene-referenced chain (positive -> node 23, the ReferenceLatent built from the whole
+    # original image); 'replace' drops that full-scene pass (nodes 21 + 23) and conditions on
+    # the masked-region latent (node 22) -- the same rewiring imagegen's _submit_edit
+    # preserve_scene_context=False performs. If this drifts (a node id changes, the wrong
+    # latent is wired), the two modes silently collapse back into one graph and 'replace'
+    # stops removing anything -- the exact defect the user hit on a real render.
+    from stackd.toolbox.engine import _apply_mode
+    edit_g = G.painted_mask_graph(mask_filename="m.png")
+    _apply_mode(edit_g, {"kind": "edit"})
+    check("edit mode keeps the scene-referenced KSampler conditioning",
+          edit_g[WF.MASK_KSAMPLER_NODE]["inputs"]["positive"] == [WF.MASK_FULL_REFLATENT_NODE, 0]
+          and WF.MASK_FULL_REFLATENT_NODE in edit_g and WF.MASK_FULL_ENCODE_NODE in edit_g)
+    rep_g = G.painted_mask_graph(mask_filename="m.png")
+    _apply_mode(rep_g, {"kind": "replace"})
+    check("replace mode conditions on the masked region and drops the full-scene pass",
+          rep_g[WF.MASK_KSAMPLER_NODE]["inputs"]["positive"] == [WF.MASK_REGION_REFLATENT_NODE, 0]
+          and WF.MASK_FULL_REFLATENT_NODE not in rep_g and WF.MASK_FULL_ENCODE_NODE not in rep_g)
+    check("replace mode keeps the prompt + region latent the KSampler now depends on",
+          WF.MASK_POSITIVE_NODE in rep_g and WF.MASK_REGION_REFLATENT_NODE in rep_g
+          and isinstance(_json.dumps(rep_g), str))
 
 
 def main() -> int:

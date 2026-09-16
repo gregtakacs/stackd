@@ -61,7 +61,7 @@ screenshot, and the source-vs-result diff that would show the erase removed some
 | seed | `MASK_SEED_NODE` | yes |
 | width / height | `MASK_WIDTH_NODE` / `MASK_HEIGHT_NODE` | yes |
 | edge (per object), feather | `masks.normalize_layers` | yes (mask geometry) |
-| mode / kind | job row only; `engine.py` never reads it | **none** — all five modes run one graph |
+| mode (Edit / Replace) | `engine._apply_mode` rewires the KSampler conditioning | **yes** — Edit blends into the scene; Replace reimagines the mask |
 | edit strength | nowhere | none |
 | blend opacity | nowhere | none |
 | blend mode | nowhere | none |
@@ -83,17 +83,27 @@ Fixed today:
   disabled. Mutants prove both bite (empty `DEAD_KNOBS` -> 8 failures; disabling `prompt`
   -> 1 failure). Liveness is *measured* by grepping `.get("k"` / `["k"]` in
   `engine.py`+`api.py`, never asserted — the bare-name form passes on comments.
-- **The mode dropdown lied.** `darkroom` promised deterministic tone ops without the GPU
-  while `engine.py` has zero references to `kind` — every mode runs the same GPU Klein
-  inpaint, so choosing it to save GPU time would have billed the GPU anyway. Labels are now
-  plain names plus `Darkroom (not implemented)`, and the panel says all modes run one
-  repaint graph. If someone wires `kind` into the engine, the premise check fails and the
-  labels get revisited deliberately.
+- **The mode dropdown was theatre — now a real control (2026-09-16, 2nd pass).** `darkroom`
+  once promised deterministic tone ops without the GPU while `engine.py` had zero references
+  to `kind`; it was first honestified (labels stripped, "all modes run one graph" disclosed).
+  A user then hit the real gap: the single repaint graph can recolor but cannot *remove* an
+  object, because the KSampler's positive conditioning (node 23) references a pass built from
+  the whole original image — it conditions the model on the very thing being changed away from.
+  `engine._apply_mode` now reads `kind` and offers the two real paths, mirroring imagegen's
+  own `_submit_edit` `preserve_scene_context` branch (the replacement the OWUI edit_image tool
+  performs), bound to the painted mask: **Edit** keeps the scene-referenced pass (node 23) so
+  surface edits blend in; **Replace** drops the full-scene pass (nodes 21+23) and conditions on
+  the masked region alone (node 22), so the prompt can do a genuine identity-level swap/removal.
+  The five theatre modes are gone; Edit and Replace are the only options. The offline suite
+  pins both halves: engine reads `kind`, and `replace` rewires the graph to the region latent.
 - Blend blankness has a browser mutant (`--mutate blendblank`) faithful to the shipped
   defect — it reverts BOTH halves (old `select()` and the bare-value caller), since either
   half alone still labels correctly — and it goes red on exactly `no blank options`.
 
-Counts after today: offline **295/295**, browser **62/62**.
+Counts after the 2nd pass: offline **298/298** (the +3 are the functional proof that
+`replace` rewires the graph and `edit` keeps it). The `/tmp/tbtest` browser suite still
+asserts the OLD "same repaint graph" disclosure text, so re-point that one assertion at the
+new Edit/Replace note before running it — the shipped code itself is unchanged in that respect.
 
 ---
 

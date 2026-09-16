@@ -101,9 +101,10 @@ def _pick_model(spec: dict) -> str:
 def _patch_graph(graph: dict, spec: dict, *, source_filename: str, mask_filename: str,
                  w: int, h: int, seed: int) -> dict:
     """Point the derived painted-mask graph at this job's uploaded files + parameters.
-    Only the LOAD_IMAGE (photo), the mask filename on the LoadImageMask node, and the
-    PrimitiveString front-ends (prompt / width / height / seed) change — never the MASK_*
-    scaffold, which is what keeps workflows' id-based rewiring valid (see graphs.py)."""
+    The LOAD_IMAGE (photo), the mask filename on the LoadImageMask node, the
+    PrimitiveString front-ends (prompt / width / height / seed) and the KSampler
+    conditioning (per the mode, see _apply_mode) change -- the rest of the MASK_*
+    scaffold stays put, which is what keeps workflows' id-based rewiring valid."""
     from stackd.imagegen import workflows as wf
     graph[_graphs.LOAD_IMAGE_NODE]["inputs"]["image"] = source_filename
     graph[_graphs.SEGMENT_NODE]["inputs"]["image"] = mask_filename
@@ -111,7 +112,37 @@ def _patch_graph(graph: dict, spec: dict, *, source_filename: str, mask_filename
     wf.set_node(graph, wf.MASK_WIDTH_NODE, "width", int(w))
     wf.set_node(graph, wf.MASK_HEIGHT_NODE, "height", int(h))
     wf.set_node(graph, wf.MASK_SEED_NODE, "seed", int(seed))
+    _apply_mode(graph, spec)
     return graph
+
+
+def _apply_mode(graph: dict, spec: dict) -> None:
+    """The mode dropdown is NOT cosmetic: it selects the KSampler conditioning, so the
+    two modes genuinely produce different images. The region is ALWAYS the painted mask
+    (LoadImageMask) in both -- this only changes WHAT the region is regenerated toward.
+
+    'edit' (default) keeps the scene-referenced chain (KSampler positive -> node 23, the
+    ReferenceLatent that conditions on a pass built from the WHOLE original image). That
+    second pass is what makes surface edits -- recolor, a different shirt, an accessory --
+    land and blend into the surroundings, so it is the default for most edits.
+
+    'replace' drops that full-image pass (nodes 21 + 23) and conditions the KSampler on the
+    masked-region latent alone (node 22). Without the whole-image pass the model is no
+    longer conditioned on the very thing being changed away from, so the prompt can do a
+    genuine identity-level swap or removal of the masked region. This mirrors imagegen's
+    own _submit_edit preserve_scene_context=False branch -- the same replacement the OWUI
+    edit_image tool performs -- but bound to the PAINTED mask rather than a text
+    segmentation, so it acts only where the user painted.
+
+    Unknown / absent kind keeps the scene-referenced 'edit' behaviour (never a silent
+    no-op mode, and never a path the labels do not advertise)."""
+    from stackd.imagegen import workflows as wf
+    kind = str((spec or {}).get("kind") or "edit").lower()
+    if kind != "replace":
+        return
+    graph[wf.MASK_KSAMPLER_NODE]["inputs"]["positive"] = [wf.MASK_REGION_REFLATENT_NODE, 0]
+    graph.pop(wf.MASK_FULL_REFLATENT_NODE, None)
+    graph.pop(wf.MASK_FULL_ENCODE_NODE, None)
 
 
 def comfy_render(job: dict, source: bytes, mask: bytes, *, on_prompt_id=None):

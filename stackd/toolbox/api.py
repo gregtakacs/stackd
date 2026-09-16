@@ -677,7 +677,7 @@ class Toolbox:
                              "painted — paint the area to change, then Preview")
         job_id = hashlib.sha256(f"{email}|{time.time_ns()}|{w}|{h}".encode()).hexdigest()[:16]
         seed = _as_int(spec.get("seed"), -1)
-        kind = str(spec.get("kind") or "retouch")
+        kind = str(spec.get("kind") or "edit")
 
         if self._worker is not None:
             # PAID THE DEBT: redeem the launch token single-use now that we KNOW we will

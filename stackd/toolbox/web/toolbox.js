@@ -630,7 +630,7 @@
   // disagreement here costs quality, never correctness.
   function params() {
     return {
-      kind: el.kind ? el.kind.value : 'retouch',
+      kind: el.kind ? el.kind.value : 'edit',
       prompt: el.prompt ? el.prompt.value : '',
       strength: val('tb_strength', 0.25),
       // Derived, never independent: one bipolar knob is the only way to express this, so the
@@ -797,29 +797,26 @@
     g3.appendChild(ctl('detail', 'range', 0.35, 'keep original detail', { min: 0, max: 1, step: 0.05 }));
     root.appendChild(g3);
 
-    // MODE IS COSMETIC TODAY: nothing in engine.py reads spec["kind"] -- all five modes
-    // run the IDENTICAL repaint graph, so the only things that change the image are the
-    // prompt, the seed and the mask geometry. The values are still recorded on the job row
-    // (and Darkroom is where deterministic ops will live once they exist), but labels must
-    // not promise a differentiation no user can ever observe. The darkroom label this
-    // replaced claimed deterministic tone ops on the CPU, while the only path that has
-    // ever existed is the GPU Klein inpaint -- a user picking it to save GPU time would
-    // have been billed for it.
-    // The offline suite pins both halves: that engine still ignores kind, and that this
-    // panel carries the caveat.
+    // The mode is NOT cosmetic: engine._apply_mode reads spec["kind"] and rewires the
+    // KSampler conditioning, so these two really produce different images. 'edit' keeps the
+    // scene-referenced pass (KSampler conditions on a latent built from the whole original
+    // image) so surface changes -- recolor, a different shirt, an accessory -- blend into the
+    // surroundings. 'replace' drops that pass and conditions on the masked region alone, so
+    // the prompt can do a genuine identity-level swap / removal. Both act on the PAINTED
+    // mask only (never a text segmentation, so nothing outside your paint is touched). This
+    // mirrors imagegen's _submit_edit preserve_scene_context branch -- the same replacement
+    // the OWUI edit_image tool performs. The offline suite pins the wiring (engine reads
+    // kind; 'replace' rewires the graph) and that these labels describe the two real paths.
     root.appendChild(labelled('mode', select('kind', [
-      ['retouch', 'Retouch'],
-      ['erase', 'Erase'],
-      ['inpaint', 'Replace'],
-      ['localize_stylize', 'Local style'],
-      ['darkroom', 'Darkroom (not implemented)']
+      ['edit', 'Edit — recolor / light touch, blends into the scene'],
+      ['replace', 'Replace — erase / swap what is inside the mask']
     ])));
     root.appendChild(mk('div', 'tb-hint tb-deadnote',
-      'all modes run the same repaint graph today — the prompt and the mask are what change ' +
-      'the image; deterministic Darkroom ops are not built yet'));
+      'Edit blends the change into the surroundings and keeps what is in the mask; Replace ' +
+      'reimagines the mask from the prompt. Either way only the area you paint is touched.'));
     el.prompt = document.createElement('textarea');
     el.prompt.id = 'tb_prompt'; el.prompt.rows = 2;
-    el.prompt.placeholder = 'What to put there (Replace / Erase / Local style). Empty = just clean up.';
+    el.prompt.placeholder = 'What to put there (for Replace). For Edit, name the change. Empty = clean up.';
     el.prompt.value = CFG.prompt || '';
     root.appendChild(labelled('prompt', el.prompt));
 
