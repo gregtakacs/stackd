@@ -2703,8 +2703,22 @@ let xpSort = null;                      // {tier,dir} column-sort override; null
 
 function xpAllFacts() { return (LAST_FACTS && LAST_FACTS.facts) || []; }
 function xpTiers() { return (LAST_FACTS && LAST_FACTS.tiers) || []; }
+// Brave Search hits: a separate, thinner record set (day + user_email only —
+// no served_stack/served_model/requested_model/served_profile, since a search
+// hit isn't any of those). Kept out of xpAllFacts()/xpFacts() so the tree
+// explorer never has to fake a model for it; the pivot chart below folds it
+// in as its own metric instead, via a parallel accumulation pass.
+function xpAllBrave() { return (LAST_FACTS && LAST_FACTS.brave) || []; }
+function xpFilteredBrave() {
+  return xpAllBrave().filter(r => XP_DIMS.every(d => {
+    const sel = XP.filters[d.k];
+    return sel == null || sel.includes(r[d.k] == null ? "?" : String(r[d.k]));
+  }));
+}
 function xpDistinct(dim) {
-  return [...new Set(xpAllFacts().map(r => String(r[dim])))].sort();
+  const vals = new Set(xpAllFacts().map(r => String(r[dim])));
+  if (dim === "user_email") for (const r of xpAllBrave()) vals.add(String(r.user_email));
+  return [...vals].sort();
 }
 function xpFacts() {
   // filters[dim]: null/undefined = all values; [] = none; [..] = just those
@@ -3083,6 +3097,7 @@ async function loadUsage() {
   const pay = (sv.tiers || []).find(t => t.label === sv.payback_tier) || (sv.tiers || [])[sv.tiers.length - 1];
   box.append(stat(fmtNum(sv.reqs), "requests"));
   box.append(stat(fmtSI((sv.prompt_tokens || 0) + (sv.completion_tokens || 0)), "tokens"));
+  if (sv.brave_reqs) box.append(stat(fmtNum(sv.brave_reqs), "brave search hits"));
   const tp = sv.throughput || {};
   if (tp.decode_tps) box.append(stat(rnd1(tp.decode_tps) + " tok/s", "generation (engine)"));
   if (tp.prefill_tps) box.append(stat(rnd1(tp.prefill_tps) + " tok/s", "prompt / prefill (engine)"));
@@ -3197,7 +3212,11 @@ function saveXC() { try { localStorage.setItem("stackd_explorer_chart", JSON.str
 let xcHidden = new Set();          // series temporarily hidden via legend click (session-only)
 
 function xpSeriesDomain(dim) {
-  if (dim === "day") return [...new Set(xpAllFacts().map(r => bucketDay(String(r.day), XP.dateGran) || "?"))].sort();
+  if (dim === "day") {
+    const vals = new Set(xpAllFacts().map(r => bucketDay(String(r.day), XP.dateGran) || "?"));
+    for (const r of xpAllBrave()) vals.add(bucketDay(String(r.day), XP.dateGran) || "?");
+    return [...vals].sort();
+  }
   return xpDistinct(dim);
 }
 // a value's color is its fixed position in the FULL distinct-value domain for
@@ -3216,6 +3235,7 @@ function xpMetricOptions() {
     { v: "gen", label: "Gen t/s" },
     { v: "pre", label: "Prefill t/s" },
     { v: "ctx", label: "Ctx (tok-wtd)" },
+    { v: "brave", label: "Brave search hits" },
   ];
   for (const t of xpTiers()) {
     opts.push({ v: "tier:" + t.label + ":net", label: t.label + " · net $" });
@@ -3228,7 +3248,7 @@ function xpMetricLabel(metric) {
   return o ? o.label : metric;
 }
 function xpMetricFmt(metric) {
-  if (metric === "reqs") return v => fmtNum(Math.round(v));
+  if (metric === "reqs" || metric === "brave") return v => fmtNum(Math.round(v));
   if (metric === "tin" || metric === "tout" || metric === "ctx") return v => fmtSI(v);
   if (metric === "gen" || metric === "pre") return v => rnd1(v) + " t/s";
   if (metric.startsWith("tier:")) return v => fmtUsd(v);
@@ -3241,6 +3261,7 @@ function xpMetricValue(node, metric) {
   if (metric === "gen") return xpDerive(node).gen;
   if (metric === "pre") return xpDerive(node).pre;
   if (metric === "ctx") return xpDerive(node).ctx;
+  if (metric === "brave") return node.brave || 0;
   const m = /^tier:(.+):(net|gross)$/.exec(metric);
   if (m) {
     const gross = node.gross[m[1]] || 0;
@@ -3252,7 +3273,7 @@ function xpMetricValue(node, metric) {
 }
 function xpPivot() {
   const tiers = xpTiers();
-  const mk = () => ({ reqs: 0, tin: 0, tout: 0, ctx_max: 0, engine_ctx_max: 0,
+  const mk = () => ({ reqs: 0, tin: 0, tout: 0, ctx_max: 0, engine_ctx_max: 0, brave: 0,
                       ...Object.fromEntries(XP_TIMING.map(k => [k, 0])),
                       gross: Object.fromEntries(tiers.map(t => [t.label, 0])) });
   const xMap = new Map();          // xKey -> Map(seriesKey -> accum node)
@@ -3263,6 +3284,16 @@ function xpPivot() {
     const sMap = xMap.get(xk);
     if (!sMap.has(sk)) sMap.set(sk, mk());
     xpAcc(sMap.get(sk), r, tiers);
+  }
+  // Brave hits ride the same x/series buckets (day, user_email real; any other
+  // dim collapses to "?", same as xpKeyOf does for facts missing a field).
+  for (const r of xpFilteredBrave()) {
+    const xk = xpKeyOf(XC.x, r);
+    const sk = XC.series ? xpKeyOf(XC.series, r) : "";
+    if (!xMap.has(xk)) xMap.set(xk, new Map());
+    const sMap = xMap.get(xk);
+    if (!sMap.has(sk)) sMap.set(sk, mk());
+    sMap.get(sk).brave += r.reqs || 0;
   }
   return xMap;
 }

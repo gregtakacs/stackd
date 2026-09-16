@@ -229,6 +229,13 @@ def _build_parser() -> argparse.ArgumentParser:
     pc.add_argument("--db", default=os.environ.get("STACKD_DB"))
     pc.add_argument("--pricing", type=pathlib.Path, default=None)
 
+    bv = sub.add_parser("brave", help="Brave Search API credit ledger — who used how much (needs --db)")
+    bv.add_argument("--db", default=os.environ.get("STACKD_DB"))
+    bv.add_argument("--from", dest="from_day", default=None)
+    bv.add_argument("--to", dest="to_day", default=None)
+    bv.add_argument("--raw", action="store_true", help="every call (ts, query, source_ip) instead of the per-user tally")
+    bv.add_argument("--json", action="store_true")
+
     bd = sub.add_parser("build", help="build a local image (container.build) via the Docker API")
     bd.add_argument("models", nargs="*",
                     help="model names or media targets like 'image:vulkan'; default: all with a build recipe")
@@ -884,7 +891,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     # datastore commands (no Manager)
-    if args.cmd in ("users", "savings", "migrate", "prices"):
+    if args.cmd in ("users", "savings", "migrate", "prices", "brave"):
         from stackd.store import Store
         db = _db_path(args)
         if args.cmd == "migrate":
@@ -916,6 +923,31 @@ def main(argv: list[str] | None = None) -> int:
                 print(store.resolve_key(args.email) or "(not found)")
             elif args.action == "delete":
                 print("deleted" if store.delete_user(args.email) else "(not found)")
+            return 0
+        if args.cmd == "brave":
+            import json as _json
+            if args.raw:
+                rows = store.brave_usage_rows(args.from_day, args.to_day)
+                if args.json:
+                    print(_json.dumps(rows, indent=2))
+                else:
+                    for r in rows:
+                        who = r["user_email"] or (f"ambiguous({r['candidate_emails']})"
+                                                   if r["candidate_emails"] else f"unknown ip={r['source_ip']}")
+                        mark = "ok" if r["ok"] else "FAIL"
+                        print(f"  {r['day']} {who:<32} {mark:<4} {r['query'] or ''}")
+            else:
+                rows = store.brave_usage_by_user(args.from_day, args.to_day)
+                if args.json:
+                    print(_json.dumps(rows, indent=2))
+                else:
+                    totals: dict[str, int] = {}
+                    for r in rows:
+                        totals[r["user_email"]] = totals.get(r["user_email"], 0) + r["hits"]
+                    total = sum(totals.values())
+                    print(f"{total} brave hit(s) total")
+                    for email, n in sorted(totals.items(), key=lambda kv: -kv[1]):
+                        print(f"  {email:<32} {n}")
             return 0
         from stackd.pricing import load_pricing, savings, sync_manual_prices, refresh_openrouter
         pcfg = load_pricing(_pricing_path(args))

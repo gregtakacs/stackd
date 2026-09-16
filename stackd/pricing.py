@@ -73,6 +73,24 @@ def _group(rows: list[dict], key: str) -> dict[str, list[dict]]:
     return out
 
 
+# Brave Search API hits are not a served model — no tokens, no stack, no
+# profile — so they don't belong in the (day, user_email, requested_model,
+# served_stack, served_model, served_profile) fact grain the explorer pivots
+# on. Instead they ride as a sibling metric at (day, user_email) grain,
+# exactly the way `reqs` and the token columns are already reported at the
+# top of savings(): a flat count plus the same count broken out by user and
+# by day.
+def _brave_totals(store: Store, from_day: str | None, to_day: str | None) -> dict:
+    total = 0
+    by_user: dict[str, int] = {}
+    by_day: dict[str, int] = {}
+    for r in store.brave_usage_by_user(from_day, to_day):
+        total += r["hits"]
+        by_user[r["user_email"]] = by_user.get(r["user_email"], 0) + r["hits"]
+        by_day[r["day"]] = by_day.get(r["day"], 0) + r["hits"]
+    return {"reqs": total, "by_user": by_user, "by_day": by_day}
+
+
 def _tier_rows(rows: list[dict], tier: dict) -> list[dict]:
     """A tier may scope to `served_models` — only price rows served by one of
     those. stackd only keeps `requested_model` at day grain, so match loosely
@@ -90,6 +108,7 @@ def savings(store: Store, cfg: dict, *, from_day: str | None = None,
             if r["requested_model"] not in set(cfg.get("exclude_models", []))]
     days = sorted({r["day"] for r in rows})
     energy = store.energy_between(days[0], days[-1]) if days else {"gpu_kwh": 0.0, "host_kwh": 0.0}
+    brave = _brave_totals(store, from_day, to_day)
     kwh = energy["gpu_kwh"] + energy["host_kwh"]
     energy_cost = round(kwh * cfg["electricity_price_per_kwh"], 4)
     span_days = ((_d(days[-1]) - _d(days[0])).days + 1) if days else 0
@@ -119,6 +138,17 @@ def savings(store: Store, cfg: dict, *, from_day: str | None = None,
             }
             for dim in ("day", "user_email", "requested_model", "served_profile")
         }
+        # Brave hits aren't tied to a model or profile, so they only ride the
+        # two dims where that's meaningless: user_email and day. Sibling field
+        # next to `reqs`, not a new pivotable row — a user/day with brave
+        # activity but no LLM usage in this tier gets a zeroed entry so the
+        # count still shows up.
+        for dim, bkey in (("user_email", "by_user"), ("day", "by_day")):
+            for k, v in by[dim].items():
+                v["brave_reqs"] = brave[bkey].get(k, 0)
+            for k, n in brave[bkey].items():
+                by[dim].setdefault(k, {"gross": 0.0, "net": 0.0, "prompt_tokens": 0,
+                                       "completion_tokens": 0, "reqs": 0, "brave_reqs": n})
         net = round(gross - energy_cost, 4)
         price = store.price_on(tier["ref"], days[-1]) if days else None
         return {
@@ -153,6 +183,12 @@ def savings(store: Store, cfg: dict, *, from_day: str | None = None,
         "reqs": sum(r["reqs"] for r in rows),
         "prompt_tokens": sum(r["prompt_tokens"] for r in rows),
         "completion_tokens": sum(r["completion_tokens"] for r in rows),
+        # Brave Search API credit count — sibling to `reqs`, not folded into it
+        # (it's not an LLM request); `brave_by_user`/`brave_by_day` give the
+        # same per-user/per-day breakdown `by` above gives requested_model.
+        "brave_reqs": brave["reqs"],
+        "brave_by_user": brave["by_user"],
+        "brave_by_day": brave["by_day"],
         # engine-measured throughput (token-weighted) + peak context over the range
         "throughput": {
             "decode_tps": round(_dct * 1000 / _dcm, 1) if _dcm else 0.0,
@@ -284,6 +320,13 @@ def savings_facts(store: Store, cfg: dict, *, from_day: str | None = None,
         "energy_cost": energy_cost,
         "tiers": tier_meta,
         "facts": facts,
+        # Kept separate from `facts` (no requested_model/served_stack/served_model/
+        # served_profile — a search hit isn't any of those), at the one grain it
+        # actually has: (day, user_email). The dashboard's pivot chart folds this
+        # in as its own selectable metric alongside reqs/tokens/gross, bucketing
+        # under "?" for any other dimension.
+        "brave": [{"day": r["day"], "user_email": r["user_email"], "reqs": r["hits"]}
+                  for r in store.brave_usage_by_user(from_day, to_day)],
     }
 
 

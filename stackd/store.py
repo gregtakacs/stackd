@@ -14,7 +14,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 RETAIN_DAYS = 40
 
 _SCHEMA = """
@@ -94,6 +94,28 @@ CREATE TABLE IF NOT EXISTS price_points (
 CREATE TABLE IF NOT EXISTS energy (
     day TEXT PRIMARY KEY, gpu_wh REAL DEFAULT 0, host_wh REAL DEFAULT 0
 );
+
+-- Brave Search API credit ledger (searxng's `braveapi` engine — 1000/mo quota).
+-- One row per engine invocation, reported by a searxng plugin (see
+-- appdata/searxng/brave_usage_plugin.py) over POST /brave/hit. `user_email` is
+-- resolved by serve._brave_candidates: which OWU chat session (by
+-- X-OpenWebUI-User-Email, tracked the same way as the usage ledger) was in
+-- flight at the report's timestamp. NULL when no session was in flight (a
+-- direct/non-OWU caller) or more than one was (`candidate_emails` then holds
+-- every overlapping email, comma-joined, for manual reconciliation).
+-- Never pruned: Brave's own quota caps this at ~1000 rows/month, far below
+-- where `usage`'s RETAIN_DAYS trick would matter.
+CREATE TABLE IF NOT EXISTS brave_usage (
+    id INTEGER PRIMARY KEY,
+    ts REAL NOT NULL,
+    day TEXT NOT NULL,
+    user_email TEXT,
+    candidate_emails TEXT,
+    source_ip TEXT,
+    ok INTEGER DEFAULT 1,
+    query TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_brave_usage_day ON brave_usage(day);
 
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 """
@@ -518,4 +540,47 @@ class Store:
         return [dict(r) for r in self.conn.execute(
             "SELECT day, gpu_wh, host_wh FROM energy WHERE day BETWEEN ? AND ? "
             "ORDER BY day", (start_day, end_day)
+        ).fetchall()]
+
+    # -- brave search credits -------------------------------------------------------
+    def record_brave_hit(self, *, user_email: str | None, candidate_emails: list[str] | None,
+                         source_ip: str | None, ok: bool, query: str | None,
+                         now: float | None = None) -> None:
+        now = time.time() if now is None else now
+        self.conn.execute(
+            "INSERT INTO brave_usage(ts,day,user_email,candidate_emails,source_ip,ok,query) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (now, _utc_day(now), user_email, ",".join(candidate_emails or []) or None,
+             source_ip, int(ok), query),
+        )
+
+    def brave_usage_rows(self, start_day: str | None = None,
+                         end_day: str | None = None) -> list[dict]:
+        """Raw per-call rows (the full audit trail — query text included)."""
+        w, args = [], []
+        if start_day:
+            w.append("day >= ?"); args.append(start_day)
+        if end_day:
+            w.append("day <= ?"); args.append(end_day)
+        where = (" WHERE " + " AND ".join(w)) if w else ""
+        return [dict(r) for r in self.conn.execute(
+            "SELECT ts,day,user_email,candidate_emails,source_ip,ok,query FROM brave_usage" +
+            where + " ORDER BY ts", args
+        ).fetchall()]
+
+    def brave_usage_by_user(self, start_day: str | None = None,
+                            end_day: str | None = None) -> list[dict]:
+        """Per day/user call counts — 'who used how much of the 1000/mo quota'.
+        user_email is 'unknown' when no OWU session was in flight and no
+        candidate could be attributed."""
+        w, args = [], []
+        if start_day:
+            w.append("day >= ?"); args.append(start_day)
+        if end_day:
+            w.append("day <= ?"); args.append(end_day)
+        where = (" WHERE " + " AND ".join(w)) if w else ""
+        return [dict(r) for r in self.conn.execute(
+            "SELECT day, COALESCE(user_email,'unknown') user_email, COUNT(*) hits, "
+            "SUM(ok) ok_hits FROM brave_usage" + where +
+            " GROUP BY day, user_email ORDER BY day", args
         ).fetchall()]

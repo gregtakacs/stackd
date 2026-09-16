@@ -514,6 +514,9 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path in ("/v1/chat/completions", "/v1/completions", "/v1/embeddings"):
             return self._completions()
 
+        if self.path == "/brave/hit":
+            return self._brave_hit()
+
         if self.path == "/comfyui" or self.path.startswith("/comfyui/") or self.path.startswith("/comfyui?"):
             return self._do_comfyui()
 
@@ -1141,6 +1144,14 @@ class _Handler(BaseHTTPRequestHandler):
         # _inflight_start's docstring) — a real request is about to go out, so this
         # is the one place to start the clock regardless of which relay path it takes.
         inflight_rid = _inflight_start(rr.stack, len(raw) // 4) if (rr.stack and not is_embeddings) else None
+        # Same "is a real chat turn actually running" gate as inflight_rid — this
+        # is what /brave/hit correlates a searxng call's timestamp against, so a
+        # web-search tool call fired mid-turn lands on the user who's chatting.
+        brave_session = (
+            _brave_session_start(self.headers.get("X-OpenWebUI-User-Email")
+                                  or self.headers.get("X-OpenWebUI-User-Id") or "direct")
+            if inflight_rid is not None else None
+        )
 
         def _on_body(buf: bytes, status: int, meta: dict | None = None) -> None:
             self._record_usage(model, rr, buf, status, embeddings=is_embeddings,
@@ -1184,6 +1195,8 @@ class _Handler(BaseHTTPRequestHandler):
             # never clears. _inflight_finish is a no-op if on_body already popped it.
             if inflight_rid is not None:
                 _inflight_finish(rr.stack, inflight_rid)
+            if brave_session is not None:
+                _brave_session_finish(brave_session)
 
     # -- ledger ------------------------------------------------------------------------
     def _record_usage(self, requested_model, rr, buf: bytes, status: int, *,
@@ -1215,6 +1228,37 @@ class _Handler(BaseHTTPRequestHandler):
                 )
         except Exception:  # noqa: BLE001 — ledger must never break a response
             pass
+
+    def _brave_hit(self):
+        """One Brave Search API credit was just spent by searxng's `braveapi`
+        engine — reported by appdata/searxng/brave_usage_plugin.py's post_search
+        hook, one POST per engine invocation (braveapi has no batching: each hit
+        here is exactly one of the 1000/mo quota). `ts` is when searxng saw the
+        request, used to look up which OWU chat session was in flight at that
+        moment (see _brave_candidates) — not `time.time()` here, since the report
+        itself arrives slightly after the fact."""
+        if self.store is None:
+            return self._send_json(503, {"error": {"message": "no store configured"}})
+        try:
+            body = json.loads(self._read_body() or b"{}")
+        except json.JSONDecodeError:
+            return self._send_json(400, {"error": {"message": "invalid JSON"}})
+        try:
+            ts = float(body.get("ts"))
+        except (TypeError, ValueError):
+            ts = time.time()
+        ok = bool(body.get("ok", True))
+        source_ip = str(body.get("source_ip") or "")[:64] or None
+        query = str(body.get("query") or "")[:500] or None
+        candidates = _brave_candidates(ts)
+        user_email = candidates[0] if len(candidates) == 1 else None
+        with self.lock:
+            self.store.record_brave_hit(
+                user_email=user_email, candidate_emails=candidates,
+                source_ip=source_ip, ok=ok, query=query, now=ts,
+            )
+        return self._send_json(200, {"recorded": True, "user_email": user_email,
+                                      "candidates": candidates})
 
     # -- warm wait ----------------------------------------------------------------
     def _await_ready(self, rr, model, streaming):
@@ -1762,6 +1806,48 @@ def _inflight_snapshot(stack: str) -> list:
     ]
     out.sort(key=lambda r: r["age_s"])
     return out
+
+
+# Which OWU user was chatting when a Brave API credit got spent (see /brave/hit
+# and store.record_brave_hit). Deliberately separate from _INFLIGHT above: that
+# dict is dumped to the dashboard/live API as-is, and it's keyed by stack, not
+# user — mixing email into it would leak "who's chatting right now" to every
+# dashboard viewer. This list is private to the correlation lookup.
+_BRAVE_SESSIONS: list[dict] = []
+_BRAVE_SESSIONS_LOCK = threading.Lock()
+_BRAVE_SESSION_GRACE_S = 5.0   # a searxng call can lag the LLM request that triggered it
+_BRAVE_SESSION_TTL_S = 600.0   # drop finished sessions once no report could plausibly land
+
+
+def _brave_session_start(email: str) -> dict:
+    entry = {"email": email, "start": time.time(), "end": None}
+    with _BRAVE_SESSIONS_LOCK:
+        _BRAVE_SESSIONS.append(entry)
+        cutoff = time.time() - _BRAVE_SESSION_TTL_S
+        _BRAVE_SESSIONS[:] = [e for e in _BRAVE_SESSIONS if e["end"] is None or e["end"] > cutoff]
+    return entry
+
+
+def _brave_session_finish(entry: dict) -> None:
+    with _BRAVE_SESSIONS_LOCK:
+        entry["end"] = time.time()
+
+
+def _brave_candidates(ts: float) -> list[str]:
+    """Every OWU user whose chat request was in flight at `ts` (± a small
+    grace window, since the searxng call it triggered reports back slightly
+    later). Empty if none were; more than one means a genuine concurrency
+    tie the caller has to record rather than silently guess through."""
+    with _BRAVE_SESSIONS_LOCK:
+        snap = list(_BRAVE_SESSIONS)
+    now = time.time()
+    out = set()
+    for e in snap:
+        start = e["start"] - _BRAVE_SESSION_GRACE_S
+        end = (e["end"] if e["end"] is not None else now) + _BRAVE_SESSION_GRACE_S
+        if start <= ts <= end:
+            out.add(e["email"])
+    return sorted(out)
 
 
 # The caches above (and telemetry._eng_state's sticky `last_sess`) are in-memory,
