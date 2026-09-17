@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import io
 import math
+import os
 
 try:
     from PIL import Image, ImageChops, ImageFilter
@@ -64,6 +65,28 @@ ALPHA_IS_MEANINGFUL_MIN = 250
 MAX_MORPH_PX = 64                   # expand/shrink radius clamp; see _morph()
 DEFAULT_FORMAT = "PNG"
 
+# --------------------------------------------------------------------------------
+# The long-edge ceiling EVERY handover obeys: the editor's <img>, the SAM3 segmenter
+# and the ComfyUI render all receive an image whose long side is <= this.
+#
+# This is a measurement, not a preference. Job e35265c66c8bcce4 (2026-09-17) asked to
+# wet an asphalt patch: 1.07% coverage, 2048x1584, flux2-klein, 6 sampler steps. It
+# sampled in 486 s (59 -> 91 s/it, degrading as the APU thrashed its own unified pool)
+# and decoded+composited in another 110 s -- 616 s wall, PAST the 600 s client deadline,
+# so a finished render was reported to the user as an error. The same graph at the
+# ~1.7MP the MCP tier budgets for itself ran in 76-156 s. Editing at 1024 on the long
+# edge keeps the same edit inside a minute on the iGPU, which is the only engine that is
+# always resident.
+#
+# Per-deployment escape hatch: TOOLBOX_RENDER_MAX_SIDE. The discrete-CUDA tier handled
+# 2048 comfortably, so an operator who has that card free may raise it -- but the
+# DEFAULT has to serve the machine that is actually up when a job arrives, and a
+# silently-10-minute render is the worse failure.
+# --------------------------------------------------------------------------------
+RENDER_MAX_SIDE = int(os.getenv("TOOLBOX_RENDER_MAX_SIDE", "1024") or "1024")
+LATENT_GRID = 16          # Flux.2 Klein requires multiples of 16 (see workflows._round16)
+MIN_WORKING_SIDE = 64     # below this the latent grid has nothing to work with
+
 
 class MaskError(Exception):
     """The mask cannot be used at all (undecodable, empty after normalization).
@@ -95,6 +118,107 @@ def image_size(image_bytes: bytes) -> tuple[int, int]:
     itself rather than trusting what the browser thinks it displayed."""
     img = _open(image_bytes)
     return img.width, img.height
+
+
+def fit_within(width, height, max_side: int = 0, *,
+               min_side: int = MIN_WORKING_SIDE, grid: int = LATENT_GRID):
+    """(w, h) to RUN an image at: aspect preserved, long side <= max_side (0 = no cap),
+    both sides on the 16-px latent grid, neither below min_side.
+
+    Pure integer math — deliberately no PIL — because the working size has to be
+    decidable (and testable) without an image decoder, and because `api._dims()` runs on
+    the no-pillow fail-closed path too.
+
+    The rounding matches the editor's own canvas maths (round to the nearest multiple of
+    16), so the size the browser paints at and the size the server normalises the mask to
+    cannot drift apart — a mismatch there is how an edit lands on the wrong third of a
+    photo. After a shrink the long side lands exactly on max_side; the follow-up loop only
+    bites for a max_side that is NOT itself grid-aligned (e.g. the env override set to
+    1000), where naive rounding could push it back over the ceiling the operator asked for.
+    """
+    try:
+        w, h = int(width), int(height)
+    except (TypeError, ValueError):
+        raise ValueError("working size needs integer width and height")
+    if w <= 0 or h <= 0:
+        raise ValueError(f"working size {w}x{h} is not positive")
+    cap = int(max_side or 0)
+    if cap and max(w, h) > cap:
+        s = cap / float(max(w, h))
+        w, h = int(round(w * s)), int(round(h * s))
+
+    lo = min_side if not cap or cap >= min_side else grid
+
+    def grid_round(v):
+        return max(lo, int(round(v / float(grid))) * grid)
+    w, h = grid_round(w), grid_round(h)
+
+    # A cap below the min_side floor is the operator overriding the floor on purpose, so
+    # the floor yields to it (down to one grid step) rather than silently breaking the cap.
+    while cap and max(w, h) > cap and max(w, h) > grid:
+        if w >= h:
+            w = max(grid, w - grid)
+        else:
+            h = max(grid, h - grid)
+    return w, h
+
+
+def shrink_to_max_side(image_bytes: bytes, max_side: int = RENDER_MAX_SIDE, *,
+                       min_side: int = MIN_WORKING_SIDE, grid: int = LATENT_GRID):
+    """(bytes, (w, h)) — the ONE ingest resize. The photo the browser is handed, the
+    source uploaded to ComfyUI and the source the no-GPU preview overlay is tinted from
+    all come from here, so no process ever sees the raw upload at full size.
+
+    Downscale ONLY. An image already inside the cap is returned byte-for-byte unchanged,
+    and that is a correctness decision, not an optimisation:
+      * grid-rounding an 800x600 photo to 800x608 would be an *upscale* — resampling in
+        detail the sensor never captured, which the next edit then inherits, because
+        toolbox edits chain (the artifact becomes the next source);
+      * a needless PNG re-encode of a correctly-sized photo costs CPU on every request
+        and, for a photo that arrived with metadata, quietly discards it.
+    """
+    _require_pil()
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        img.load()
+    except Exception as e:  # noqa: BLE001 — normalised into the module's own failure type
+        raise MaskError(f"could not decode the source image ({e.__class__.__name__}: {e})")
+    cap = int(max_side or 0)
+    if not cap or max(img.width, img.height) <= cap:
+        return image_bytes, (img.width, img.height)     # already inside: hand back the bytes
+    # FLOOR to the grid here, NOT round-to-nearest as fit_within does. The difference is
+    # deliberate: this function resamples REAL PIXELS, and rounding a 1030x770 photo to
+    # 1024x800 would be a 4% upscale of the short edge — invented detail that the next edit
+    # inherits, because toolbox edits chain (the artifact becomes the next source).
+    # fit_within keeps round-to-nearest because it sizes the working canvas, not pixels.
+    s = cap / float(max(img.width, img.height))
+    w = max(grid, int(img.width * s) // grid * grid)
+    h = max(grid, int(img.height * s) // grid * grid)
+    out = io.BytesIO()
+    # convert("RGB") matches comfyui_client.downscale_to_exact_size: sources are photos,
+    # and an alpha channel reaching the graph is a different image than the one previewed.
+    img.convert("RGB").resize((w, h), Image.LANCZOS).save(out, DEFAULT_FORMAT)
+    return out.getvalue(), (w, h)
+
+
+def resize_canonical(mask_bytes: bytes, width: int, height: int) -> bytes:
+    """Resample a CANONICAL mask (RGBA, alpha = coverage) onto a new size.
+
+    Deliberately no morph, no threshold, no feather: normalize_layers already applied
+    each object's grow/shrink/feather exactly once, and applying them twice is the
+    double-grow bug this package fixed once already (see the display-wash note in
+    web/toolbox.js). This exists for the one case where a job's recorded working size
+    disagrees with the mask normalised for it — an older row, or a cap changed between
+    create and render — so the source and the mask still meet at the same dims.
+    """
+    _require_pil()
+    img = _open(mask_bytes).convert("RGBA")
+    if (img.width, img.height) == (int(width), int(height)):
+        return mask_bytes
+    out = io.BytesIO()
+    img.resize((int(width), int(height)), Image.LANCZOS).save(out, DEFAULT_FORMAT)
+    return out.getvalue()
+
 
 
 

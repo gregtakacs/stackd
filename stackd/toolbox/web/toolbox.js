@@ -1792,7 +1792,10 @@
 
     var im = new Image();
     im.onload = function () {
-      var cap = CFG.max_side || 2048;
+      // The server hands us the photo already inside its render ceiling and tells us what
+      // that ceiling is; the fallback is the shipped default, not the old 2048, so a server
+      // that predates the field cannot put us back on the 10-minute path.
+      var cap = CFG.max_side || 1024;
       var long = Math.max(im.width, im.height) || 1;
       var s = long > cap ? cap / long : 1;
       // Multiples of 16, matching the pipeline's own constraint (workflows._round16), so
@@ -1805,7 +1808,14 @@
       viewC.width = W; viewC.height = H;
       ringC.width = W; ringC.height = H;
       fitW = 0;
-      status('Ready — ' + W + 'x' + H + '. Paint the area; the mask preview updates live.');
+      // Say what size we will actually RENDER at, and that it is a ceiling rather than a
+      // mystery: the server caps the long edge at CFG.max_side (masks.RENDER_MAX_SIDE) and
+      // now hands us the photo already inside it, so a user who loads a 4000px original is
+      // told the truth once, here, instead of guessing when the result comes back smaller.
+      status('Ready — ' + W + 'x' + H
+             + (s < 1 ? ' (shrunk from ' + im.width + 'x' + im.height + ')' : '')
+             + '; renders run at this size, long edge capped at ' + cap + 'px.'
+             + ' Paint the area; the mask preview updates live.');
       compose();
       wirePointer();
       applyZoom();

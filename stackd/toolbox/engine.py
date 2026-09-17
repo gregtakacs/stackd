@@ -169,6 +169,26 @@ def _graph_mask(mask: bytes) -> bytes:
     return out.getvalue()
 
 
+def render_size(job: dict) -> tuple[int, int, bool]:
+    """(w, h, was_capped) — the size a job is ALLOWED to run at, enforced at the one place
+    that actually hands pixels to ComfyUI.
+
+    `api._dims()` applies the same ceiling when the row is created, so this is normally a
+    no-op; it is the belt for a row that predates the ceiling, a create path that bypassed
+    _dims, or a ceiling that moved while the job sat in the queue. Returning the flag (not
+    silently resizing) is what lets comfy_render rescale the mask to match — source and
+    mask must disagree by exactly nothing. See masks.RENDER_MAX_SIDE for the measurement.
+    """
+    from stackd.toolbox import masks as _m
+    try:
+        w = int((job or {}).get("working_w") or 0) or 1024
+        h = int((job or {}).get("working_h") or 0) or 1024
+    except (TypeError, ValueError):
+        w = h = 1024          # a junk row is sized, not fatalised, at the handover
+    cw, ch = _m.fit_within(w, h, _m.RENDER_MAX_SIDE)
+    return cw, ch, (cw, ch) != (w, h)
+
+
 def comfy_render(job: dict, source: bytes, mask: bytes, *, on_prompt_id=None):
     """jobs.JobQueue render seam. Returns (artifact_png_b64, "image/png") after ALSO
     saving the result to the calling user's OWU (so the chat/standalone mounts have a
@@ -184,8 +204,15 @@ def comfy_render(job: dict, source: bytes, mask: bytes, *, on_prompt_id=None):
 
     email = (job or {}).get("email") or ""
     spec = (job or {}).get("spec") or {}
-    w = int((job or {}).get("working_w") or 0) or 1024
-    h = int((job or {}).get("working_h") or 0) or 1024
+    w, h, resized = render_size(job)
+    if resized:
+        # The row disagreed with the ceiling (it predates it, or the ceiling moved while
+        # the job sat in the queue). Rescale the mask GEOMETRICALLY-FREE — resize_canonical
+        # applies no grow/feather, because normalize_layers already applied each object's
+        # geometry exactly once and applying it twice is the double-grow bug this package
+        # has already fixed once. Source and mask must disagree by exactly nothing.
+        from stackd.toolbox import masks as _m
+        mask = _m.resize_canonical(mask, w, h)
     seed = int(spec.get("seed") if spec.get("seed") is not None else -1)
     if seed < 0:
         seed = uuid.uuid4().int % (2 ** 32 - 1)
@@ -346,17 +373,22 @@ def _norm_points(points):
 
 
 def _seg_size(source: bytes, max_side: int) -> tuple[int, int]:
-    """Working size for the segment graph: preserve aspect, cap the long side, round to 16
-    (the latent grid SAM3's decoder tolerates any size but 16 keeps the saved mask a clean
-    multiple like the rest of the pipeline)."""
+    """Working size for the segment graph — ONE rule with the render path, via
+    masks.fit_within (aspect preserved, long side capped, both sides on the 16-px grid,
+    min 64). The old body claimed "round to 16" in its docstring and never did it, so the
+    mask SAM3 returned could be a non-multiple of 16 while the render canvas was — the
+    browser resamples between the two, but agreement is free here and drift is not.
+
+    max_side deliberately defaults to 1024 in comfy_segment_click rather than following
+    masks.RENDER_MAX_SIDE: SAM3 resizes to 1008 internally, so a bigger upload buys
+    nothing at all and costs an upload plus a paid GPU step every single click.
+    """
     from stackd.toolbox import masks as _m
     w, h = _m.image_size(source)
     if w <= 0 or h <= 0:
         raise ValueError("image has no size")
-    s = max_side / float(max(w, h))
-    if s < 1.0:
-        w, h = int(round(w * s)), int(round(h * s))
-    return max(64, w), max(64, h)
+    return _m.fit_within(w, h, max_side)
+
 
 
 def _q(v: float) -> int:

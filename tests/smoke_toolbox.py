@@ -138,6 +138,15 @@ def rect_mask(size, box):
     return png_bytes("RGBA", size, f)
 
 
+def flat_png(size):
+    """A real PNG at `size` without a per-pixel loop: png_bytes on a 3.2 MP frame takes
+    longer than the assertions it feeds are worth, and a slow suite gets skipped."""
+    im = Image.new("RGB", size, (11, 22, 33))
+    buf = io.BytesIO()
+    im.save(buf, "PNG")
+    return buf.getvalue()
+
+
 def doodle_mask(size, box):
     """The shape a phone markup app exports: black canvas, WHITE box, no meaningful
     alpha — polarity must come from luminance here, not from alpha."""
@@ -868,10 +877,14 @@ def test_routes():
              {"mask_png": base64.b64encode(blank((640, 480))).decode()}, token=fresh_token())
     check("preview flags an empty mask loudly", r.payload["empty"] is True and "error" in r.payload)
 
+    # Sub-ceiling on purpose: this pins ROUND-TO-NEAREST grid rounding of the working
+    # canvas. The over-ceiling case (1030x770 and anything bigger is pulled down to
+    # masks.RENDER_MAX_SIDE) is pinned in test_working_size, where it belongs.
     r = post(tb, "/toolbox/mask/preview",
-             {"mask_png": MASK_B64, "spec": {"width": 1030, "height": 770}}, token=fresh_token())
+             {"mask_png": MASK_B64, "spec": {"width": 1010, "height": 770}}, token=fresh_token())
     check("preview resamples to 16-aligned working dims",
-          r.payload["info"]["size"] == [round(1030 / 16) * 16, round(770 / 16) * 16])
+          r.payload["info"]["size"] == [round(1010 / 16) * 16, round(770 / 16) * 16],
+          str(r.payload["info"]["size"]))
 
     r = post(tb, "/toolbox/mask/preview", {"mask_png": MASK_B64, "spec": {"invert": True}},
              token=fresh_token())
@@ -1288,6 +1301,7 @@ def main() -> int:
     test_spike_wiring()
     test_graphs()
     test_jobs()
+    test_working_size()
     bad = [(n, d) for n, ok, d in CHECKS if not ok]
     for n, d in bad:
         print(f"  FAIL  {n}" + (f"\n          → {d}" if d else ""))
@@ -1354,7 +1368,13 @@ def test_spike_wiring():
     #     purpose — there are two `im.onload` handlers in the editor and the boot one is the
     #     second, so a first-occurrence window looks at the wrong function entirely.
     check("editor reports height on a ladder, not once", "reportHeightSoon" in js and "1600" in js)
-    onload = js.rsplit("im.onload", 1)[1][:1200] if "im.onload" in js else ""
+    # Bounded STRUCTURALLY, not by a character budget: the boot handler is the last
+    # `im.onload` and the statement right after it is `im.onerror`. A fixed window had to be
+    # re-widened every time the onload body grew (a disclosure line about the render ceiling
+    # pushed reportHeightSoon() past 1200 once already), and a window that silently grows
+    # past its function is a window that eventually reads the wrong function again.
+    _tail = js.rsplit("im.onload", 1)[1] if "im.onload" in js else ""
+    onload = _tail.split("im.onerror", 1)[0]
     check("editor re-reports after the photo decodes", "reportHeightSoon()" in onload)
     check("probe reports content height AND viewport separately, so 'too tall' and 'frame too "
           "short' are distinguishable instead of both reading as 'scrollable'",
@@ -1722,6 +1742,179 @@ def test_jobs():
     loc = (f2.sent_headers or {}).get("location", "")
     check("launch with a verified identity 302s to the embed carrying a minted token",
           f2.status == 302 and loc.startswith("/toolbox/embed?token=v1."), loc)
+
+
+def test_working_size():
+    """The render ceiling: NOTHING is handed to a process above masks.RENDER_MAX_SIDE on
+    the long edge — not the browser's <img>, not the SAM3 segmenter, not the ComfyUI
+    upload. Measured reason in masks.py: a 2048x1584 Replace at 1.07% coverage sampled for
+    486 s on the resident iGPU and was still decoding when the 600 s client deadline fired,
+    so a finished render was reported to the user as an error.
+
+    Every assertion is RELATIVE to masks.RENDER_MAX_SIDE, never to the literal 1024, so an
+    operator who raises the ceiling with TOOLBOX_RENDER_MAX_SIDE cannot turn this suite red
+    for the wrong reason — what it pins is that all four handovers obey ONE number.
+    """
+    import io as _io
+    from stackd.toolbox import jobs as J
+
+    CEIL = M.RENDER_MAX_SIDE
+    BIG_SIDE = max(2048, CEIL * 2)                 # always over the ceiling, whatever it is
+    BIG = flat_png((BIG_SIDE, int(BIG_SIDE * 0.77)))
+    BIG_NAT = M.image_size(BIG)
+
+    # ---------------- fit_within: the sizing rule, pure math, no decoder ----------------
+    w, h = M.fit_within(BIG_SIDE, int(BIG_SIDE * 0.77), CEIL)
+    check("fit_within caps the long edge at the ceiling", max(w, h) <= CEIL, f"{w}x{h}")
+    check("fit_within keeps every side on the 16-px latent grid",
+          w % 16 == 0 and h % 16 == 0, f"{w}x{h}")
+    drift = abs((w / h) - 1.0 / 0.77) / (1.0 / 0.77)
+    check("fit_within preserves aspect to within a grid step", drift < 0.03, f"drift {drift:.3f}")
+    w2, h2 = M.fit_within(BIG_SIDE, BIG_SIDE, 1000)         # a deliberately unaligned cap
+    check("fit_within never exceeds an unaligned ceiling (rounding cannot push it back over)",
+          max(w2, h2) <= 1000 and w2 % 16 == 0 and h2 % 16 == 0, f"{w2}x{h2}")
+    check("fit_within leaves a photo that already fits at its own width",
+          M.fit_within(800, 608, CEIL)[0] == 800, str(M.fit_within(800, 608, CEIL)))
+    check("fit_within honours a ceiling below its own min-side floor",
+          M.fit_within(100, 80, 64) == (64, 64), str(M.fit_within(100, 80, 64)))
+    try:
+        M.fit_within(0, 500, CEIL)
+        zero_raised = False
+    except ValueError:
+        zero_raised = True
+    check("fit_within refuses a non-positive size loudly, not as a silent 0x0", zero_raised)
+
+    # ---------------- shrink_to_max_side: the one ingest resize of REAL pixels ----------
+    out, sz = M.shrink_to_max_side(BIG, CEIL)
+    dec = Image.open(_io.BytesIO(out))
+    check("shrink_to_max_side brings an oversized photo inside the ceiling",
+          max(sz) <= CEIL and dec.size == (sz[0], sz[1]), f"{sz} decodes {dec.size}")
+    check("shrink_to_max_side actually loses pixels (it resized, not just relabelled)",
+          out is not BIG and len(out) != len(BIG))
+    edge_in = flat_png((1030, 770))
+    _o3, sz3 = M.shrink_to_max_side(edge_in, CEIL)
+    check("shrink_to_max_side never grows either edge beyond the original",
+          sz3[0] <= 1030 and sz3[1] <= 770, f"1030x770 -> {sz3}")
+    # The real shape of the pre-fix bug, which "not bigger than the original" CANNOT see:
+    # grid-ROUNDING a 2048x1584 photo gives 1024x800 — smaller than the original, yet 8 rows
+    # ABOVE the proportional 792, i.e. invented detail, and toolbox edits chain so the next
+    # edit inherits it. Pinned at fixed numbers on purpose: this checks the resize RULE,
+    # not the configured ceiling, and 792 = 49*16 + 8 sits exactly on the floor/round seam.
+    round_probe = flat_png((2048, 1584))
+    _o5, sz5 = M.shrink_to_max_side(round_probe, 1024)
+    check("shrink_to_max_side FLOORS the short edge (2048x1584 -> 1024x784, not 1024x800)",
+          sz5 == (1024, 784), f"2048x1584 -> {sz5}; round-to-nearest gives (1024, 800)")
+    small = flat_png((800, 600))
+    _o4, sz4 = M.shrink_to_max_side(small, CEIL)
+    check("shrink_to_max_side hands back the SAME bytes for a photo already inside",
+          _o4 == small and sz4 == (800, 600), f"{sz4}")
+
+
+    # ---------------- the routes obey it, at every handover ---------------------------
+    class FakeWorker:
+        """Records exactly what the queue is handed, because THAT is what the GPU gets."""
+        def __init__(self):
+            self.store = J.JobStore(":memory:")
+            self.enqueued = []
+
+        def enqueue(self, job_id, *, source, mask):
+            self.enqueued.append((job_id, source, mask))
+
+    fw = FakeWorker()
+    tb_big = make_tb(source=lambda email, ref: BIG, worker=fw)
+    r = post(tb_big, "/toolbox/jobs",
+             # MASK_B64, not a 2048-wide mask: the server resamples the mask to the working
+             # size, so the mask's own pixel size is not what is under test here — and
+             # building one at 3.2 MP with the per-pixel fixture would cost seconds.
+             {"mask_png": MASK_B64,
+              "spec": {"kind": "replace", "width": BIG_SIDE, "height": int(BIG_SIDE * 0.77)}},
+             token=fresh_token())
+    check("job create caps what the CLIENT asked for (the old 4096-wide hole)",
+          r.status == 200 and max(r.payload["working_size"]) <= CEIL, str(r.payload))
+    enq_size = Image.open(_io.BytesIO(fw.enqueued[0][1])).size if fw.enqueued else None
+    check("job create caps what the PHOTO was, in the bytes it enqueues",
+          enq_size is not None and max(enq_size) <= CEIL, str(enq_size))
+    check("job create SAYS it shrank, and echoes the size it shrank from",
+          "auto-shrunk" in (r.payload.get("size_note") or "")
+          and r.payload.get("source_size") == list(BIG_NAT), str(r.payload.get("size_note")))
+    check("job create reports the ceiling it applied",
+          r.payload.get("max_side") == CEIL, str(r.payload.get("max_side")))
+
+    fw2 = FakeWorker()
+    tb_ok = make_tb(worker=fw2)                      # the default PHOTO is 640x480, inside
+    r2 = post(tb_ok, "/toolbox/jobs",
+              {"mask_png": MASK_B64, "spec": {"kind": "heal"}}, token=fresh_token())
+    check("a photo that already fits is NOT re-encoded or shrunk on the way to the queue",
+          fw2.enqueued and fw2.enqueued[0][1] == PHOTO,
+          str(len(fw2.enqueued[0][1]) if fw2.enqueued else None))
+    check("a photo that already fits gets no shrink notice",
+          r2.status == 200 and r2.payload.get("size_note") == "",
+          str(r2.payload.get("size_note")))
+
+    # The browser: the data: URI in the embed document IS the photo it paints and the
+    # reference the mask is drawn against, so an uncapped one costs four O(pixels) canvases.
+    emb = get(make_tb(source=lambda email, ref: BIG),
+              "/toolbox/embed?image_id=x", token=fresh_token())
+    mdoc = re.search(rb"window\.__TB__=(\{.*?\});</script>", emb.raw or b"", re.S)
+    cfg_j = json.loads(mdoc.group(1).decode()) if mdoc else {}
+    img_b64 = (cfg_j.get("image") or "").split(",", 1)[-1]
+    handed = Image.open(_io.BytesIO(base64.b64decode(img_b64))) if img_b64 else None
+    check("embed hands the browser the photo ALREADY inside the ceiling",
+          handed is not None and max(handed.size) <= CEIL,
+          str(handed.size if handed else None))
+    check("embed advertises the same ceiling it enforces (canvas and render cannot drift)",
+          cfg_j.get("max_side") == CEIL, str(cfg_j.get("max_side")))
+    check("the ceiling is ONE number read from masks, not re-hardcoded per route",
+          tb_api._masks is M and tb_api._masks.RENDER_MAX_SIDE == CEIL)
+
+
+    # ---------------- the belt at the actual handover to ComfyUI -----------------------
+    from stackd.toolbox import engine as E
+    cw, ch, capped = E.render_size({"working_w": BIG_SIDE, "working_h": int(BIG_SIDE * 0.77)})
+    check("engine caps a row that predates the ceiling, at the GPU handover",
+          max(cw, ch) <= CEIL and capped is True, f"{cw}x{ch}")
+    small_row = {"working_w": 640, "working_h": 480}
+    cw2, ch2, capped2 = E.render_size(small_row)
+    check("engine leaves an already-capped row exactly alone (a belt that always bites is a bug)",
+          capped2 is False and (cw2, ch2) == (640, 480), f"{cw2}x{ch2} capped={capped2}")
+    cw3, ch3, _c3 = E.render_size({"working_w": "junk", "working_h": None})
+    check("engine survives a junk row rather than throwing at the GPU",
+          max(cw3, ch3) <= CEIL and cw3 > 0 and ch3 > 0, f"{cw3}x{ch3}")
+
+    # A helper nobody calls is exactly the objSig()/tooltip class of unenforced promise this
+    # package keeps getting bitten by, so the WIRING is measured, in the comfy_render body
+    # only (a bare-name grep would also be satisfied by a comment or by the helper itself).
+    eng_src = (pathlib.Path(__file__).resolve().parent.parent
+               / "stackd" / "toolbox" / "engine.py").read_text()
+    cr_body = eng_src.split("def comfy_render", 1)[1].split("\ndef ", 1)[0]
+    check("the ceiling is WIRED: comfy_render actually calls render_size(job)",
+          "render_size(job)" in cr_body, "helper exists, nobody calls it")
+    check("when the belt bites, the mask is rescaled so source and mask cannot disagree",
+          "resize_canonical(" in cr_body, "mask would stay at the oversized dims")
+    check("comfy_render cannot fall back to reading the row size directly (render_size owns it)",
+          "working_w" not in cr_body, "an uncapped direct read of the row is back")
+
+    # resize_canonical must rescale WITHOUT re-applying geometry: normalize_layers already
+    # grew/feathered each object, and doing it twice is the double-grow bug fixed once.
+    src_mask = rect_mask((1024, 768), (300, 200, 700, 560))
+    frac_before = M.coverage(src_mask)
+    smaller = M.resize_canonical(src_mask, 512, 384)
+    frac_after = M.coverage(smaller)
+    check("resize_canonical rescales the mask to the size asked for",
+          Image.open(_io.BytesIO(smaller)).size == (512, 384),
+          str(Image.open(_io.BytesIO(smaller)).size))
+    # Tolerance is LANCZOS edge ringing, NOT slack for a morph: a re-applied grow/feather
+    # moves the perimeter by its radius, which at these sizes is >>2% of the canvas.
+    check("resize_canonical changes NOTHING but size (coverage fraction preserved)",
+          frac_before is not None and abs(frac_after - frac_before) < 0.02,
+          f"{frac_before:.5f} -> {frac_after:.5f}")
+    check("resize_canonical is a byte-for-byte no-op when the size already agrees",
+          M.resize_canonical(src_mask, 1024, 768) == src_mask)
+
+    # the segmenter shares the rule: its docstring claimed 16-alignment and did not do it
+    sw, sh = E._seg_size(BIG, 1024)
+    check("_seg_size puts the SAM3 mask on the same 16-px grid as the render",
+          sw % 16 == 0 and sh % 16 == 0 and max(sw, sh) <= 1024, f"{sw}x{sh}")
 
 
 if __name__ == "__main__":

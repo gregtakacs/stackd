@@ -174,12 +174,13 @@ have been marked selected (whole-frame fill — gated on `flat`); a whole-line `
 and annihilated a fully-selected erode (seed-aware `_dt1d`); `_layer_coverage` never bound `kind`
 (NameError on every auto/edge layer); and the new test's own `_selected` shadowed a module helper.
 
-**Validation status:** `py_compile` clean for `masks.py`/`engine.py`/`api.py`/`smoke_toolbox.py`.
-The offline suite ran once and its *only* failure was the `_selected` shadow (since fixed); a green
-re-run of `python3 tests/smoke_toolbox.py` (offline, incl. the new K2 disc/denoise/feather checks) and
-the browser suite (`/tmp/tbtest`) were **blocked by a harness command outage this session** and are the
-remaining gate. The container has **NOT** been re-synced — it still runs the previously-validated
-build, so no unvalidated kernel is live. Do `docker cp` + restart only after both suites are green.
+**Validation status (updated 2026-09-17, was "blocked"):** both suites are GREEN against
+this code and were re-run from a clean snapshot after the negative controls — offline
+`python3 tests/smoke_toolbox.py` (incl. the K2 disc/denoise/feather checks) and the
+`/tmp/tbtest` browser suite at 80/80. The harness command outage that blocked them last
+session did not recur. The work is committed as `8c7e945` and the container has been
+re-synced (`docker cp` + restart), md5-identical host↔container — but it is still
+**hot-patched, not built**, so `docker compose build stackd` would revert it (§1).
 
 
 **Still open (honest):** the human crosswalk-photo validation of the *whole* flow (click person →
@@ -188,19 +189,79 @@ slider live) — the automated suite proves the wire contract and the chrome rem
 should confirm the on-screen feel. SAM3 cold start, `/toolbox/launch` 403, dead compositing knobs,
 and the uncapped full-render path are unchanged from the list below.
 
+### 0B-follow-up-4 — the render ceiling: nothing above 1024 on the long edge reaches a process (2026-09-17)
+
+**Why, from a measurement, not a hunch.** Job `e35265c66c8bcce4` (greg@takacs.net, `replace`,
+"wet ashpalt matching the surrounding", **2048x1584, 1.07% coverage**) was handed to
+`comfyui-rocm` — the Strix Halo **Radeon 8060S** iGPU, resident because the CUDA card was
+full (sglang held 95.0/97.9 GiB, `cuda_vram pool 91.6/95.6 GiB`). Timeline from the container
+logs and the jobs DB: model swap +20 s, KSampler 6 steps **+486 s** (degrading 59→91 s/it as
+the APU thrashed its own unified pool), VAE + KJNodes composite +110 s = **616 s wall**, while
+`config.TIMEOUT_S` gave the client **600 s**. ComfyUI logged `execution_success` 16 s *after*
+we declared the job failed; the artifact (5.5 MB, valid 2048x1584 RGB) was rescued to
+`/tmp/toolbox_e35265c66c8bcce4.png` and never reached the user's OWU library, because
+`save_image()` sits behind `wait_and_fetch()` in `_run()`. The identical graph on
+`comfyui-cuda` (jobs `fafcf4a7`, `f54bde13`, `d8b446bb`) finished in 76–156 s.
+
+**The change: one ceiling, enforced at every handover.** `masks.RENDER_MAX_SIDE` (default
+1024, override with `TOOLBOX_RENDER_MAX_SIDE`) is now applied by:
+
+| Handover | Enforcement |
+|---|---|
+| the browser's `<img>` | `api._ingest_source()` → `masks.shrink_to_max_side()`; `/toolbox/embed` and `/toolbox/source.png` carry the ALREADY-shrunk photo, and the cfg now advertises the real ceiling (`max_side`), which the editor's canvas maths already obeyed |
+| the mask / working size | `api._dims()` — `fit_within()` replaces the old per-side `min(4096, round16(v))`, which is how a 3.24 MP job (and potentially 4096x4096) ever reached the graph at all |
+| ComfyUI (render) | `engine.render_size(job)` at the top of `comfy_render`, plus `masks.resize_canonical()` so the mask follows the size we actually run at |
+| ComfyUI (SAM3 click) | `engine._seg_size()` now shares `fit_within` — its docstring claimed 16-alignment and its body never did it |
+
+Three deliberate decisions, each with a test that can go red:
+- **Downscale only.** `shrink_to_max_side` returns the SAME bytes for a photo already inside
+  the cap — no PNG re-encode, and no grid-rounding an 800x600 photo *up* to 800x608. Edits
+  chain (the artifact becomes the next source), so invented detail is permanent.
+- **Floor, never round, when resampling pixels.** `fit_within` keeps round-to-nearest (it
+  sizes the working canvas, and must keep matching the editor's own maths); the pixel
+  resample floors, because rounding 2048x1584→1024x800 invents 8 rows over the proportional
+  792. A weaker "not bigger than the original" assertion passes on BOTH — that trap was hit
+  while writing the control, and the check now pins `(1024, 784)` exactly.
+- **Say so.** `/toolbox/jobs` returns `working_size`, `source_size`, `max_side` and a
+  `size_note` ("input auto-shrunk from 2048x1584 to 1024x784…"), and the editor's Ready
+  line states the ceiling. A silent half-size render reads as a defect.
+
+**Verified:** offline **366/366** (27 new checks, incl. three that pin the *wiring* —
+`comfy_render` must actually call `render_size(job)` and `resize_canonical`, since a helper
+nobody calls is the same class of unenforced promise as `objSig()` and the shortcut
+tooltips). Browser suite **80/80** unchanged. Six negative controls, each reintroducing the
+exact pre-fix line, and the red counts they produce: A `_dims` uncapped → 1; B ingest-resize
+skipped → 2; C pixel-resample rounds up → 1 (shows `1024, 800`); D `_seg_size` off-grid → 1
+(shows `1024x788`); E belt unwired → 2; F passthrough removed → 4 (a 640x480 photo gets
+*upscaled* to 1024x768).
+
+**Known consequence, not yet fixed — the resolution ratchet.** The artifact is now ≤1024 on
+its long edge and is saved to the user's OWU library, where it becomes the next edit's
+source, so repeated edits permanently lose resolution. The honest fix is the compositing
+pass §1B/§6 already owes: render the crop small, upscale it back and paste over the
+full-resolution source server-side (which also finally gives `blend_mode`/`opacity`/
+`color_match`/`preserve_detail` something to do). Until then, do not chain more than a couple
+of edits on one photo.
+
+**Still open from the same incident:** `TIMEOUT_S=600` is ONE global shared with the MCP
+chat image-gen tools and is still under the worst-case toolbox render; on timeout we do not
+`/interrupt` (only cancel does), so the GPU keeps burning for the remainder, and we do not
+re-poll `/history/<prompt_id>` before declaring `error` even though `prompt_id` is persisted
+at submit — the 16-second miss that lost a finished render is a 5-line fix waiting on a
+`TOOLBOX_RENDER_TIMEOUT_S` decision.
+
 ---
 
 ## 1. Do first — the two that can silently lose work
 
-### Commit the toolbox
-Nothing in the toolbox is committed. `git status` shows `?? stackd/toolbox/` (the whole
-module, including `masks.py`, `api.py`, `engine.py`, `jobs.py`, `web/toolbox.js`,
-`web/toolbox.css`) plus modified `stackd/serve.py`, `stackd/cli.py`, `pyproject.toml`,
-`deploy/.env.example`, `deploy/docker-compose.yml`, and new `tests/smoke_toolbox.py`,
-`tests/verify_all.py`, `tests/check_serve_live.py`.
-
-This is a full feature sitting in the working tree with no history. Any `git clean -fd`
-or branch switch with discard destroys it.
+### Commit the toolbox — DONE 2026-09-17, one risk remains
+This section used to read "Nothing in the toolbox is committed" (`?? stackd/toolbox/`, a
+whole feature one `git clean -fd` from deletion). That is no longer true: the toolbox is
+`45b6812..8c7e945` on `feat/comfy-toolbox` (5-6 commits ahead of `main`), and the
+smart-select geometry pass is `8c7e945`. **What is still unpushed is the branch itself** —
+`git rev-parse --abbrev-ref feat/comfy-toolbox@{u}` reports *no upstream configured*, so
+every one of those commits exists only in this working copy. `git push -u origin
+feat/comfy-toolbox` is the remaining half of "don't lose the work".
 
 ### Rebuild the running image
 `stackd` is running a **hot-patched** container: the current `masks.py`, `api.py`,

@@ -47,7 +47,10 @@ MILESTONE = "M0-passed"
 MAX_MASK_BYTES = 24 * 1024 * 1024      # a 4MP RGBA PNG is 2-6 MB; headroom, not an expected ceiling
 
 MAX_BODY_BYTES = 32 * 1024 * 1024
-MAX_SIDE = 2048                        # mirrors workflows.MAX_SIDE; the editor caps its canvas the same way
+# (retired) MAX_SIDE = 2048 — the editor used to be told 2048 and the server used to accept
+# anything up to 4096 from the client. Both were wrong for the engine that is actually
+# resident; the one ceiling now lives in masks.RENDER_MAX_SIDE and is enforced by
+# masks.fit_within() at every handover (see api._dims / api._ingest_source / engine).
 
 # VISIBLE DEBT — now PAID. Job creation redeems the launch token single-use, so a leaked
 # launch token cannot be replayed to mint unlimited GPU jobs (the point of the token per the
@@ -284,24 +287,70 @@ class Toolbox:
             raise ValueError("the source image could not be found for this user")
         return data
 
+    def _ingest_source(self, email, body, query):
+        """Resolve the photo AND bring it inside the render ceiling, in one step, so no
+        handover — the browser's <img>, the SAM3 segmenter, the ComfyUI upload, the no-GPU
+        preview overlay — can be reached by a code path that simply forgot to resize.
+        See masks.RENDER_MAX_SIDE for the measurement behind the number.
+
+        Returns (bytes, size_after, size_before). "before" is carried because the editor
+        has to be able to tell the user WHAT IT DID — a photo that quietly comes back at
+        half resolution looks like a defect, not a policy.
+
+        Fails OPEN on a pillow-less host or an undecodable photo: without a decoder we
+        cannot resize, and handing the raw bytes through is strictly better than breaking
+        the editor — the render routes already fail closed on no-PIL separately, so nothing
+        unverified reaches the GPU.
+        """
+        data = self._source_bytes(email, body, query)
+        if not data or not _masks.HAS_PIL:
+            return data, (0, 0), (0, 0)
+        try:
+            out, size = _masks.shrink_to_max_side(data, _masks.RENDER_MAX_SIDE)
+            return out, size, _masks.image_size(data)
+        except Exception as e:  # noqa: BLE001 — a resize failure must not sink the request
+            self._note(f"toolbox: source not resized on ingest ({e.__class__.__name__}: {e})")
+            return data, (0, 0), (0, 0)
+
+    def _size_note(self, spec, w, h):
+        """Say out loud when the requested size was NOT what we run. A render that quietly
+        comes back smaller than the photo the user loaded looks like a bug; the same
+        render with a stated reason looks like the design it is."""
+        try:
+            rw, rh = int(spec.get("width") or 0), int(spec.get("height") or 0)
+        except (TypeError, ValueError):
+            rw = rh = 0
+        if rw <= w and rh <= h:
+            return ""
+        return (f"input auto-shrunk from {rw}x{rh} to {w}x{h}: the long edge is capped at "
+                f"{_masks.RENDER_MAX_SIDE}px for the image engine that is resident "
+                f"(set TOOLBOX_RENDER_MAX_SIDE to raise it)")
+
     def _dims(self, spec, source_bytes):
         """Working dims for the mask resample. The client's numbers are a REQUEST, never
         truth: masks.normalize() resamples to whatever the job actually submits to
-        ComfyUI, so disagreement here costs quality, not correctness."""
+        ComfyUI, so disagreement here costs quality, not correctness.
+
+        THE RENDER CEILING LIVES HERE. Every route that sizes work (embed document, mask
+        preview, job create) comes through this one function, so a client that asks for
+        4096x4096 — or an older cached editor that still asks for 2048 — gets the ceiling
+        instead, and the mask, the source and the graph's width/height nodes are all
+        derived from the same number. engine.comfy_render re-applies it as a belt at the
+        actual handover, for rows created before a cap change."""
         try:
             w, h = int(spec.get("width") or 0), int(spec.get("height") or 0)
         except (TypeError, ValueError):
             w = h = 0
         if w > 0 and h > 0:
-            def q(v):   # workflows._round16: the latent grid the mask eventually feeds
-                return max(64, min(4096, int(round(v / 16.0)) * 16))
-            return q(w), q(h)
+            return _masks.fit_within(w, h, _masks.RENDER_MAX_SIDE)
         if _masks.HAS_PIL:
             try:
-                return _masks.image_size(source_bytes)
+                return _masks.fit_within(*_masks.image_size(source_bytes),
+                                         _masks.RENDER_MAX_SIDE)
             except Exception:  # noqa: BLE001 — fall through to the safe default
                 pass
-        return 1024, 1024
+        return _masks.fit_within(1024, 1024, _masks.RENDER_MAX_SIDE)
+
 
     def _engine_up(self):
         if self._image_engine_up is None:
@@ -493,7 +542,11 @@ class Toolbox:
         probe = self.spike_enabled and (query.get("probe") or "") in ("1", "true", "yes")
         spec = {"width": 0, "height": 0}
         try:
-            source = self._source_bytes(email, {}, query)
+            # Ingest resize, not display resize: the photo the browser is handed is the
+            # same bytes the mask will be normalised against and the same size the graph
+            # runs at. Handing a 3000x4000 original to an iframe only moves the cost, and
+            # the editor's per-stroke morph is O(pixels) in JavaScript.
+            source, _after, before = self._ingest_source(email, {}, query)
         except ValueError:
             # A mount without a resolvable photo is still a valid document to load: the
             # editor itself reports "no source image was handed to the editor", which is
@@ -505,8 +558,14 @@ class Toolbox:
             "token": self._token_from(http, query),
             "image": ("data:image/png;base64," + base64.b64encode(source).decode()) if source else None,
             "image_id": query.get("image_id") or query.get("source_ref") or "",
-            "max_side": MAX_SIDE,
+            # The canvas ceiling the EDITOR must obey, which is now the same number the
+            # server renders at (it used to advertise workflows.MAX_SIDE=2048 while the
+            # engine choked on it). masks.RENDER_MAX_SIDE is the single source of truth.
+            "max_side": _masks.RENDER_MAX_SIDE,
+            "working_size": [w, h],
+            "size_note": self._size_note({"width": before[0], "height": before[1]}, w, h),
         }
+
         http._send_bytes(200, _web.embed_document(cfg, title="Comfy Toolbox",
                                                   probe=probe).encode("utf-8"),
                          "text/html", cache_s=0)
@@ -516,7 +575,9 @@ class Toolbox:
         never uses this route (its document carries a data: URI), which is exactly why the
         route is auth-checked the same way anyway."""
         email = self._identity(http, query, single_use=False)
-        data = self._source_bytes(email, {}, query)
+        # Same ingest ceiling as the embed document, so panel A of the harness shows the
+        # user the pixels their edit will actually run against, not the original.
+        data, _, _ = self._ingest_source(email, {}, query)
         http._send_bytes(200, data, "image/png", cache_s=60)
 
     # ---------------- transport probe ----------------
@@ -556,7 +617,9 @@ class Toolbox:
         layers = self._layers_from(body)
         mask = None if layers else self._mask_from(body)
         try:
-            source = self._source_bytes(email, body, {})
+            # The overlay must be tinted from the SAME bytes the render will use, or the
+            # preview approves a photo the GPU never sees (masks.RENDER_MAX_SIDE).
+            source, _, _ = self._ingest_source(email, body, {})
         except ValueError as e:
             source = None
             self._note(f"preview without source for {email}: {e}")
@@ -631,7 +694,7 @@ class Toolbox:
                                            "instead", "reason": "no_image_engine"},
                             self._cors())
             return
-        source = self._source_bytes(email, body, {})
+        source, _, _ = self._ingest_source(email, body, {})
         res = self._segmenter(source, text, float(body.get("threshold") or 0.4))
         mask_png, info = res if isinstance(res, tuple) else (None, res)
         if not mask_png:
@@ -676,7 +739,7 @@ class Toolbox:
                                            "instead", "reason": "no_image_engine"},
                             self._cors())
             return
-        source = self._source_bytes(email, body, {})
+        source, _, _ = self._ingest_source(email, body, {})
         try:
             threshold = float(body.get("threshold") or 0.5)
         except (TypeError, ValueError):
@@ -729,7 +792,11 @@ class Toolbox:
         # they cannot drift apart. If this ever disagrees with the preview, fix it there.
         layers = self._layers_from(body)
         mask = None if layers else self._mask_from(body)
-        source = self._source_bytes(email, body, {})
+        # The bytes we enqueue ARE the bytes the graph runs at, so the "10 minutes on the
+        # iGPU" failure mode cannot be reached by a photo that arrived bigger than the
+        # resident engine can afford (masks.RENDER_MAX_SIDE). Normalising the mask against
+        # these same bytes is what keeps preview and render in agreement.
+        source, _after, before = self._ingest_source(email, body, {})
         w, h = self._dims(spec, source)
         if layers:
             canon, info = _masks.normalize_layers(layers, w, h,
@@ -767,6 +834,14 @@ class Toolbox:
         http._send_json(200, {
             "ok": True, "job_id": job_id, "state": "queued", "seed": seed,
             "email": email, "mask": info, "working_size": [w, h],
+            # Honest about the ceiling: the size we run is reported, and if it is smaller
+            # than the photo the user loaded, WHY. "It came back at half the size" is only
+            # a bug when nobody says so.
+            "max_side": _masks.RENDER_MAX_SIDE,
+            "source_size": list(before) if before and before[0] else None,
+            "size_note": self._size_note(
+                {"width": max(before[0], _as_int(spec.get("width"), 0)),
+                 "height": max(before[1], _as_int(spec.get("height"), 0))}, w, h),
             # Echoed whole. kind/prompt/strength/opacity/blend_mode/color_match/
             # preserve_detail/variants are the graph knobs; returning them verbatim means a
             # refactor that silently drops one shows up as a diff here (test_contract).

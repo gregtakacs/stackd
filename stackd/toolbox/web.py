@@ -77,8 +77,10 @@ def embed_document(cfg: dict, *, title: str = "Comfy Toolbox", probe: bool = Fal
     the field contract): api (absolute base of the /toolbox endpoints), token (launch
     HMAC token — a header on every call, never a cookie), image (a data: URI of the
     source photo, inlined server-side precisely so the opaque-origin iframe never needs
-    the user's Open WebUI session to fetch it), source_ref/image_id (what to render),
-    root, max_side.
+    the user's Open WebUI session to fetch it — AND already inside the render ceiling, so
+    the iframe never has to downscale a photo the engine could not afford),
+    source_ref/image_id (what to render), root, max_side (the ceiling itself, from
+    masks.RENDER_MAX_SIDE), working_size, size_note.
 
     `probe=True` appends the M0 instrumentation (web/probe.js). It is reachable only from
     the spike route; a real mount must never ship it.
