@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import signal
 import threading
 import time
@@ -1176,17 +1177,20 @@ class _Handler(BaseHTTPRequestHandler):
         # non-deterministic first attempt already sent). Applies to every
         # client that declares `tools`, OpenWebUI included — the buffering
         # window is now just the tool call itself, not the whole response.
+        # `declared_tools` also lets the gate recover a call the model leaked into
+        # plain content under a hallucinated name (see _extract_leaked_toolcall).
         toolcall_safe_model = (
             body.get("model") if (self.path.endswith("chat/completions")
                                    and isinstance(body.get("tools"), list)
                                    and len(body["tools"]) > 0) else None)
+        declared_tools = body.get("tools") if toolcall_safe_model else None
         on_chunk = (lambda: _inflight_tick(rr.stack, inflight_rid)) if inflight_rid is not None else None
         try:
             self._relay(rr.endpoint.rstrip("/") + self.path, "POST",
                         json.dumps(body).encode(), streaming=streaming, on_body=_on_body,
                         inject_timings=_INJECT_TIMINGS and not is_embeddings,
                         alias_token_ids=not is_embeddings, on_chunk=on_chunk,
-                        toolcall_safe_model=toolcall_safe_model)
+                        toolcall_safe_model=toolcall_safe_model, declared_tools=declared_tools)
         finally:
             # Safety net: on_body (above) is the normal finish path, but a couple of
             # _relay's error branches (upstream unreachable/timeout) return without
@@ -1364,7 +1368,8 @@ class _Handler(BaseHTTPRequestHandler):
     # -- reverse proxy ----------------------------------------------------------------
     def _relay(self, url: str, method: str, body: bytes | None, *, streaming: bool,
                on_body=None, inject_timings: bool = False, alias_token_ids: bool = False,
-               on_chunk=None, toolcall_safe_model: str | None = None):
+               on_chunk=None, toolcall_safe_model: str | None = None,
+               declared_tools: list | None = None):
         """Forward one request upstream and relay the response. `streaming` chunk-
         relays a response with no content-length (SSE); otherwise buffers and sends
         with a real content-length. `on_body(bytes, status)` gets the full response
@@ -1396,7 +1401,10 @@ class _Handler(BaseHTTPRequestHandler):
 
         `toolcall_safe_model` (chat/completions only): when set (to the model name,
         for event-log labeling), gate a tool call through _ToolCallGate instead of
-        relaying it live — see that class for the hold/flush/swallow behavior."""
+        relaying it live — see that class for the hold/flush/swallow behavior.
+        `declared_tools` (the request's own `tools` list) rides along so the gate can
+        recover a call the model leaked into plain content under a name that isn't
+        declared — see _extract_leaked_toolcall."""
         fwd_ct = self.headers.get("content-type", "application/json")
         req = urllib.request.Request(
             url, data=body, method=method,
@@ -1445,7 +1453,7 @@ class _Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 lb = b""            # line buffer — relay whole SSE events (\n\n-delimited)
                 usage_merged = False
-                gate = _ToolCallGate(toolcall_safe_model) if toolcall_safe_model else None
+                gate = _ToolCallGate(toolcall_safe_model, declared_tools) if toolcall_safe_model else None
                 while True:
                     chunk = up.read(8192)
                     if not chunk:
@@ -1477,7 +1485,7 @@ class _Handler(BaseHTTPRequestHandler):
                 data = up.read()
                 _tee(data)
                 if toolcall_safe_model:
-                    data = _sanitize_toolcall_body(data, toolcall_safe_model) or data
+                    data = _sanitize_toolcall_body(data, toolcall_safe_model, declared_tools) or data
                 if inject_timings:
                     data = _inject_body_timings(data, t0, time.monotonic()) or data
                 if alias_token_ids:
@@ -1543,6 +1551,62 @@ def _extract_usage(buf: bytes) -> dict:
 # tokens), so there is no bigger number left to ask for on a second attempt, and a
 # second generation could not safely replace content already streamed to the client
 # anyway (SSE is append-only, and generation is not deterministic run to run).
+
+
+# --- recovering a call the model leaked into plain content -------------------------
+# Qwen3.8-Flash-Next (native qwen3_coder XML format) occasionally hallucinates a tool
+# name close to but not exactly one of the declared tools — "edit" for "editor",
+# "run_files" for "read_files" (blending it with "run_commands") — both observed live
+# via Cline. SGLang's own qwen3_coder detector *does* parse the <tool_call><function=
+# ...> structure, but by design (see the phantom-tool-call fix, qwen3-coder-streaming-
+# phantom-toolcall era) drops any call whose name isn't in the declared list rather
+# than emitting it — correct behavior for genuine garbage/quoted examples, but it means
+# a well-formed near-miss just falls through as inert visible text instead of a
+# tool_calls entry, and the turn is lost. _extract_leaked_toolcall re-parses that raw
+# text stackd already has in hand and, if the leaked call's PARAMETER NAMES uniquely
+# match exactly one declared tool's schema (shape, not name — the hallucinated name is
+# never trusted), rebuilds it as that tool's real call. Deliberately conservative:
+# ambiguous (zero or multiple candidate matches) recovers nothing, same as an
+# unrecoverable truncation.
+_LEAKED_CALL_RE = re.compile(
+    r"<tool_call>\s*<function=([^>]+)>(.*?)</function>\s*</tool_call>", re.DOTALL)
+_LEAKED_PARAM_RE = re.compile(r"<parameter=([^>]+)>\n?(.*?)\n?</parameter>", re.DOTALL)
+
+
+def _extract_leaked_toolcall(content: str, tools: list) -> dict | None:
+    """Scan `content` (plain assistant text) for one leaked <tool_call> block and try
+    to recover it against `tools` (the request's own declared tools list). Returns
+    ``{"name": ..., "arguments": {...}}`` or None — never raises."""
+    if not content or "<tool_call" not in content:
+        return None
+    m = _LEAKED_CALL_RE.search(content)
+    if not m:
+        return None
+    leaked_name = m.group(1).strip()
+    params: dict = {}
+    for pm in _LEAKED_PARAM_RE.finditer(m.group(2)):
+        key = pm.group(1).strip()
+        raw = pm.group(2).strip()
+        try:
+            params[key] = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            params[key] = raw
+    if not params:
+        return None
+    fns = [(t.get("function") or {}) for t in (tools or []) if isinstance(t, dict)]
+    # exact name match: the tag itself was fine, something else (thinking-state
+    # confusion, a stray character) kept SGLang from emitting it natively.
+    if leaked_name in {fn.get("name") for fn in fns}:
+        return {"name": leaked_name, "arguments": params}
+    # otherwise: the name is hallucinated -- trust the parameter SHAPE instead.
+    keys = set(params.keys())
+    candidates = [
+        fn["name"] for fn in fns
+        if fn.get("name") and keys <= set(((fn.get("parameters") or {}).get("properties") or {}).keys())
+    ]
+    if len(candidates) != 1:
+        return None
+    return {"name": candidates[0], "arguments": params}
 
 
 def _toolcall_args_self_wrapped(name: str | None, parsed) -> bool:
@@ -1659,25 +1723,37 @@ def _clean_toolcall_finish(doc: dict) -> dict:
 
 class _ToolCallGate:
     """Per-response streaming state machine for one tools-declaring chat/completions
-    call. Passes SSE events through live until the first delta carrying `tool_calls`
-    appears, then holds every event from that point on — nothing about the call reaches
-    the client until it's known to be whole. At the terminal (finish_reason-bearing)
-    event: if the held tool call closed with valid JSON, flush everything held, in
-    order, as if it had streamed normally (just delayed by however long the call itself
-    took to generate). If it didn't — cut off by the output limit, or invalid for any
-    other reason — discard everything held and emit one synthetic _clean_toolcall_finish
-    event instead. Either way, events after the decision (a trailing `usage` chunk,
-    `[DONE]`) relay live again untouched; nothing about them needed to be buffered.
+    call. Passes SSE events through live until either the first delta carrying
+    `tool_calls` appears, OR the accumulated content starts looking like a leaked
+    `<tool_call` tag (see _extract_leaked_toolcall) — whichever comes first — then
+    holds every event from that point on — nothing about the call reaches the client
+    until it's known to be whole. At the terminal (finish_reason-bearing) event: if a
+    held NATIVE tool call closed with valid JSON, flush everything held, in order, as
+    if it had streamed normally (just delayed by however long the call itself took to
+    generate). If it didn't — cut off by the output limit, or invalid for any other
+    reason — discard everything held and emit one synthetic _clean_toolcall_finish
+    event instead. If there was no native tool call at all, try to recover a leaked one
+    from the held content before falling back to flushing it as plain text. Either
+    way, events after the decision (a trailing `usage` chunk, `[DONE]`) relay live
+    again untouched; nothing about them needed to be buffered.
+
+    Note the tradeoff on the content-leak trigger: once `<tool_call` appears anywhere
+    in the accumulated content, the REST of that response is held to the end rather
+    than streamed live token-by-token — a real turn ends up delayed instead of typed
+    out live if it merely mentions the tag in prose without it ever closing. Bounded to
+    that one turn, and correctness (catching the leak) wins over live-typing feel here.
 
     Also logs (without altering anything) the sibling failure mode this same terminal
     event can reveal: reasoning alone ran the whole budget out before any tool call
     began, so there was never anything to hold in the first place."""
 
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str, tools: list | None = None):
         self.model_name = model_name
+        self.tools = tools or []
         self.holding = False
         self.resolved = False
         self.pending: list[bytes] = []
+        self.content_seen = ""
 
     def handle(self, evt: bytes) -> tuple[bytes, ...]:
         """Feed one raw `\\n\\n`-terminated SSE event. Returns the events to relay to
@@ -1697,11 +1773,15 @@ class _ToolCallGate:
             for ch in (doc.get("choices") or []):
                 if not isinstance(ch, dict):
                     continue
-                if (ch.get("delta") or {}).get("tool_calls"):
+                delta = ch.get("delta") or {}
+                if delta.get("tool_calls"):
                     has_tc = True
+                if delta.get("content"):
+                    self.content_seen += delta["content"]
                 if ch.get("finish_reason"):
                     finish_reason = ch["finish_reason"]
-        if not self.holding and not has_tc:
+        leaking = "<tool_call" in self.content_seen
+        if not self.holding and not has_tc and not leaking:
             if finish_reason == "length":
                 events.record("toolcall-unstarted-length", stack=self.model_name,
                               detail="hit the output limit before any tool call began")
@@ -1717,18 +1797,55 @@ class _ToolCallGate:
             events.record("toolcall-swallowed", stack=self.model_name,
                           detail=f"finish_reason={finish_reason}")
             return (b"data: " + json.dumps(_clean_toolcall_finish(doc)).encode() + b"\n\n",)
+        if not has:
+            recovered = _extract_leaked_toolcall(self.content_seen, self.tools)
+            if recovered:
+                events.record("toolcall-recovered", stack=self.model_name,
+                              detail=f"leaked as content, corrected name={recovered['name']}")
+                synth = _clean_toolcall_finish(doc)
+                synth["choices"][0]["finish_reason"] = "tool_calls"
+                synth["choices"][0]["delta"] = {"tool_calls": [{
+                    "index": 0,
+                    "id": "call_recovered_" + hashlib.sha1(self.content_seen.encode()).hexdigest()[:12],
+                    "type": "function",
+                    "function": {"name": recovered["name"],
+                                 "arguments": json.dumps(recovered["arguments"])},
+                }]}
+                return (b"data: " + json.dumps(synth).encode() + b"\n\n",)
         return tuple(held)
 
 
-def _sanitize_toolcall_body(data: bytes, model_name: str) -> bytes | None:
+def _sanitize_toolcall_body(data: bytes, model_name: str, tools: list | None = None) -> bytes | None:
     """Non-streamed counterpart to _ToolCallGate: if the (already complete, in hand)
     response has a tool call that never became valid JSON, OR parsed into a self-
     wrapped envelope (see _toolcall_args_self_wrapped), log it and return a rewritten
     body with tool_calls cleared and finish_reason forced to "length" instead of
     forwarding the broken call. Also logs the reasoning-ran-out-the-budget sibling
-    case, unchanged. None if nothing needs to change."""
+    case, unchanged. If there's no tool call at all, try to recover one leaked into
+    plain `message.content` under a hallucinated name (see _extract_leaked_toolcall)
+    before giving up. None if nothing needs to change."""
     has, finish, bad = _completion_toolcall_state(data)
     if not has:
+        try:
+            doc = json.loads(data)
+            content = ((doc.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+        except (json.JSONDecodeError, ValueError, TypeError, IndexError, AttributeError):
+            doc, content = None, ""
+        recovered = _extract_leaked_toolcall(content, tools or []) if content else None
+        if recovered and isinstance(doc, dict) and isinstance(doc.get("choices"), list):
+            events.record("toolcall-recovered", stack=model_name,
+                          detail=f"non-streamed, corrected name={recovered['name']}")
+            for ch in doc["choices"]:
+                if isinstance(ch, dict) and isinstance(ch.get("message"), dict):
+                    ch["message"]["content"] = ""
+                    ch["message"]["tool_calls"] = [{
+                        "id": "call_recovered_" + hashlib.sha1(content.encode()).hexdigest()[:12],
+                        "type": "function",
+                        "function": {"name": recovered["name"],
+                                     "arguments": json.dumps(recovered["arguments"])},
+                    }]
+                    ch["finish_reason"] = "tool_calls"
+            return json.dumps(doc).encode()
         if "length" in finish:
             events.record("toolcall-unstarted-length", stack=model_name,
                           detail="hit the output limit before any tool call began")
