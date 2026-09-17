@@ -2479,6 +2479,7 @@ def serve(mgr: Manager, host: str, port: int, api_key: str | None,
             secret=tb_secret, spike_enabled=False,
             source=_tb_engine.make_source(),
             image_engine_up=_tb_engine.image_engine_up,
+            click_segmenter=_tb_engine.comfy_segment_click,
             worker=jobs_q, prewarm=_tb_engine.prewarm_edit,
             logger=logging.getLogger("stackd.toolbox"),
         )

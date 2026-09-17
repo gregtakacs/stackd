@@ -31,6 +31,7 @@ a job whose mask nobody inspected.
 from __future__ import annotations
 
 import io
+import math
 
 try:
     from PIL import Image, ImageChops, ImageFilter
@@ -161,6 +162,217 @@ def _morph(cov: "Image.Image", px: int, *, grow: bool) -> "Image.Image":
     for _ in range(px):
         cov = cov.filter(f)
     return cov
+# ---------------------------------------------------------------------------------
+# Circular (Euclidean) morphology, connected-component denoise, outward feather.
+#
+# For the SMART-SELECT ('auto') objects ONLY -- the square `_morph` above stays for
+# shape/brush/legacy (a web of byte-exact tests pins its composition identity). A square
+# structuring element is precisely why a grown smart-select turns into a SQUARE (a lone
+# pixel dilated by r=6 becomes 169 px, not a disc's ~113). A true binary disc is built with
+# a separable squared-EUCLIDEAN DISTANCE TRANSFORM (Felzenszwalb-Huttenlocher): on inside
+# the disc of radius r grown from the selection iff distance-to-nearest-selected <= r. Two
+# linear-time 1-D lower-envelope passes, O(area), no numpy/scipy (container ships neither).
+# A Gaussian can NOT do this: it ERASES thin masks (a lone pixel blurred at sigma 0.6 then
+# thresholded at 128 -> 0 px) -- the same reason the old symmetric feather shrank objects.
+# ---------------------------------------------------------------------------------
+_INF = float("inf")
+DISK_CAP = 2048     # hard bound on the EDT grid's long side; bigger inputs morph at this
+                    # scale and composite back, so a 4 MP preview cannot hang the UI.
+
+
+def _dt1d(f):
+    """1-D squared-distance transform: D[q] = min_p((q-p)^2 + f[p]), via the parabola lower
+    envelope. f holds 0.0 at seeds and _INF elsewhere (or a prior pass's distances). Only
+    FINITE f entries are seeds; a whole-line of _INF returns _INF (no seed -> distance is
+    unbounded), which is what keeps a fully-selected auto mask from annihilating on erode."""
+    n = len(f)
+    if n == 0:
+        return []
+    INF = _INF
+    v = [0] * n
+    z = [0.0] * (n + 1)
+    d = [INF] * n
+    k = -1                                   # no parabola yet
+    for q in range(n):
+        if f[q] >= INF:                      # not a seed: contributes no parabola
+            continue
+        if k < 0:                            # first seed becomes the initial parabola
+            k = 0
+            v[0] = q
+            z[0] = -INF
+            z[1] = INF
+            continue
+        fq = f[q]
+        while True:
+            vk = v[k]
+            s = ((q * q + fq) - (vk * vk + f[vk])) / (2.0 * (q - vk))
+            if s > z[k]:
+                break
+            k -= 1
+        k += 1
+        v[k] = q
+        z[k] = s
+        z[k + 1] = INF
+    if k < 0:
+        return d                             # the whole line is _INF: distance unbounded
+    kk = 0
+    for q in range(n):
+        while z[kk + 1] < q:
+            kk += 1
+        dq = q - v[kk]
+        d[q] = dq * dq + f[v[kk]]
+    return d
+
+
+def _edt(on_rows, w, h):
+    """Exact squared Euclidean distance-to-nearest-selected over an h x w bool grid."""
+    INF = _INF
+    tmp = [[0.0] * h for _ in range(w)]
+    for x in range(w):
+        col = [0.0 if on_rows[y][x] else INF for y in range(h)]
+        dc = _dt1d(col)
+        for y in range(h):
+            tmp[x][y] = dc[y]
+    out = [[0.0] * w for _ in range(h)]
+    for y in range(h):
+        row = [tmp[x][y] for x in range(w)]
+        dr = _dt1d(row)
+        for x in range(w):
+            out[y][x] = dr[x]
+    return out
+
+
+def _on_rows(cov, w, h):
+    px = list(cov.getdata())
+    t = COVERAGE_BRIGHTNESS_THRESHOLD
+    return [[px[y * w + x] > t for x in range(w)] for y in range(h)]
+
+
+def _rows_to_image(rows_bool, w, h):
+    im = Image.new("L", (w, h), 0)
+    p = im.load()
+    for y in range(h):
+        r = rows_bool[y]
+        for x in range(w):
+            p[x, y] = 255 if r[x] else 0
+    return im
+
+
+def _morph_disk(cov: "Image.Image", px: int, *, grow: bool) -> "Image.Image":
+    """Binary dilate/erode by a CIRCULAR structuring element of radius `px`.
+
+    grow: on iff a selected pixel lies within Euclidean distance px. shrink: stay on iff
+    every pixel within px is selected (distance to nearest UNselected > px). Read off the
+    same COVERAGE threshold the rest of the module uses, so preview and render agree. The
+    grid is capped so cost never explodes; a lone pixel grows to a DISC, not a square."""
+    px = int(max(0, min(MAX_MORPH_PX, int(px))))
+    if px <= 0:
+        return cov
+    w, h = cov.size
+    s = max(w, h)
+    if s > DISK_CAP:
+        sc = DISK_CAP / float(s)
+        cw, ch = max(1, int(round(w * sc))), max(1, int(round(h * sc)))
+        work = cov.resize((cw, ch), Image.LANCZOS)
+        r = max(1, int(round(px * (cw / float(w)))))
+    else:
+        cw, ch, work, r = w, h, cov, px
+    on = _on_rows(work, cw, ch)
+    if grow:
+        D = _edt(on, cw, ch)
+        r2 = r * r + 0.25
+        out_rows = [[D[y][x] <= r2 for x in range(cw)] for y in range(ch)]
+    else:
+        off = [[not on[y][x] for x in range(cw)] for y in range(ch)]
+        D = _edt(off, cw, ch)
+        # erode: a pixel survives radius r iff NO unselected pixel lies within r of it,
+        # i.e. its distance-to-nearest-outside D (exact integer squared dist) exceeds r*r.
+        # Strict '>' here is the contract _erode_with_cap's histogram relies on: both must
+        # pick the same pixels or the preview and the render would disagree.
+        out_rows = [[on[y][x] and D[y][x] > r * r for x in range(cw)] for y in range(ch)]
+    im = _rows_to_image(out_rows, cw, ch)
+    if (cw, ch) != (w, h):
+        im = im.resize((w, h), Image.LANCZOS).point(
+            lambda p: 255 if p > COVERAGE_BRIGHTNESS_THRESHOLD else 0)
+    return im
+
+
+def keep_significant_components(mask_bytes: bytes, *, min_frac: float = 0.01,
+                                min_px: int = 30) -> bytes:
+    """Drop the disconnected islands SAM3 scatters around the real object.
+
+    The 'random squares outside the selection' are the click segmenter's stray speckles: a
+    few px each, which a square grow then inflates into a visible block. A smart selection
+    is meant to be contiguous, so islands below a size floor are removed -- but the floor is
+    RELATIVE (a fraction of the dominant blob) so a genuinely separate part the user
+    deliberately shift-clicked to add (the hat, the backpack) SURVIVES; only decoder noise
+    dies. 8-connected flood fill (a diagonal bridge keeps a part attached to its object)."""
+    _require_pil()
+    img = _open(mask_bytes)
+    cov = extract_coverage(img)
+    w, h = cov.size
+    on = _on_rows(cov, w, h)
+    flat = [v for row in on for v in row]
+    n = w * h
+    lab = [0] * n
+    seen = [False] * n
+    areas = []
+    nxt = 0
+    nbr = [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)]
+    for i in range(n):
+        if not flat[i] or seen[i]:
+            continue
+        seen[i] = True
+        lab[i] = nxt
+        size = 1
+        stack = [i]
+        while stack:
+            c = stack.pop()
+            cx, cy = c % w, c // w
+            for dx, dy in nbr:
+                x, y = cx + dx, cy + dy
+                if 0 <= x < w and 0 <= y < h:
+                    j = y * w + x
+                    if flat[j] and not seen[j]:
+                        seen[j] = True
+                        lab[j] = nxt
+                        size += 1
+                        stack.append(j)
+        areas.append(size)
+        nxt += 1
+    if nxt <= 1:
+        return mask_bytes                       # empty or a single region: nothing to drop
+    floor = max(int(min_px), int(min_frac * max(areas)))
+    keepset = set(i for i, a in enumerate(areas) if a >= floor)
+    if len(keepset) == nxt:
+        return mask_bytes                       # every region clears the floor
+    out_rows = [[(flat[y * w + x] and lab[y * w + x] in keepset)
+                 for x in range(w)] for y in range(h)]
+    cov = _rows_to_image(out_rows, w, h)
+    white = Image.new("RGB", (w, h), (255, 255, 255))
+    out = Image.merge("RGBA", (*white.split(), cov))
+    buf = io.BytesIO()
+    out.save(buf, DEFAULT_FORMAT)
+    return buf.getvalue()
+
+
+def _feather_out(cov: "Image.Image", f: float) -> "Image.Image":
+    """Soften the boundary OUTWARD, never eroding the object.
+
+    A plain Gaussian pulls the 128-crossing INWARD, so the binarised mask is smaller than
+    what the user approved (the 'feather shrinks my selection' complaint). Growing first by
+    the feather radius then blurring places the soft skirt BEYOND the edge and keeps the
+    solid core; the >=128 footprint can only match or exceed the hard selection."""
+    f = float(f or 0)
+    if f <= 0:
+        return cov
+    grown = _morph_disk(cov, max(1, int(round(f))), grow=True)
+    soft = grown.filter(ImageFilter.GaussianBlur(max(0.5, f)))
+    return ImageChops.lighter(cov, soft)     # union: interior preserved, edge only grows
+
+
+
+
 
 
 def normalize(mask_bytes: bytes, width: int, height: int, *, expand: int = 0,
@@ -322,7 +534,7 @@ def _selected_px(cov) -> int:
     return sum(cov.histogram()[COVERAGE_BRIGHTNESS_THRESHOLD + 1:])
 
 
-def _erode_with_cap(cov, px: int):
+def _erode_with_cap(cov, px: int, *, disk: bool = False):  # noqa: C901 (two kernel paths)
     """Erode by `px`, clamped to the largest radius that still leaves a real selection.
 
     Returns (image, px_actually_applied, capped).
@@ -330,27 +542,19 @@ def _erode_with_cap(cov, px: int):
     Why the clamp exists: shrinking is the one direction that can destroy what it is
     applied to. A 20 px shape is simply gone by radius 12 (measured 441 -> 121 -> 1 -> 0 px),
     and a mask that selects nothing paints nothing -- silently, which is the exact failure
-    this module exists to refuse. Capping by bounding box does NOT catch the common case: a
-    ring painted as blob-minus-eraser has a 300 px bbox but only ~100 px of material, so it
-    dies far earlier than its bbox suggests. The cap must come from what actually survives.
+    this module exists to refuse. The cap must come from what actually survives, not bbox.
 
-    Why one threshold rather than a fallback: the applied radius has to be monotonic in the
-    requested one, or the slider behaves perversely. Halving on failure did exactly that --
-    on a ring, edge=-40 fell back to -20 and kept 31024 px while the SMALLER edge=-32 kept
-    11944, so dragging further left produced MORE mask. One scan, one cap, applied=min(px,cap).
-
-    Why a walk instead of a kernel: square-SE erosion composes -- applying a 3x3 min filter
-    r times is exactly a single (2r+1) filter, because [-1,1] composed r times is [-r,r].
-    Verified byte-for-byte against the single kernel at r = 1, 3, 7, 15, 31. Walking by one
-    is therefore both cheaper (a 3x3 never pays the quadratic kernel cost: measured 118 ms
-    vs 1855 ms at r=64 on a 400x400 layer) and yields the whole survival curve for free,
-    which is what finding the cap needs. Cost becomes proportional to the radius actually
-    kept rather than to EDGE_LIMIT, which matters because this runs on the live debounced
-    preview at up to 4096px working size: 40 ms is usable, 10 s is not.
+    The square path walks a 3x3 min filter r times (cheap, C, and composes to the direct
+    kernel). The DISK path (smart-select 'auto') cannot use that walk: a disc's unit step is
+    a plus/4-neighbourhood, and r pluses compose into a DIAMOND, not a disc. So the whole
+    monotone survival curve comes from ONE Euclidean distance transform instead -- the count
+    of pixels that survive erosion of radius r is exactly the count whose distance-to-
+    outside exceeds r -- which is what finding the cap needs and keeps applied monotonic in
+    requested, so the slider never behaves perversely. Both paths return the same bitmap a
+    single radius would, so the approved preview and the render agree.
 
     The floor is 10% of the original coverage, never a token 8 px: below that the surviving
-    mask is speckle the user cannot see, and approving it costs them a 13-170 s render to
-    discover it painted nothing.
+    mask is speckle the user cannot see, and approving it costs them a 13-170 s render.
     """
     px = int(max(0, min(EDGE_LIMIT, int(px))))
     if px <= 0:
@@ -358,14 +562,66 @@ def _erode_with_cap(cov, px: int):
     before = _selected_px(cov)
     if before <= 0:
         return cov, 0, False
-    floor = max(8, int(before * 0.10))
-    cur, keep = cov, 0
-    for _r in range(px):
-        nxt = _morph(cur, 1, grow=False)
-        if _selected_px(nxt) < floor:
-            break                      # every larger radius can only remove more
-        cur, keep = nxt, _r + 1
-    return cur, keep, keep != px
+    if not disk:
+        floor = max(8, int(before * 0.10))
+        cur, keep = cov, 0
+        for _r in range(px):
+            nxt = _morph(cur, 1, grow=False)
+            if _selected_px(nxt) < floor:
+                break                      # every larger radius can only remove more
+            cur, keep = nxt, _r + 1
+        return cur, keep, keep != px
+
+    # --- disc survival from a single EDT -------------------------------------------
+    w, h = cov.size
+    s = max(w, h)
+    if s > DISK_CAP:
+        sc = DISK_CAP / float(s)
+        cw, ch = max(1, int(round(w * sc))), max(1, int(round(h * sc)))
+        work = cov.resize((cw, ch), Image.LANCZOS)
+        rad_scale = cw / float(w)
+    else:
+        cw, ch, work, rad_scale = w, h, cov, 1.0
+    on = _on_rows(work, cw, ch)
+    sel = sum(1 for row in on for v in row if v)
+    if sel <= 0:
+        return cov, 0, False
+    floorc = max(8, int(sel * 0.10))
+    off = [[not v for v in row] for row in on]
+    D = _edt(off, cw, ch)
+    # Histogram by the WORKING max radius each selected pixel survives: it stays on under an
+    # erosion of working radius rr iff m >= rr, where m = isqrt(Doff-1). Candidate `cand`
+    # erodes at working radius round(cand*rad_scale) (exactly what _morph_disk uses), so
+    # bucketing here and indexing by rr below are in the SAME units -- and produce the same
+    # bitmap _morph_disk(cov, keep) renders, or preview and render would disagree.
+    hist = [0] * (px + 1)
+    for y in range(ch):
+        onr, Dr = on[y], D[y]
+        for x in range(cw):
+            if not onr[x]:
+                continue
+            dv = Dr[x]
+            if dv == _INF or dv >= (1 << 52):
+                m = px                       # no outside pixel anywhere: survives any radius
+            else:
+                m = int(math.isqrt(max(0, int(dv) - 1)))   # survives r iff r*r < Doff
+            hist[min(m, px)] += 1
+    suffix = [0] * (px + 2)
+    acc = 0
+    for r in range(px, -1, -1):
+        acc += hist[r]
+        suffix[r] = acc
+    keep = 0
+    for cand in range(1, px + 1):
+        rr = max(1, int(round(cand * rad_scale))) if rad_scale != 1.0 else cand
+        if suffix[min(rr, px)] >= floorc:
+            keep = cand
+        else:
+            break                       # monotone: larger cand keeps fewer pixels
+    if keep <= 0:
+        return cov, 0, False
+    return _morph_disk(cov, keep, grow=False), keep, keep != px
+
 
 
 def _layer_coverage(layer_png: bytes, width: int, height: int, lay: dict):
@@ -380,6 +636,7 @@ def _layer_coverage(layer_png: bytes, width: int, height: int, lay: dict):
         cov = cov.resize((width, height), Image.LANCZOS)
     binary, allow_feather, allow_morph = KIND_RULES.get(
         str(lay.get("kind") or "shape"), KIND_RULES["shape"])
+    kind = str(lay.get("kind") or "shape")     # bound once; drives the disc/outward morph below
     # measured on the RESAMPLED, pre-morphology coverage: this is the size the offset
     # is being applied against, so a client can say "that 12 px was 30% of this object"
     # without guessing from its own display scale.
@@ -390,12 +647,16 @@ def _layer_coverage(layer_png: bytes, width: int, height: int, lay: dict):
     if not allow_morph:            # a brush edge is handwork: no offset, either direction
         edge = applied = 0
     elif edge is not None:
-        # New one-axis protocol: a single signed offset, grow or shrink, never both.
+        # New one-axis protocol: a single signed offset, grow or shrink, never both. An
+        # 'auto' (smart-select) silhouette grows/shrinks on a DISC so a blob stays round and
+        # a lone pixel becomes a circle, not a square (masks._morph_disk); shapes keep the
+        # cheap square kernel their byte-exact tests pin down.
         if edge > 0:
-            cov = _morph(cov, edge, grow=True)
+            cov = (_morph_disk(cov, edge, grow=True) if kind == "auto"
+                   else _morph(cov, edge, grow=True))
             applied = int(edge)
         elif edge < 0:
-            cov, got, capped = _erode_with_cap(cov, -edge)
+            cov, got, capped = _erode_with_cap(cov, -edge, disk=(kind == "auto"))
             applied = -int(got)
     else:
         # Legacy two-field protocol, unchanged in behaviour: an older client (or the spike)
@@ -405,10 +666,11 @@ def _layer_coverage(layer_png: bytes, width: int, height: int, lay: dict):
         # user even on the legacy path, and the preview has to name a single number.
         g = int(lay.get("grow", 0) or 0)
         shr = int(lay.get("shrink", 0) or 0)
-        cov = _morph(cov, g, grow=True)
+        cov = (_morph_disk(cov, g, grow=True) if kind == "auto"
+               else _morph(cov, g, grow=True))
         applied = g
         if shr:
-            cov, got, capped = _erode_with_cap(cov, shr)
+            cov, got, capped = _erode_with_cap(cov, shr, disk=(kind == "auto"))
             applied = g - int(got)
     if binary:
         # Hard-edged only where the source is a geometric shape, which has no meaningful
@@ -417,7 +679,13 @@ def _layer_coverage(layer_png: bytes, width: int, height: int, lay: dict):
         cov = cov.point(lambda p: 255 if p > COVERAGE_BRIGHTNESS_THRESHOLD else 0)
     feather = lay.get("feather", 0) if allow_feather else 0
     if feather and feather > 0:
-        cov = cov.filter(ImageFilter.GaussianBlur(max(0.5, float(feather))))
+        # An 'auto' silhouette feathers OUTWARD (soft skirt beyond the edge, solid core
+        # preserved) so binarising at 128 never shrinks what the user approved; a shape keeps
+        # the plain symmetric soften its byte-exact tests expect.
+        if kind == "auto":
+            cov = _feather_out(cov, float(feather))
+        else:
+            cov = cov.filter(ImageFilter.GaussianBlur(max(0.5, float(feather))))
     return cov, edge, applied, capped, min_side
 
 

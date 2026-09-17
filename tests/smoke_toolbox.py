@@ -263,6 +263,21 @@ def test_layers():
     check("layers: shape shrink reduces the selection", _selected(cn) < _selected(c0),
           f"{_selected(c0)} -> {_selected(cn)}")
 
+    # --- C2: the 'auto' kind (smart-select / CLIPSeg) is a first-class layer, not a brush.
+    # The browser's exportLayers used to skip every stroke without a vertex list, so a
+    # smart-select PLUS a brush stroke shipped layers WITHOUT the SAM3 mask -- and because
+    # the server prefers layers over mask_png, the selected object silently vanished from the
+    # render. This pins that 'auto' is honoured (thresholded + growable like a shape).
+    a0, _ = M.normalize_layers([{"png": rect_mask(SIZE, BOX), "kind": "auto"}], *SIZE)
+    a1, ia1 = M.normalize_layers(
+        [{"png": rect_mask(SIZE, BOX), "kind": "auto", "grow": 12, "feather": 8}], *SIZE)
+    check("layers: an auto layer is thresholded (shape rule, NOT the brush no-threshold rule)",
+          ia1["layers"][0]["thresholded"] is True, ia1["layers"][0])
+    check("layers: an auto layer CAN grow (smart-select under-selects, so grow is honoured)",
+          _selected(a1) > _selected(a0), f"{_selected(a0)} -> {_selected(a1)}")
+    check("layers: an auto layer keeps its feather",
+          float(ia1["layers"][0]["feather"]) == 8.0, ia1["layers"][0])
+
     # --- D: mixing kinds in one mask applies per-object rules -----------------------
     cmix, imix = M.normalize_layers(
         [{"png": brush_ramp_mask(SIZE, BOX, 0.4), "kind": "brush"},
@@ -347,6 +362,30 @@ def test_layers():
     check("route: shape layer kept the per-object grow it was given",
           int(kinds.get("shape", {}).get("grow", -1)) == 12, kinds)
     check("route: preview overlay came back", bool((r.payload or {}).get("overlay_png")))
+
+    # The 'auto' (SAM3 smart-select) layer must obey per-object grow/shrink/feather for REAL,
+    # not just echo the number back. The earlier suite only asserted the info ECHO carried the
+    # requested grow, which is exactly the weak check that let "re-render but nothing changes"
+    # survive: echoing 12 is not proof the mask moved. Compare returned COVERAGE across edge
+    # values so a grow that silently no-ops on an auto layer fails here.
+    _auto = base64.b64encode(rect_mask(SIZE, (30, 30, 80, 80))).decode()
+    def _cov(edge, feather=0):
+        rr = post(tb, "/toolbox/mask/preview", {
+            "image_id": "img", "mask_png": MASK_B64,
+            "layers": [{"png": _auto, "kind": "auto", "edge": edge,
+                        "grow": max(0, edge), "shrink": max(0, -edge), "feather": feather}],
+            "spec": {"width": SIZE[0], "height": SIZE[1]},
+        }, token=tok)
+        return (rr.payload or {}).get("coverage"), (rr.payload or {}).get("info", {}).get("layers", [{}])
+    c0, li0 = _cov(0)
+    cg, lig = _cov(10)
+    cs, lis = _cov(-10)
+    check("route: an AUTO layer's coverage GROWS with a positive edge (per-object morph is real)",
+          c0 is not None and cg is not None and cg > c0, {"edge0": c0, "edge+10": cg})
+    check("route: an AUTO layer's coverage SHRINKS with a negative edge",
+          cs is not None and c0 is not None and cs < c0, {"edge0": c0, "edge-10": cs})
+    check("route: an AUTO layer reports the edge it actually applied",
+          li0 and int((lig or [{}])[0].get("edge_applied", 0)) == 10, lig)
 
     # A body with no layers must still work: the spike, older editors and any
     # hand-built request rely on the single-mask path.
@@ -501,7 +540,89 @@ def test_layers():
             check("layers: composed erosion matches the direct kernel [%s grow=%s]"
                   % (_label, _grow), not _bad, "mismatched radii %s" % _bad)
 
-    # --- L: shrinking can never annihilate the selection ------------------------------
+    # --- K2: the CIRCULAR (Euclidean) smart-select morphology, denoise, outward feather --
+    # These prove the four smart-select fixes at the source, independent of the HTTP layer.
+    from PIL import ImageDraw as _IDraw
+
+    def _sel_l(im, th=50):
+        return sum(im.histogram()[th + 1:])
+
+    # (a) a lone pixel must grow into a DISC, not a square: axis edge filled, corners empty,
+    #     and area near pi*r^2 -- NOT (2r+1)^2. The square _morph is shown for contrast so the
+    #     assertion is meaningful (verified: at r=6 the square fills a 13x13=169 block where a
+    #     disc fills ~113). This is the regression lock for "everything grows into a square".
+    for _r in (4, 8, 12):
+        _cov = Image.new("L", SIZE, 0)
+        _cx, _cy = SIZE[0] // 2, SIZE[1] // 2
+        if min(SIZE) < 2 * _r + 5:
+            continue
+        _cov.putpixel((_cx, _cy), 255)
+        _sq = M._morph(_cov, _r, grow=True)
+        _ds = M._morph_disk(_cov, _r, grow=True)
+        _d = _ds.load()
+        _corner = (_d[_cx - _r, _cy - _r] > 50) or (_d[_cx + _r, _cy + _r] > 50)
+        _axis = _d[_cx - _r, _cy] > 50 and _d[_cx, _cy + _r] > 50
+        _a_disc, _a_sq = _sel_l(_ds), _sel_l(_sq)
+        _ideal = 3.14159 * _r * _r
+        check("auto-morph: disc grow leaves the corners EMPTY (a square would fill them) r=%d" % _r,
+              _corner is False and _a_sq > _a_disc,
+              "disc=%d square=%d corner=%s" % (_a_disc, _a_sq, _corner))
+        check("auto-morph: disc grow fills the axis edge and is round (area ~ pi r^2) r=%d" % _r,
+              _axis and abs(_a_disc - _ideal) / _ideal < 0.18,
+              "area=%d ideal=%d axis=%s" % (_a_disc, int(_ideal), _axis))
+
+    # (b) keep_significant_components: drop a stray speckle, KEEP a deliberately-added part
+    #     (a second large island) -- the user's hat/backpack case.
+    def _rgba(png_on):
+        im = Image.new("RGBA", SIZE, (0, 0, 0, 0))
+        dd = ImageDraw.Draw(im)
+        for box in png_on:
+            dd.rectangle(box, fill=(255, 255, 255, 255))
+        buf = io.BytesIO(); im.save(buf, "PNG"); return buf.getvalue()
+
+    _big = (10, 10, 50, 50)                 # the object (dominant)
+    _part = (60, 60, 90, 88)                # a separate, sizeable added part -> keep
+    _speck = (5, 60, 6, 61)                 # a 2x2 decoder-noise speckle -> drop
+    _den = M.keep_significant_components(_rgba([_big, _part, _speck]))
+    _dcov = M.extract_coverage(M._open(_den))
+    _dd = _dcov.load()
+    _in = lambda xy: (0 <= xy[0] < SIZE[0] and 0 <= xy[1] < SIZE[1]
+                      and _dd[xy[0], xy[1]] > 50)
+    check("denoise: the dominant blob survives",
+          _in(((30, 30))) and _in(((75, 74))), "big/part pixels missing")
+    check("denoise: the stray speckle is removed", not _in(((5, 60))), "speckle survived")
+    # A lone selection (single connected region) is the OBJECT — never delete it, however
+    # small: dropping the only thing a user selected is worse than a stray speckle. Guards
+    # both over-deletion and the background-fill bug (out_rows must be gated on `flat`).
+    _only = M.keep_significant_components(_rgba([(5, 5, 6, 6)]))
+    _onlycov = M.extract_coverage(M._open(_only))
+    check("denoise: a single (even tiny) region is the object and is KEPT, never deleted",
+          _sel_l(_onlycov) > 0, _sel_l(_onlycov))
+    # and a mask with a dominant blob + noise keeps the blob and drops noise (not fill-to-frame)
+    _den2 = M.keep_significant_components(_rgba([_big, _speck]))
+    _dcov2 = M.extract_coverage(M._open(_den2))
+    _dd2 = _dcov2.load()
+    _tot = _sel_l(_dcov2)
+    check("denoise: dominant blob kept, speckle dropped, background stays empty",
+          (0 <= 30 < SIZE[0] and _dd2[30, 30] > 50) and not _dd2[5, 60] and
+          _tot < (SIZE[0] * SIZE[1]),   # not filled to the whole frame
+          "total_selected=%d of %d" % (_tot, SIZE[0] * SIZE[1]))
+
+    # (c) outward feather: the >=128 footprint never shrinks vs the hard shape, and coverage
+    #     appears OUTSIDE the original box (the old symmetric blur pulled it inward).
+    _box = (20, 20, 59, 59)
+    _scov = Image.new("L", SIZE, 0)
+    ImageDraw.Draw(_scov).rectangle(_box, fill=255)
+    _before = sum(1 for y in range(SIZE[1]) for x in range(SIZE[0]) if _scov.getpixel((x, y)) > 128)
+    _fc = M._feather_out(_scov, 6)
+    _after = sum(1 for y in range(SIZE[1]) for x in range(SIZE[0]) if _fc.getpixel((x, y)) > 128)
+    _outside = any(_fc.getpixel((x, y)) > 50
+                   for x in (_box[0] - 3,) for y in range(_box[1] + 1) if 0 <= x < SIZE[0])
+    check("auto-feather: outward feather never shrinks the >=128 core",
+          _after >= _before, "before=%d after=%d" % (_before, _after))
+    check("auto-feather: the soft skirt extends BEYOND the original edge",
+          _outside, "no coverage found outside the box (feather must bias outward, not inward)")
+
     # Silent by nature: a mask selecting nothing paints nothing, and the only way the user
     # learns is a 13-170 s render of their untouched photo. `tiny` is the obvious case (a
     # 20 px shape dies at radius 12). `ring` is the case a BBOX-based guard would MISS: its
@@ -727,6 +848,22 @@ def test_routes():
           "overlay_png" in r.payload and
           Image.open(io.BytesIO(base64.b64decode(r.payload["overlay_png"]))).size == (640, 480))
 
+    # The overlay "opacity" slider reaches the SERVER bake: a stronger alpha must produce a
+    # visibly different overlay, and garbage must fall back to the default rather than 500.
+    def _overlay(spec):
+        rr = post(tb, "/toolbox/mask/preview",
+                  {"mask_png": base64.b64encode(spot_mask()).decode(), "spec": spec},
+                  token=fresh_token())
+        return rr, (rr.payload or {}).get("overlay_png")
+    r0, ov0 = _overlay({"mask_feather": 6, "overlay_alpha": 0.0})
+    r1, ov1 = _overlay({"mask_feather": 6, "overlay_alpha": 1.0})
+    check("preview: overlay_alpha is honoured (alpha 0 and alpha 1 bake different overlays)",
+          r0.status == 200 and r1.status == 200 and ov0 and ov1 and ov0 != ov1)
+    rb, ovb = _overlay({"mask_feather": 6, "overlay_alpha": "not-a-number"})
+    check("preview: a junk overlay_alpha falls back to the default (no 500, still an overlay)",
+          rb.status == 200 and bool(ovb) and
+          Image.open(io.BytesIO(base64.b64decode(ovb))).size == (640, 480))
+
     r = post(tb, "/toolbox/mask/preview",
              {"mask_png": base64.b64encode(blank((640, 480))).decode()}, token=fresh_token())
     check("preview flags an empty mask loudly", r.payload["empty"] is True and "error" in r.payload)
@@ -788,6 +925,40 @@ def test_routes():
     r = post(make_tb(segmenter=lambda b, t, th: (MASK, {})), "/toolbox/mask/auto",
              {"text": "   "}, token=fresh_token())
     check("auto-mask refuses an empty description", r.status == 400)
+
+    # click-to-select (SAM3) degrades honestly, mirroring the text auto-mask contract.
+    CLICK = {"points": [[0.5, 0.5]]}
+    r = post(make_tb(click_segmenter=None), "/toolbox/mask/click", CLICK, token=fresh_token())
+    check("click-select 503s when no click segmenter is wired",
+          r.status == 503 and r.payload["reason"] == "no_click_segmenter")
+    r = post(make_tb(click_segmenter=lambda s, p, n, **k: (MASK, {}),
+                      image_engine_up=lambda: False),
+             "/toolbox/mask/click", CLICK, token=fresh_token())
+    check("click-select 503s when the engine is down",
+          r.status == 503 and r.payload["reason"] == "no_image_engine")
+    r = post(make_tb(click_segmenter=lambda s, p, n, **k: (MASK, {})),
+             "/toolbox/mask/click", CLICK, token=fresh_token())
+    check("click-select returns an editable mask", r.status == 200 and "mask_png" in r.payload)
+    r = post(make_tb(click_segmenter=lambda s, p, n, **k: (None, {"error": "engine blew up"})),
+             "/toolbox/mask/click", CLICK, token=fresh_token())
+    check("click-select FAILS LOUDLY when the engine errors",
+          r.status == 502 and "engine blew up" in r.payload["error"])
+    r = post(make_tb(click_segmenter=lambda s, p, n, **k: (MASK, {})),
+             "/toolbox/mask/click", {"points": []}, token=fresh_token())
+    check("click-select refuses an empty point list", r.status == 400)
+    r = post(make_tb(click_segmenter=lambda s, p, n, **k: (MASK, {})),
+             "/toolbox/mask/click", {"points": [[0.5, 0.5]] * 40}, token=fresh_token())
+    check("click-select caps runaway point lists", r.status == 400)
+    # the seam receives the points UNMODIFIED (browser-sent normalised coords), so a
+    # mis-scaled coordinate can be attributed to the server, not silently absorbed here.
+    seen = {}
+    def cap_seg(s, p, n, **k):
+        seen["pos"] = p; seen["neg"] = n
+        return MASK, {}
+    post(make_tb(click_segmenter=cap_seg), "/toolbox/mask/click",
+         {"points": [[0.25, 0.75]], "negative_points": [[0.1, 0.1]]}, token=fresh_token())
+    check("click-select forwards positive+negative points to the seam",
+          seen.get("pos") == [[0.25, 0.75]] and seen.get("neg") == [[0.1, 0.1]])
 
     # CORS, because the in-chat mount is an opaque origin
     r = post(tb, "/toolbox/echo", {"mask_png": MASK_B64}, token=fresh_token())
@@ -1074,6 +1245,37 @@ def test_graphs():
     check("graph mask flips the alpha (server 255=edit-here -> graph edit-where-0)",
           _alpha_mean(_src_mask, 0, 4) > 200 and _alpha_mean(_src_mask, 4, 8) < 60
           and _alpha_mean(_inv, 0, 4) < 60 and _alpha_mean(_inv, 4, 8) > 200)
+
+    # Click-to-select graph (SAM3): a standalone tiny graph, GPU-free testable. Pin the
+    # wiring that, if it drifted, would silently return the wrong pixels (or none) on paid
+    # GPU time -- exactly the discipline validate_painted_mask_graph enforces upstream.
+    seg = G.sam3_segment_graph(source_filename="src_abc.png",
+                               points=[{"x": 10, "y": 20}],
+                               negative_points=[{"x": 30, "y": 40}])
+    check("sam3 graph passes its own layout validator",
+          G.validate_sam3_segment_graph(seg) == [])
+    check("sam3 graph is JSON-serialisable (what gets POSTed to /prompt)",
+          isinstance(_json.dumps(seg), str))
+    check("SAM3_Detect consumes the CheckpointLoader MODEL (output 0) and LoadImage IMAGE",
+          seg[G.SEG_DETECT]["inputs"]["model"] == [G.SEG_CKPT, 0]
+          and seg[G.SEG_DETECT]["inputs"]["image"] == [G.SEG_LOAD, 0])
+    check("source filename threaded to the LoadImage node",
+          seg[G.SEG_LOAD]["inputs"]["image"] == "src_abc.png")
+    check("positive+negative clicks reach SAM3_Detect as JSON coord lists",
+          _json.loads(seg[G.SEG_DETECT]["inputs"]["positive_coords"]) == [{"x": 10, "y": 20}]
+          and _json.loads(seg[G.SEG_DETECT]["inputs"]["negative_coords"]) == [{"x": 30, "y": 40}])
+    check("mask reaches SaveImage through MaskToImage (fetchable like any render)",
+          seg[G.SEG_MASKIMG]["inputs"]["mask"] == [G.SEG_DETECT, 0]
+          and seg[G.SEG_SAVE]["inputs"]["images"] == [G.SEG_MASKIMG, 0])
+    check("a pure click does NOT load the CLIP text encoder (point path needs none)",
+          G.SEG_CLIP not in seg and "conditioning" not in seg[G.SEG_DETECT]["inputs"])
+    txt = G.sam3_segment_graph(source_filename="s.png", points=[], text="the cat")
+    check("text segmentation adds the CLIPTextEncode conditioning edge",
+          G.SEG_CLIP in txt and txt[G.SEG_DETECT]["inputs"].get("conditioning") == [G.SEG_CLIP, 0])
+    bad3 = G.sam3_segment_graph(source_filename="s.png", points=[{"x": 1, "y": 2}])
+    bad3[G.SEG_DETECT]["inputs"]["model"] = ["99", 0]
+    check("sam3 validator catches a mis-wired model edge",
+          any("model" in p for p in G.validate_sam3_segment_graph(bad3)))
 
 
 def main() -> int:

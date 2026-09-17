@@ -251,6 +251,118 @@ def _prepare_source(source: bytes, w: int, h: int) -> bytes:
         return source
 
 
+def comfy_segment_click(source: bytes, points, negative_points=None, *,
+                        threshold: float = 0.5, base: str | None = None,
+                        max_side: int = 1024):
+    """Click-to-object mask via ComfyUI's native SAM3_Detect node -- the ``click_segmenter``
+    seam the Toolbox's /toolbox/mask/click route calls (mirrors the ``segmenter`` text seam).
+
+    ``points`` / ``negative_points`` are lists of ``[x, y]`` normalised to 0..1 in the
+    DISPLAYED photo's own space (the browser divides the click by its canvas natural size),
+    so the caller never needs to know the server's working resolution: we choose a modest
+    segmentation size here and scale the fractional clicks to exactly the image we upload.
+    SAM3 resizes to 1008 internally regardless, so a big upload buys nothing -- cap the side
+    to keep the per-click upload and the paid GPU step cheap.
+
+    Returns (canonical_mask_png, info) in the load-stroke contract (RGBA, RGB white, ALPHA =
+    selection -- what the editor's 'load' stroke and masks.normalize both speak), or
+    (None, {"error": ...}) so the handler can 502 honestly. Never raises on GPU/network
+    trouble: like every other engine seam, a failure is an honest error row, not a stall.
+    """
+    from stackd.imagegen import comfyui_client
+    from stackd.toolbox import graphs as G
+
+    if not source:
+        return None, {"error": "the source image could not be resolved for this user"}
+    pts = _norm_points(points)
+    negs = _norm_points(negative_points)
+    if not pts:
+        return None, {"error": "no click was given to select on"}
+
+    if base is None:
+        base, note = comfyui_base()
+        if not base:
+            return None, {"error": note or "no serveable image engine right now"}
+
+    try:
+        w, h = _seg_size(source, max_side)
+    except Exception as e:  # noqa: BLE001 — a bad source is an honest error, not a crash
+        return None, {"error": f"could not size the photo for segmentation ({e.__class__.__name__}: {e})"}
+
+    async def _run():
+        src_b = comfyui_client.downscale_to_exact_size(source, w, h)
+        src_name = await comfyui_client.upload_to_comfy(src_b, "toolbox_seg_src", base=base)
+        pos = [{"x": _q(px * w), "y": _q(py * h)} for (px, py) in pts]
+        neg = [{"x": _q(px * w), "y": _q(py * h)} for (px, py) in negs]
+        graph = G.sam3_segment_graph(source_filename=src_name, points=pos,
+                                      negative_points=neg, threshold=threshold)
+        problems = G.validate_sam3_segment_graph(graph)
+        if problems:
+            # A mis-wired segmentation graph returns the wrong pixels on paid GPU time; refuse.
+            raise _jobs.NoEngine("sam3 graph is not valid: " + "; ".join(problems))
+        pid = await comfyui_client.submit_workflow(graph, base=base)
+        by_node = await comfyui_client.wait_and_fetch(pid, {G.SEG_SAVE}, base=base)
+        return (by_node.get(G.SEG_SAVE) or [None])[0]
+
+    try:
+        raw = asyncio.run(_run())
+    except Exception as e:  # noqa: BLE001 — surface every GPU/network failure honestly
+        return None, {"error": f"segmentation failed ({e.__class__.__name__}: {e})"}
+    if not raw:
+        return None, {"error": "the segmentation engine returned no mask"}
+    # The graph saved a plain black/white mask image. Before anything else, drop the
+    # disconnected speckles SAM3 scatters around the real object (issue: "the selection has
+    # to remain contiguous"): they are a handful of pixels each, and a later grow inflates
+    # every one into a visible square. Keep substantial islands (a deliberately shift-clicked
+    # hat/backpack survives), drop only decoder noise. Doing it HERE, at the source, means
+    # the on-screen stroke the browser stores AND the mask the render re-normalises are both
+    # already clean, so growth can never re-inflate a speckle.
+    try:
+        from stackd.toolbox import masks as _m
+        raw = _m.keep_significant_components(raw)
+        canon, info = _m.normalize(raw, w, h, binary=True)
+    except Exception as e:  # noqa: BLE001
+        return None, {"error": f"could not canonicalize the mask ({e.__class__.__name__}: {e})"}
+    return canon, info
+
+
+def _norm_points(points):
+    """Coerce a browser point list to [(x, y)] clamped to 0..1. Rejects junk entries
+    rather than trusting them: a stray non-number must not poison the whole click request
+    with a 500, it is simply dropped (an empty result makes the handler 400)."""
+    out = []
+    for p in (points or []):
+        try:
+            if isinstance(p, dict):
+                x, y = p["x"], p["y"]
+            else:
+                x, y = p[0], p[1]
+            x = max(0.0, min(1.0, float(x)))
+            y = max(0.0, min(1.0, float(y)))
+        except (TypeError, ValueError, KeyError, IndexError):
+            continue
+        out.append((x, y))
+    return out
+
+
+def _seg_size(source: bytes, max_side: int) -> tuple[int, int]:
+    """Working size for the segment graph: preserve aspect, cap the long side, round to 16
+    (the latent grid SAM3's decoder tolerates any size but 16 keeps the saved mask a clean
+    multiple like the rest of the pipeline)."""
+    from stackd.toolbox import masks as _m
+    w, h = _m.image_size(source)
+    if w <= 0 or h <= 0:
+        raise ValueError("image has no size")
+    s = max_side / float(max(w, h))
+    if s < 1.0:
+        w, h = int(round(w * s)), int(round(h * s))
+    return max(64, w), max(64, h)
+
+
+def _q(v: float) -> int:
+    return int(round(v))
+
+
 def comfy_cancel(prompt_id: str, base: str) -> None:
     """jobs.JobQueue cancel seam: best-effort interrupt of ONE running prompt. Mirrors
     imagegen/bench.py's _abort_queue but targeted — we interrupt only the prompt id this

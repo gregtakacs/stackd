@@ -95,6 +95,10 @@ class Toolbox:
     `source(email, ref) -> bytes | None`  — fetch the photo being edited
     `segmenter(bytes, text, threshold) -> (mask_png, info) | (None, err)`
                     — optional; wired to the ComfyUI CLIPSegMask path when resident
+    `click_segmenter(source, points, negative_points, *, threshold) -> (mask_png, info) | (None, err)`
+                    — optional; SAM3 click-to-select. points are [x, y] normalised to 0..1
+                    in the displayed photo; the mask comes back in the editable load-stroke
+                    contract, exactly like the text segmenter, so it lands as an editable layer
     `image_engine_up() -> bool`           — optional, for honest 503s
     `worker`        — an optional jobs.JobQueue. PRESENT -> /toolbox/jobs enqueues a real
                       render and /jobs/poll reads the store; ABSENT (the M0 spike) -> the
@@ -107,11 +111,12 @@ class Toolbox:
 
     def __init__(self, *, secret: str = "", spike_enabled: bool = False, source=None,
                  segmenter=None, image_engine_up=None, logger=None, worker=None,
-                 prewarm=None):
+                 prewarm=None, click_segmenter=None):
         self.secret = secret or ""
         self.spike_enabled = bool(spike_enabled)
         self._source = source
         self._segmenter = segmenter
+        self._click_segmenter = click_segmenter
         self._image_engine_up = image_engine_up
         self._worker = worker
         self._prewarm = prewarm
@@ -328,6 +333,7 @@ class Toolbox:
         return True
 
     POST_ONLY = ("/toolbox/echo", "/toolbox/mask/preview", "/toolbox/mask/auto",
+                 "/toolbox/mask/click",
                  "/toolbox/jobs", "/toolbox/jobs/poll", "/toolbox/jobs/cancel")
     GET_ONLY = ("/toolbox/health", "/toolbox/spike", "/toolbox/embed", "/toolbox/source.png",
                 "/toolbox/launch")
@@ -361,6 +367,8 @@ class Toolbox:
                 self.h_mask_preview(http)
             elif path == "/toolbox/mask/auto":
                 self.h_mask_auto(http)
+            elif path == "/toolbox/mask/click":
+                self.h_mask_click(http)
             elif path == "/toolbox/jobs":
                 self.h_job_create(http)
             elif path == "/toolbox/jobs/poll":
@@ -397,6 +405,7 @@ class Toolbox:
             "tokens": bool(self.secret),
             "spike": self.spike_enabled,
             "segmenter": self._segmenter is not None,
+            "click_segmenter": self._click_segmenter is not None,
             "image_engine": self._engine_up(),
             "redeem_on_create": REDEEM_ON_CREATE,
             # M1: is a real render queue wired (vs. the M0 validate-and-echo stub)? The
@@ -571,9 +580,18 @@ class Toolbox:
                "empty": empty, "tiny": tiny, "email": email}
         if source:
             # canon, not the raw upload: canon is already resampled+feathered, so the
-            # overlay is literally what the graph's mask will be.
+            # overlay is literally what the graph's mask will be. The tint alpha is the
+            # editor's "overlay" slider — a purely cosmetic read-strength control, never a
+            # change to the mask itself (canon is untouched), so it must not silently fall
+            # back to the library default of 0.5: without threading it here the slider had
+            # no path to the one overlay the user actually sees once the preview lands.
+            try:
+                _oa = float(spec.get("overlay_alpha", 0.5))
+            except (TypeError, ValueError):
+                _oa = 0.5
             out["overlay_png"] = base64.b64encode(
-                _masks.overlay(source, canon, width=w, height=h, feather=0)).decode()
+                _masks.overlay(source, canon, width=w, height=h, feather=0,
+                               alpha=max(0.0, min(1.0, _oa)))).decode()
         if empty:
             # Wording matters. For a USER-painted mask this almost always means the mask
             # did not line up (orientation, painted on a thumbnail, polarity) — NOT that
@@ -629,6 +647,57 @@ class Toolbox:
             out["warning"] = ('nothing matched "' + text + '" — try a shorter, concrete '
                               "visual description (one distinctive appearance feature, not "
                               "a pose), or just paint it")
+        http._send_json(200, out, self._cors())
+
+    def h_mask_click(self, http):
+        """Pixel clicks -> object mask via the SAM3 click_segmenter seam. The browser sends
+        the clicks normalised to 0..1 in the displayed photo (it does not know the server's
+        working size); positive points say "this object", negative say "not that". The mask
+        returns through the SAME editable load-stroke contract as the text auto-mask, so a
+        click-selected region is as erasable/undoable as a brush stroke. Like h_mask_auto it
+        fails LOUDLY — 503 without a segmenter or engine, 502 when segmentation returns
+        nothing — rather than handing back a silently-empty mask."""
+        email = self._identity(http, {}, single_use=False)
+        body = self._json_body(http)
+        points = body.get("points") or []
+        negative = body.get("negative_points") or body.get("negatives") or []
+        if not isinstance(points, list) or not points:
+            raise ValueError("no click was given to select on")
+        if len(points) > 32 or len(negative) > 64:
+            raise ValueError("too many click points in one selection")
+        if self._click_segmenter is None:
+            http._send_json(503, {"error": "click-to-select is not wired on this install — "
+                                           "paint the mask instead (it needs no GPU)",
+                                   "reason": "no_click_segmenter"}, self._cors())
+            return
+        if not self._engine_up():
+            http._send_json(503, {"error": "the image engine is not resident right now, so "
+                                           "click-to-select cannot run — paint the mask "
+                                           "instead", "reason": "no_image_engine"},
+                            self._cors())
+            return
+        source = self._source_bytes(email, body, {})
+        try:
+            threshold = float(body.get("threshold") or 0.5)
+        except (TypeError, ValueError):
+            threshold = 0.5
+        res = self._click_segmenter(source, points, negative, threshold=threshold)
+        mask_png, info = res if isinstance(res, tuple) else (None, res)
+        if not mask_png:
+            msg = info.get("error") if isinstance(info, dict) else str(info)
+            http._send_json(502, {"error": msg or "click-to-select failed",
+                                  "reason": "segmentation_failed"}, self._cors())
+            return
+        cov = _masks.coverage(mask_png)
+        out = {"ok": True, "mask_png": base64.b64encode(mask_png).decode(),
+               "coverage": cov, "email": email}
+        if cov is None:
+            out["warning"] = ("pillow is unavailable so the selection could not be measured; "
+                              "check the mask covers the object before rendering")
+        elif cov < _masks.USER_MASK_EMPTY_FLOOR:
+            out["empty"] = True
+            out["warning"] = ("the click selected nothing — tap directly on the object "
+                              "(a solid, well-lit part, not its edge or a thin limb)")
         http._send_json(200, out, self._cors())
 
 

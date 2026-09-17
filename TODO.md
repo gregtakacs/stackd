@@ -12,6 +12,184 @@ pytest
 
 ---
 
+## 0B. SAM3 click-to-select (smart select) — shipped + verified 2026-09-16
+
+Click an object, its silhouette loads as an editable mask. Built on the standalone SAM3
+point prompt (`forward_segment(point_inputs=…)`, no CLIP text encoder needed — only the
+1.75 GB `sam3.1_multiplex_fp16.safetensors` checkpoint).
+
+**Wiring (server → browser):**
+- `graphs.sam3_segment_graph()` + `validate_sam3_segment_graph()` — a tiny standalone graph
+  (`CheckpointLoader → SAM3_Detect(positive_coords/negative_coords as JSON) → MaskToImage →
+  SaveImage`). The CLIP text node is added ONLY for text prompts; a pure click omits it.
+- `engine.comfy_segment_click(source, points, negatives, …)` — uploads the source, runs the
+  graph, returns the mask in the load-stroke contract (RGBA, alpha=coverage), plus
+  `{size, coverage_paint, coverage_after, inverted}`. Coords are normalised 0..1 and
+  multiplied to pixels against the size ComfyUI actually renders at.
+- `api.Toolbox(click_segmenter=…)` seam + `POST /toolbox/mask/click`. Degrades honestly:
+  503 `no_click_segmenter` / `no_image_engine`, 502 on engine failure, 400 on empty or
+  runaway (>24) point lists. `serve.py` passes `click_segmenter=_tb_engine.comfy_segment_click`.
+- `web/toolbox.js` — a "Smart select" tool. Plain click = one positive point (fresh
+  selection); shift+click adds a positive; alt/ctrl+click subtracts. The WHOLE accumulated
+  point list is re-sent every click (the node is stateless) and the result REPLACES the one
+  `load` stroke, so an excluded region genuinely vanishes rather than surviving as a union.
+  Point-list mutation lives in `runSmart` so a failed/empty click rolls back to exactly the
+  mask still on canvas.
+
+**Latent bug found while testing the feature (fixed):** `exportLayers` skipped every stroke
+without a `pts` list, so a `load`/auto stroke was invisible to the per-object contract. A
+smart-select ALONE happened to work (layers null → server falls back to `mask_png`), but
+**smart-select + a brush stroke shipped `layers:[brush]`, and because the server prefers
+`layers` over `mask_png`, the SAM3 selection silently vanished from the render** while still
+looking selected on screen. Fix: `exportLayers` now lets `mode==='load'` through
+(`masks.KIND_RULES['auto'] = threshold+feather+morph`, so it is honoured like a shape). The
+browser suite proves the guard with a negative control (restore the old line → the auto-layer
+assertion goes red, `last=[]`).
+
+**Verified:** offline `tests/smoke_toolbox.py` 320/320. Browser suite 78/78. Live
+GPU synthetic render: red/blue split with a green square, click inside → alpha inside 255,
+over the blue half 0, coverage 10.6% ≈ the square's true area, `inverted:false`.
+
+### 0B-follow-up: per-object editing, multiple objects, smart lasso, overlay opacity — 2026-09-16
+
+Three gaps reported after first use of Smart select, all fixed (frontend-only):
+
+- **Grow/shrink/feather an auto selection was impossible.** Root cause: `objBBox()` tested
+  `!o.pts` *before* the `mode==='load'` case, and a load stroke has no `pts`, so every smart
+  selection got a `null` bbox → `hitTest` skipped it → the Select-tool inspector (which does
+  offer edge+feather for an `auto` object) could never open. Fixed the guard order and added
+  `measureLoadBBox()` (a tight coverage box, scanned once from the mask PNG on a 96² downsample)
+  so selection, the "…% of this object" readout and hit-testing all agree on where the object
+  is. `translateSel`/`scaleSel` now no-op for a `load` stroke (it has no vertices — an auto mask
+  is a segmentation of the photo's real pixels, not a movable vector shape).
+- **Multiple objects.** `runSmart` kept one `smartLayer` and replaced it, so a second click
+  wiped the first. It is now an object model: a plain click starts a NEW independent `load`
+  stroke (its own points, its own layer, separately grow/feather/delete); shift/alt refine the
+  current one.
+- **Smart lasso (Auto/Manual).** A Smart-tool drag traces a live loop; on release, *Auto* seeds
+  SAM3 with a point-in-polygon scatter of interior points and re-uses the verified `/mask/click`
+  point seam (SAM3 snaps to the true boundary), *Manual* commits the exact traced pixels as an
+  add/subtract shape stroke. A `Loop: Auto/Manual` toolbar button toggles it (enabled only while
+  the Smart tool is up). NOTE: the native `SAM3_Detect.bboxes` box-prompt path was investigated
+  and is **broken on the fp16 multiplex checkpoint** — every wiring variant (literal JSON string,
+  `CreateBoundingBoxes` with/without `editor_state`) returned an empty mask, so the Auto loop
+  deliberately uses the interior-point path, which is proven on GPU.
+- **Overlay opacity was inert once the server preview landed.** `compose()` drew the server's
+  `overlay_png` (tint baked at a constant `alpha=0.5`) at full alpha and returned early, so the
+  `overlay` slider only ever moved the pre-preview local wash. Fixed honestly: the preview
+  request now carries `overlay_alpha` (from the slider), `h_mask_preview` bakes the tint at that
+  alpha, and `paramsSig` folds it in so the cheap no-GPU overlay re-fires on a slider drag. The
+  knob is cosmetic (never touches `canon`, so the render mask is unchanged).
+
+**Verified:** browser 78/78, incl. plain-click→new-object vs shift-accumulate (click-point
+sequence `[1,2,1]`), an Auto loop firing `/mask/click` with interior seeds (16), a Manual loop
+firing NO SAM3 call and leaving a `shape` layer, and deselect→re-tap reopening an edge+feather
+inspector. The deselect assertion goes RED under a `--mutate autobbox` negative control (guard
+order restored), so it genuinely tests the fix. Offline 320/320 (added overlay-alpha-is-honoured
++ junk-alpha-falls-back). Live GPU: an Auto loop of interior points on the synthetic red/blue +
+green square → green alpha 255, a yellow distractor 0, blue background 0, `inverted:false`.
+
+**Still outstanding (not yet done, honest list):**
+
+- SAM3 **cold start**: first `SAM3_Detect` call loads the checkpoint into VRAM (~10–20 s on
+  ROCm); subsequent in-process calls are fast. There is NO `prewarm_segment` hook yet (only
+  `_prewarm_edit` for the inpaint scaffold). The 30 s `req()` fetch timeout currently covers
+  the worst case, so a first click shows "Selecting…" for that long. Recommend a background
+  prewarm on tool-page load.
+- The container is **hot-patched**, not rebuilt (see §1). Rebuild before trusting a deploy.
+- A hand validation on a real photo (the crosswalk shot): click the person → silhouette loads
+  → Replace → render. Not yet done by a human.
+- `/toolbox/launch` is still 403 on the router (no oauth chain wired).
+- The compositing pass (`blend_mode`/`opacity`/`color_match`/`preserve_detail`) is still dead
+  (greyed knobs, §1B). The full render path has no resolution cap (156 s at 2048×1584);
+  the segmentation path caps at 1024.
+
+### 0B-follow-up-2 — smart-select masks were unselectable chrome + per-object edge was a no-op (this pass)
+
+Two regressions survived the first follow-up and were reported against a real photo: (1) a
+smart selection drew **stray squares outside the object**, and (2) grow/shrink/feather "re-render
+but nothing changes" on smart-select masks. Root-caused empirically, not assumed:
+
+- **Server per-object morph is fine.** A direct `masks.normalize_layers` probe on an `auto`
+  silhouette moved coverage 5,789 → 16,829 px at `edge=+24` and applied feather; the new offline
+  route checks (`smoke_toolbox`: an AUTO layer's coverage GROWS/SHRINKS with a signed edge and
+  reports `edge_applied`) are green. So the frozen mask was NOT the server.
+- **Bug 1 — the squares were the selection chrome.** `requestSmart` auto-`selectObj()`s every
+  smart layer, so `compose → drawSelection` painted a dashed bounding rectangle **plus a solid
+  blue corner "scale" handle** over each auto object — and `objBBox` falls back to the full frame
+  when `measureLoadBBox` can't read the PNG, so the box covered the whole photo. An auto mask is a
+  fixed silhouette (`translateSel`/`scaleSel` are deliberately no-ops on it), so that affordance
+  advertised nothing and read as a stray square. Fix: `drawSelection` now early-returns for
+  `mode==='load'` (the red wash already shows the selection; the inspector still opens). The
+  misleading "drag to move, corner to scale" status for an auto object was replaced with a
+  grow/shrink/feather hint.
+- **Bug 2 — the TOOLBAR edge/feather sliders fed the path the layered server ignores.** With a
+  smart layer present, `h_mask_preview`/job-create take the `normalize_layers` branch, which
+  applies each layer's OWN `grow/shrink/feather` and never the global `mask_expand/feather`. The
+  toolbar sliders only set the globals, so dragging them changed `paramsSig` (preview re-fired)
+  but the server returned an identical overlay — literally "re-render, nothing changes." Fix: when
+  an **auto** object is selected, the toolbar `edge`/`feather` sliders now write to THAT object
+  (`o.edge/grow/shrink` or `o.feather`) and re-preview; `selectObj` mirrors the object's current
+  values back into the sliders. Unselected / shape / brush keep the old "defaults for the next
+  object" meaning. I did NOT bake the morph into the on-canvas wash: that canvas feeds
+  `exportMask`/`exportLayers`, and the server re-applies the same edge, so baking it would grow the
+  object twice. The WYSIWYG grow/feather feedback is the server overlay, exactly as for shapes.
+
+**Verified:** browser **80/80** (added: toolbar edge/feather reach the selected auto layer as
+`grow=30/feather=20`, and edge+feather controls exist), and two negative controls each turn
+exactly the right assertion RED — `--mutate autoslider` (routing removed → auto layer hits the wire
+at grow=0/feather=8) and `--mutate autobbox` (guard order restored → empty-area tap fails to
+deselect). Offline **323/323** (the three new AUTO per-object coverage-morph route checks).
+Container `stackd` re-synced: `web/toolbox.js`, `masks.py`, `api.py` byte-identical host↔container
+(md5). `toolbox.js` is served per-request, so the fix is live without a restart.
+
+### 0B-follow-up-3 — smart-select geometry: contiguity, radial growth, outward feather, active object, live sliders (this pass)
+
+A real-photo pass surfaced five distinct defects, each root-caused to code (verified against the
+container's PIL 12.3.0, which ships **no numpy/scipy** — every kernel below is pure PIL+python):
+
+1. **Stray speckles → squares.** SAM3's raw output scatters a few-pixel islands around the object;
+   a grow then inflates each into a visible block. Fix: `masks.keep_significant_components` (an
+   8-connected flood fill) drops islands below a *relative* floor (a fraction of the dominant blob),
+   so a deliberately shift-clicked hat/backpack survives while decoder noise dies. Wired at the
+   source in `engine.click_segmenter` so the on-screen stroke and the render mask are both clean.
+2. **Growth was square, not radial.** `masks._morph` composes a 3×3 square filter — measured: a lone
+   pixel dilated by r=6 → a 13×13 = 169 px block, not a disc's ~113. A Gaussian could not fix it
+   (blur-then-threshold *erases* thin masks — measured a lone pixel → 0 px). Fix: `_morph_disk`, an
+   exact binary disc via a separable squared-Euclidean distance transform (Felzenszwalb), applied to
+   the `auto` kind only in `_layer_coverage`. Shapes/brush/legacy keep the tested square `_morph`.
+3. **Feather shrank inward.** The symmetric blur pulled the ≥128 crossing inside the edge, so the
+   binarised mask was smaller than approved. Fix: `_feather_out` (grow-by-radius then blur then union)
+   for `auto`, so the ≥128 footprint can only match or exceed the hard selection.
+4. **No active-object cue.** `drawSelection` early-returns for auto (Bug 1 above), so nothing marked
+   the selected object. Fix: `drawActiveAutoOutline` strokes the object's *actual* edge-morphed
+   silhouette in cyan (never a rectangle), and it tracks the edge slider.
+5. **No live slider feedback.** `schedulePreview` nulled the overlay each input, so the canvas fell
+   back to the raw blit for the whole 420 ms. Fix: `compose()` builds a **display-only** wash that
+   mirrors the server's disc-grow/shrink + outward feather for the SELECTED auto object, so the slider
+   is live; `maskC` (export) stays raw → the server applies the geometry exactly once (no double-grow).
+
+**Audit caught four real bugs before any green run:** background pixels retained `lab=0` and would
+have been marked selected (whole-frame fill — gated on `flat`); a whole-line `INF` made `INF−INF=NaN`
+and annihilated a fully-selected erode (seed-aware `_dt1d`); `_layer_coverage` never bound `kind`
+(NameError on every auto/edge layer); and the new test's own `_selected` shadowed a module helper.
+
+**Validation status:** `py_compile` clean for `masks.py`/`engine.py`/`api.py`/`smoke_toolbox.py`.
+The offline suite ran once and its *only* failure was the `_selected` shadow (since fixed); a green
+re-run of `python3 tests/smoke_toolbox.py` (offline, incl. the new K2 disc/denoise/feather checks) and
+the browser suite (`/tmp/tbtest`) were **blocked by a harness command outage this session** and are the
+remaining gate. The container has **NOT** been re-synced — it still runs the previously-validated
+build, so no unvalidated kernel is live. Do `docker cp` + restart only after both suites are green.
+
+
+**Still open (honest):** the human crosswalk-photo validation of the *whole* flow (click person →
+Select tool → grow/shrink/feather visibly; second independent person; Auto/Manual loop; overlay
+slider live) — the automated suite proves the wire contract and the chrome removal, but a person
+should confirm the on-screen feel. SAM3 cold start, `/toolbox/launch` 403, dead compositing knobs,
+and the uncapped full-render path are unchanged from the list below.
+
+---
+
 ## 1. Do first — the two that can silently lose work
 
 ### Commit the toolbox

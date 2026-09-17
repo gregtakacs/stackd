@@ -27,6 +27,19 @@
   var W = 0, H = 0;             // natural (source) pixel size of all layers
   var baseC = null, maskC = null, viewC = null, ringC = null;
   var strokes = [], active = null, tool = 'brush';
+  // Smart-select (SAM3) session state. Points are kept in NORMALISED 0..1 coords so a zoom
+  // or resize never shifts a committed click. Each SUCCESSFUL selection is its own OBJECT in
+  // smartObjs — {pos, neg, layer} — so "select a car, then select another car" yields TWO
+  // independent masks, each separately growable/featherable/deletable. shift/alt refine the
+  // CURRENT object (the most recent one), which is what a follow-up click means to a user;
+  // select another object with the Select tool and refine targets are unchanged (refine only
+  // ever applies to the object you are actively building). The server re-infers the mask from
+  // the WHOLE point list each call, so an excluded region genuinely vanishes rather than
+  // ghosting back. smartSeq guards against a late reply applying out of order.
+  var smartObjs = [], smartCur = -1, smartSeq = 0;
+  // The lasso refine mode: Auto = trace a loose loop, seed SAM3 inside it (snaps to the
+  // true boundary); Manual = commit the exact pixels traced. A one-button toggle.
+  var smartAuto = true, smartDrag = null;
   // The object being manipulated by the Select tool, as an index into `strokes`.
   // An index and not a reference because undo/redo splice the array; every use
   // re-checks the bounds so a stale selection after Undo cannot throw.
@@ -117,7 +130,8 @@
   }
   function paramsSig() {
     var p = params();
-    return [p.width, p.height, p.mask_expand, p.mask_shrink, p.mask_feather, p.invert].join(',');
+    return [p.width, p.height, p.mask_expand, p.mask_shrink, p.mask_feather, p.invert,
+            p.overlay_alpha].join(',');
   }
 
   /* ---------------- painting model: vector strokes, rasterized on demand ----------------
@@ -173,8 +187,15 @@
    * sees and the geometry the server rasterizes are derived from the same numbers.
    */
   function objBBox(o) {
+    // A load/auto (smart-select) stroke carries no vertex list — its extent is the opaque
+    // region of the PNG it draws. The tight coverage box (o._bb) is measured once at load
+    // time by measureLoadBBox; until that lands (or if it fails) fall back to the full
+    // frame so the object is still selectable. THIS MUST PRECEDE the !pts guard: a load
+    // stroke has no pts, so testing pts first returned null and made every smart selection
+    // invisible to hitTest — the inspector that offers grow/shrink/feather for an 'auto'
+    // object could never open, so "edit the selection the tool made" was impossible.
+    if (o.mode === 'load') return o._bb || { x0: 0, y0: 0, x1: W, y1: H };
     if (!o.pts || !o.pts.length) return null;
-    if (o.mode === 'load') return { x0: 0, y0: 0, x1: W, y1: H };   // a whole-frame auto mask
     var x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
     for (var i = 0; i < o.pts.length; i++) {
       var p = o.pts[i];
@@ -183,6 +204,69 @@
     }
     var pad = (o.size || 0) / 2;                    // a brush's footprint is part of its box
     return { x0: x0 - pad, y0: y0 - pad, x1: x1 + pad, y1: y1 + pad };
+  }
+
+  // Measure the tight coverage box of a loaded (smart-select / auto) PNG ONCE, in NATURAL
+  // canvas coords, and stash it on the stroke as o._bb so objBBox/hitTest/the edge "% of
+  // this object" readout all agree on where the selection actually is. Scanned on a
+  // downsampled copy so a 1024² mask costs a fixed 96² pass, not a per-frame pixel walk.
+  function measureLoadBBox(o) {
+    if (!o || o.mode !== 'load' || !o.img) return null;
+    try {
+      var g = 96;
+      var c = document.createElement('canvas'); c.width = g; c.height = g;
+      var x = c.getContext('2d');
+      x.clearRect(0, 0, g, g);
+      x.drawImage(o.img, 0, 0, g, g);
+      var d = x.getImageData(0, 0, g, g).data;
+      var x0 = g, y0 = g, x1 = -1, y1 = -1, any = false;
+      for (var yy = 0; yy < g; yy++) {
+        for (var xx = 0; xx < g; xx++) {
+          if (d[(yy * g + xx) * 4 + 3] > 16) {                 // alpha = coverage (load contract)
+            any = true;
+            if (xx < x0) x0 = xx; if (xx > x1) x1 = xx;
+            if (yy < y0) y0 = yy; if (yy > y1) y1 = yy;
+          }
+        }
+      }
+      if (!any) { o._bb = null; return null; }
+      o._bb = { x0: x0 / g * W, y0: y0 / g * H,
+                x1: (x1 + 1) / g * W, y1: (y1 + 1) / g * H };
+      return o._bb;
+    } catch (e) { o._bb = null; return null; }                 // a tainted/failed read is not fatal
+  }
+
+  // A representative scatter of points strictly INSIDE a closed polygon, used to seed the
+  // proven SAM3 point prompt from a hand-traced lasso loop. Centroid + the interior samples
+  // of a coarse grid over the bbox; ray-cast point-in-polygon keeps only points that are
+  // genuinely inside the traced shape, so SAM3 is prompted on the object, never on background
+  // the loose loop swept over. Capped so a big loop stays one cheap GPU call.
+  function interiorSeeds(pts, cap) {
+    if (!pts || pts.length < 3) return [];
+    var ax = 1e9, ay = 1e9, bx = -1e9, by = -1e9, sx = 0, sy = 0, i;
+    for (i = 0; i < pts.length; i++) {
+      if (pts[i].x < ax) ax = pts[i].x; if (pts[i].x > bx) bx = pts[i].x;
+      if (pts[i].y < ay) ay = pts[i].y; if (pts[i].y > by) by = pts[i].y;
+      sx += pts[i].x; sy += pts[i].y;
+    }
+    function inside(px, py) {
+      var c = false, j = pts.length - 1;
+      for (i = 0; i < pts.length; j = i++) {
+        var xi = pts[i].x, yi = pts[i].y, xj = pts[j].x, yj = pts[j].y;
+        if (((yi > py) !== (yj > py)) && (px < (xj - xi) * (py - yi) / (yj - yi) + xi)) c = !c;
+      }
+      return c;
+    }
+    var out = [];
+    if (inside(sx / pts.length, sy / pts.length)) out.push([sx / pts.length, sy / pts.length]);
+    var STEP = 5;                                              // ~5x5 grid over the bbox
+    for (var gy = 0; gy <= STEP && out.length < (cap || 16); gy++) {
+      for (var gx = 0; gx <= STEP && out.length < (cap || 16); gx++) {
+        var px = ax + (bx - ax) * gx / STEP, py = ay + (by - ay) * gy / STEP;
+        if (inside(px, py)) out.push([px, py]);
+      }
+    }
+    return out;
   }
 
   function hitTest(p) {
@@ -201,23 +285,36 @@
 
   function selectObj(i) {
     sel = i;
+    // Mirror the per-object edge/feather into the toolbar sliders for an auto object so the
+    // obvious slider reads (and then edits) THIS object's geometry. For any other object the
+    // sliders keep their global "defaults for the next object" meaning and are left alone.
+    var o = (i >= 0 && i < strokes.length) ? strokes[i] : null;
+    if (o && (o.kind || kindOf(o)) === 'auto') {
+      if (el.edge) { el.edge.value = (typeof o.edge === 'number') ? o.edge : 0;
+                     if (el.edge_out) el.edge_out.textContent = String(el.edge.value); }
+      if (el.feather) { el.feather.value = (typeof o.feather === 'number') ? o.feather : 0;
+                        if (el.feather_out) el.feather_out.textContent = String(el.feather.value); }
+    }
     syncInspector();
     rasterize();
     if (i < 0) status('Nothing selected.');
     else {
       var o = strokes[i];
-      status('Selected a ' + (o.kind || kindOf(o)) + ' — drag to move, corner to scale.');
+      status(o.mode === 'load'
+        ? 'Selected an auto selection — use edge / feather to grow, shrink or soften it.'
+        : 'Selected a ' + (o.kind || kindOf(o)) + ' — drag to move, corner to scale.');
     }
   }
 
   function translateSel(dx, dy) {
     var o = selObj(); if (!o) return;
+    if (!o.pts) return;                              // an auto/load selection has no vertices to move
     for (var i = 0; i < o.pts.length; i++) { o.pts[i].x += dx; o.pts[i].y += dy; }
     rasterize();
   }
 
   function scaleSel(f) {
-    var o = selObj(); if (!o) return;
+    var o = selObj(); if (!o || !o.pts) return;
     var b = objBBox(o), cx = (b.x0 + b.x1) / 2, cy = (b.y0 + b.y1) / 2;
     for (var i = 0; i < o.pts.length; i++) {
       o.pts[i].x = cx + (o.pts[i].x - cx) * f;
@@ -370,6 +467,14 @@
       // An auto-mask arrives as a ready PNG (white RGB + alpha coverage, the same
       // canonical shape masks.normalize() emits) and is committed as ONE stack entry, so
       // the guess stays erasable/undoable instead of becoming the ground truth.
+      //
+      // Paint the RAW coverage, do NOT bake grow/shrink/feather here. This canvas feeds
+      // BOTH exportMask() and exportLayers(), and the server re-applies this layer's edge
+      // + feather (masks.normalize_layers, KIND_RULES['auto']). Morphing on top of the raw
+      // blit here would grow the object TWICE (once here, once on the server). Live
+      // grow/shrink/feather feedback is delivered by the server OVERLAY (compose draws
+      // preview.img), which is the WYSIWYG source of truth — not by a browser approximation
+      // that the render would then disagree with.
       m.drawImage(s.img, 0, 0, W, H);
       m.restore();
       return;
@@ -444,6 +549,133 @@
   }
 
 
+  /* ---------------- display-only morphology for the selected smart-select -------------- */
+  // #5: the toolbar edge/feather sliders must give LIVE feedback before the (debounced)
+  // server overlay lands. This morphs the SELECTED auto object's coverage for DISPLAY only;
+  // it is never written to maskC, so exportMask/exportLayers still ship the RAW silhouette and
+  // the server applies the real geometry exactly once — no double-grow (the bug a naive client
+  // bake reintroduces). It mirrors masks._morph_disk (separable squared-Euclidean transform) so
+  // what the slider previews and what the server paints agree; when the server overlay arrives
+  // it replaces this with identical pixels, so there is no flicker.
+  var _DISK_CAP = 256;   // display-only: the browser caps lower than the server (masks.DISK_CAP
+                         // 2048) because this runs per slider-drag; it is never exported, so the
+                         // render still uses the full-resolution server kernel.
+  function _dt1d(f) {
+    // Mirrors masks._dt1d EXACTLY, including the seed-awareness: only FINITE f entries are
+    // seeds. Without the f[q] >= Infinity skip, an all-off line (every entry Infinity, which
+    // happens for any smart-select object that does not span the full canvas width) makes
+    // s = (Inf - Inf) / ... = NaN; NaN > z[k] is never true, so k walks below zero and this
+    // loop never terminates -- that hung headless Chrome for the whole 180 s budget while the
+    // server (which HAS this guard) sailed through the same mask. The two must stay in lockstep.
+    var n = f.length; if (!n) return [];
+    var INF = Infinity;
+    var v = new Int32Array(n), z = new Float64Array(n + 1), d = new Float64Array(n);
+    var k = -1, q, vk, s, kk;
+    for (q = 0; q < n; q++) {
+      if (f[q] >= INF) continue;                       // not a seed: contributes no parabola
+      if (k < 0) { k = 0; v[0] = q; z[0] = -INF; z[1] = INF; continue; }
+      var fq = f[q];
+      for (;;) {
+        vk = v[k];
+        // q != vk (seeds only, q increasing) and every f[vk]/fq is finite, so s is finite.
+        s = ((q * q + fq) - (vk * vk + f[vk])) / (2 * (q - vk));
+        if (s > z[k]) break;                           // at k=0, z[0] = -Inf, so this always breaks
+        k -= 1;
+      }
+      k += 1; v[k] = q; z[k] = s; z[k + 1] = INF;
+    }
+    if (k < 0) { for (q = 0; q < n; q++) d[q] = INF; return d; }   // whole line off: unbounded
+    kk = 0;
+    for (q = 0; q < n; q++) {
+      while (z[kk + 1] < q) kk += 1;
+      var dq = q - v[kk]; d[q] = dq * dq + f[v[kk]];
+    }
+    return d;
+  }
+  // on: Uint8Array (w*h, 1 = selected). Returns Uint8Array of the disc-dilated/eroded mask.
+  function _edtOn(on, w, h) {
+    var INF = Infinity, x, y, q;
+    var col = new Float64Array(h), tmp = new Float64Array(w * h);
+    for (x = 0; x < w; x++) {
+      for (y = 0; y < h; y++) col[y] = on[y * w + x] ? 0 : INF;
+      var dc = _dt1d(col);
+      for (y = 0; y < h; y++) tmp[y * w + x] = dc[y];
+    }
+    var row = new Float64Array(w), out = new Float64Array(w * h);
+    for (y = 0; y < h; y++) {
+      for (x = 0; x < w; x++) row[x] = tmp[y * w + x];
+      var dr = _dt1d(row);
+      for (x = 0; x < w; x++) out[y * w + x] = dr[x];
+    }
+    return out;
+  }
+  // Morph one auto stroke's coverage into `dst` (a canvas ctx in natural W×H coords),
+  // applying the object's signed edge (disc grow/shrink) and outward feather — the same
+  // operators the server uses. Reads the raw alpha off `srcImg` (the committed PNG).
+  function morphAutoForDisplay(dst, srcImg, edge, feather) {
+    var sw = srcImg.naturalWidth || W, sh = srcImg.naturalHeight || H;
+    var sc = document.createElement('canvas'); sc.width = sw; sc.height = sh;
+    var sx = sc.getContext('2d', { willReadFrequently: true });
+    sx.drawImage(srcImg, 0, 0);
+    var img, on, w = sw, h = sh;
+    if (Math.max(w, h) > _DISK_CAP) {
+      var k = _DISK_CAP / Math.max(w, h);
+      w = Math.max(1, Math.round(sw * k)); h = Math.max(1, Math.round(sh * k));
+      var cc = document.createElement('canvas'); cc.width = w; cc.height = h;
+      cc.getContext('2d').drawImage(srcImg, 0, 0, w, h);
+      sc = cc; sx = sc.getContext('2d', { willReadFrequently: true });
+    }
+    try { img = sx.getImageData(0, 0, w, h); } catch (e) { return false; }
+    var a = img.data;
+    on = new Uint8Array(w * h);
+    for (var i = 0; i < w * h; i++) on[i] = a[i * 4 + 3] > 50 ? 1 : 0;   // alpha coverage
+    var e2 = Math.round(edge || 0);
+    if (e2 > 0) on = _discOn(on, w, h, Math.round(e2 * (w / sw)), true);
+    else if (e2 < 0) on = _discOn(on, w, h, Math.round(-e2 * (w / sw)), false);
+    // rasterise the on-grid back to an RGBA (white + coverage) canvas
+    var mc = document.createElement('canvas'); mc.width = w; mc.height = h;
+    var mx = mc.getContext('2d');
+    var mi = mx.createImageData(w, h), md = mi.data;
+    for (var j = 0; j < w * h; j++) {
+      md[j * 4] = 255; md[j * 4 + 1] = 255; md[j * 4 + 2] = 255;
+      md[j * 4 + 3] = on[j] ? 255 : 0;
+    }
+    mx.putImageData(mi, 0, 0);
+    dst.save();
+    if (feather && feather > 0) {
+      // outward feather: draw the shape, then a blurred copy of a slightly grown version,
+      // unioned — the >=128 core is preserved and the soft skirt only ever extends outward.
+      var gc = document.createElement('canvas'); gc.width = w; gc.height = h;
+      var gx = gc.getContext('2d');
+      gx.filter = 'blur(' + Math.max(0.5, feather * (w / sw)) + 'px)';
+      gx.drawImage(mc, 0, 0);
+      gx.filter = 'none';
+      dst.drawImage(mc, 0, 0, W, H);
+      dst.globalCompositeOperation = 'lighter';
+      dst.drawImage(gc, 0, 0, W, H);
+      dst.globalCompositeOperation = 'source-over';
+    } else {
+      dst.drawImage(mc, 0, 0, W, H);
+    }
+    dst.restore();
+    return true;
+  }
+  function _discOn(on, w, h, r, grow) {
+    if (r <= 0) return on;
+    var D = _edtOn(on, w, h), out = new Uint8Array(w * h), i;
+    if (grow) {
+      var r2 = r * r + 0.25;
+      for (i = 0; i < w * h; i++) out[i] = (on[i] || D[i] <= r2) ? 1 : 0;
+    } else {
+      // erode: stay on iff nearest OFF pixel is farther than r
+      var off = new Uint8Array(w * h);
+      for (i = 0; i < w * h; i++) off[i] = on[i] ? 0 : 1;
+      var Do = _edtOn(off, w, h);
+      for (i = 0; i < w * h; i++) out[i] = (on[i] && Do[i] > r * r) ? 1 : 0;
+    }
+    return out;
+  }
+
   /* ---------------- compositing (what the user sees) ---------------- */
   // Default: the mask as a translucent red wash over the photo — the SAME thing the
   // server's dry-run overlay (masks.overlay) draws, so local + authoritative agree in
@@ -459,17 +691,80 @@
     if (preview && preview.img && preview.sig === previewSig()) {
       v.drawImage(preview.img, 0, 0, W, H);
       drawActiveOutline(v);
+      if (selObj() && selObj().mode === 'load') drawActiveAutoOutline(v, selObj());
       return;
     }
     var wash = document.createElement('canvas');
     wash.width = W; wash.height = H;
     var wc = wash.getContext('2d');
-    wc.drawImage(maskC, 0, 0);
+    // Build the display coverage. For the SELECTED smart-select object we substitute a
+    // locally-morphed copy (its edge/feather) so the sliders are LIVE; everything else is the
+    // raw committed mask. maskC itself is never touched, so the exported geometry stays raw and
+    // the server applies the real morphology exactly once.
+    var so = selObj();
+    var morphedSel = false;
+    if (so && so.mode === 'load' && so.img && ((so.edge || 0) || (so.feather || 0))) {
+      // remove the raw blit, then paint the morphed coverage in its place
+      wc.drawImage(maskC, 0, 0);
+      wc.save();
+      wc.globalCompositeOperation = 'destination-out';
+      wc.drawImage(so.img, 0, 0, W, H);
+      wc.restore();
+      morphedSel = morphAutoForDisplay(wc, so.img, so.edge || 0, so.feather || 0);
+      if (!morphedSel) wc.drawImage(maskC, 0, 0);   // readback failed: revert to raw
+    } else {
+      wc.drawImage(maskC, 0, 0);
+    }
     wc.globalCompositeOperation = 'source-in';
     wc.fillStyle = 'rgba(232,62,62,' + val('tb_wash', 0.45) + ')';
     wc.fillRect(0, 0, W, H);
     v.drawImage(wash, 0, 0);
+    if (so && so.mode === 'load') drawActiveAutoOutline(v, so, morphedSel);
     drawActiveOutline(v);
+  }
+
+  // #4: which smart-select object is ACTIVE. A smart layer has no vector to box, so draw its
+  // ACTUAL silhouette boundary (not a rectangle): take the object's coverage, apply its signed
+  // edge (the same disc grow/shrink the wash and the server use) so the ring TRACKS the edge
+  // slider, then stroke the 1-px outline in a bright cyan. Only the selected object gets it, so
+  // it reads unmistakably as "this is the one the sliders are driving."
+  function drawActiveAutoOutline(v, o) {
+    try {
+      var sw = o.img.naturalWidth || W, sh = o.img.naturalHeight || H;
+      var w = sw, h = sh;
+      if (Math.max(w, h) > _DISK_CAP) {
+        var k = _DISK_CAP / Math.max(w, h);
+        w = Math.max(1, Math.round(sw * k)); h = Math.max(1, Math.round(sh * k));
+      }
+      var a = document.createElement('canvas'); a.width = w; a.height = h;
+      var ax = a.getContext('2d', { willReadFrequently: true });
+      ax.drawImage(o.img, 0, 0, w, h);
+      var gi = ax.getImageData(0, 0, w, h).data;
+      var n = w * h, on = new Uint8Array(n), i;
+      for (i = 0; i < n; i++) on[i] = gi[i * 4 + 3] > 50 ? 1 : 0;
+      var e2 = Math.round(o.edge || 0);
+      if (e2 > 0) on = _discOn(on, w, h, Math.max(1, Math.round(e2 * (w / sw))), true);
+      else if (e2 < 0) on = _discOn(on, w, h, Math.max(1, Math.round(-e2 * (w / sw))), false);
+      var ring = _boundaryRing(on, w, h);
+      var rc = document.createElement('canvas'); rc.width = w; rc.height = h;
+      var rx = rc.getContext('2d');
+      var ri = rx.createImageData(w, h), rd = ri.data;
+      for (var j = 0; j < n; j++) {
+        if (ring[j]) { rd[j * 4] = 60; rd[j * 4 + 1] = 220; rd[j * 4 + 2] = 255; rd[j * 4 + 3] = 255; }
+      }
+      rx.putImageData(ri, 0, 0);
+      v.save();
+      v.globalAlpha = 0.95;
+      v.drawImage(rc, 0, 0, W, H);
+      v.restore();
+    } catch (e) { /* readback/taint: skip the outline, the wash still shows the selection */ }
+  }
+  function _boundaryRing(on, w, h) {
+    var off = new Uint8Array(w * h), i;
+    for (i = 0; i < w * h; i++) off[i] = on[i] ? 0 : 1;
+    var Do = _edtOn(off, w, h), ring = new Uint8Array(w * h);
+    for (i = 0; i < w * h; i++) ring[i] = (on[i] && Do[i] <= 1) ? 1 : 0;   // edge band
+    return ring;
   }
 
   // The in-progress shape, drawn in natural coords so it scales with the view for free.
@@ -477,6 +772,13 @@
   // ellipse — every tool now previews while it builds, which the lasso previously did not.
   function drawSelection(v) {
     var o = selObj(); if (!o) return;
+    // A 'load' (smart-select) object is a fixed silhouette, not a movable/scalable vector:
+    // its translate+scale are deliberately no-ops. Drawing the dashed bounding rectangle AND
+    // the solid blue corner handle over it therefore advertises an affordance that does nothing
+    // and — worse — reads as a stray square "selecting" background outside the object. The red
+    // wash already shows what is selected, and the inspector still opens (selectObj runs), so
+    // skip the box/handle for auto objects entirely.
+    if (o.mode === 'load') return;
     var b = objBBox(o); if (!b) return;
     v.save();
     v.strokeStyle = '#3ba7ff'; v.lineWidth = Math.max(1.5, 2 * scale());
@@ -539,6 +841,7 @@
   }
   function clearMask() {
     strokes = []; redoStack = []; active = null; preview = null; sel = -1; selDrag = null;
+    smartObjs = []; smartCur = -1; smartDrag = null;   // a cleared canvas has no object to refine
     rasterize(); status('Mask cleared');
   }
   // Invert is a mask *semantic*, so it travels as a parameter instead of being baked
@@ -605,7 +908,13 @@
     }
     for (var i = 0; i < strokes.length; i++) {
       var o = strokes[i];
-      if (!o.pts || !o.pts.length) continue;
+      // A 'load' (smart-select / auto) stroke has no vertex list — its coverage IS the drawn
+      // PNG — so the !pts guard below must NOT skip it. It is a first-class 'auto' object
+      // (masks.KIND_RULES['auto'] = threshold+feather+morph). Skipping it meant a
+      // smart-select PLUS a brush stroke shipped layers WITHOUT the SAM3 mask, and because
+      // the server prefers layers over mask_png, the selected object silently vanished from
+      // the actual render even though it looked selected on screen.
+      if (o.mode !== 'load' && (!o.pts || !o.pts.length)) continue;
       var k = { kind: o.kind || kindOf(o), edge: o.edge || 0,
                 grow: o.grow || 0, shrink: o.shrink || 0,
                 feather: o.feather || 0, erase: !!o.erase };
@@ -640,6 +949,11 @@
       mask_shrink: Math.max(0, -val('tb_edge', 0)),
       mask_feather: val('tb_feather', 8),
       invert: inverted(),
+      // Cosmetic read-strength of the mask overlay (the 'overlay' slider). Sent to the
+      // preview so the SERVER bakes the tint at the chosen alpha; the client cannot fade
+      // the server's already-composited image without also fading the photo underneath.
+      // Never reaches the render's mask maths.
+      overlay_alpha: val('tb_wash', 0.45),
       opacity: val('tb_opacity', 1.0),
       blend_mode: el.blend ? el.blend.value : 'normal',
       color_match: val('tb_colormatch', 0.9),
@@ -676,9 +990,31 @@
     for (var k in (attrs || {})) { if (Object.prototype.hasOwnProperty.call(attrs, k)) i.setAttribute(k, attrs[k]); }
     i.value = value;
     var out = mk('span', 'tb-num', String(value));
-    i.addEventListener('input', function () { out.textContent = i.value; refresh(); });
+    // When a smart-select (auto) object is selected, the edge/feather sliders must edit THAT
+    // object: the per-object geometry is what the layered server path normalises (see
+    // masks.normalize_layers + api h_mask_preview), and the global mask_expand/feather the same
+    // sliders otherwise feed are IGNORED once layers exist. Routing the obvious slider to the
+    // selected auto object is what makes "grow/shrink/feather my selection" actually work. A
+    // brush is excluded (its edge is hardness) and an unselected canvas keeps the old meaning
+    // of these controls: defaults for the NEXT object.
+    i.addEventListener('input', function () {
+      out.textContent = i.value;
+      var o = selObj();
+      if ((id === 'edge' || id === 'feather') && o && (o.kind || kindOf(o)) === 'auto') {
+        var v = parseFloat(i.value) || 0;
+        if (id === 'edge') {
+          o.edge = v; o.grow = v > 0 ? v : 0; o.shrink = v < 0 ? -v : 0;
+        } else {
+          o.feather = v;
+        }
+        rasterize();                 // maskC repaint + schedulePreview under the new geometry
+        if (typeof syncInspector === 'function') syncInspector();   // keep the inspector row honest
+        return;
+      }
+      refresh();
+    });
     wrap.appendChild(i); wrap.appendChild(out);
-    el[id] = i;
+    el[id] = i; el[id + '_out'] = out;   // *_out lets selectObj mirror the object's numbers in
     return wrap;
   }
   function toggle(id, label, on) {
@@ -728,6 +1064,9 @@
     if (t !== 'select' && sel >= 0) { sel = -1; syncInspector(); }
     if (t === 'lasso') active = { mode: 'draw', pts: [], size: 0, hardness: 1, erase: false };
     else if (t === 'polygon') active = { mode: 'poly', pts: [], size: 0, hardness: 1, erase: false };
+    else if (t === 'smart') msg = msg || 'Smart select — click an object to select it whole; shift+click adds, alt/ctrl+click removes. Drag a loop: Auto snaps it to the object, Manual keeps the exact pixels.';
+    if (el.smartmode) el.smartmode.disabled = (t !== 'smart');   // the loop mode only means something here
+    if (t !== 'smart') smartDrag = null;                          // never leak a half-traced loop into another tool
     // brush/eraser hide the OS cursor so the drawn ring is the only cursor — otherwise a
     // crosshair and the size ring fight each other and the size is still ambiguous.
     if (viewC) viewC.style.cursor = (t === 'brush' || t === 'eraser') ? 'none'
@@ -747,6 +1086,18 @@
     el.tools.appendChild(tbtn('eraser', 'Eraser', 'Erase from the mask (E)'));
     el.tools.appendChild(tbtn('lasso', 'Lasso', 'Freehand: drag a loop around the area (L)'));
     el.tools.appendChild(tbtn('polygon', 'Polygon', 'Click points around the area, then Close (P)'));
+    el.tools.appendChild(tbtn('smart', 'Smart select', 'Click an object to select the whole thing (SAM3). Shift+click adds to it, Alt/Ctrl+click subtracts. Drag a loop to lasso-select.'));
+    // The lasso mode only matters while the Smart tool is up, but keeping it visible (and
+    // greyed otherwise) means one glance always says what a smart drag will DO — Auto snaps
+    // the loop to the real SAM3 boundary, Manual commits exactly the pixels traced.
+    el.smartmode = btn('Loop: Auto', function () {
+      smartAuto = !smartAuto;
+      el.smartmode.textContent = smartAuto ? 'Loop: Auto' : 'Loop: Manual';
+      status(smartAuto ? 'Smart loop = Auto: SAM3 snaps your loop to the object edge.'
+                       : 'Smart loop = Manual: the exact pixels you trace are added/removed.');
+    }, 'Smart drag: Auto snaps your loop to the SAM3 boundary; Manual uses the exact pixels traced.');
+    el.smartmode.setAttribute('data-smartmode', '1');
+    el.tools.appendChild(el.smartmode);
     el.tools.appendChild(tbtn('rect', 'Rect', 'Drag a box'));
     el.tools.appendChild(tbtn('ellipse', 'Ellipse', 'Drag an ellipse'));
     el.tools.appendChild(btn('Close shape', function () {
@@ -917,6 +1268,113 @@
       im.src = 'data:image/png;base64,' + r.mask_png;
     }).catch(function (e) { status('Auto-mask failed: ' + e.message, 'bad'); });
   }
+
+  // ---- SAM3 smart-select ---------------------------------------------------------------
+  // mode: 'new' (fresh object, plain click) | 'add' (grow, shift) | 'neg' (shrink, alt).
+  // A plain click always STARTS A NEW independent object, so "select a car, then another
+  // car" leaves two separately-editable masks; shift/alt refine the current (most recent)
+  // object. runSmart owns the point-list edit so a failed/empty request rolls back to exactly
+  // the mask still on canvas. Every request re-sends the WHOLE list and REPLACES that object's
+  // layer (the node is stateless), so an excluded region genuinely disappears rather than
+  // surviving as a union of prior guesses.
+  function runSmart(mode, pt) {
+    var obj;
+    if (mode === 'new') {
+      obj = { pos: [pt], neg: [], layer: null };
+      smartObjs.push(obj); smartCur = smartObjs.length - 1;
+    } else {
+      obj = smartObjs[smartCur];                       // refine the object being built
+      if (!obj) { obj = { pos: [], neg: [], layer: null }; smartObjs.push(obj); smartCur = smartObjs.length - 1; }
+      if (mode === 'neg') obj.neg = obj.neg.concat([pt]); else obj.pos = obj.pos.concat([pt]);
+    }
+    if (!obj.pos.length) {
+      status('Alt+click only subtracts — click the object normally first.', 'warn');
+      if (mode !== 'new') { obj.neg = obj.neg.slice(0, -1); } else { smartObjs.pop(); smartCur = smartObjs.length - 1; }
+      return;
+    }
+    requestSmart(obj, mode);
+  }
+
+  // Shared SAM3 request + commit. `obj` carries the full point list and its layer (replaced in
+  // place on a refine, appended once on a first success). seq guards out-of-order replies.
+  function requestSmart(obj, tag) {
+    var seq = ++smartSeq;
+    status('Selecting…');
+    req('/toolbox/mask/click', {
+      image: CFG.image || null, image_id: CFG.image_id || null,
+      points: obj.pos, negative_points: obj.neg, threshold: 0.5
+    }).then(function (r) {
+      if (seq !== smartSeq) return;                        // a later click already superseded this
+      if (r.error) throw new Error(r.error);
+      if (!r.mask_png) throw new Error('no mask came back');
+      if (r.empty) {                                        // selected nothing: undo this click's point
+        if (tag === 'new') { smartObjs.pop(); smartCur = smartObjs.length - 1; }
+        else if (tag === 'neg') obj.neg = obj.neg.slice(0, -1);
+        else obj.pos = obj.pos.slice(0, -1);
+        status(r.warning || 'That click selected nothing — tap a solid part of the object.', 'warn');
+        return;
+      }
+      var im = new Image();
+      im.onload = function () {
+        if (seq !== smartSeq) return;                       // superseded while the image decoded
+        active = null;
+        if (obj.layer && strokes.indexOf(obj.layer) >= 0) {
+          obj.layer.img = im; measureLoadBBox(obj.layer);   // refine in place: replace, never append
+        } else {
+          obj.layer = stamp({ mode: 'load', img: im, size: 0, hardness: 1, erase: false });
+          strokes.push(obj.layer); redoStack = [];
+          measureLoadBBox(obj.layer);
+        }
+        selectObj(strokes.indexOf(obj.layer));             // show the selection + open its editor
+        rasterize();
+        var c = 100 * (typeof r.coverage === 'number' ? r.coverage : 0);
+        status('Selected ' + c.toFixed(1) + '% — Select-tool to grow/feather, shift+click to add, alt+click to remove, then Preview.');
+      };
+      im.src = 'data:image/png;base64,' + r.mask_png;
+    }).catch(function (e) {
+      if (seq !== smartSeq) return;
+      if (tag === 'new' && !obj.layer) { smartObjs.pop(); smartCur = smartObjs.length - 1; }
+      status('Smart select failed: ' + e.message, 'bad');
+    });
+  }
+
+  // The lasso path. `seed` is a natural-px polygon; Auto converts it to interior points and
+  // reuses the verified point seam (SAM3 snaps to the real boundary); Manual commits the exact
+  // traced loop as a normal shape stroke (already pixel-accurate, no second guess to snap).
+  // 'add'/'neg' refine the current object; 'new' starts a fresh one.
+  function smartLasso(seedPts, mode) {
+    if (!seedPts || seedPts.length < 3) return;
+    if (mode !== 'new') {
+      var obj = smartObjs[smartCur];
+      if (!obj) { obj = { pos: [], neg: [], layer: null }; smartObjs.push(obj); smartCur = smartObjs.length - 1; }
+      if (smartAuto) {
+        var frac = interiorSeeds(seedPts).map(function (q) { return [q[0] / W, q[1] / H]; });
+        if (!frac.length) { status('That loop had no clear interior to sample.', 'warn'); return; }
+        if (mode === 'neg') obj.neg = obj.neg.concat(frac); else obj.pos = obj.pos.concat(frac);
+        requestSmart(obj, mode);
+      } else {
+        active = null;
+        strokes.push(stamp({ mode: 'draw', pts: seedPts, size: 0, hardness: 1, erase: mode === 'neg' }));
+        redoStack = []; rasterize();
+        status((mode === 'neg' ? 'Removed' : 'Added') + ' that loop to the selection.');
+      }
+      return;
+    }
+    // 'new'
+    if (!smartAuto) {
+      active = null;
+      var o = stamp({ mode: 'draw', pts: seedPts, size: 0, hardness: 1, erase: false });
+      strokes.push(o); redoStack = []; rasterize();
+      status('Added that loop as a shape — Select-tool to grow/feather it.');
+      return;
+    }
+    var fr = interiorSeeds(seedPts).map(function (q) { return [q[0] / W, q[1] / H]; });
+    if (!fr.length) { status('That loop had no clear interior to sample.', 'warn'); return; }
+    var nobj = { pos: fr, neg: [], layer: null };
+    smartObjs.push(nobj); smartCur = smartObjs.length - 1;
+    requestSmart(nobj, 'new');
+  }
+
 
   var jobTimer = null;
   var jobId = null;
@@ -1170,6 +1628,18 @@
         if (!active || active.mode !== 'poly') active = { mode: 'poly', pts: [], size: 0, hardness: 1, erase: false };
         active.pts.push(p); dragEnabled = false; compose(); return;
       }
+      if (t === 'smart') {                      // tap = point prompt; drag = a lasso loop
+        // Decide click-vs-lasso on release: a finger that barely moved is a point prompt
+        // (shift/alt add/remove a point); one that traced a path is a lasso. We start a
+        // 'draw' buffer so the loop previews live, exactly like the Lasso tool, but do NOT
+        // commit here — up() routes it to smartLasso, not the generic shape commit.
+        var sm = (ev.altKey || ev.ctrlKey || ev.metaKey) ? 'neg' : (ev.shiftKey ? 'add' : 'new');
+        smartDrag = { mode: sm, moved: false, x0: p.x, y0: p.y };
+        active = { mode: 'draw', size: 0, hardness: 1, erase: false, pts: [p] };
+        dragEnabled = true;
+        try { viewC.setPointerCapture(ev.pointerId); } catch (e) { /* not fatal */ }
+        return;
+      }
       if (t === 'brush' || t === 'eraser') {
         active = { mode: 'free', size: brushR() * 2, hardness: hard, pts: [p], erase: t === 'eraser' };
       } else if (t === 'lasso') {               // freehand: one point now, more on move
@@ -1209,6 +1679,11 @@
         return;
       }
       var p = toNatural(ev);
+      if (tool === 'smart' && smartDrag && !smartDrag.moved) {
+        // Past a small displacement this is a lasso trace, not a tap; the generic 'draw'
+        // branch below still appends the points so the loop previews while tracing.
+        if (Math.hypot(p.x - smartDrag.x0, p.y - smartDrag.y0) > 6) smartDrag.moved = true;
+      }
       if (active.mode === 'free' || active.mode === 'draw') {
         // jitter guard: a real drag must move at least ~1 natural px so a fast swipe does
         // not stack hundreds of near-identical discs (slow, and it thickens the stroke)
@@ -1235,6 +1710,22 @@
       if (Date.now() - pinchEnd < 400) { restIfEmpty(); return; }
       dragEnabled = false;
       if (tool === 'select') { selDrag = null; return; }
+      if (tool === 'smart') {
+        // A barely-moved press is a point prompt; a traced path is a lasso. Neither commits
+        // through the generic shape path below — runSmart/smartLasso own it (Auto reuses the
+        // point seam; Manual commits the exact loop). active is discarded either way.
+        var sd = smartDrag; smartDrag = null;
+        var loop = active && active.pts ? active.pts.slice() : null; active = null;
+        if (!sd) { if (ev && ev.pointerType === 'touch') hideRing(); restIfEmpty(); rasterize(); return; }
+        if (sd.moved && loop && loop.length >= 3) {
+          smartLasso(loop, sd.mode);
+        } else {
+          runSmart(sd.mode, [sd.x0 / W, sd.y0 / H]);
+        }
+        if (ev && ev.pointerType === 'touch') hideRing();
+        restIfEmpty(); rasterize();
+        return;
+      }
       if (!active) return;
       var m = active.mode;
       if (m === 'free') { if (active.pts.length) strokes.push(stamp(active)); }
