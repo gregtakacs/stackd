@@ -152,6 +152,18 @@ RUN git clone --recursive ${SGLANG_FORK_REPO} . \
     && git checkout ${SGLANG_FORK_REF} \
     && git submodule update --init --recursive
 
+# Vendor our own copy of the fork's bundled Froggeric v22.5 chat template
+# (extracted from the sglang-pennyroyal:local image built at pennyroyal-v2.5.0,
+# 2026-09-17) instead of trusting it silently on every future SGLANG_FORK_REF
+# bump — this file controls the exact tool-call instructions/format the model
+# is prompted with (qwen3.8-flash-next.yaml's cmd_extra selects `xml` vs
+# `json` via chat_template_kwargs.tool_call_format; --tool-call-parser must
+# match: qwen3_coder for xml, hermes for json). Before ever bumping
+# SGLANG_FORK_REF, diff this file against a fresh clone's
+# configs/pennyroyal/templates/froggeric-v22.5.jinja and re-vendor deliberately
+# — same discipline as the patches/ directory below.
+COPY templates/froggeric-v22.5.jinja configs/pennyroyal/templates/froggeric-v22.5.jinja
+
 # TEMPORARY local hotfix, same shape as the retired qwen3_coder phantom
 # tool-call patch above (v2.4.0 note): patches/qwen3-reasoning-tool-mention.patch
 # fixes python/sglang/srt/parser/reasoning_parser.py's `Qwen3Detector` (and its

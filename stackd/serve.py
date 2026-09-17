@@ -1545,13 +1545,40 @@ def _extract_usage(buf: bytes) -> dict:
 # anyway (SSE is append-only, and generation is not deterministic run to run).
 
 
+def _toolcall_args_self_wrapped(name: str | None, parsed) -> bool:
+    """True if a successfully-PARSED ``arguments`` value is still the wrong shape —
+    the model re-wrapped a whole call envelope inside its own arguments instead of
+    emitting the flat parameter object the tool's schema declares. Distinct from (and
+    not caught by) the plain JSON-parseability check below: this is valid JSON, just
+    self-referential. Observed live on real Cline history replays against both
+    tool-call formats (see AI-STACK/scripts/tool-call-probes/replay_real_session.py):
+    qwen3_coder/xml producing ``{"arguments": "{\\"commands\\": [...]}"}`` and (while
+    A/B-testing hermes/json, since reverted — see qwen3.8-flash-next.yaml) a nested
+    ``{"name": "run_commands", "arguments": {"name": "run_commands", "arguments":
+    {...}}}``. Exact-set matches only (not a subset check) to avoid flagging a real
+    tool whose schema happens to declare an "arguments" or "name" parameter alongside
+    others."""
+    if not isinstance(parsed, dict):
+        return False
+    keys = set(parsed.keys())
+    if keys == {"arguments"}:
+        return True
+    if keys == {"name", "arguments"}:
+        return True
+    if name and name in parsed:
+        return True
+    return False
+
+
 def _completion_toolcall_state(buf: bytes):
     """Scan a chat/completions response (JSON body OR an SSE capture) and rebuild the
     assistant tool calls. Returns ``(has_tool_calls, finish_reasons, bad_args)`` where
     ``bad_args`` is True if any tool call's accumulated ``arguments`` is non-empty but
-    not valid JSON (i.e. truncated). Deliberately conservative: never raises, and an
-    empty ``arguments`` (a genuinely argument-less call) is NOT flagged — only unparseable
-    content or a finish_reason of "length" alongside a tool call marks it broken."""
+    either not valid JSON (i.e. truncated) or valid JSON in the wrong SHAPE — a
+    self-wrapped envelope, see _toolcall_args_self_wrapped. Deliberately conservative:
+    never raises, and an empty ``arguments`` (a genuinely argument-less call) is NOT
+    flagged — only unparseable/wrongly-shaped content or a finish_reason of "length"
+    alongside a tool call marks it broken."""
     finish: set[str] = set()
     acc: dict[int, list] = {}     # index -> [name, arguments-so-far]
 
@@ -1594,13 +1621,16 @@ def _completion_toolcall_state(buf: bytes):
                     _absorb_tools((ch.get("delta") or {}).get("tool_calls"))
 
     bad = False
-    for _name, args in acc.values():
+    for name, args in acc.values():
         a = (args or "").strip()
         if not a:
             continue
         try:
-            json.loads(a)
+            parsed = json.loads(a)
         except (json.JSONDecodeError, ValueError):
+            bad = True
+            continue
+        if _toolcall_args_self_wrapped(name, parsed):
             bad = True
     return bool(acc), finish, bad
 
@@ -1692,9 +1722,10 @@ class _ToolCallGate:
 
 def _sanitize_toolcall_body(data: bytes, model_name: str) -> bytes | None:
     """Non-streamed counterpart to _ToolCallGate: if the (already complete, in hand)
-    response has a tool call that never became valid JSON, log it and return a
-    rewritten body with tool_calls cleared and finish_reason forced to "length" instead
-    of forwarding the broken call. Also logs the reasoning-ran-out-the-budget sibling
+    response has a tool call that never became valid JSON, OR parsed into a self-
+    wrapped envelope (see _toolcall_args_self_wrapped), log it and return a rewritten
+    body with tool_calls cleared and finish_reason forced to "length" instead of
+    forwarding the broken call. Also logs the reasoning-ran-out-the-budget sibling
     case, unchanged. None if nothing needs to change."""
     has, finish, bad = _completion_toolcall_state(data)
     if not has:
