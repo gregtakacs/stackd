@@ -35,12 +35,13 @@ import math
 import os
 
 try:
-    from PIL import Image, ImageChops, ImageFilter
+    from PIL import Image, ImageChops, ImageFilter, ImageStat
     HAS_PIL = True
 except ImportError:  # pragma: no cover - exercised only on a pillow-less install
     Image = None
     ImageFilter = None
     ImageChops = None
+    ImageStat = None
     HAS_PIL = False
 
 
@@ -199,6 +200,273 @@ def shrink_to_max_side(image_bytes: bytes, max_side: int = RENDER_MAX_SIDE, *,
     # and an alpha channel reaching the graph is a different image than the one previewed.
     img.convert("RGB").resize((w, h), Image.LANCZOS).save(out, DEFAULT_FORMAT)
     return out.getvalue(), (w, h)
+
+
+# --------------------------------------------------------------------------------
+# Crop-and-paste: render the region the user actually selected.
+#
+# The ceiling above caps what the ENGINE can afford; cropping is what makes a small
+# edit cheap WITHOUT throwing the photo away. A 1% selection in a full-resolution frame
+# costs 1% of the latents, and the result is pasted back onto the ORIGINAL pixels
+# instead of replacing them — which is also the compositing pass the panel's
+# blend_mode / opacity / color_match / preserve_detail knobs have promised since M1
+# (TODO 1B's honest-control inventory). This is where they finally live.
+#
+# Coordinate spaces, spelled out because a mistake here is silent:
+#   canvas  the working grid the browser paints on and the canonical mask lives on,
+#           (cw, ch) == the job's working_w/h, always <= RENDER_MAX_SIDE
+#   box     the crop rect, held in CANVAS px, grid-aligned
+#   render  what ComfyUI runs at — the box itself (never upscaled)
+#   source  the photo as the user loaded it, (sw, sh). Mapping canvas -> source is
+#           PROPORTIONAL (see _scale_box) and only ever happens where the source is
+#           actually in hand, so a stale canvas size cannot quietly skew a crop.
+# --------------------------------------------------------------------------------
+
+CROP_MARGIN_FRAC = 0.35      # context ring around the selection, x its long edge
+CROP_MARGIN_MIN = 96         # floor on that ring, in canvas px
+MIN_CROP_SIDE = 256          # don't ask a diffusion model to paint a postage stamp
+CROP_AFFORDABLE = 0.75       # crop only when the box stays under this fraction of frame
+SEAM_FEATHER_PX = 12         # how far the paste edge fades
+BLEND_MODES = ("normal", "multiply", "screen", "overlay", "soft_light", "hard_light",
+               "luminosity", "color")
+
+
+def selection_bbox(mask_bytes: bytes, *, threshold: int = COVERAGE_BRIGHTNESS_THRESHOLD):
+    """(x0, y0, x1, y1) of the selected pixels in the mask's OWN grid, or None when it
+    selects nothing. Read via extract_coverage — the SAME rule the render's mask uses —
+    so a crop planned from this can never miss paint the graph will honour."""
+    cov = extract_coverage(_open(mask_bytes))
+    box = cov.point(lambda p: 255 if p > threshold else 0).getbbox()
+    return tuple(box) if box else None
+
+
+def _scale_box(box, frame, target):
+    """A rect from one pixel grid to another, proportionally per axis, clamped to the
+    target. Per-axis on purpose: canvas and source agree on aspect only up to a grid
+    rounding, and assuming one shared factor is how an edit lands off-centre."""
+    (bx0, by0, bx1, by1), (fw, fh), (tw, th) = box, frame, target
+    fx, fy = (tw / float(fw or 1)), (th / float(fh or 1))
+    x0, y0 = max(0, int(round(bx0 * fx))), max(0, int(round(by0 * fy)))
+    x1, y1 = min(tw, int(round(bx1 * fx))), min(th, int(round(by1 * fy)))
+    return (x0, y0, max(x0 + 1, x1), max(y0 + 1, y1))
+
+
+def plan_crop(mask_bytes: bytes, *, max_side: int = RENDER_MAX_SIDE,
+              grid: int = LATENT_GRID):
+    """The crop plan for a canonical mask, or None when rendering the whole frame is the
+    better call (empty/degenerate selection, or a box covering most of the frame).
+
+    {"box": canvas-space grid-aligned rect, "frame": (cw, ch) the mask's own size,
+     "size": (rw, rh) the render runs at}
+
+    The margin decides whether the paste is invisible. A model can only continue a
+    texture/perspective/light gradient from context it was GIVEN, so a box hugging the
+    selection pastes a region whose surroundings were never in the latents and the seam
+    shows: ring = CROP_MARGIN_FRAC of the selection's long edge, floored at
+    CROP_MARGIN_MIN, with MIN_CROP_SIDE on the box itself.
+    """
+    _require_pil()
+    img = _open(mask_bytes)
+    cw, ch = img.width, img.height
+    box = selection_bbox(mask_bytes)
+    if not box:
+        return None
+    x0, y0, x1, y1 = box
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return None
+    ring = max(CROP_MARGIN_MIN, int(round(CROP_MARGIN_FRAC * max(x1 - x0, y1 - y0))))
+    bx0, by0 = max(0, x0 - ring), max(0, y0 - ring)
+    bx1, by1 = min(cw, x1 + ring), min(ch, y1 + ring)
+    # Widen to the model's comfort floor, symmetrically where the frame allows. Ask for a
+    # grid step MORE than MIN_CROP_SIDE, because the alignment below floors inward: asking
+    # for exactly 256 could land on 240 and quietly break the floor we just applied.
+    for axis in ("x", "y"):
+        lo, hi, cap = (bx0, bx1, cw) if axis == "x" else (by0, by1, ch)
+        want = min(MIN_CROP_SIDE + grid, cap)
+        if hi - lo < want:
+            need = want - (hi - lo)
+            lo, hi = max(0, lo - (need + 1) // 2), min(cap, hi + need // 2)
+            if hi - lo < want:                      # wall-hit: push the other way instead
+                lo = max(0, hi - want) if hi >= want else 0
+        if axis == "x":
+            bx0, bx1 = lo, hi
+        else:
+            by0, by1 = lo, hi
+    # THEN align: origins floor to the grid and the sizes are floored to whole grid steps,
+    # which keeps the far edge inside the frame (bw <= bx1 - bx0 <= cap - bx0). Sending an
+    # unaligned width/height to a Flux graph is not a rounding detail — it is rejected.
+    bx0, by0 = bx0 // grid * grid, by0 // grid * grid
+    bw = max(grid * 2, ((bx1 - bx0) // grid) * grid)
+    bh = max(grid * 2, ((by1 - by0) // grid) * grid)
+    bw, bh = min(bw, cw - bx0), min(bh, ch - by0)
+    if bw % grid or bh % grid or bw < grid or bh < grid:
+        return None                       # a frame so small nothing grid-aligned fits
+    if bw * bh > CROP_AFFORDABLE * cw * ch:
+        return None                       # no real saving, and a seam to hide for nothing
+    return {"box": (int(bx0), int(by0), int(bx0 + bw), int(by0 + bh)),
+            "frame": (int(cw), int(ch)), "size": (int(bw), int(bh))}
+
+
+def crop_for_render(source_bytes: bytes, plan: dict, *, size=None):
+    """The photo crop the GPU is given — the plan's rect out of whatever source it is
+    handed (the full-resolution photo, proportionally), resampled to the render size.
+    Returns (bytes, (rw, rh)) so the caller patches the graph's width/height nodes with
+    the SAME numbers it cropped at. Resize-to-exact is deliberate: it matches
+    comfyui_client.downscale_to_exact_size and the graph's own ImageScale(crop="disabled")
+    stretch, so source and mask arrive with identical geometry."""
+    _require_pil()
+    img = Image.open(io.BytesIO(source_bytes))
+    box = _scale_box(plan["box"], plan["frame"], (img.width, img.height))
+    want = tuple(size or plan["size"])
+    buf = io.BytesIO()
+    img.convert("RGB").crop(box).resize(want, Image.LANCZOS).save(buf, DEFAULT_FORMAT)
+    return buf.getvalue(), want
+
+
+def crop_mask(mask_bytes: bytes, plan: dict, *, size=None) -> bytes:
+    """The SAME rect of the canonical mask, on the render grid. Geometry-free on purpose
+    (see resize_canonical): normalize_layers applied each object's grow/feather exactly
+    once already, and applying them twice is the double-grow bug fixed in 0B-follow-up-2."""
+    _require_pil()
+    img = _open(mask_bytes).convert("RGBA")
+    want = tuple(size or plan["size"])
+    sub = img.crop(_scale_box(plan["box"], plan["frame"], (img.width, img.height)))
+    if sub.size != want:
+        sub = sub.resize(want, Image.LANCZOS)
+    buf = io.BytesIO(); sub.save(buf, DEFAULT_FORMAT)
+    return buf.getvalue()
+
+
+def _seam_alpha(size, feather: int = SEAM_FEATHER_PX) -> "Image.Image":
+    """An 'L' mask, 255 across the crop, fading to 0 at its border. This border fade is
+    the ONLY edge the paste has to hide — the selection's own edge was already honoured by
+    ImageCompositeMasked inside the crop — so the seam is a rectangle, not a silhouette."""
+    w, h = int(size[0]), int(size[1])
+    f = max(1, min(int(feather), max(1, min(w, h) // 3)))
+    a = Image.new("L", (w, h), 0)
+    a.paste(Image.new("L", (max(1, w - 2 * f), max(1, h - 2 * f)), 255), (f, f))
+    return a.filter(ImageFilter.GaussianBlur(f / 2.0))
+
+
+def _color_match(src: "Image.Image", ref: "Image.Image") -> "Image.Image":
+    """Per-channel mean/std transfer of src toward ref (no numpy): the crop inherits the
+    photo it is being dropped back into, which is what the color_match knob exposes."""
+    if src.mode != "RGB":
+        src = src.convert("RGB")
+    if ref.mode != "RGB":
+        ref = ref.convert("RGB")
+    s, r = ImageStat.Stat(src), ImageStat.Stat(ref)
+    # split()/merge(), not the band API: getband/putband are not part of Pillow's public
+    # Image surface (absent in 12.x), so this is a portable form rather than an
+    # AttributeError raised mid-render on real GPU time — the class of bug a syntax check
+    # cannot see and a suite with no coverage for this function will happily bless.
+    bands = src.split()
+    for i in range(3):
+        smean, sstd = s.mean[i], s.stddev[i]
+        rmean, rstd = r.mean[i], r.stddev[i]
+        # A flat source band has no scale to transfer — but it still has the wrong LEVEL,
+        # and shifting its mean toward the reference is the whole point of the knob (a flat
+        # grey patch pasted into sunlight must come out of color_match lit, not grey).
+        # Bailing out here used to make color_match a silent no-op on exactly that case.
+        ratio = (rstd / sstd) if sstd > 1e-6 else 1.0
+        offset = rmean - smean * ratio
+        shifted = bands[i].point(
+            lambda p, k=ratio, b=offset: max(0, min(255, int(round(p * k + b)))))
+        bands = bands[:i] + (shifted,) + bands[i + 1:]
+    return Image.merge("RGB", bands)
+
+
+def paste_back(source_bytes: bytes, artifact_png: bytes, plan: dict, *,
+               opacity: float = 1.0, blend_mode: str = "normal",
+               color_match: float = 0.0, preserve_detail: float = 0.0):
+    """Paste a regenerated crop back over the FULL-RESOLUTION photo. (bytes, note).
+
+    Server-side rather than graph nodes, because the graph never sees the uncropped
+    photo — no ComfyUI node could composite against it — and keeping it here means the
+    one module that owns mask semantics also owns "what pixels survived the round trip",
+    where the smoke suite can look at it.
+
+    The four M1 dead knobs ARE the four operations below, each with a direction check in
+    tests/smoke_toolbox.py:
+      opacity           alpha of the paste; 0 returns the source byte-for-byte
+      blend_mode        ImageChops operators in ComfyUI's ImageBlend spellings
+      color_match       0..1 pull of the crop's histogram toward the photo around it
+      preserve_detail   0..1 of the ORIGINAL high-frequency detail added back, so a
+                        smooth model output does not erase the texture it replaced
+    """
+    _require_pil()
+    try:
+        base = Image.open(io.BytesIO(source_bytes)).convert("RGB")
+    except Exception as e:  # noqa: BLE001
+        raise MaskError(f"could not decode the source image ({e.__class__.__name__}: {e})")
+    box = _scale_box(plan["box"], plan["frame"], (base.width, base.height))
+    x0, y0, x1, y1 = box
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return source_bytes, "the crop fell outside the photo; nothing was pasted"
+    region = base.crop((x0, y0, x1, y1))
+    want = region.size
+    try:
+        new = Image.open(io.BytesIO(artifact_png)).convert("RGB").resize(want, Image.LANCZOS)
+    except Exception as e:  # noqa: BLE001
+        return source_bytes, f"could not decode the rendered crop ({e.__class__.__name__}: {e})"
+
+    notes = []
+
+    def frac(key, default=0.0):
+        try:
+            v = float(key if key is not None else default)
+        except (TypeError, ValueError):
+            notes.append(f"{default if key is None else key!r} was not a number; used {default}")
+            v = default
+        return max(0.0, min(1.0, v))
+
+    cm = frac(color_match)
+    if cm > 0:
+        new = Image.blend(new, _color_match(new, region), cm)
+    pd = frac(preserve_detail)
+    if pd > 0:
+        # high-pass the ORIGINAL, graft it onto the model output: detail = orig - blur(orig)
+        r = max(1, min(8, (min(want) // 24) or 2))
+        gray = Image.new("RGB", want, (128, 128, 128))
+        hp = ImageChops.subtract(ImageChops.add(region, gray), region.filter(
+            ImageFilter.GaussianBlur(r)))
+        new = ImageChops.subtract(ImageChops.add(new, Image.blend(gray, hp, pd)), gray)
+
+    mode = str(blend_mode or "normal").strip().lower()
+    if mode not in BLEND_MODES:
+        notes.append(f"unknown blend_mode {blend_mode!r}; used normal")
+        mode = "normal"
+    if mode != "normal":
+        fn = {"multiply": ImageChops.multiply, "screen": ImageChops.screen,
+              "overlay": ImageChops.overlay, "soft_light": ImageChops.soft_light,
+              "hard_light": ImageChops.hard_light}.get(mode)
+        if fn is not None:
+            new = fn(new, region)
+        else:
+            try:      # luminosity / color: one LAB channel swap, no extra library needed
+                # split()/merge() rather than getband(): that API is not on Pillow 12's
+                # Image. The except below stays, so a genuinely unsupported mode degrades
+                # instead of losing the render — but smoke_toolbox asserts the "unavailable"
+                # note NEVER appears, which is what keeps this guard from quietly becoming
+                # a dead knob again (the failure this suite was blind to at 366/366 green).
+                al, bl = new.convert("LAB").split(), region.convert("LAB").split()
+                merged = Image.merge("LAB", (al[0], bl[1], bl[2])
+                                     if mode == "luminosity"
+                                     else (bl[0], al[1], al[2]))
+                new = merged.convert("RGB")
+            except Exception as e:  # noqa: BLE001 — never lose a render over a blend
+                notes.append(f"blend_mode {mode} unavailable ({e.__class__.__name__}); normal")
+
+    op = frac(opacity, 1.0)
+    if op <= 0.0:
+        return source_bytes, "opacity 0 — the paste was skipped"
+    alpha = _seam_alpha(want)
+    if op < 1.0:
+        alpha = alpha.point(lambda p, k=op: int(round(p * k)))
+    out = base.copy()
+    out.paste(new, (x0, y0), alpha)
+    buf = io.BytesIO(); out.save(buf, DEFAULT_FORMAT)
+    return buf.getvalue(), "; ".join(notes)
 
 
 def resize_canonical(mask_bytes: bytes, width: int, height: int) -> bytes:
