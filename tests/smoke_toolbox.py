@@ -1302,6 +1302,7 @@ def main() -> int:
     test_graphs()
     test_jobs()
     test_working_size()
+    test_crop_pipeline()
     bad = [(n, d) for n, ok, d in CHECKS if not ok]
     for n, d in bad:
         print(f"  FAIL  {n}" + (f"\n          → {d}" if d else ""))
@@ -1915,6 +1916,215 @@ def test_working_size():
     sw, sh = E._seg_size(BIG, 1024)
     check("_seg_size puts the SAM3 mask on the same 16-px grid as the render",
           sw % 16 == 0 and sh % 16 == 0 and max(sw, sh) <= 1024, f"{sw}x{sh}")
+
+def test_crop_pipeline():
+    """The resolution pipeline: crop small selections, render at the ceiling, paste back at
+    the PHOTO's resolution.
+
+    Measured reason: the 1024 ceiling that stopped 486 s iGPU stalls also caps the DETAIL of
+    every output, so re-editing a pasted result re-encodes an already-downsampled frame and
+    the image ratchets toward mush. plan_crop keeps the box in CANVAS px and maps
+    canvas->source proportionally only at use time, which is what lets a 4000x3000 phone
+    photo be crop-rendered at the ceiling and pasted back at full resolution.
+
+    Thresholds are read off masks.* (LATENT_GRID / MIN_CROP_SIDE / CROP_AFFORDABLE), never a
+    literal, for the same reason test_working_size does it: an operator who raises
+    TOOLBOX_RENDER_MAX_SIDE must not turn this suite red for the wrong reason.
+
+    The knob assertions check DIRECTION, not survival. "It ran" is not evidence here: an
+    AttributeError on the band API made color_match crash outright, while the LAB blends fell
+    through their own except into `normal` and merely returned a note string -- dead knobs
+    that a suite checking only for exceptions reports green. Each knob is therefore compared
+    against its own knob-off baseline and must measurably move pixels.
+    """
+    from PIL import ImageChops, ImageStat
+    if not M.HAS_PIL:
+        check("crop pipeline: PIL present", False, "skipped")
+        return
+    import random
+    G = M.LATENT_GRID
+    CW, CH = G * 32, G * 24                                # 512x384 canvas, grid-aligned
+
+    def textured(size, seed=11):
+        """Texture with real per-channel stddev, and no per-pixel Python loop: noise and
+        gradient are both C-level, so this stays cheap at megapixel sizes (see flat_png's
+        note). A FLAT band has no stddev to transfer, and a suite built on flat images is
+        exactly how a dead color_match knob stayed green."""
+        n = Image.effect_noise(size, 70).convert("RGB")
+        g = Image.linear_gradient("L").resize(size).convert("RGB")
+        im = ImageChops.add(ImageChops.multiply(n, g), n)
+        d = ImageDraw.Draw(im)
+        rnd = random.Random(seed)
+        for _ in range(24):
+            x, y = rnd.randrange(size[0]), rnd.randrange(size[1])
+            d.ellipse([x, y, x + rnd.randrange(8, 48), y + rnd.randrange(8, 48)],
+                      fill=(rnd.randrange(256), rnd.randrange(256), rnd.randrange(256)))
+        return im
+
+    def save(im):
+        buf = io.BytesIO(); im.save(buf, "PNG"); return buf.getvalue()
+
+    def band_mean(b, box=None):
+        im = Image.open(io.BytesIO(b)).convert("RGB")
+        if box:
+            im = im.crop(box)
+        return sum(ImageStat.Stat(im).mean) / 3.0
+
+    def diff(a, b):
+        x = Image.open(io.BytesIO(a)).convert("RGB")
+        y = Image.open(io.BytesIO(b)).convert("RGB")
+        if x.size != y.size:
+            return float("inf")
+        return sum(ImageStat.Stat(ImageChops.difference(x, y)).mean) / 3.0
+
+    def mask_at(size, box):
+        im = Image.new("RGBA", size, (0, 0, 0, 0))
+        ImageDraw.Draw(im).rectangle(list(box), fill=(255, 255, 255, 255))
+        return save(im)
+
+    # ---------------- plan_crop: alignment is a contract, not a nicety --------------
+    # An unaligned width/height is a flat rejection by a Flux graph, so this is the
+    # difference between a render and an exception after real GPU time.
+    plan = M.plan_crop(mask_at((CW, CH), (120, 100, 210, 190)))
+    check("plan_crop returns a plan for a small selection", plan is not None)
+    if plan:
+        bx0, by0, bx1, by1 = plan["box"]
+        rw, rh = plan["size"]
+        check("plan_crop: origins grid-aligned", bx0 % G == 0 and by0 % G == 0, plan["box"])
+        check("plan_crop: sizes are whole grid steps", rw % G == 0 and rh % G == 0, plan["size"])
+        check("plan_crop: box and size agree", bx1 - bx0 == rw and by1 - by0 == rh,
+              (plan["box"], plan["size"]))
+        check("plan_crop: box stays inside the frame",
+              bx0 >= 0 and by0 >= 0 and bx1 <= CW and by1 <= CH, plan["box"])
+        check("plan_crop: box clears the model-comfort floor",
+              rw >= M.MIN_CROP_SIDE and rh >= M.MIN_CROP_SIDE, plan["size"])
+        check("plan_crop: the margin ring surrounds the selection",
+              bx0 < 120 and by0 < 100 and bx1 > 210 and by1 > 190, plan["box"])
+        check("plan_crop: frame is the mask's own size", plan["frame"] == (CW, CH), plan["frame"])
+    check("plan_crop bails on an empty mask",
+          M.plan_crop(mask_at((CW, CH), (0, 0, 0, 0))) is None)
+    check("plan_crop bails when the box saves nothing (no seam for nothing)",
+          M.plan_crop(mask_at((CW, CH), (6, 6, CW - 6, CH - 6))) is None)
+
+    # The margin ring, asserted where it is the ONLY thing that can produce the result.
+    # A small selection cannot test this: the widen-to-MIN_CROP_SIDE step inflates the box
+    # past the selection all by itself, so "the box surrounds the selection" passes even with
+    # ring=0 -- a mutant that proved dead here. A selection whose long edge ALREADY clears
+    # MIN_CROP_SIDE removes that escape, so the box width is selection + 2*ring or nothing.
+    # A visible seam is the failure mode: the model can only continue a texture or a light
+    # gradient from context it was actually given.
+    WIDE = (100, 140, 380, 240)
+    wide_plan = M.plan_crop(mask_at((CW, CH), WIDE))
+    check("plan_crop: a wide selection is planned", wide_plan is not None)
+    if wide_plan:
+        wx0, wy0, wx1, wy1 = wide_plan["box"]
+        sel_w = WIDE[2] - WIDE[0]
+        check("plan_crop: the ring adds real context, not just the comfort floor",
+              (wx1 - wx0) >= sel_w + 2 * M.CROP_MARGIN_MIN - 3 * G,
+              "box w=%d for a %d-wide selection (ring=%d)"
+              % (wx1 - wx0, sel_w, M.CROP_MARGIN_MIN))
+        check("plan_crop: a wide selection stays on the grid",
+              wide_plan["size"][0] % G == 0 and wide_plan["size"][1] % G == 0,
+              wide_plan["size"])
+    # ---------------- the anti-ratchet claim, at 4x phone resolution -----------------
+    CANVAS, PHOTO = (CW, CH), (CW * 4, CH * 4)
+    photo = save(textured(PHOTO))
+    big_plan = M.plan_crop(mask_at(CANVAS, (150, 110, 330, 290)))
+    check("plan_crop needs only the canvas mask (no photo => no staleness)",
+          big_plan is not None)
+    if big_plan:
+        crop_bytes, crop_size = M.crop_for_render(photo, big_plan)
+        # crop_for_render hands back the size it cropped AT, so the caller patches the
+        # graph's width/height nodes with the same numbers rather than re-deriving them.
+        check("crop_for_render returns bytes at exactly the plan's render size",
+              isinstance(crop_bytes, bytes) and crop_size == tuple(big_plan["size"])
+              and M.image_size(crop_bytes) == tuple(big_plan["size"]),
+              "%s vs plan %s" % (crop_size, big_plan["size"]))
+        check("crop_for_render obeys the ceiling on a huge photo (nothing oversized reaches a process)",
+              max(crop_size) <= M.RENDER_MAX_SIDE, "%s from a %s photo" % (crop_size, PHOTO))
+        out, note = M.paste_back(photo, save(Image.new("RGB", big_plan["size"], (9, 9, 9))),
+                                 big_plan)
+        check("paste_back returns the PHOTO's resolution, not the canvas's (ratchet ended)",
+              M.image_size(out) == PHOTO, "%s note=%r" % (M.image_size(out), note))
+        check("crop_mask stays registered with the crop",
+              M.image_size(M.crop_mask(photo, big_plan)) == tuple(big_plan["size"]),
+              M.image_size(M.crop_mask(photo, big_plan)))
+
+    # ---------------- the four knobs, by direction ----------------------------------
+    PLAN = {"box": (G * 4, G * 4, G * 28, G * 20), "frame": (CW, CH),
+            "size": (G * 24, G * 20)}
+    PHOTO_S = save(textured((CW, CH), seed=3))
+    # artefact deliberately dark against a bright surround, so "did the histogram move"
+    # has an unambiguous sign rather than just "did it differ"
+    ART_S = save(ImageChops.multiply(textured(PLAN["size"], seed=5),
+                                     Image.new("RGB", PLAN["size"], (30, 36, 46))))
+    base_out, base_note = M.paste_back(PHOTO_S, ART_S, PLAN)
+    check("paste_back: plain path records no complaint", base_note == "", base_note)
+    check("paste_back: plain path actually pastes", diff(PHOTO_S, base_out) > 1.0)
+
+    try:
+        cm_out, cm_note = M.paste_back(PHOTO_S, ART_S, PLAN, color_match=1.0)
+        check("color_match: no silent degradation", cm_note == "", cm_note)
+        off, on = band_mean(base_out, PLAN["box"]), band_mean(cm_out, PLAN["box"])
+        surr = band_mean(PHOTO_S, PLAN["box"])
+        check("color_match: pulls a dark crop toward its bright surround",
+              on > off + 3.0, "off=%.1f on=%.1f surround=%.1f" % (off, on, surr))
+        check("color_match: does not stop at the surround's level (it transfers, not clamps)",
+              abs(on - surr) < abs(off - surr), "off->surr=%.1f on->surr=%.1f"
+              % (abs(off - surr), abs(on - surr)))
+        # The flat-band case is the one the old stddev guard silently skipped: a solid grey
+        # patch has no scale to transfer, only a LEVEL, so mean-only fallback is the whole
+        # difference between a working knob and a no-op.
+        grey = save(Image.new("RGB", PLAN["size"], (128, 128, 128)))
+        g_plain, _ = M.paste_back(PHOTO_S, grey, PLAN)
+        g_cm, g_note = M.paste_back(PHOTO_S, grey, PLAN, color_match=1.0)
+        check("color_match: works on a FLAT band (the case the stddev guard used to bail on)",
+              band_mean(g_cm, PLAN["box"]) != band_mean(g_plain, PLAN["box"])
+              and g_note == "",
+              "flat cm=%.1f plain=%.1f note=%r"
+              % (band_mean(g_cm, PLAN["box"]), band_mean(g_plain, PLAN["box"]), g_note))
+    except Exception as e:  # noqa: BLE001
+        check("color_match does not raise", False, "%s: %s" % (type(e).__name__, e))
+
+    for mode in ("multiply", "screen", "overlay", "soft_light", "hard_light",
+                 "luminosity", "color"):
+        try:
+            mo, mn = M.paste_back(PHOTO_S, ART_S, PLAN, blend_mode=mode)
+            no, _n = M.paste_back(PHOTO_S, ART_S, PLAN, blend_mode="normal")
+            check("blend_mode %s: no silent degradation" % mode, mn == "", mn)
+            check("blend_mode %s: differs from normal (the knob bites)" % mode,
+                  diff(mo, no) > 1.0, "diff=%r" % diff(mo, no))
+        except Exception as e:  # noqa: BLE001
+            check("blend_mode %s applies" % mode, False, "%s: %s" % (type(e).__name__, e))
+
+    _bad, bad_note = M.paste_back(PHOTO_S, ART_S, PLAN, blend_mode="technically_perfect")
+    check("unknown blend_mode degrades WITH a note rather than a crash",
+          "normal" in bad_note, bad_note)
+
+    full_o, _ = M.paste_back(PHOTO_S, ART_S, PLAN, opacity=1.0)
+    none_o, n_note = M.paste_back(PHOTO_S, ART_S, PLAN, opacity=0.0)
+    half_o, _ = M.paste_back(PHOTO_S, ART_S, PLAN, opacity=0.5)
+    check("opacity 0 leaves the photo untouched", diff(PHOTO_S, none_o) < 0.5,
+          "diff=%r note=%r" % (diff(PHOTO_S, none_o), n_note))
+    check("opacity 0.5 lands between untouched and full",
+          0.5 < diff(PHOTO_S, half_o) < diff(PHOTO_S, full_o) + 0.5,
+          "half=%r full=%r" % (diff(PHOTO_S, half_o), diff(PHOTO_S, full_o)))
+
+    d0, _ = M.paste_back(PHOTO_S, ART_S, PLAN, preserve_detail=0.0)
+    d1, _ = M.paste_back(PHOTO_S, ART_S, PLAN, preserve_detail=1.0)
+    check("preserve_detail re-injects the original's high frequencies",
+          diff(d0, d1) > 1.0, "diff=%r" % diff(d0, d1))
+
+    # A dead knob must be impossible to re-introduce quietly: if the LAB swap ever falls
+    # back to normal again, these two lines go red rather than the suite shrugging.
+    lum, lum_note = M.paste_back(PHOTO_S, ART_S, PLAN, blend_mode="luminosity")
+    col, col_note = M.paste_back(PHOTO_S, ART_S, PLAN, blend_mode="color")
+    check("luminosity and color are distinct operations, not one shared fallback",
+          diff(lum, col) > 1.0 and lum_note == "" and col_note == "",
+          "diff=%r %r %r" % (diff(lum, col), lum_note, col_note))
+
+
+
 
 
 if __name__ == "__main__":
