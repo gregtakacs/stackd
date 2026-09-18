@@ -1426,11 +1426,12 @@
   function pollJob(id, tries, tok) {
     // Poll rather than hold a connection open: an editor session should not depend on a
     // 10-minute in-flight request surviving a daemon restart or a proxy idle timeout.
-    if (tries > 400) { status('Render timed out.', 'bad'); return; }
+    if (tries > 400) { clearBar(); status('Render timed out.', 'bad'); return; }
     req('/toolbox/jobs/poll', { job_id: id }, tok).then(function (r) {
       if (r.error) throw new Error(r.error);
       if (r.state === 'done' || r.state === 'error') {
         jobTimer = null; jobId = null; jobToken = null;   // terminal: drop the spent job token
+        clearBar();   // a bar parked at 95% next to a finished image is worse than no bar
         if (r.state === 'error') { status('Render failed: ' + (r.error_message || 'engine error'), 'bad'); return; }
         var list = r.artifacts || [];
         el.out.innerHTML = '';
@@ -1447,9 +1448,69 @@
                + cropNote(r.crop), 'ok');
         return;
       }
-      status('Rendering… (' + (r.state || 'queued') + ', ' + (tries * 2) + 's)');
+      status(progressLine(r, tries));
+      renderBar(r.progress, tries);
       jobTimer = setTimeout(function () { jobTimer = null; pollJob(id, tries + 1, tok); }, 2000);
-    }).catch(function (e) { jobTimer = null; status('Render failed: ' + e.message, 'bad'); });
+    }).catch(function (e) { jobTimer = null; clearBar(); status('Render failed: ' + e.message, 'bad'); });
+  }
+
+  function progressLine(r, tries) {
+    // Only what is KNOWN may be said. ComfyUI reports step count on /ws alone (no HTTP
+    // route, and no websocket client in this image), so this line never shows a percent
+    // complete: it shows the stage read from /queue, real elapsed seconds, and an ETA that
+    // is calibrated from this server's own recent renders at the same size -- labelled est.
+    // When there is no history, it says so instead of guessing.
+    var p = r.progress || {};
+    var secs = (p.elapsed_s === null || p.elapsed_s === undefined) ? (tries * 2) : p.elapsed_s;
+    var stage = (p.stage === 'running') ? 'generating'
+              : (p.stage === 'queued') ? ('queued' + (p.ahead ? ', ' + p.ahead + ' ahead' : ''))
+              : (p.stage === 'vanished') ? 'finishing'
+              : 'working';
+    var s = 'Rendering… ' + stage + ' · ' + Math.round(secs) + 's';
+    if (p.eta_s) {
+      s += ' · ~' + Math.max(0, Math.round(p.eta_s - secs)) + 's left (est., '
+           + (p.eta_samples || 0) + ' prior render' + ((p.eta_samples || 0) === 1 ? '' : 's') + ')';
+    } else {
+      s += ' · no timing history at this size yet';
+    }
+    return s;
+  }
+
+  function renderBar(p, tries) {
+    // The bar mirrors the line's honesty: a determinate fill ONLY when a calibrated ETA
+    // exists, capped short of 100% because we are estimating, and a dim indeterminate
+    // wash otherwise. A bar that creeps to 100% and then still says 'queued' is the single
+    // most effective way to teach users to ignore this UI.
+    var host = el.status && el.status.parentNode;
+    if (!host) return;
+    var bar = host.querySelector('#tb-progbar');
+    if (!bar) {
+      bar = document.createElement('div');
+      bar.id = 'tb-progbar';
+      bar.style.cssText = 'height:4px;border-radius:2px;background:#23272e;'
+                        + 'overflow:hidden;margin:2px 0 4px';
+      var f = document.createElement('div');
+      f.style.cssText = 'height:100%;width:0%;background:#4c8f6a;'
+                      + 'transition:width .8s linear;opacity:.35';
+      bar.appendChild(f);
+      host.insertBefore(bar, el.status.nextSibling);
+    }
+    var fill = bar.firstChild;
+    var secs = (p && p.elapsed_s != null) ? p.elapsed_s : (tries * 2);
+    if (p && p.eta_s) {
+      fill.style.opacity = '1';
+      fill.style.width = Math.max(3, Math.min(95, (secs / p.eta_s) * 100)).toFixed(1) + '%';
+    } else {
+      fill.style.opacity = '.35';
+      fill.style.width = '100%';
+    }
+  }
+
+  function clearBar() {
+    var host = el.status && el.status.parentNode;
+    if (!host) return;
+    var bar = host.querySelector('#tb-progbar');
+    if (bar && bar.parentNode) bar.parentNode.removeChild(bar);
   }
 
   function doCancel() {

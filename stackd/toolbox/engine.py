@@ -26,6 +26,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
+import time
 import uuid
 
 from stackd.toolbox import graphs as _graphs
@@ -34,6 +36,83 @@ from stackd.toolbox import jobs as _jobs
 # The verb the elastic image tier must satisfy for a masked edit to be serveable.
 EDIT_CAPABILITY = "edit"
 _DEFAULT_MODEL = "flux2-klein"
+
+# ---- how long a toolbox render may take, and what happens when it does not -------
+# Deliberately SEPARATE from imagegen's config.TIMEOUT_S. The toolbox runs crop-bounded
+# inpaints whose expected duration is a different distribution from a full generation, and
+# inheriting one shared number is not hypothetical: the resident-iGPU deployment ran with
+# TIMEOUT_S=600 (set in AI-STACK/docker-compose.yml, not in the image), and a render that
+# needed ~616 s was reported to the user as a failure while the GPU went on finishing an
+# image nobody received. Two separate knobs, because they are two separate questions:
+# when do we stop waiting, and do we bother to look after we stop.
+RENDER_TIMEOUT_S = int(os.getenv("TOOLBOX_RENDER_TIMEOUT_S", "900") or 900)
+# After the deadline, keep watching /history quietly for this long BEFORE interrupting.
+# The render that dies at 600 s was 16 s from done; interrupting at the deadline throws
+# away a finished image on the far side of a rounding of the clock.
+RENDER_GRACE_S = int(os.getenv("TOOLBOX_RENDER_GRACE_S", "45") or 45)
+# /queue is polled at most this often while waiting, so a progress line costs one small
+# request per few seconds rather than one per history poll.
+PROGRESS_THROTTLE_S = 5.0
+
+
+def render_deadline_s() -> int:
+    """The deadline handed to ComfyUI for one render, in seconds. Kept as a function so a
+    test (or a future per-job override) can see the same number the seam uses."""
+    return RENDER_TIMEOUT_S
+
+
+def _stage_from_queue(q, prompt_id: str) -> dict:
+    """The pure half of progress_of: /queue's JSON -> a stage. Separate so the branch logic
+    is testable without a network, and so the async and sync callers cannot drift."""
+    def ids(entries):
+        # /queue entries are [number, prompt_id, extra_data, outputs, prompt]
+        return [e[1] for e in (entries or []) if isinstance(e, (list, tuple)) and len(e) > 1]
+
+    running, pending = ids(q.get("queue_running")), ids(q.get("queue_pending"))
+    if prompt_id in running:
+        return {"stage": "running", "ahead": 0}
+    if prompt_id in pending:
+        return {"stage": "queued", "ahead": pending.index(prompt_id)}
+    return {"stage": "vanished", "ahead": 0, "queued_total": len(pending)}
+
+
+async def progress_of_async(client, base: str, prompt_id: str) -> dict:
+    """Awaitable progress peek, for use INSIDE the render's event loop.
+
+    This exists as a separate function because asyncio.run() cannot be called from within a
+    running loop — and the seam that needs progress is exactly that: a callback firing from
+    the coroutine that is already awaiting ComfyUI. Getting this wrong fails the render, not
+    just the progress line, so the two callers are deliberately different functions.
+    """
+    try:
+        q = await client.get_json(f"{base.rstrip('/')}/queue", timeout=5)
+    except Exception:  # noqa: BLE001 — progress is advisory
+        return {}
+    if not isinstance(q, dict):
+        return {}
+    return _stage_from_queue(q, prompt_id)
+
+
+def progress_of(base: str, prompt_id: str) -> dict:
+    """Sync progress peek for callers OUTSIDE an event loop (tests, the CLI)."""
+    try:
+        import httpx
+    except Exception:  # noqa: BLE001 — no httpx means no progress, never a failed render
+        return {}
+
+    async def _go():
+        async with httpx.AsyncClient(timeout=5) as c:
+            r = await c.get(f"{base.rstrip('/')}/queue")
+            r.raise_for_status()
+            return r.json()
+
+    try:
+        q = asyncio.run(_go())
+    except Exception:  # noqa: BLE001
+        return {}
+    if not isinstance(q, dict):
+        return {}
+    return _stage_from_queue(q, prompt_id)
 
 
 def _runtime():
@@ -190,7 +269,8 @@ def render_size(job: dict) -> tuple[int, int, bool]:
     return cw, ch, (cw, ch) != (w, h)
 
 
-def comfy_render(job: dict, source: bytes, mask: bytes, *, on_prompt_id=None):
+def comfy_render(job: dict, source: bytes, mask: bytes, *, on_prompt_id=None,
+                 on_progress=None):
     """jobs.JobQueue render seam. Returns (artifact_png_b64, "image/png") after ALSO
     saving the result to the calling user's OWU (so the chat/standalone mounts have a
     durable copy that becomes the source of the next edit). Raises jobs.NoEngine /
@@ -291,7 +371,70 @@ def comfy_render(job: dict, source: bytes, mask: bytes, *, on_prompt_id=None):
         prompt_id = await comfyui_client.submit_workflow(graph, base=base)
         if on_prompt_id is not None:
             on_prompt_id(prompt_id, base)        # so a cancel can interrupt the wait below
-        by_node = await comfyui_client.wait_and_fetch(prompt_id, {G.SAVE_NODE}, base=base)
+
+        # Progress, honestly. /history carries no percent-complete and ComfyUI exposes NO
+        # HTTP route for step count — that lives only on /ws, whose client is not installed
+        # in this image. So the user gets elapsed time plus a TRUE stage from /queue, and
+        # never a fabricated percentage. The /queue peek is scheduled on the loop we are
+        # already running on; asyncio.run() would raise from right here, and a crash in a
+        # progress hook would take down a render that is otherwise succeeding.
+        state = {"elapsed": 0.0, "peeked_at": 0.0, "stage": "waiting"}
+        peeks = set()
+
+        def _publish():
+            job["_progress_json"] = json.dumps({
+                "elapsed_s": round(state["elapsed"], 1), "stage": state["stage"],
+                "ahead": state.get("ahead", 0), "render_size": [rw, rh]})
+            if on_progress is not None:
+                try:
+                    on_progress(json.loads(job["_progress_json"]))
+                except Exception:  # noqa: BLE001 — the seam's observer must never bite
+                    pass
+
+        async def _peek(pid, b):
+            st = await progress_of_async(comfyui_client, b, pid)
+            if st:
+                state.update(stage=st["stage"], ahead=st.get("ahead", 0))
+                _publish()
+
+        def _on_poll(elapsed):
+            state["elapsed"] = elapsed
+            _publish()
+            if time.monotonic() - state["peeked_at"] < PROGRESS_THROTTLE_S:
+                return
+            state["peeked_at"] = time.monotonic()
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:      # no loop => no stage peek, elapsed still advances
+                return
+            t = loop.create_task(_peek(prompt_id, base))
+            peeks.add(t)
+            t.add_done_callback(peeks.discard)
+
+        try:
+            by_node = await comfyui_client.wait_and_fetch(
+                prompt_id, {G.SAVE_NODE}, base=base,
+                timeout_s=RENDER_TIMEOUT_S, on_poll=_on_poll)
+        except TimeoutError as first:
+            # Past the deadline, in this order: keep watching quietly for a little longer
+            # (the render that "timed out at 600s" was 16s from finishing, and interrupting
+            # at the deadline throws that image away), THEN interrupt so the GPU is not left
+            # painting an image nobody is waiting for, THEN one last look in case the output
+            # landed during the interrupt round trip.
+            by_node = await _harvest_after_deadline(comfyui_client, prompt_id, base)
+            if not by_node:
+                await _interrupt_prompt(comfyui_client, prompt_id, base)
+                by_node = await _harvest_once(comfyui_client, prompt_id, base)
+            if not by_node:
+                raise TimeoutError(
+                    f"gave up after {RENDER_TIMEOUT_S}s plus a {RENDER_GRACE_S}s grace, and "
+                    f"interrupted the prompt so the GPU is free ({first})")
+        # Drop any /queue peek still in flight: leaving one running when the render is over
+        # logs "Task was destroyed but it is pending!" against every render on the box, and
+        # noise like that is how a real warning gets learned to be ignored.
+        for _t in peeks:
+            if not _t.done():
+                _t.cancel()
         images = by_node.get(G.SAVE_NODE) or []
         if not images:
             return None, None
@@ -466,6 +609,49 @@ def _q(v: float) -> int:
     return int(round(v))
 
 
+async def _harvest_once(client, prompt_id: str, base: str):
+    """One /history check that downloads the output if the prompt has already landed.
+
+    timeout_s=0 is deliberate, not sloppy: wait_and_fetch reads /history BEFORE it tests
+    the deadline, so this means 'harvest it if it is there, fail fast if it is not' rather
+    than a second full wait. Returns the images dict, or None if nothing is there.
+    """
+    try:
+        got = await client.wait_and_fetch(prompt_id, {_graphs.SAVE_NODE}, base=base,
+                                          timeout_s=0)
+    except Exception:  # noqa: BLE001 — 'not finished yet' is the expected shape here
+        return None
+    if got and got.get(_graphs.SAVE_NODE):
+        return got
+    return None
+
+
+async def _harvest_after_deadline(client, prompt_id: str, base: str, grace=None):
+    """Keep polling for grace seconds after the deadline, WITHOUT interrupting.
+
+    The order matters and is the whole point: interrupt first and a render that was 16 s
+    from finishing is destroyed. Wait first and it may still arrive.
+    """
+    end = time.monotonic() + (RENDER_GRACE_S if grace is None else float(grace))
+    while True:
+        got = await _harvest_once(client, prompt_id, base)
+        if got:
+            return got
+        if time.monotonic() > end:
+            return None
+        await asyncio.sleep(2.0)
+
+
+async def _interrupt_prompt(client, prompt_id: str, base: str) -> None:
+    """Tell ComfyUI to stop painting an image we have stopped waiting for. Best-effort and
+    scoped to this one prompt id, so a concurrent user's render is untouched."""
+    try:
+        await client.post_json(f"{base.rstrip('/')}/interrupt",
+                               {"prompt_id": prompt_id}, timeout=10)
+    except Exception:  # noqa: BLE001 — we are already giving up; never mask the timeout
+        pass
+
+
 def comfy_cancel(prompt_id: str, base: str) -> None:
     """jobs.JobQueue cancel seam: best-effort interrupt of ONE running prompt. Mirrors
     imagegen/bench.py's _abort_queue but targeted — we interrupt only the prompt id this
@@ -476,11 +662,9 @@ def comfy_cancel(prompt_id: str, base: str) -> None:
     from stackd.imagegen import comfyui_client
 
     async def _go():
-        b = base.rstrip("/")
-        try:
-            await comfyui_client.post_json(f"{b}/interrupt", {"prompt_id": prompt_id}, timeout=10)
-        except Exception:  # noqa: BLE001
-            pass
+        # the same helper the timeout path uses, so "interrupt this one prompt" has exactly
+        # one spelling in the package rather than two that can drift apart
+        await _interrupt_prompt(comfyui_client, prompt_id, base)
     try:
         asyncio.run(_go())
     except Exception:  # noqa: BLE001

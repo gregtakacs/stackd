@@ -1305,6 +1305,7 @@ def main() -> int:
     test_crop_pipeline()
     test_crop_wiring()
     test_render_seam()
+    test_render_timeout()
     bad = [(n, d) for n, ok, d in CHECKS if not ok]
     for n, d in bad:
         print(f"  FAIL  {n}" + (f"\n          → {d}" if d else ""))
@@ -2173,11 +2174,30 @@ def test_render_seam():
             state["base"] = base
             return "pid-seam-1"
 
-        async def wait_and_fetch(prompt_id, include_node_ids, base):
+        async def wait_and_fetch(prompt_id, include_node_ids, base, timeout_s=None,
+                                 on_poll=None):
+            # Mirrors the REAL signature. The seam gained a per-call deadline and a liveness
+            # hook, and this fake not matching them is precisely the drift a suite exists to
+            # catch -- it raised TypeError here until both sides agreed.
+            state["timeout_s"] = timeout_s
+            state.setdefault("timeout_calls", []).append(timeout_s)
+            if on_poll is not None:
+                for e in (1.0, 2.0, 3.0):    # the progress callback must actually be driven
+                    on_poll(e)
             # the model returns whatever the graph was TOLD to render, so a seam that
             # uploads the wrong geometry produces a visibly wrong artifact size here
             w, h = M.image_size(state["uploads"][0]) if state.get("uploads") else (64, 64)
             state["model_size"] = (w, h)
+            # Timeout behaviour, so the seam's give-up path can be driven end to end:
+            #   "late"   the primary wait blows its deadline, but the render lands during the
+            #            grace window -- which is exactly what the grace exists to catch
+            #   "always" it never lands at all, and we must give up AND free the GPU
+            # The harvest call is distinguishable by timeout_s == 0 (see _harvest_once).
+            beh = state.get("behaviour")
+            if beh == "always":
+                raise TimeoutError("never in /history")
+            if beh == "late" and timeout_s:
+                raise TimeoutError("past the deadline")
             img = solid_png((w, h), (250, 10, 10))
             return {node: [img] for node in include_node_ids}
 
@@ -2191,6 +2211,9 @@ def test_render_seam():
             return {}
 
         async def post_json(url, body, timeout=30):
+            # recorded, because the give-up path must interrupt EXACTLY OUR prompt id and
+            # the only proof either way is what actually went over the wire
+            state.setdefault("interrupts", []).append((url, body))
             return {}
 
         cc.upload_to_comfy = upload_to_comfy
@@ -2215,9 +2238,11 @@ def test_render_seam():
         def resolve_user_key(self, email):
             return "key-for-" + (email or "")
 
-    def drive(mask_bytes, spec=None):
+    def drive(mask_bytes, spec=None, behaviour=None):
         """Run the real comfy_render with fakes; returns (state, artifact_bytes, job)."""
         state = {}
+        if behaviour:
+            state["behaviour"] = behaviour
         # The PACKAGE, never the submodules: naming them in a fromlist would import the real
         # httpx-backed clients, which this suite must not need. Plain package import is
         # already satisfied via workflows.
@@ -2239,6 +2264,9 @@ def test_render_seam():
                                        on_prompt_id=lambda pid, b: state.setdefault(
                                            "prompt_id", pid))
             art = base64.b64decode(b64) if b64 else None
+        except Exception as e:  # noqa: BLE001 — the give-up path is a RESULT under test
+            state["raised"] = e
+            art = None
         finally:
             E._runtime, E.comfyui_base = real_runtime, real_base
             for k, v in saved.items():
@@ -2248,6 +2276,20 @@ def test_render_seam():
                     sys.modules[k] = v
             pkg.comfyui_client, pkg.openwebui_client = saved_attr
         return state, art, job
+
+    def _with_short_grace(fn):
+        """Shrink the post-deadline grace window for the give-up test only.
+
+        Without this the suite sleeps the real RENDER_GRACE_S (45 s), which is exactly why
+        nobody runs slow suites. The constant is still exercised — the code under test reads
+        it, this only sets it low for one case.
+        """
+        real = E.RENDER_GRACE_S
+        E.RENDER_GRACE_S = 0.2
+        try:
+            return fn()
+        finally:
+            E.RENDER_GRACE_S = real
 
 
     from stackd.imagegen import workflows as WF
@@ -2281,6 +2323,14 @@ def test_render_seam():
               max(up_w, up_h) <= M.RENDER_MAX_SIDE, "%dx%d" % (up_w, up_h))
         check("render seam: prompt id is recorded for cancel",
               state.get("prompt_id") == "pid-seam-1", repr(state.get("prompt_id")))
+        # The deadline actually handed to ComfyUI, measured rather than grepped: this is the
+        # check that would go red if someone re-merged the toolbox onto imagegen's TIMEOUT_S.
+        check("render seam: the render is given the toolbox's OWN deadline",
+              state.get("timeout_s") == E.RENDER_TIMEOUT_S,
+              "handed %r, toolbox default %r" % (state.get("timeout_s"), E.RENDER_TIMEOUT_S))
+        check("render seam: the seam reports progress while waiting",
+              "_progress_json" in job and json.loads(job["_progress_json"])["elapsed_s"] > 0,
+              repr(job.get("_progress_json"))[:110])
         check("render seam: the artifact saved to OWU is the one returned",
               state.get("saved") == art)
         # registration: the model's crop must land where the plan says, on the photo.
@@ -2338,9 +2388,261 @@ def test_render_seam():
     prov2 = json.loads(job2["_crop_json"])
     check("render seam: a full-frame render records cropped=false",
           prov2["cropped"] is False, repr(prov2)[:120])
+    # ---- the give-up path, END TO END through comfy_render ------------------------
+    # test_render_timeout exercises the helper functions; these prove the RENDER SEAM wires
+    # them, which is where two mutants slipped through GREEN. The order is the feature: if
+    # the seam interrupts before harvesting, a render that lands one poll late is destroyed.
+    st_late, art_late, job_late = drive(small, behaviour="late")
+    check("render seam: a render that lands during the grace window is RETURNED, not lost",
+          art_late is not None, repr(st_late.get("raised"))[:90])
+    check("render seam: a render we harvested was never interrupted "
+          "(interrupting first is the bug that lost the 616s render)",
+          not st_late.get("interrupts"), repr(st_late.get("interrupts"))[:110])
+    check("render seam: the harvest went through the toolbox's own deadline path",
+          (st_late.get("timeout_calls") or [None])[0] == E.RENDER_TIMEOUT_S
+          and 0 in (st_late.get("timeout_calls") or []),
+          repr(st_late.get("timeout_calls"))[:90])
+
+    st_gone, art_gone, job_gone = _with_short_grace(
+        lambda: drive(small, behaviour="always"))
+    raised = st_gone.get("raised")
+    check("render seam: a render that never lands surfaces an honest timeout",
+          art_gone is None and isinstance(raised, TimeoutError), repr(raised)[:90])
+    check("render seam: on genuine give-up we interrupt ComfyUI exactly once",
+          len(st_gone.get("interrupts") or []) == 1,
+          repr(st_gone.get("interrupts"))[:110])
+    ids = [b.get("prompt_id") for _u, b in (st_gone.get("interrupts") or [])]
+    check("render seam: the interrupt names OUR prompt id, so a concurrent render survives",
+          ids == [st_gone.get("prompt_id")] and ids != [None],
+          "interrupted=%s ours=%r" % (ids, st_gone.get("prompt_id")))
+    check("render seam: the failed job still records progress for the UI (elapsed is truth)",
+          "_progress_json" in job_gone, repr(job_gone.get("_progress_json"))[:80])
 
 
 
+
+def test_render_timeout():
+    """Task 3: the toolbox owns its render deadline, harvests late finishers, and frees the
+    GPU when it gives up.
+
+    Measured reason: the deployment that lost a render ran with TIMEOUT_S=600 injected in
+    AI-STACK/docker-compose.yml, and a job needing ~616 s was reported as an error while
+    ComfyUI went on finishing an image nobody collected. Two bugs live in that story: one
+    shared timeout for two different workloads, and a give-up path that neither waited a
+    little longer nor told the GPU to stop.
+    """
+    import asyncio
+    import time as _t
+    from stackd.toolbox import engine as E
+    from stackd.toolbox import jobs as J
+    root = pathlib.Path(__file__).resolve().parent.parent
+    eng = (root / "stackd" / "toolbox" / "engine.py").read_text()
+
+    check("toolbox owns a render deadline separate from imagegen's",
+          hasattr(E, "RENDER_TIMEOUT_S") and hasattr(E, "RENDER_GRACE_S"))
+    check("both are operator-tunable by env, like TOOLBOX_RENDER_MAX_SIDE",
+          "TOOLBOX_RENDER_TIMEOUT_S" in eng and "TOOLBOX_RENDER_GRACE_S" in eng)
+    try:
+        from stackd.imagegen import config as IG
+        # Asserted at the seam, not by grepping the text: an earlier version of this check
+        # greped for "config.TIMEOUT_S" and was tripped by the COMMENT that explains why we
+        # do not use it. Words in prose are not evidence; the number handed to ComfyUI is.
+        check("the toolbox deadline is its own number, not imagegen's by inheritance",
+              E.render_deadline_s() == E.RENDER_TIMEOUT_S
+              and "timeout_s=RENDER_TIMEOUT_S" in eng,
+              f"toolbox={E.RENDER_TIMEOUT_S} imagegen={getattr(IG, 'TIMEOUT_S', None)}")
+    except ImportError:
+        pass
+
+    # ---- /queue -> stage: the pure half, no network, no httpx ----------------------
+    pend = [[2, "other", {}, {}, {}], [3, "third", {}, {}, {}]]
+    check("stage: our prompt in queue_running reads as running",
+          E._stage_from_queue({"queue_running": [[1, "mine", {}, {}, {}]],
+                               "queue_pending": pend}, "mine")["stage"] == "running")
+    check("stage: queued counts how many prompts are ahead of us",
+          E._stage_from_queue({"queue_running": [], "queue_pending": pend}, "third")["ahead"] == 1)
+    # THE honesty rule of this feature: /queue can say where a prompt is, never how far
+    # through a render it is. Anything not in either list is 'vanished' -- it finished, or
+    # never ran -- and must not be dressed up as progress.
+    check("stage: a prompt in neither list is 'vanished', never a percentage",
+          E._stage_from_queue({"queue_running": [], "queue_pending": pend},
+                              "gone")["stage"] == "vanished")
+    check("stage: an unreachable ComfyUI yields NO stage rather than a wrong one",
+          E.progress_of("http://127.0.0.1:1", "x") == {})
+    # ---- the give-up path: wait FIRST, interrupt SECOND ---------------------------
+    class FakeClient:
+        def __init__(self):
+            self.calls, self.interrupts = [], []
+            self.missing = True
+
+        async def wait_and_fetch(self, pid, nodes, base, timeout_s=None, on_poll=None):
+            self.calls.append(timeout_s)
+            if self.missing:
+                raise TimeoutError("not in /history")
+            return {next(iter(nodes)): [b"PNG"]}
+
+        async def post_json(self, url, body, timeout=10):
+            self.interrupts.append(body)
+
+    # The render finished on the far side of the deadline: it must be COLLECTED, and we
+    # must never have interrupted it.
+    c1 = FakeClient()
+    ticks = {"n": 0}
+
+    async def late():
+        ticks["n"] += 1
+        c1.missing = ticks["n"] >= 2          # lands on the second grace poll
+        return await E._harvest_after_deadline(c1, "p1", "http://x", grace=1.0)
+    got = asyncio.run(late())
+    check("a render that finishes just after the deadline is HARVESTED, not discarded",
+          bool(got), repr(got)[:80])
+    check("a late render that we harvested was never interrupted", c1.interrupts == [],
+          repr(c1.interrupts))
+
+    # Genuinely never lands: grace expires, THEN we interrupt, THEN one last look.
+    c2 = FakeClient()
+
+    async def never():
+        h = await E._harvest_after_deadline(c2, "p2", "http://x", grace=0.1)
+        if not h:
+            await E._interrupt_prompt(c2, "p2", "http://x")
+            h = await E._harvest_once(c2, "p2", "http://x")
+        return h
+    out2 = asyncio.run(never())
+    check("a render that never lands is not reported as a success", out2 is None)
+    check("we INTERRUPT exactly once we truly give up (no GPU burning after we quit)",
+          len(c2.interrupts) == 1 and c2.interrupts[0].get("prompt_id") == "p2",
+          repr(c2.interrupts))
+    check("the interrupt is scoped to OUR prompt id, never the whole queue",
+          all(list(i.keys()) == ["prompt_id"] for i in c2.interrupts), repr(c2.interrupts))
+    check("grace is spent BEFORE the interrupt (ordering is the feature, not cosmetics)",
+          len(c2.calls) > len(c2.interrupts), "polls=%d interrupts=%d"
+          % (len(c2.calls), len(c2.interrupts)))
+
+    # ---- progress is offered only to seams that accept it -------------------------
+    def old_seam(job, source, mask, *, on_prompt_id=None):
+        return None, None
+
+    def new_seam(job, source, mask, *, on_prompt_id=None, on_progress=None):
+        return None, None
+
+    def star_seam(job, source, mask, **kw):
+        return None, None
+
+    check("a seam without on_progress is still callable (a TypeError here would be the user's failed job)",
+          J._accepts_progress(old_seam) is False)
+    check("a seam that takes on_progress is handed it", J._accepts_progress(new_seam) is True)
+    check("**kwargs seams get progress too", J._accepts_progress(star_seam) is True)
+
+    seen = {}
+
+    def reporting(job, source, mask, *, on_prompt_id=None, on_progress=None):
+        on_prompt_id("pid-x", "http://comfy:8188")
+
+
+
+        seen["kwarg"] = on_progress is not None
+        if on_progress is not None:
+            on_progress({"elapsed_s": 12.5, "stage": "running", "ahead": 0,
+                         "render_size": [512, 512]})
+        return (base64.b64encode(b"X").decode(), "image/png")
+
+    store = J.JobStore(":memory:")
+    jq = J.JobQueue(store, render=reporting)
+    jq.start()
+    jid = store.create(email="a@b.c", kind="retouch", w=512, h=512, spec={}, mask_info={})
+    jq.enqueue(jid, source=b"S", mask=b"M")
+    end = _t.time() + 3
+    while _t.time() < end and store.get(jid)["state"] not in ("done", "error", "cancelled"):
+        _t.sleep(0.02)
+    row = store.get(jid)
+    jq.stop()
+    check("the seam was actually handed the on_progress kwarg", seen.get("kwarg") is True)
+    check("progress reaches the row, so a reopened page shows the same truth",
+          row.get("progress_json") is not None
+          and json.loads(row["progress_json"])["stage"] == "running",
+          repr(row.get("progress_json"))[:110])
+    check("a progress-reporting render still completes", row["state"] == "done", row["state"])
+
+
+
+
+
+
+
+
+
+
+
+    # ---- the client may not claim more than the server knows ----------------------
+    js = (root / "stackd" / "toolbox" / "web" / "toolbox.js").read_text()
+    check("progress line is defined AND called (a dead helper is a dead knob)",
+          "function progressLine(" in js and "status(progressLine(r, tries))" in js)
+    check("the UI never invents a percent-complete for a render",
+          "%" not in js.split("function progressLine(")[1].split("function renderBar(")[0]
+          or "Math.min(95" in js)
+    check("an ETA is labelled as an estimate, never as a fact",
+          "est." in js and "no timing history at this size yet" in js)
+    check("the bar stays indeterminate without a calibrated ETA",
+          "if (p && p.eta_s)" in js and "opacity = '.35'" in js)
+    check("the bar is capped short of 100% because it is an estimate",
+          "Math.min(95" in js)
+    check("the bar is cleared on every terminal path (done, error, timeout, cancel)",
+          js.count("clearBar()") >= 3)
+    # ...and specifically on the DONE path: a count-only assertion let a mutant that removed
+    # just this one call pass GREEN, leaving a bar parked at 95% beside a finished image.
+    done_branch = (js.split("if (r.state === 'done' || r.state === 'error') {")[1]
+                   .split("status(progressLine")[0])
+    check("the bar is cleared inside the done/error branch itself, not merely somewhere",
+          "clearBar()" in done_branch, done_branch[:100])
+    check("the determinate bar is capped below 100% because it is an estimate",
+          "Math.min(95" in js)
+    check("stage names come from /queue reality, not from a timer",
+          "'generating'" in js and "'queued'" in js and "'finishing'" in js)
+
+    # ---- the poll route serves progress, calibrated or silent --------------------
+    store3 = J.JobStore(":memory:")
+    tb3 = make_tb(worker=J.JobQueue(store3, render=lambda job, s, m, **kw: (None, None)))
+    r3 = post(tb3, "/toolbox/jobs", {"mask_png": MASK_B64, "spec": {"seed": 1}},
+              token=fresh_token())
+    j3, tok3 = r3.payload.get("job_id"), r3.payload.get("token")
+    store3.set(j3, state="running", progress_json=json.dumps(
+        {"elapsed_s": 20.0, "stage": "running", "ahead": 0, "render_size": [512, 384]}))
+    p3 = post(tb3, "/toolbox/jobs/poll", {"job_id": j3}, token=tok3)
+    prog3 = p3.payload.get("progress") or {}
+    check("poll exposes progress with the true stage and elapsed",
+          prog3.get("stage") == "running" and prog3.get("elapsed_s") == 20.0,
+          repr(prog3)[:110])
+    check("with no timing history at this size the ETA is None, NOT a guess",
+          prog3.get("eta_s") is None, repr(prog3.get("eta_s")))
+    # seed history at the same working size, then the ETA must appear and be labelled
+    now = _t.time()
+    # Seed at the job's REAL working size: the create path derives w/h from the fixture
+    # photo, so hard-coding 512x384 here tested the wrong geometry and the ETA legitimately
+    # stayed None -- a test bug, not a product bug, but the kind that hides a real feature.
+    WW, WH = store3.get(j3)["working_w"], store3.get(j3)["working_h"]
+    jh = store3.create(email="a@b.c", kind="retouch", w=WW, h=WH, spec={}, mask_info={})
+    store3.set(jh, state="done", artifact_b64="eA==", artifact_type="image/png")
+    store3.conn.execute("UPDATE jobs SET created_at=?, updated_at=? WHERE id=?",
+                        (now - 40, now, jh))
+    p4 = post(tb3, "/toolbox/jobs/poll", {"job_id": j3}, token=tok3)
+    prog4 = p4.payload.get("progress") or {}
+    check("with history at the same size the ETA is calibrated and labelled",
+          prog4.get("eta_s") == 40.0 and prog4.get("eta_basis")
+          and prog4.get("eta_samples") == 1, repr(prog4)[:140])
+    # ...and history at a DIFFERENT size must not calibrate this one: an ETA borrowed from
+    # another geometry is the same false promise wearing a different hat.
+    jh2 = store3.create(email="a@b.c", kind="retouch", w=WW + 16, h=WH, spec={}, mask_info={})
+    store3.set(jh2, state="done", artifact_b64="eA==", artifact_type="image/png")
+    store3.conn.execute("UPDATE jobs SET created_at=?, updated_at=? WHERE id=?",
+                        (now - 900, now, jh2))
+    check("the ETA is calibrated only from renders at the SAME size",
+          sorted(store3.recent_durations(WW, WH)) == [40.0],
+          repr(store3.recent_durations(WW, WH))[:80])
+    store3.set(j3, state="done", artifact_b64="eA==", artifact_type="image/png")
+    p5 = post(tb3, "/toolbox/jobs/poll", {"job_id": j3}, token=tok3)
+    check("progress stops being offered once the job is done",
+          "progress" not in p5.payload, repr(sorted(p5.payload))[:130])
 
 
 def test_crop_wiring():

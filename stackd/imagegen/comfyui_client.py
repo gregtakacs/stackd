@@ -197,20 +197,42 @@ async def submit_workflow(workflow: dict, base: str) -> str:
 
 
 async def wait_and_fetch(
-    prompt_id: str, include_node_ids: set[str], base: str
+    prompt_id: str, include_node_ids: set[str], base: str,
+    timeout_s: float | None = None,
+    on_poll=None,
 ) -> dict[str, list[bytes]]:
     """Polls /history until the prompt completes, then downloads every image any of
     include_node_ids produced. Returns images keyed by node id so callers can tell a
     real output apart from e.g. a debug mask preview with certainty, instead of relying
-    on dict/list ordering ComfyUI doesn't guarantee."""
+    on dict/list ordering ComfyUI doesn't guarantee.
+
+    timeout_s overrides config.TIMEOUT_S for this call only. It exists for the toolbox,
+    whose renders are crop-bounded and therefore have a very different expected duration
+    from a full imagegen generation: inheriting one shared number meant a toolbox job was
+    killed by a timeout calibrated for someone else's workload. None keeps the old
+    behaviour exactly, so imagegen callers are untouched.
+
+    on_poll, when given, is called as on_poll(elapsed_s) once per poll. It is a *liveness*
+    seam, not a progress seam: /history says nothing about how far along a render is, and
+    ComfyUI exposes no HTTP route for step count (only /ws carries that). Callers that
+    want a stage should ask /queue themselves (see toolbox/engine.progress_of). Never
+    raises: a broken progress hook must not sink a render that is otherwise succeeding.
+    """
     base = base.rstrip("/")
-    deadline = time.monotonic() + config.TIMEOUT_S
+    limit = config.TIMEOUT_S if timeout_s is None else float(timeout_s)
+    deadline = time.monotonic() + limit
+    started = time.monotonic()
     while True:
         history = await get_json(f"{base}/history/{prompt_id}", timeout=30)
         if prompt_id in history:
             break
         if time.monotonic() > deadline:
-            raise TimeoutError(f"Timed out after {config.TIMEOUT_S}s waiting for ComfyUI.")
+            raise TimeoutError(f"Timed out after {limit}s waiting for ComfyUI.")
+        if on_poll is not None:
+            try:
+                on_poll(time.monotonic() - started)
+            except Exception:  # noqa: BLE001 — progress is advisory, the render is not
+                pass
         await asyncio.sleep(config.POLL_INTERVAL_S)
 
     images_by_node: dict[str, list[bytes]] = {node_id: [] for node_id in include_node_ids}

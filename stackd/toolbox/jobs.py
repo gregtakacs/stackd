@@ -21,6 +21,7 @@ lying that they are still queued. That is the honest failure, not a stall.
 from __future__ import annotations
 
 import base64
+import inspect as _inspect
 import json
 import queue
 import sqlite3
@@ -47,6 +48,25 @@ class Cancelled(RuntimeError):
 
 def _now() -> float:
     return time.time()
+
+
+def _accepts_progress(fn) -> bool:
+    """True if the injected render seam takes an on_progress keyword.
+
+    Inspected rather than assumed: the queue's contract is (job, source, mask,
+    on_prompt_id), smoke_toolbox drives it with plain fakes, and passing an unexpected kwarg
+    to a callable that does not take **kwargs raises TypeError that the worker would report
+    to the user as a failed render. A progress bar is not worth failing jobs over.
+    """
+    try:
+        params = _inspect.signature(fn).parameters
+    except (TypeError, ValueError):        # builtins / C callables: assume it does not
+        return False
+    p = params.get("on_progress")
+    if p is None:
+        return any(v.kind is _inspect.Parameter.VAR_KEYWORD for v in params.values())
+    return p.kind in (_inspect.Parameter.KEYWORD_ONLY, _inspect.Parameter.POSITIONAL_OR_KEYWORD)
+
 
 
 class JobStore:
@@ -88,8 +108,11 @@ class JobStore:
         # gains the column NULL-filled (a job that never cropped has no provenance, which
         # is exactly what NULL should mean here).
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(jobs)")}
-        if "crop_json" not in cols:
-            self.conn.execute("ALTER TABLE jobs ADD COLUMN crop_json TEXT")
+        for col in ("crop_json", "progress_json"):
+            if col not in cols:
+                # progress_json is IN-FLIGHT state (elapsed/stage), the one piece of live
+                # UI data that must survive a page reload; crop_json is terminal provenance.
+                self.conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} TEXT")
         self._lock = threading.Lock()
 
     def create(self, *, email, kind, w, h, spec, mask_info, job_id=None) -> str:
@@ -106,7 +129,7 @@ class JobStore:
 
     def set(self, job_id, **fields) -> None:
         allowed = {"state", "prompt_id", "engine_base", "artifact_b64",
-                   "artifact_type", "error", "note", "crop_json"}
+                   "artifact_type", "error", "note", "crop_json", "progress_json"}
         bad = set(fields) - allowed
         if bad:
             raise ValueError(f"unknown job field(s): {sorted(bad)}")
@@ -116,6 +139,26 @@ class JobStore:
         vals = list(fields.values()) + [_now(), job_id]
         with self._lock:
             self.conn.execute(f"UPDATE jobs SET {sets}, updated_at=? WHERE id=?", vals)
+
+    def recent_durations(self, w, h, *, limit: int = 8) -> list:
+        """Wall-clock durations of the last few COMPLETED renders at this exact working
+        size. Feeds the poll route's ETA. Median rather than mean at the call site: one
+        cold-start or evicted-model render is an outlier that would double the estimate."""
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT created_at, updated_at FROM jobs "
+                "WHERE state='done' AND working_w=? AND working_h=? "
+                "ORDER BY updated_at DESC LIMIT ?", (int(w), int(h), int(limit))).fetchall()
+        out = []
+        for r in rows:
+            try:
+                d = float(r[1]) - float(r[0])
+            except (TypeError, ValueError):
+                continue
+            if 0.5 < d < 3600:                     # a junk row is not a calibration point
+                out.append(d)
+        return out
+
 
     def get(self, job_id) -> dict | None:
         with self._lock:
@@ -274,8 +317,27 @@ class JobQueue:
             # interrupt a render that is still waiting on its result.
             self.store.set(job_id, state="running", prompt_id=prompt_id, engine_base=base)
 
+        def on_progress(fields):
+            # In-flight progress for the bar, written straight to the row rather than
+            # buffered: the poll route reads the row, so a page reopened mid-render shows
+            # the same truth the worker saw instead of restarting from zero.
+            try:
+                self.store.set(job_id, progress_json=json.dumps(fields))
+            except Exception:  # noqa: BLE001 — a lost progress tick must never cost a render
+                pass
+
         try:
-            art_b64, art_type = self._render(job, source, mask, on_prompt_id=on_prompt_id)
+            # on_progress is offered only when the injected render accepts it. The seam is
+            # documented as (job, source, mask, on_prompt_id); the suite's fakes and any
+            # older render would TypeError on an unexpected kwarg, and that TypeError would
+            # land on the user as a failed job.
+            if _accepts_progress(self._render):
+                art_b64, art_type = self._render(job, source, mask,
+                                                 on_prompt_id=on_prompt_id,
+                                                 on_progress=on_progress)
+            else:
+                art_b64, art_type = self._render(job, source, mask,
+                                                 on_prompt_id=on_prompt_id)
         except Cancelled as e:
             self.store.set(job_id, state="cancelled", error=str(e) or None)
             return

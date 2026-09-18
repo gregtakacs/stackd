@@ -905,6 +905,40 @@ class Toolbox:
             except (ValueError, TypeError):
                 out["crop"] = None
                 out["crop_note"] = "provenance for this render could not be parsed"
+        # Live progress for the bar. What may be SAID is limited to what is KNOWN: ComfyUI
+        # puts step count only on /ws (no HTTP route, no websocket client in this image), so
+        # there is no percent-complete here and none is invented. The bar gets elapsed time,
+        # a stage read from /queue, and an ETA calibrated from this server's own recent
+        # renders AT THE SAME SIZE -- labelled as an estimate, never dressed as a percentage.
+        if row["state"] in ("queued", "running"):
+            try:
+                prog = json.loads(row.get("progress_json") or "null")
+            except (ValueError, TypeError):
+                prog = None
+            if not isinstance(prog, dict):
+                prog = {}
+            try:
+                prog.setdefault("elapsed_s",
+                                round(time.time() - float(row.get("created_at") or 0), 1))
+            except (TypeError, ValueError):
+                prog.setdefault("elapsed_s", None)
+            if self._worker is not None:
+                try:
+                    hist = self._worker.store.recent_durations(
+                        row.get("working_w") or 0, row.get("working_h") or 0)
+                except Exception:  # noqa: BLE001 — calibration is a courtesy, not a dependency
+                    hist = []
+                if hist:
+                    hist = sorted(hist)
+                    med = hist[len(hist) // 2]
+                    prog["eta_s"] = round(med, 1)
+                    prog["eta_samples"] = len(hist)
+                    prog["eta_basis"] = "median of recent renders at this size"
+                else:
+                    # No history at this size: say nothing rather than guess a number that
+                    # the user will read as a promise.
+                    prog["eta_s"] = None
+            out["progress"] = prog
         if row["state"] == "error":
             out["error_message"] = row.get("error") or "render failed"
         # elapsed_s from the row timestamps, so the status line can say how long it took.
