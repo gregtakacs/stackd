@@ -1132,13 +1132,20 @@ def _layer_coverage(layer_png: bytes, width: int, height: int, lay: dict):
         cov = cov.point(lambda p: 255 if p > COVERAGE_BRIGHTNESS_THRESHOLD else 0)
     feather = lay.get("feather", 0) if allow_feather else 0
     if feather and feather > 0:
-        # An 'auto' silhouette feathers OUTWARD (soft skirt beyond the edge, solid core
-        # preserved) so binarising at 128 never shrinks what the user approved; a shape keeps
-        # the plain symmetric soften its byte-exact tests expect.
-        if kind == "auto":
-            cov = _feather_out(cov, float(feather))
-        else:
-            cov = cov.filter(ImageFilter.GaussianBlur(max(0.5, float(feather))))
+        # EVERY feathered kind softens OUTWARD — 'auto' and 'shape' alike. The plain
+        # symmetric Gaussian this used to fall back to for shapes pulls the 128-crossing
+        # INWARD (its own docstring at the _morph_disk header calls that out: "the same
+        # reason the old symmetric feather shrank objects"): half the skirt's alpha is
+        # stolen from the solid core, so what the graph binarises is SMALLER than what
+        # the user approved and the ramp visibly points into the object. _feather_out
+        # (disc-grow by f -> blur by f -> lighter union) keeps the >=128 footprint at or
+        # beyond the hard silhouette and puts all of the softness beyond the edge. No
+        # test pinned the shape-side blur's kernel (the contract checked is the REPORTED
+        # feather number + thresholding), so the "byte-exact" excuse for the split was
+        # stale; the browser's display copy grows the same disc the same way, which is
+        # what makes preview and render agree again. The disc is also what stops the
+        # skirt squaring off at the corners (Chebyshev grow bulges on the diagonals).
+        cov = _feather_out(cov, float(feather))
     return cov, edge, applied, capped, min_side
 
 

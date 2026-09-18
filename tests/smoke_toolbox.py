@@ -287,6 +287,49 @@ def test_layers():
     check("layers: an auto layer keeps its feather",
           float(ia1["layers"][0]["feather"]) == 8.0, ia1["layers"][0])
 
+    # --- C3: the shape feather must be OUTWARD and DISC-round, at the server ---------
+    # The render path used to Gaussian-blur shape layers symmetrically, which pulls the
+    # 128-crossing INWARD: the binarised footprint the graph binarises shrinks under the
+    # very slider meant to only soften, and the ramp points into the object (the user's
+    # 'render feathers towards the inside' report, while the client preview — disc-grow +
+    # blur — looked right). The shape branch now shares auto's masks._feather_out, and so
+    # must every future kind. These gates read the canonical mask itself.
+    _F = 12
+    _sf0, _ = M.normalize_layers([{"png": rect_mask(SIZE, BOX), "kind": "shape"}], *SIZE)
+    _sfc, _ = M.normalize_layers([{"png": rect_mask(SIZE, BOX), "kind": "shape",
+                                   "feather": _F}], *SIZE)
+    _c0 = Image.open(io.BytesIO(_sf0)).convert("RGBA").split()[3]
+    _c1 = Image.open(io.BytesIO(_sfc)).convert("RGBA").split()[3]
+    _solid0 = sum(1 for y in range(SIZE[1]) for x in range(SIZE[0]) if _c0.getpixel((x, y)) > 128)
+    _solid1 = sum(1 for y in range(SIZE[1]) for x in range(SIZE[0]) if _c1.getpixel((x, y)) > 128)
+    check("render contract: feathering a SHAPE never shrinks its >=128 footprint",
+          _solid1 >= _solid0, f"{_solid0} -> {_solid1} (symmetric blur pulls it inward)")
+    _inside_edge = _c1.getpixel((BOX[0] + 1, (BOX[1] + BOX[3]) // 2))
+    check("render contract: the solid core survives the feather (interior stays 255)",
+          _inside_edge == 255, f"1px inside boundary alpha={_inside_edge}")
+    _skirt_mid = _c1.getpixel((BOX[2] + (_F + 2), (BOX[1] + BOX[3]) // 2))
+    check("render contract: the soft skirt reaches OUTSIDE the approved edge",
+          _skirt_mid > 50, f"alpha at f+2 beyond right edge = {_skirt_mid}")
+    # Disc vs Chebyshev on the >=128 SILHOUETTE, not on raw tail alpha: a blurred alpha
+    # probe cannot tell the kernels apart (the square grow's corner bulge cancels the
+    # extra blur distance — measured: a Chebyshev _feather_out passes an alpha-tail probe
+    # cleanly). The silhouette's REACH in the diagonal direction is the honest signal:
+    # disc ~ f + ~0.4f, Chebyshev ~ f*sqrt(2) + ~0.4f. Side reach is the reference.
+    def _reach(px, x_axis):
+        # how far past the box the >128 silhouette extends, scanning from 3f out
+        for d in range(3 * _F, 1, -1):
+            if x_axis:
+                if _c1.getpixel((BOX[2] + d, (BOX[1] + BOX[3]) // 2)) > 128:
+                    return d
+            else:
+                if _c1.getpixel((BOX[2] + d, BOX[3] + d)) > 128:
+                    return d
+        return 1
+    _r_side, _r_corner = _reach(_c1, True), _reach(_c1, False)
+    check("render contract: feather skirt rounds off at the corner (disc, not Chebyshev)",
+          _r_corner <= _r_side + 3,
+          f"diag reach {_r_corner} vs side {_r_side} (square grow bulges ~{(2**0.5-1)*_F:.0f}px)")
+
     # --- D: mixing kinds in one mask applies per-object rules -----------------------
     cmix, imix = M.normalize_layers(
         [{"png": brush_ramp_mask(SIZE, BOX, 0.4), "kind": "brush"},

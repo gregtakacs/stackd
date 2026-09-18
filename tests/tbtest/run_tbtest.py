@@ -3,7 +3,7 @@
     python3 tests/tbtest/run_tbtest.py [--mutate NAME] [--width 420] [--height 620]
     (--mutate: sticky ctlorder softpunch brushfeather kindstr autoslider widetol
      rawwash allmerge nosig selguard twoslider noderive blendblank seldbg
-     barwash bar95 polltoken movelost shrinkrad legacy)
+     barwash bar95 polltoken movelost shrinkrad padsniped legacy)
 
 --mutate rebuilds the page with a deliberately broken copy of the shipped JS, so the suite
 proves it can actually see the two bugs it claims to have fixed. A green test that cannot
@@ -378,15 +378,14 @@ def LEGACY_MOVELOST(s):
 # the harness view is 160x320, so the mutant stands the cap in at 48 — the SAME relative
 # shrinkage the user sees at 1024 px (feather 30 drawn as ~4, visibly hard-edged).
 def LEGACY_SHRINKRAD(s):
-    an = "    var e = Math.round(r.edge || 0);\n"
-    an += "    if (e) on = (r.kind === 'auto' ? _discOn : _boxOn)(on, w, h, Math.min(96, Math.max(1, Math.abs(e))), e > 0);"
+    an = "    if (e) on = (r.kind === 'auto' ? _discOn : _boxOn)(on, w, h, Math.min(96, Math.max(1, Math.abs(e))), e > 0);"
     assert an in s, 'true-edge anchor moved'
     s = s.replace(an,
         "    var sd = Math.min(1, 48 / Math.max(1, Math.max(w, h)));\n" + an.replace(
             'Math.min(96, Math.max(1, Math.abs(e)))', 'Math.max(1, Math.round(Math.abs(e) * sd))'), 1)
-    g2 = "var grown = (r.kind === 'auto' ? _discOn : _boxOn)(on, w, h, Math.min(96, Math.max(1, f)), true);"
+    g2 = "var grown = _discOn(on, w, h, Math.min(96, Math.max(1, f)), true);"
     assert g2 in s, 'true-grow anchor moved'
-    s = s.replace(g2, "var grown = (r.kind === 'auto' ? _discOn : _boxOn)(on, w, h, Math.max(1, Math.round(f * sd)), true);", 1)
+    s = s.replace(g2, "var grown = _discOn(on, w, h, Math.max(1, Math.round(f * sd)), true);", 1)
     b3 = "bx.filter = 'blur(' + Math.max(0.5, Math.min(96, f)) + 'px)';"
     assert b3 in s, 'true-blur anchor moved'
     s = s.replace(b3, "bx.filter = 'blur(' + Math.max(0.5, f * sd) + 'px)';", 1)
@@ -395,6 +394,22 @@ def LEGACY_SHRINKRAD(s):
 
 MUTANTS["movelost"] = LEGACY_MOVELOST
 MUTANTS["shrinkrad"] = LEGACY_SHRINKRAD
+
+
+# CLIENT FEATHER SKIRT — the visible square-corner defect, restored: the display grid
+# padded only e+f+2 past the bbox, cutting the blurred skirt on a hard axis-aligned
+# line. Measured: disc-vs-Chebyshev grow is INVISIBLE under a sigma-f blur (>=128 reach
+# (32,15) vs (34,17) — within jitter), so the CLIP — not the kernel — squared off the
+# corners; the _boxOn/_discOn kind split this replaces was faithful-to-server only, and
+# no honest gate could tell the difference. The clip could, and does.
+def LEGACY_PADSNIP(s):
+    an = "    var pad = Math.max(0, (r.edge || 0)) + 2 * (r.feather || 0) + 4;"
+    assert an in s, 'regionGeom pad anchor moved'
+    return s.replace(an,
+        "    var pad = Math.max(0, (r.edge || 0)) + (r.feather || 0) + 2;", 1)
+
+
+MUTANTS["padsniped"] = LEGACY_PADSNIP
 
 
 def main():
@@ -447,7 +462,7 @@ def main():
         print('COMPOSE TRACE:')
         for i, d in enumerate(res['dbg'][:10]):
             print('  ', i, d)
-    EXPECT = 115
+    EXPECT = 118   # 115 + FR trio (precondition, skirt-continuity x2)
     if len(res["tests"]) != EXPECT:
         print("TRUNCATED RUN: got %d assertions, expected %d -- an early error stopped the "
               "steps (notes: %s). This is NOT a pass." %

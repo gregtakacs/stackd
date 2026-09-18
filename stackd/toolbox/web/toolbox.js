@@ -800,9 +800,9 @@
    */
   // Read a move/delete stroke's own footprint into a compact occupancy grid, and hand
   // it to the NEXT rebuildRegions as a synthetic ancestor (see bakeMove / undo / redo).
-  // applied=true: the stroke's pixels lie at their DESTINATION (a baked move in place,
+  // applied=true: the stroke pixels lie at their DESTINATION (a baked move in place,
   // an undone delete still out); false: at the ORIGIN (a popped move restored, a
-  // restored delete). The footprint's ink count doubles as the ancestor's 'area', so
+  // restored delete). The footprint ink count doubles as the ancestor area, so
   // the >=6 / >=20% majority gates weigh it exactly like a pixel-overlap ancestor.
   function noteMoveIdentity(st, applied) {
     pendingMove = null;
@@ -993,7 +993,12 @@
   }
 
   function regionGeom(r) {
-    var pad = Math.max(0, (r.edge || 0)) + (r.feather || 0) + 2;
+    // The pad must cover the WHOLE display skirt: edge grows the silhouette by e, then
+    // _feather_out grows a further f AND blurs f — tails to roughly 2f past the grown
+    // edge. A pad of only (e + f + 2) CLIPPED the wash right where the feathering
+    // lives, so the preview read tighter than the render on every side — the second
+    // report. 2f + 4 covers the >=128 footprint (f + ~0.5f) with the visible tail.
+    var pad = Math.max(0, (r.edge || 0)) + 2 * (r.feather || 0) + 4;
     var px0 = Math.max(0, r.bbox.x0 - pad), py0 = Math.max(0, r.bbox.y0 - pad);
     var px1 = Math.min(W - 1, r.bbox.x1 + pad), py1 = Math.min(H - 1, r.bbox.y1 + pad);
     return { px0: px0, py0: py0, w: px1 - px0 + 1, h: py1 - py0 + 1 };
@@ -1075,7 +1080,12 @@
     if (f > 0) {
       // outward feather: solid core UNION blurred grown copy — the >=128 footprint can
       // only match or exceed the hard silhouette the user approved (masks._feather_out).
-      var grown = (r.kind === 'auto' ? _discOn : _boxOn)(on, w, h, Math.min(96, Math.max(1, f)), true);
+      // DISC for every kind — mirroring masks._feather_out's _morph_disk grow exactly.
+      // A Chebyshev (_boxOn) grow bulges at the corners and clips along the diagonals,
+      // which previewed a SQUARE skirt while the render feathered round (the second
+      // half of the user's report). Edge grow/shrink above still keeps the kind split,
+      // because THAT mirrors _morph (square) vs _morph_disk (disc) server-side.
+      var grown = _discOn(on, w, h, Math.min(96, Math.max(1, f)), true);
       var gc = document.createElement('canvas'); gc.width = w; gc.height = h;
       var gx = gc.getContext('2d');
       var gi = gx.createImageData(w, h), gd = gi.data;

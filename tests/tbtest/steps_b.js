@@ -802,6 +802,68 @@
     });
   });
 
+  /* =====================================================================================
+   * FEATHER ROUNDNESS — 'the preview feather has the same square-corner issue we had
+   * with the grow/shrink thing'. The client grows the feathered copy for display; a
+   * Chebyshev (_boxOn) grow clips the skirt at the diagonals while the server's
+   * _feather_out grows on a DISC (_morph_disk), always. The blur hides the kernel in
+   * the alpha tail (measured offline: >128 reach is ~kernel-independent), so the
+   * witness is where the two visibly differ: wash ink in the corner-diagonal band vs
+   * the straight-edge band at the SAME distance past the silhouette.
+   * ===================================================================================== */
+  step('FR clear + knobs', function () {
+    clearForDraw();
+    knobSet('tb_edge', 0); knobSet('tb_feather', 30); knobSet('tb_wash', 1);
+    return wait(150);
+  });
+  step('FR paint square', function () {
+    var b = toolButton('rect'); if (b) b.click();
+    fire('pointerdown', 740, 60, 140, { isPrimary: true });
+    for (var i = 1; i <= 6; i++) fire('pointermove', 740, 60 + i * 5, 140, {});
+    for (var j = 1; j <= 6; j++) fire('pointermove', 740, 90, 140 + j * 10, {});
+    fire('pointerup', 740, 90, 200, {});
+    return wait(150);
+  });
+  step('FR corner probe', function () {
+    var r = region();
+    var me = r && r.all && r.all[0];
+    out.note.push('FR_PRE ' + JSON.stringify(r && r.all));
+    if (!me) { T('the square object exists for the corner probe', false,
+                 'no region — all=' + JSON.stringify(r && r.all)); return true; }
+    var st = toolButton('select'); if (st) st.click();
+    fire('pointerdown', 741, 150, 310, { isPrimary: true });   // tap empty -> deselect (no ring)
+    fire('pointerup', 741, 150, 310, {});
+    return wait(160).then(function () {
+      var b = me.bbox;
+      // Same distance-class in both directions (34..40 px from the nearest painted
+      // pixel): straight-out from the edge at dx 34..40, and diagonally at dx,dy
+      // 24..28 (sqrt ~ 34..40). A DISC grows f in every direction, so both sit 4..10
+      // beyond the grown silhouette: equal blurred tails. A CHEBYSHEV square covers
+      // dx,dy<=f (the diagonal corner stays solid to ~42) and dies right after 30:
+      // corner >> edge. That imbalance IS the square skirt the user reported.
+      // MEASURED truth, twice-refuted theory: the disc-vs-Chebyshev grow is INVISIBLE
+      // (fixed reach (32,15) vs box-mutant (34,17) — a sigma=f blur flattens both
+      // kernels alike), so no gate can honestly claim to test the kernel. The VISIBLE
+      // square-corner defect was the display PAD clip: the wash grid ended at e+f+2 px
+      // in a hard axis-aligned line, slicing the skirt's gradient into a SQUARE the
+      // eye reads long before >=128 alphas matter. These gates read the faint wash
+      // just beyond the old clip line — straight-out (x1+40..48) and on the corner
+      // diagonal (+32..38, exactly where the old pad=32 edge fell): the fixed code has
+      // a continuous blurred skirt there; pad-clipped code has a sharp zero.
+      T('the square keeps edge 0 / feather 30 (precondition)',
+        me.kind === 'shape' && me.edge === 0 && me.feather === 30, JSON.stringify(me));
+      var noClipSide = bandAvg(b.x1 + 40, b.x1 + 48, b.y0 + 20, b.y1 - 20);
+      var noClipCorner = bandAvg(b.x1 + 32, b.x1 + 38, b.y1 + 32, b.y1 + 38);
+      out.note.push('FR_CLIP side=' + noClipSide.toFixed(1) + ' corner=' +
+                    noClipCorner.toFixed(1) + ' bbox=' + JSON.stringify(b));
+      T('the feather skirt keeps fading PAST the old e+f+2 clip line (no hard square cut)',
+        noClipSide > 25, 'sideBeyondOldClip=' + noClipSide);
+      T('the corner keeps its skirt too: the clip cut the diagonals into a square',
+        noClipCorner > 15, 'cornerBeyondOldClip=' + noClipCorner);
+      return true;
+    });
+  });
+
   step('final fit', function () {
     var f = byText('Fit'); if (f) f.click();
     return wait(120);
