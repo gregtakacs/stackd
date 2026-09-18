@@ -127,8 +127,25 @@ green run is evidence about the real system rather than about a throwaway imitat
 ## Verify
 
 ```bash
-python3 tests/smoke_toolbox.py       # 129 checks: tokens, mask semantics, routes, contract,
-                                     # harness wiring (the rig that reports the spike result)
+python3 tests/smoke_toolbox.py       # 493 checks: tokens, mask semantics, routes, contract,
+                                     # harness wiring, and the shipped JS/CSS as the build
+                                     # serves them (attribute whitelist, dead-knob ledger,
+                                     # brace/paren balance, DOM-id cross-checks)
+
+python3 tests/tbtest/run_tbtest.py   # 93 browser assertions in real headless Chrome against
+                                     # the SHIPPED bytes through the SHIPPED assembler: the
+                                     # region model (merge/split/inherit), pixel-exact
+                                     # hit-testing, live morphological display for every
+                                     # object (not just the selected one), layer export per
+                                     # connected region, mobile gesture lockup, scrollbars.
+
+# Every browser assertion must be able to go RED on the defect it guards. Each --mutate
+# name rebuilds the page with one faithful defect reintroduced; the run must FAIL:
+python3 tests/tbtest/run_tbtest.py --mutate rawwash   # deselected objects snap back to raw
+                                                      # geometry (the reported bug #1)
+#   ... widetol (bbox-shadowed hit-test), allmerge (one blob = one object), autoslider
+#   (toolbar knobs ignored), brushfeather (KIND_RULES bypass), kindstr, twoslider, noderive,
+#   selguard, sticky, nosig, softpunch, ctlorder, blendblank, legacy — see run_tbtest.py
 ```
 
 Runs on a stdlib+pillow host — no ComfyUI, no Open WebUI, no browser. Covers polarity
@@ -145,7 +162,7 @@ wrong scope / cross-job token), honest 503s, CORS, and the JS↔server field con
 | `api.py` | `/toolbox/*` as a `dispatch()` any host can mount (stdlib only) |
 | `web.py` | server-renders the self-contained embed document; inlines CSS/JS because a srcdoc frame has no base URL to resolve against |
 | `spike.py` | the standalone M0 server above |
-| `web/toolbox.js` | the mount-agnostic editor (vector strokes, so undo/size/eraser stay editable after the fact) |
+| `web/toolbox.js` | the mount-agnostic editor. Objects are CONNECTED PAINT REGIONS (two-pass union-find over the composited mask), each with live per-object edge/feather; strokes are kept only as replay history for undo and eraser-ordering, never as the unit of selection |
 | `web/probe.js` | M0 instrumentation — injected into the spike only, never a real mount |
 | `web/harness.html`, `web/harness.js` | the two-panel feasibility page |
 

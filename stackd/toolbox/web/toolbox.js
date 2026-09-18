@@ -27,6 +27,33 @@
   var W = 0, H = 0;             // natural (source) pixel size of all layers
   var baseC = null, maskC = null, viewC = null, ringC = null;
   var strokes = [], active = null, tool = 'brush';
+  /* ---- selection OBJECTS are connected components of the composited paint ----
+   * What the user selects, tunes and deletes is a REGION (an 8-connected blob of the
+   * final mask pixels), not the stroke that painted it: a brush touch that lands on a
+   * smart-select becomes PART of that object (one object, one edge/feather adjuster),
+   * an eraser slice that cuts a blob in two splits the object into two (each fragment
+   * retains the parent's edge and feather — the feather across the fresh cut is the
+   * seam-hider), and two blobs bridged by one stroke become one (edge resets to its
+   * actual size, feather the ancestor-weighted average of the two). Strokes remain
+   * only as the paint history rasterize() replays — that keeps undo push/pop honest
+   * without the user ever touching a vector parameter after commit.
+   * Contiguity is measured on the RAW composited pixels, never on the displayed
+   * morphology: grow/feather are adjustments ON TOP, and if they decided identity a
+   * slider drag that made two objects touch would silently merge them (and average
+   * their feathers) under the user's own finger.
+   */
+  var MAX_REGIONS = 64;             // blobs past this are painted but not selectable
+  var REGION_ALPHA_MIN = 50;        // mirrors masks.COVERAGE_BRIGHTNESS_THRESHOLD: the
+                                    // server's own "counts as selected" number, so the
+                                    // client's object identity cannot disagree with what
+                                    // the server will actually paint
+  var regions = [];                 // [{id, kind, edge, feather, area, bbox, disp, dispKey, mvx, mvy, _dg}]
+  var regionSeq = 1;
+  var regionRev = 0;                // bumped on every pixel rebuild (cache generations)
+  var compLabel = null;             // Int32Array W*H: 0 = background, else region index + 1
+  var maskA = null;                 // Uint8Array W*H: composited alpha, one read per rebuild
+  var commitHintKind = 'shape';     // kind a zero-ancestor (brand-new) blob inherits
+  var _dragReg = null;              // region currently being dragged by the Select tool
   // Smart-select (SAM3) session state. Points are kept in NORMALISED 0..1 coords so a zoom
   // or resize never shifts a committed click. Each SUCCESSFUL selection is its own OBJECT in
   // smartObjs — {pos, neg, layer} — so "select a car, then select another car" yields TWO
@@ -109,19 +136,19 @@
   // `preview.sig === previewSig()` whether to keep painting it, and without per-object
   // geometry in that key, moving or re-tuning an object would leave both the key and the
   // overlay untouched. Keeping the key complete costs nothing and defuses that trap.
-  //
-  // Coordinates fold into two quantised sums rather than being listed: same O(pts) cost,
-  // a short key, and sub-pixel jitter cannot thrash the server while any real drag moves.
   function objSig() {
+    // Preview-cache key over the REGION table (post-refactor truth): params live on the
+    // blob, not the stroke, so a feather change on an object nobody is holding must still
+    // invalidate the cached server overlay. Geometry folds in as quantised bbox corners
+    // and an area bucket — any real paint edit moves them; sub-pixel jitter cannot.
     var parts = [];
-    for (var i = 0; i < strokes.length; i++) {
-      var o = strokes[i], pts = o.pts || [], sx = 0, sy = 0;
-      for (var j = 0; j < pts.length; j++) { sx += pts[j].x; sy += pts[j].y; }
-      parts.push([o.mode, o.kind, o.edge, o.grow, o.shrink, o.feather, o.erase ? 1 : 0,
-                  o.size, o.hardness, pts.length,
-                  Math.round(sx * 4) / 4, Math.round(sy * 4) / 4].join(':'));
+    for (var i = 0; i < regions.length; i++) {
+      var r = regions[i], b = r.bbox || { x0: 0, y0: 0, x1: 0, y1: 0 };
+      parts.push([r.kind, r.edge, r.feather, r.area >> 4,
+                  Math.round(b.x0 / 4), Math.round(b.y0 / 4),
+                  Math.round(b.x1 / 4), Math.round(b.y1 / 4)].join(':'));
     }
-    return parts.join('|');
+    return parts.join('|') + '#' + strokes.length;
   }
 
   function previewSig() {
@@ -134,20 +161,25 @@
             p.overlay_alpha].join(',');
   }
 
-  /* ---------------- painting model: vector strokes, rasterized on demand ----------------
-   * Painting straight into a bitmap is the tempting design and the wrong one: undo then
-   * needs pixel snapshots, a brush-size change cannot retro-apply, and the eraser cannot
-   * be re-ordered. Keeping strokes as point lists and repainting the mask from scratch
-   * costs O(pixels x strokes) per frame, trivially real-time at these canvas sizes, and
-   * it is what makes the "sloppy by design" promise actually true — undo, size, hardness
-   * and eraser order all stay editable after the fact.
+  /* ---------------- painting model: strokes replay, but OBJECTS are pixels ----------
+   * Strokes stay point lists because rasterize() replays them, which is what makes undo
+   * push/pop honest and the eraser re-orderable BEFORE commit. But the user-facing object
+   * is no longer a stroke: it is a connected component of the composited paint
+   * (rebuildRegions below), so after commit there is nothing to "re-parameterise" — the
+   * pure pixel values ARE the selection, exactly as a mask should be.
    */
   function rasterize() {
     if (!maskC) return;
-    var m = maskC.getContext('2d');
+    var m = maskC.getContext('2d', { willReadFrequently: true });
     m.clearRect(0, 0, W, H);
-    var all = strokes.concat(active ? [active] : []);
-    for (var i = 0; i < all.length; i++) paintStroke(m, all[i]);
+    var i;
+    for (i = 0; i < strokes.length; i++) paintStroke(m, strokes[i]);
+    // Identity from COMMITTED pixels only — and NOT on every pointermove: the O(pixels)
+    // rebuild is gated off mid-stroke AND mid-select-drag (during a drag the blob moves
+    // as a display offset; rebuildRegions() would re-derive it from pre-move pixels
+    // every frame and starve a phone). The table is rebuilt once, at commit.
+    if (!((dragEnabled && active) || (tool === 'select' && selDrag))) rebuildRegions();
+    if (active) paintStroke(m, active);   // the in-progress shape is not an object yet
     compose();
     schedulePreview();     // any paint change invalidates the server preview; refresh on idle
   }
@@ -187,6 +219,7 @@
    * sees and the geometry the server rasterizes are derived from the same numbers.
    */
   function objBBox(o) {
+    if (o && o.bbox) return o.bbox;            // a REGION: measured, not guessed
     // A load/auto (smart-select) stroke carries no vertex list — its extent is the opaque
     // region of the PNG it draws. The tight coverage box (o._bb) is measured once at load
     // time by measureLoadBBox; until that lands (or if it fails) fall back to the full
@@ -270,58 +303,90 @@
   }
 
   function hitTest(p) {
-    // Topmost wins: reverse order, so the thing the user can see on top is the thing they
-    // grab. Tolerance makes thin strokes reachable with a finger.
-    for (var i = strokes.length - 1; i >= 0; i--) {
-      var b = objBBox(strokes[i]);
-      if (!b) continue;
-      var tol = 8 / scale();
-      if (p.x >= b.x0 - tol && p.x <= b.x1 + tol && p.y >= b.y0 - tol && p.y <= b.y1 + tol) return i;
+    // Objects are REGIONS (connected paint blobs), so the finger grabs the pixels it
+    // actually touches: exact label lookup FIRST (a tap in the hole of a ring, or in a
+    // channel an eraser cut, selects NOTHING — bbox-only hit-testing is the historic
+    // smart-select grab-shadowing bug). The fallback for a near-miss then measures
+    // DISTANCE TO REAL PIXELS of each region (windowed label scan), not to bboxes: a
+    // bbox fallback would reintroduce the very shadowing it exists to prevent — two
+    // boxes overlapping a gap always pick whichever sorts first.
+    //
+    // The window is 8 CSS px (what a finger aims), converted natural = px x scale().
+    // The shipped formula divided; at the suite's ~0.36 px/css that widened tolerance
+    // from 3 natural px to 23 and let the empty channel grab a stranger. Minimum 2
+    // natural px so a 1:1 canvas (or a zoomed phone) keeps a usable finger target.
+    if (!compLabel || !regions.length) return -1;
+    var ix = Math.round(p.x), iy = Math.round(p.y);
+    if (ix >= 0 && iy >= 0 && ix < W && iy < H) {
+      var id = compLabel[iy * W + ix];
+      if (id) return id - 1;
+      var tol = Math.max(2, Math.round(8 * scale()));
+      var best = -1, bestN = 0;
+      var y0 = Math.max(0, iy - tol), y1 = Math.min(H - 1, iy + tol);
+      var x0 = Math.max(0, ix - tol), x1 = Math.min(W - 1, ix + tol);
+      var counts = {}, y2, x2;
+      for (y2 = y0; y2 <= y1; y2++) {
+        for (x2 = x0; x2 <= x1; x2++) {
+          var q = compLabel[y2 * W + x2];
+          if (!q) continue;
+          var c = (counts[q] || 0) + 1;
+          counts[q] = c;
+          if (c > bestN) { bestN = c; best = q; }
+        }
+      }
+      if (best > 0) return best - 1;
     }
     return -1;
   }
 
-  function selObj() { return (sel >= 0 && sel < strokes.length) ? strokes[sel] : null; }
+  function selObj() { return (sel >= 0 && sel < regions.length) ? regions[sel] : null; }
 
   function selectObj(i) {
-    sel = i;
-    // Mirror the per-object edge/feather into the toolbar sliders for an auto object so the
-    // obvious slider reads (and then edits) THIS object's geometry. For any other object the
-    // sliders keep their global "defaults for the next object" meaning and are left alone.
-    var o = (i >= 0 && i < strokes.length) ? strokes[i] : null;
-    if (o && (o.kind || kindOf(o)) === 'auto') {
+    sel = (i >= 0 && i < regions.length) ? i : -1;
+    // Mirror the object's edge/feather into the toolbar sliders so the obvious slider
+    // reads (and then edits) THIS object. Brush objects are excluded: the server forbids
+    // any morphology on a hand-painted edge (KIND_RULES['brush']), and a live slider that
+    // silently did nothing is the exact lie this project exists to prevent.
+    var o = selObj();
+    if (o && o.kind !== 'brush') {
       if (el.edge) { el.edge.value = (typeof o.edge === 'number') ? o.edge : 0;
                      if (el.edge_out) el.edge_out.textContent = String(el.edge.value); }
       if (el.feather) { el.feather.value = (typeof o.feather === 'number') ? o.feather : 0;
                         if (el.feather_out) el.feather_out.textContent = String(el.feather.value); }
     }
     syncInspector();
-    rasterize();
-    if (i < 0) status('Nothing selected.');
-    else {
-      var o = strokes[i];
-      status(o.mode === 'load'
-        ? 'Selected an auto selection — use edge / feather to grow, shrink or soften it.'
-        : 'Selected a ' + (o.kind || kindOf(o)) + ' — drag to move, corner to scale.');
-    }
+    compose();
+    if (sel < 0) status('Nothing selected.');
+    else status(o.kind === 'auto'
+      ? 'Selected an auto selection — use edge / feather to grow, shrink or soften it.'
+      : 'Selected a ' + o.kind + ' selection — drag to move it.');
   }
 
   function translateSel(dx, dy) {
+    // A region is pixels: dragging offsets its pixels for display (cheap, live); the move
+    // is BAKED into one compound stroke on release (bakeMove). It is also what finally
+    // makes a smart-select movable — the old vector translate was a silent no-op for it.
     var o = selObj(); if (!o) return;
-    if (!o.pts) return;                              // an auto/load selection has no vertices to move
-    for (var i = 0; i < o.pts.length; i++) { o.pts[i].x += dx; o.pts[i].y += dy; }
-    rasterize();
+    o.mvx = (o.mvx || 0) + dx;
+    o.mvy = (o.mvy || 0) + dy;
+    compose();
   }
 
-  function scaleSel(f) {
-    var o = selObj(); if (!o || !o.pts) return;
-    var b = objBBox(o), cx = (b.x0 + b.x1) / 2, cy = (b.y0 + b.y1) / 2;
-    for (var i = 0; i < o.pts.length; i++) {
-      o.pts[i].x = cx + (o.pts[i].x - cx) * f;
-      o.pts[i].y = cy + (o.pts[i].y - cy) * f;
-    }
-    if (o.size) o.size = Math.max(2, o.size * f);   // a scaled brush keeps a scaled footprint
+  function bakeMove() {
+    var r = _dragReg; _dragReg = null;
+    if (!r) return;
+    var dx = Math.round(r.mvx || 0), dy = Math.round(r.mvy || 0);
+    r.mvx = 0; r.mvy = 0;
+    if (!dx && !dy) return;
+    var cv = regionRawCanvas(r, true);
+    // ONE compound stroke (lift the blob's pixels here, lay them down at the offset).
+    // Two strokes would let Undo pop half a move and leave the object drawn twice —
+    // the compound keeps vector-undo honest for something vectors could never express.
+    strokes.push({ mode: 'move', cv: cv, ox: r.bbox.x0, oy: r.bbox.y0, dx: dx, dy: dy,
+                   kind: 'shape', edge: 0, grow: 0, shrink: 0, feather: 0,
+                   size: 0, hardness: 1, erase: false });
     rasterize();
+    status('Moved.');
   }
 
   // The inspector is what makes per-object parameters *legible*: the global sliders are
@@ -347,9 +412,9 @@
     inp.addEventListener('input', function () {
       out.textContent = inp.value;
       var o = selObj(); if (!o) return;
+      if (inp.disabled) return;
       o[key] = parseFloat(inp.value);
-      if (o.mode === 'free' && key === 'hardness') { /* live repaint only */ }
-      rasterize();
+      touchObject();               // a parameter change: pixels untouched, view + cache refresh
     });
     wrap.appendChild(inp); wrap.appendChild(out);
     lab.appendChild(wrap);
@@ -377,6 +442,10 @@
     var inp = mk('input');
     inp.type = 'range'; inp.min = -60; inp.max = 60; inp.step = 2;
     inp.value = (typeof o.edge === 'number') ? o.edge : 0;
+    if (o.kind === 'brush') {                        // handwork edge: KIND_RULES forbids morphing it
+      inp.disabled = true;
+      lab.appendChild(mk('span', 'tb-hint', 'hardness sets this edge'));
+    }
     var out = mk('span', 'tb-v', String(inp.value));
     var rel = mk('span', 'tb-hint', '');
     function paint(v) {
@@ -393,13 +462,12 @@
       rel.classList.toggle('tb-warn', !!risky);
     }
     inp.addEventListener('input', function () {
+      if (inp.disabled) return;
       var v = parseInt(inp.value, 10) || 0;
       var t = selObj(); if (!t) return;
-      t.edge = v;
-      t.grow = v > 0 ? v : 0;
-      t.shrink = v < 0 ? -v : 0;
+      t.edge = v;                     // the derived grow/shrink pair is built at export
       paint(v);
-      rasterize();
+      touchObject();
     });
     paint(parseInt(inp.value, 10) || 0);
     wrap.appendChild(inp); wrap.appendChild(out);
@@ -413,19 +481,17 @@
     if (!o) { el_inspect.innerHTML = ''; el_inspect.style.display = 'none'; return; }
     el_inspect.style.display = '';
     el_inspect.innerHTML = '';
-    var kind = o.kind || kindOf(o);
+    var kind = o.kind;
     var brush = kind === 'brush';
+    // The inspector edits the OBJECT (the connected blob), not the strokes that made it:
+    // after commit there is no size/hardness vertex left to re-tune — the pixels are the
+    // selection. A brush blob shows its edge/feather rows disabled with the reason,
+    // because the server refuses morphology on handwork (masks.KIND_RULES['brush']).
     el_inspect.appendChild(mk('div', 'tb-inspect-h',
-      (brush ? 'Brush stroke' : (kind === 'auto' ? 'Auto selection' : 'Shape')) +
-      ' — ' + (o.erase ? 'eraser' : 'paint')));
-    if (brush) {
-      el_inspect.appendChild(ipair('hardness', 'hardness', o, 0, 1, 0.05, o.hardness, false));
-      el_inspect.appendChild(ipair('size', 'size', o, 4, 400, 2, o.size || 60, false));
-      el_inspect.appendChild(ipair('feather', 'feather', o, 0, 64, 1, 0, true));
-    } else {
-      el_inspect.appendChild(edgePair(o));
-      el_inspect.appendChild(ipair('feather', 'feather', o, 0, 64, 1, o.feather || 0, false));
-    }
+      (brush ? 'Brush selection' : (kind === 'auto' ? 'Auto selection' : 'Shape selection')) +
+      ' — ' + (o.area || 0) + ' px'));
+    el_inspect.appendChild(edgePair(o));
+    el_inspect.appendChild(ipair('feather', 'feather', o, 0, 64, 1, o.feather || 0, brush));
     var rowb = mk('div', 'tb-row');
     rowb.appendChild(btn('Delete object', deleteSel, 'Remove this object from the mask'));
     rowb.appendChild(btn('Deselect', function () { selectObj(-1); }));
@@ -433,9 +499,16 @@
   }
 
   function deleteSel() {
-    if (!selObj()) return;
-    strokes.splice(sel, 1);
-    sel = -1; selDrag = null;
+    var r = selObj(); if (!r) return;
+    var cv = regionRawCanvas(r, true);
+    // Deleting an OBJECT (a blob that may be made of many strokes) lifts exactly its
+    // pixels as one synthetic erase stroke — splicing a stroke could not express it once
+    // contiguity, not authorship, decides what an object is. Undo pops the carve; pixels back.
+    strokes.push({ mode: 'load', img: cv, ox: r.bbox.x0, oy: r.bbox.y0,
+                   w: cv.width, h: cv.height, erase: true,
+                   kind: 'shape', edge: 0, grow: 0, shrink: 0, feather: 0,
+                   size: 0, hardness: 1 });
+    sel = -1; selDrag = null; _dragReg = null;
     redoStack = [];                                  // a deletion is a real edit; redo is stale
     syncInspector(); rasterize(); status('Object removed.');
   }
@@ -469,13 +542,25 @@
       // the guess stays erasable/undoable instead of becoming the ground truth.
       //
       // Paint the RAW coverage, do NOT bake grow/shrink/feather here. This canvas feeds
-      // BOTH exportMask() and exportLayers(), and the server re-applies this layer's edge
-      // + feather (masks.normalize_layers, KIND_RULES['auto']). Morphing on top of the raw
-      // blit here would grow the object TWICE (once here, once on the server). Live
-      // grow/shrink/feather feedback is delivered by the server OVERLAY (compose draws
-      // preview.img), which is the WYSIWYG source of truth — not by a browser approximation
-      // that the render would then disagree with.
-      m.drawImage(s.img, 0, 0, W, H);
+      // BOTH exportMask() and the region ship-copies, and the server re-applies each
+      // object's edge + feather exactly once (masks.normalize_layers, KIND_RULES) —
+      // morphing on top of the raw blit here would grow the object TWICE. Live feedback
+      // is the display-only region copy (regionDispCanvas below), never exported; the
+      // server overlay then paints identical pixels over it, so what the user approves
+      // is what the graph will render.
+      m.drawImage(s.img, s.ox || 0, s.oy || 0, s.w || W, s.h || H);
+      m.restore();
+      return;
+    }
+    if (s.mode === 'move' && s.cv) {
+      // A COMPOUND region move (bakeMove): lift the blob's pixels where they stand and
+      // lay them down at the offset — ONE replay entry, so Undo pops a whole move and
+      // never half of one. destination-out with the blob's own footprint removes exactly
+      // its pixels, even where other strokes' coverage lies underneath them.
+      m.globalCompositeOperation = 'destination-out';
+      m.drawImage(s.cv, s.ox || 0, s.oy || 0);
+      m.globalCompositeOperation = 'source-over';
+      m.drawImage(s.cv, (s.ox || 0) + s.dx, (s.oy || 0) + s.dy);
       m.restore();
       return;
     }
@@ -549,14 +634,16 @@
   }
 
 
-  /* ---------------- display-only morphology for the selected smart-select -------------- */
-  // #5: the toolbar edge/feather sliders must give LIVE feedback before the (debounced)
-  // server overlay lands. This morphs the SELECTED auto object's coverage for DISPLAY only;
-  // it is never written to maskC, so exportMask/exportLayers still ship the RAW silhouette and
-  // the server applies the real geometry exactly once — no double-grow (the bug a naive client
-  // bake reintroduces). It mirrors masks._morph_disk (separable squared-Euclidean transform) so
-  // what the slider previews and what the server paints agree; when the server overlay arrives
-  // it replaces this with identical pixels, so there is no flicker.
+  /* ---------------- display-only morphology (region copies) -------------------------
+   * #5 (generalised by the region model): the toolbar edge/feather sliders must give LIVE
+   * feedback for EVERY object, not just the selected one, before the (debounced) server
+   * overlay lands. regionDispCanvas morphs each region's committed coverage for DISPLAY
+   * only; it is never written to maskC nor shipped by exportMask/exportLayers, so the
+   * server still applies the real geometry exactly once — no double-grow (the bug a naive
+   * client bake reintroduces). It mirrors masks._morph_disk / _morph / _feather_out so
+   * what the sliders preview and what the server paints agree; when the server overlay
+   * arrives it replaces these with identical pixels, so there is no flicker.
+   */
   var _DISK_CAP = 256;   // display-only: the browser caps lower than the server (masks.DISK_CAP
                          // 2048) because this runs per slider-drag; it is never exported, so the
                          // render still uses the full-resolution server kernel.
@@ -609,57 +696,6 @@
     }
     return out;
   }
-  // Morph one auto stroke's coverage into `dst` (a canvas ctx in natural W×H coords),
-  // applying the object's signed edge (disc grow/shrink) and outward feather — the same
-  // operators the server uses. Reads the raw alpha off `srcImg` (the committed PNG).
-  function morphAutoForDisplay(dst, srcImg, edge, feather) {
-    var sw = srcImg.naturalWidth || W, sh = srcImg.naturalHeight || H;
-    var sc = document.createElement('canvas'); sc.width = sw; sc.height = sh;
-    var sx = sc.getContext('2d', { willReadFrequently: true });
-    sx.drawImage(srcImg, 0, 0);
-    var img, on, w = sw, h = sh;
-    if (Math.max(w, h) > _DISK_CAP) {
-      var k = _DISK_CAP / Math.max(w, h);
-      w = Math.max(1, Math.round(sw * k)); h = Math.max(1, Math.round(sh * k));
-      var cc = document.createElement('canvas'); cc.width = w; cc.height = h;
-      cc.getContext('2d').drawImage(srcImg, 0, 0, w, h);
-      sc = cc; sx = sc.getContext('2d', { willReadFrequently: true });
-    }
-    try { img = sx.getImageData(0, 0, w, h); } catch (e) { return false; }
-    var a = img.data;
-    on = new Uint8Array(w * h);
-    for (var i = 0; i < w * h; i++) on[i] = a[i * 4 + 3] > 50 ? 1 : 0;   // alpha coverage
-    var e2 = Math.round(edge || 0);
-    if (e2 > 0) on = _discOn(on, w, h, Math.round(e2 * (w / sw)), true);
-    else if (e2 < 0) on = _discOn(on, w, h, Math.round(-e2 * (w / sw)), false);
-    // rasterise the on-grid back to an RGBA (white + coverage) canvas
-    var mc = document.createElement('canvas'); mc.width = w; mc.height = h;
-    var mx = mc.getContext('2d');
-    var mi = mx.createImageData(w, h), md = mi.data;
-    for (var j = 0; j < w * h; j++) {
-      md[j * 4] = 255; md[j * 4 + 1] = 255; md[j * 4 + 2] = 255;
-      md[j * 4 + 3] = on[j] ? 255 : 0;
-    }
-    mx.putImageData(mi, 0, 0);
-    dst.save();
-    if (feather && feather > 0) {
-      // outward feather: draw the shape, then a blurred copy of a slightly grown version,
-      // unioned — the >=128 core is preserved and the soft skirt only ever extends outward.
-      var gc = document.createElement('canvas'); gc.width = w; gc.height = h;
-      var gx = gc.getContext('2d');
-      gx.filter = 'blur(' + Math.max(0.5, feather * (w / sw)) + 'px)';
-      gx.drawImage(mc, 0, 0);
-      gx.filter = 'none';
-      dst.drawImage(mc, 0, 0, W, H);
-      dst.globalCompositeOperation = 'lighter';
-      dst.drawImage(gc, 0, 0, W, H);
-      dst.globalCompositeOperation = 'source-over';
-    } else {
-      dst.drawImage(mc, 0, 0, W, H);
-    }
-    dst.restore();
-    return true;
-  }
   function _discOn(on, w, h, r, grow) {
     if (r <= 0) return on;
     var D = _edtOn(on, w, h), out = new Uint8Array(w * h), i;
@@ -674,6 +710,290 @@
       for (i = 0; i < w * h; i++) out[i] = (on[i] && Do[i] > r * r) ? 1 : 0;
     }
     return out;
+  }
+
+  /* ---------------- region rebuild: pixels -> objects ----------------
+   * Two-pass connected-components (union-find, 8-connected - the same connectivity
+   * masks.keep_significant_components uses server-side, so client identity and the
+   * server's de-speckle never disagree about what one blob is). Identity is read off
+   * the COMMITTED composited pixels, never off the displayed morphology: grow/feather
+   * are adjustments on top, and letting them decide identity would merge objects the
+   * moment a slider drag made their skirts touch - renumbering the user's objects
+   * mid-gesture.
+   *
+   * Parameter carry-over by ancestor overlap (a new blob inherits from the old blobs
+   * whose pixels it contains, when the overlap clears a floor of ~20% of either side -
+   * a 3-px brush touch must not silently renumber a stranger object, and a bridge
+   * stroke joining two big blobs must count BOTH):
+   *   1 ancestor  -> inherit kind/edge/feather. A brush touch onto a smart-select
+   *                 makes the brushed pixels PART of that object (one adjuster for the
+   *                 whole blob), and an erase that trims or SPLITS a blob leaves
+   *                 fragments that retain the parent's edge and feather - the feather
+   *                 across the fresh cut is what hides the seam of the split.
+   *   2+ ancestors-> MERGE: edge resets to 0 (the new object starts at its actual
+   *                 size and grows from there - averaging two offsets double-counts),
+   *                 feather = the ancestors' overlap-weighted average, kind prefers
+   *                 'auto' then 'shape' then 'brush'.
+   *   0 ancestors -> brand-new blob: kind from the committing stroke's hint, edge 0,
+   *                 feather default read from the sliders AT COMMIT (the sliders are
+   *                 defaults for the NEXT object - the contract stamp() has honoured).
+   */
+  function rebuildRegions() {
+    regionRev++;
+    var n = W * H;
+    if (!maskA || maskA.length !== n) maskA = new Uint8Array(n);
+    var m = maskC.getContext('2d', { willReadFrequently: true });
+    var data;
+    try { data = m.getImageData(0, 0, W, H).data; }
+    catch (e) { compLabel = null; regions = []; sel = -1; return; }   // tainted: overlay still rules
+    var i, x, y;
+    for (i = 0; i < n; i++) maskA[i] = data[i * 4 + 3];
+    var prevLabel = compLabel, prevRegs = regions;
+    compLabel = new Int32Array(n);
+    var parent = new Int32Array(n + 1);
+    for (i = 0; i <= n; i++) parent[i] = i;
+    function find(a) { while (parent[a] !== a) { parent[a] = parent[parent[a]]; a = parent[a]; } return a; }
+    function join(a, b) { a = find(a); b = find(b); if (a !== b) { if (a < b) parent[b] = a; else parent[a] = b; } }
+    var lab = compLabel;
+    for (y = 0; y < H; y++) {
+      for (x = 0; x < W; x++) {
+        i = y * W + x;
+        if (maskA[i] <= REGION_ALPHA_MIN) continue;
+        var l = x > 0 ? lab[i - 1] : 0;
+        var u = y > 0 ? lab[i - W] : 0;
+        var ul = (x > 0 && y > 0) ? lab[i - W - 1] : 0;
+        var ur = (x < W - 1 && y > 0) ? lab[i - W + 1] : 0;
+        if (!l && !u && !ul && !ur) { lab[i] = i + 1; continue; }
+        var mn = l || u || ul || ur;   // (a diagonal-only neighbour made mn 0 and merged the whole blob into the background)
+        if (ul && ul < mn) mn = ul;
+        if (ur && ur < mn) mn = ur;
+        lab[i] = mn;
+        if (l) join(mn, l);
+        if (u) join(mn, u);
+        if (ul) join(mn, ul);
+        if (ur) join(mn, ur);
+      }
+    }
+    var stats = {}, order = [];
+    for (i = 0; i < n; i++) {
+      var a = lab[i];
+      if (!a) continue;
+      var root = find(a);
+      lab[i] = root;
+      var st = stats[root];
+      if (!st) { st = stats[root] = { area: 0, x0: W, y0: H, x1: -1, y1: -1, anc: null }; order.push(root); }
+      var px = i % W, py = (i - px) / W;
+      st.area++;
+      if (px < st.x0) st.x0 = px;
+      if (px > st.x1) st.x1 = px;
+      if (py < st.y0) st.y0 = py;
+      if (py > st.y1) st.y1 = py;
+      if (prevLabel) {
+        var pa = prevLabel[i];
+        if (pa) { if (!st.anc) st.anc = {}; st.anc[pa] = (st.anc[pa] || 0) + 1; }
+      }
+    }
+    order.sort(function (p, q) { return p - q; });       // scan order == paint-order proxy
+    var selReg = (sel >= 0 && sel < prevRegs.length) ? prevRegs[sel] : null;
+    regions = [];
+    var newSel = -1;
+    var rootSlot = {};
+    for (var oi = 0; oi < order.length && oi < MAX_REGIONS; oi++) {
+      var st2 = stats[order[oi]];
+      var q = null;
+      if (st2.anc && prevRegs.length) {
+        q = [];
+        for (var key in st2.anc) {
+          var old = prevRegs[(key | 0) - 1];
+          if (!old) continue;
+          var cnt = st2.anc[key];
+          if (cnt >= 6 && (cnt >= 0.2 * st2.area || cnt >= 0.2 * (old.area || 1))) q.push({ old: old, cnt: cnt });
+        }
+      }
+      var kind, edge, feather;
+      if (q && q.length === 1) {
+        kind = q[0].old.kind; edge = q[0].old.edge; feather = q[0].old.feather;
+      } else if (q && q.length > 1) {
+        var ws = 0, wf = 0, sawAuto = false, sawShape = false;
+        for (var qi = 0; qi < q.length; qi++) {
+          ws += q[qi].cnt; wf += q[qi].cnt * (q[qi].old.feather || 0);
+          if (q[qi].old.kind === 'auto') sawAuto = true;
+          else if (q[qi].old.kind === 'shape') sawShape = true;
+        }
+        feather = ws ? Math.round(wf / ws) : 0;
+        edge = 0;
+        kind = sawAuto ? 'auto' : (sawShape ? 'shape' : 'brush');
+      } else {
+        kind = commitHintKind || 'shape';
+        edge = kind === 'brush' ? 0 : val('tb_edge', 0);
+        feather = kind === 'brush' ? 0 : val('tb_feather', 8);
+      }
+      var reg = { id: regionSeq++, kind: kind, edge: edge, feather: feather,
+                  area: st2.area, mvx: 0, mvy: 0,
+                  bbox: { x0: st2.x0, y0: st2.y0, x1: st2.x1, y1: st2.y1 } };
+      if (q) for (var qj = 0; qj < q.length; qj++) {
+        if (q[qj].old === selReg) newSel = regions.length;
+        if (_dragReg && q[qj].old === _dragReg) { reg.mvx = _dragReg.mvx; reg.mvy = _dragReg.mvy; }
+      }
+      regions.push(reg);
+      rootSlot[order[oi]] = regions.length - 1;   // the slot becomes the exported label
+    }
+    // Remap the union-find ROOTS (seed pixel ids — huge, meaningless numbers) down to
+    // region slot+1. Every consumer (hitTest, the ship-copies, the display morphs) reads
+    // compLabel as slot+1; shipping raw roots left every per-region canvas silently
+    // empty, because no pixel's root ever equalled a small slot number.
+    if (regions.length) {
+      for (i = 0; i < n; i++) {
+        var rw = lab[i];
+        if (!rw) { continue; }
+        var sl = rootSlot[rw];
+        lab[i] = (sl === undefined) ? 0 : sl + 1;
+      }
+    }
+    sel = newSel;
+  }
+
+  // Square-kernel binary morph — mirrors masks._morph (server-side, shapes use the
+  // square kernel; only 'auto' gets the disc, and the client display mirrors exactly
+  // which kind gets which). Sliding-window OR over the box, two separable passes.
+  function _boxOn(on, w, h, r, grow) {
+    if (r <= 0) return on;
+    var tmp = new Uint8Array(w * h), out = new Uint8Array(w * h);
+    var src = on, x, y, k;
+    if (!grow) {
+      src = new Uint8Array(w * h);
+      for (k = 0; k < w * h; k++) src[k] = on[k] ? 0 : 1;      // erode = no OFF in window
+    }
+    for (y = 0; y < h; y++) {
+      var row = y * w, run = 0;
+      for (k = 0; k <= Math.min(w - 1, r); k++) run += src[row + k];
+      for (x = 0; x < w; x++) {
+        tmp[row + x] = run > 0 ? 1 : 0;
+        if (x + 1 + r < w) run += src[row + x + 1 + r];
+        if (x - r >= 0) run -= src[row + x - r];
+      }
+    }
+    for (x = 0; x < w; x++) {
+      var run2 = 0;
+      for (k = 0; k <= Math.min(h - 1, r); k++) run2 += tmp[k * w + x];
+      for (y = 0; y < h; y++) {
+        out[y * w + x] = run2 > 0 ? 1 : 0;
+        if (y + 1 + r < h) run2 += tmp[(y + 1 + r) * w + x];
+        if (y - r >= 0) run2 -= tmp[(y - r) * w + x];
+      }
+    }
+    if (grow) return out;
+    var res = new Uint8Array(w * h);
+    for (k = 0; k < w * h; k++) res[k] = (on[k] && !out[k]) ? 1 : 0;
+    return res;
+  }
+
+  function regionGeom(r) {
+    var pad = Math.max(0, (r.edge || 0)) + (r.feather || 0) + 2;
+    var px0 = Math.max(0, r.bbox.x0 - pad), py0 = Math.max(0, r.bbox.y0 - pad);
+    var px1 = Math.min(W - 1, r.bbox.x1 + pad), py1 = Math.min(H - 1, r.bbox.y1 + pad);
+    return { px0: px0, py0: py0, w: px1 - px0 + 1, h: py1 - py0 + 1 };
+  }
+
+  // The blob's OWN pixels. binary=true lifts the whole object (destination-out cuts
+  // must be total); binary=false keeps the composited alpha so a pure-brush object
+  // ships its hardness gradient (masks.KIND_RULES['brush'] forbids the server from
+  // touching it, so nothing here may pre-morph the pixels either — the double-grow
+  // bug this whole file has been bitten by once).
+  function regionRawCanvas(r, binary) {
+    var ck = binary ? '_cBin' : '_cShip';
+    var key = regionRev + '|' + binary + '|' + r.bbox.x0 + ',' + r.bbox.y0 + ',' + r.bbox.x1 + ',' + r.bbox.y1;
+    if (r[ck + 'Key'] === key) return r[ck];
+    var id = regions.indexOf(r) + 1;
+    var w = r.bbox.x1 - r.bbox.x0 + 1, h = r.bbox.y1 - r.bbox.y0 + 1;
+    var c = document.createElement('canvas'); c.width = w; c.height = h;
+    var cx = c.getContext('2d');
+    var im = cx.createImageData(w, h), d = im.data;
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        var g = (y + r.bbox.y0) * W + (x + r.bbox.x0);
+        if (compLabel && compLabel[g] === id) {
+          var o = (y * w + x) * 4;
+          d[o] = 255; d[o + 1] = 255; d[o + 2] = 255;
+          d[o + 3] = binary ? 255 : maskA[g];
+        }
+      }
+    }
+    cx.putImageData(im, 0, 0);
+    r[ck] = c; r[ck + 'Key'] = key;
+    return c;
+  }
+
+  // The blob's DISPLAY copy: its own signed edge and outward feather, applied with the
+  // server's own operators (disc for auto, square for shape, nothing for brush). This
+  // is why every object stays live on screen whatever the Select tool points at — the
+  // bug it replaces only ever showed the SELECTED object's morphology, so a just-tuned
+  // object snapped back to raw geometry the moment you reached for the next one.
+  // Cached per (pixel generation, kind, edge, feather, bbox): a slider drag recomputes
+  // only the object being dragged. Grid capped at _DISK_CAP — display only, never
+  // exported; the server overlay replaces these pixels with identical ones.
+  function regionDispCanvas(r) {
+    var key = regionRev + '|' + r.kind + '|' + r.edge + '|' + r.feather + '|'
+            + r.bbox.x0 + ',' + r.bbox.y0 + ',' + r.bbox.x1 + ',' + r.bbox.y1;
+    if (r._cDispKey === key) return r._cDisp;
+    var dg = regionGeom(r);
+    r._dg = dg;
+    var w = dg.w, h = dg.h, id = regions.indexOf(r) + 1, x, y, k;
+    var c = document.createElement('canvas'); c.width = w; c.height = h;
+    var cx = c.getContext('2d');
+    if (r.kind === 'brush') {                       // hardness IS the edge: raw pixels
+      cx.drawImage(regionRawCanvas(r, false), r.bbox.x0 - dg.px0, r.bbox.y0 - dg.py0);
+      r._on = null;
+      r._cDisp = c; r._cDispKey = key;
+      return c;
+    }
+    var on = new Uint8Array(w * h);
+    for (y = 0; y < h; y++) {
+      for (x = 0; x < w; x++) {
+        var g = (y + dg.py0) * W + (x + dg.px0);
+        on[y * w + x] = (compLabel && compLabel[g] === id && maskA[g] > REGION_ALPHA_MIN) ? 1 : 0;
+      }
+    }
+    var sd = Math.min(1, _DISK_CAP / Math.max(1, Math.max(w, h)));
+    var e = Math.round(r.edge || 0);
+    if (e) on = (r.kind === 'auto' ? _discOn : _boxOn)(on, w, h, Math.max(1, Math.round(Math.abs(e) * sd)), e > 0);
+    var im = cx.createImageData(w, h), d = im.data;
+    for (k = 0; k < w * h; k++) {
+      if (on[k]) { var o = k * 4; d[o] = 255; d[o + 1] = 255; d[o + 2] = 255; d[o + 3] = 255; }
+    }
+    cx.putImageData(im, 0, 0);
+    var f = Math.round(r.feather || 0);
+    if (f > 0) {
+      // outward feather: solid core UNION blurred grown copy — the >=128 footprint can
+      // only match or exceed the hard silhouette the user approved (masks._feather_out).
+      var grown = (r.kind === 'auto' ? _discOn : _boxOn)(on, w, h, Math.max(1, Math.round(f * sd)), true);
+      var gc = document.createElement('canvas'); gc.width = w; gc.height = h;
+      var gx = gc.getContext('2d');
+      var gi = gx.createImageData(w, h), gd = gi.data;
+      for (k = 0; k < w * h; k++) if (grown[k]) { var oo = k * 4; gd[oo] = 255; gd[oo + 1] = 255; gd[oo + 2] = 255; gd[oo + 3] = 255; }
+      gx.putImageData(gi, 0, 0);
+      var bc = document.createElement('canvas'); bc.width = w; bc.height = h;
+      var bx = bc.getContext('2d');
+      bx.filter = 'blur(' + Math.max(0.5, f * sd) + 'px)';
+      bx.drawImage(gc, 0, 0);
+      cx.globalCompositeOperation = 'lighter';
+      cx.drawImage(bc, 0, 0);
+      cx.globalCompositeOperation = 'source-over';
+    }
+    r._on = on;
+    r._cDisp = c; r._cDispKey = key;
+    return c;
+  }
+
+  // A pure parameter change (edge/feather): pixels untouched, view + preview cache updated.
+  function touchObject() { compose(); schedulePreview(); syncInspectorSoon(); }
+
+  function commitStroke(s) {
+    s = stamp(s);                       // slider defaults read AT COMMIT, as ever
+    commitHintKind = s.kind === 'brush' ? 'brush' : (s.kind === 'auto' ? 'auto' : 'shape');
+    strokes.push(s);
+    redoStack = [];
+    return s;
   }
 
   /* ---------------- compositing (what the user sees) ---------------- */
@@ -691,71 +1011,61 @@
     if (preview && preview.img && preview.sig === previewSig()) {
       v.drawImage(preview.img, 0, 0, W, H);
       drawActiveOutline(v);
-      if (selObj() && selObj().mode === 'load') drawActiveAutoOutline(v, selObj());
+      var s0 = selObj(); if (s0) drawActiveAutoOutline(v, s0);
       return;
     }
+    // Local wash: EVERY region is drawn with its OWN edge/feather — the whole point of
+    // the region model. The bug this replaces showed the morph of only the SELECTED
+    // object, so a just-tuned selection snapped back to raw geometry the moment you
+    // reached for the next one. The server overlay, when it lands, paints identical
+    // pixels over these (same operators, same numbers), so this copy never ships.
     var wash = document.createElement('canvas');
     wash.width = W; wash.height = H;
     var wc = wash.getContext('2d');
-    // Build the display coverage. For the SELECTED smart-select object we substitute a
-    // locally-morphed copy (its edge/feather) so the sliders are LIVE; everything else is the
-    // raw committed mask. maskC itself is never touched, so the exported geometry stays raw and
-    // the server applies the real morphology exactly once.
-    var so = selObj();
-    var morphedSel = false;
-    if (so && so.mode === 'load' && so.img && ((so.edge || 0) || (so.feather || 0))) {
-      // remove the raw blit, then paint the morphed coverage in its place
-      wc.drawImage(maskC, 0, 0);
-      wc.save();
-      wc.globalCompositeOperation = 'destination-out';
-      wc.drawImage(so.img, 0, 0, W, H);
-      wc.restore();
-      morphedSel = morphAutoForDisplay(wc, so.img, so.edge || 0, so.feather || 0);
-      if (!morphedSel) wc.drawImage(maskC, 0, 0);   // readback failed: revert to raw
-    } else {
-      wc.drawImage(maskC, 0, 0);
+    for (var i = 0; i < regions.length; i++) {
+      var r = regions[i];
+      var disp = regionDispCanvas(r), dg = r._dg;
+      wc.drawImage(disp, dg.px0 + (r.mvx || 0), dg.py0 + (r.mvy || 0));
     }
+    if (active) paintStroke(wc, active);   // the in-progress shape, at full liveness
     wc.globalCompositeOperation = 'source-in';
     wc.fillStyle = 'rgba(232,62,62,' + val('tb_wash', 0.45) + ')';
     wc.fillRect(0, 0, W, H);
     v.drawImage(wash, 0, 0);
-    if (so && so.mode === 'load') drawActiveAutoOutline(v, so, morphedSel);
+    var so = selObj();
+    if (so) drawActiveAutoOutline(v, so);
     drawActiveOutline(v);
   }
 
-  // #4: which smart-select object is ACTIVE. A smart layer has no vector to box, so draw its
-  // ACTUAL silhouette boundary (not a rectangle): take the object's coverage, apply its signed
-  // edge (the same disc grow/shrink the wash and the server use) so the ring TRACKS the edge
-  // slider, then stroke the 1-px outline in a bright cyan. Only the selected object gets it, so
-  // it reads unmistakably as "this is the one the sliders are driving."
+  // #4: the SELECTED region gets a bright cyan ring on its MORPHED edge (the same disc/
+  // square grow the wash and the server use), so the ring tracks the edge slider and
+  // reads unmistakably as "this is the one the sliders are driving".
   function drawActiveAutoOutline(v, o) {
     try {
-      var sw = o.img.naturalWidth || W, sh = o.img.naturalHeight || H;
-      var w = sw, h = sh;
-      if (Math.max(w, h) > _DISK_CAP) {
-        var k = _DISK_CAP / Math.max(w, h);
-        w = Math.max(1, Math.round(sw * k)); h = Math.max(1, Math.round(sh * k));
+      var on = o._on, dg = o._dg;
+      if (!on) {
+        // brush blobs keep their raw silhouette (no _on grid): binarise the ship copy
+        // for the ring. A brush edge is handwork, so the ring traces what it ships.
+        var rc0 = regionRawCanvas(o, true);
+        var pw = rc0.width, ph = rc0.height;
+        if (!pw || !ph) return;
+        var pc = rc0.getContext('2d', { willReadFrequently: true });
+        var pd = pc.getImageData(0, 0, pw, ph).data;
+        on = new Uint8Array(pw * ph);
+        for (var t = 0; t < pw * ph; t++) on[t] = pd[t * 4 + 3] > 50 ? 1 : 0;
+        dg = { px0: o.bbox.x0, py0: o.bbox.y0, w: pw, h: ph };
       }
-      var a = document.createElement('canvas'); a.width = w; a.height = h;
-      var ax = a.getContext('2d', { willReadFrequently: true });
-      ax.drawImage(o.img, 0, 0, w, h);
-      var gi = ax.getImageData(0, 0, w, h).data;
-      var n = w * h, on = new Uint8Array(n), i;
-      for (i = 0; i < n; i++) on[i] = gi[i * 4 + 3] > 50 ? 1 : 0;
-      var e2 = Math.round(o.edge || 0);
-      if (e2 > 0) on = _discOn(on, w, h, Math.max(1, Math.round(e2 * (w / sw))), true);
-      else if (e2 < 0) on = _discOn(on, w, h, Math.max(1, Math.round(-e2 * (w / sw))), false);
-      var ring = _boundaryRing(on, w, h);
-      var rc = document.createElement('canvas'); rc.width = w; rc.height = h;
+      var ring = _boundaryRing(on, dg.w, dg.h);
+      var rc = document.createElement('canvas'); rc.width = dg.w; rc.height = dg.h;
       var rx = rc.getContext('2d');
-      var ri = rx.createImageData(w, h), rd = ri.data;
-      for (var j = 0; j < n; j++) {
-        if (ring[j]) { rd[j * 4] = 60; rd[j * 4 + 1] = 220; rd[j * 4 + 2] = 255; rd[j * 4 + 3] = 255; }
+      var ri = rx.createImageData(dg.w, dg.h), rd = ri.data;
+      for (var j = 0; j < ring.length; j++) {
+        if (ring[j]) { var q = j * 4; rd[q] = 60; rd[q + 1] = 220; rd[q + 2] = 255; rd[q + 3] = 255; }
       }
       rx.putImageData(ri, 0, 0);
       v.save();
       v.globalAlpha = 0.95;
-      v.drawImage(rc, 0, 0, W, H);
+      v.drawImage(rc, dg.px0 + (o.mvx || 0), dg.py0 + (o.mvy || 0));
       v.restore();
     } catch (e) { /* readback/taint: skip the outline, the wash still shows the selection */ }
   }
@@ -772,22 +1082,18 @@
   // ellipse — every tool now previews while it builds, which the lasso previously did not.
   function drawSelection(v) {
     var o = selObj(); if (!o) return;
-    // A 'load' (smart-select) object is a fixed silhouette, not a movable/scalable vector:
-    // its translate+scale are deliberately no-ops. Drawing the dashed bounding rectangle AND
-    // the solid blue corner handle over it therefore advertises an affordance that does nothing
-    // and — worse — reads as a stray square "selecting" background outside the object. The red
-    // wash already shows what is selected, and the inspector still opens (selectObj runs), so
-    // skip the box/handle for auto objects entirely.
-    if (o.mode === 'load') return;
     var b = objBBox(o); if (!b) return;
+    // Pixel objects: the dashed box is an indicator, not a manipulator. The corner SCALE
+    // handle retired with the vector model — a blob that may BE a merge of several
+    // strokes has no "vector to resize", and an affordance that scales half of what the
+    // user sees is exactly the dead-control lie this project's greyed-knobs rule exists
+    // to prevent. Drag anywhere inside the object to move its pixels.
     v.save();
     v.strokeStyle = '#3ba7ff'; v.lineWidth = Math.max(1.5, 2 * scale());
     v.setLineDash([6 * scale(), 4 * scale()]);
-    v.strokeRect(b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0);
+    v.strokeRect(b.x0 + (o.mvx || 0), b.y0 + (o.mvy || 0),
+                 b.x1 - b.x0 + 1, b.y1 - b.y0 + 1);
     v.setLineDash([]);
-    v.fillStyle = '#3ba7ff';                          // the one handle: uniform scale
-    var hs = 5 * scale();
-    v.fillRect(b.x1 - hs / 2, b.y1 - hs / 2, hs, hs);
     v.restore();
   }
 
@@ -841,6 +1147,7 @@
   }
   function clearMask() {
     strokes = []; redoStack = []; active = null; preview = null; sel = -1; selDrag = null;
+    regions = []; compLabel = null; maskA = null; _dragReg = null;
     smartObjs = []; smartCur = -1; smartDrag = null;   // a cleared canvas has no object to refine
     rasterize(); status('Mask cleared');
   }
@@ -882,51 +1189,39 @@
     return (maskC.toDataURL('image/png').split(',')[1]) || null;   // base64, no data: prefix
   }
 
-  // The mask as per-object LAYERS.
-  //
-  // Run-length grouped, NOT grouped by params key: objects are walked in paint order and a
-  // new layer starts whenever the params key changes. Grouping by key instead would move a
-  // mid-list eraser to the end of the stack and let it eat paint the user added afterwards
-  // — a silent, catastrophic difference from what they can see on screen. Contiguous runs
-  // still coalesce, so a typical session ships 1-3 PNGs rather than one per object.
+  // The mask as per-object LAYERS — one PNG per connected REGION, in scan order.
+  // Contiguity already decided who the objects are: a brush touch that landed on a
+  // smart-select ships INSIDE that object's layer (one object, one edge/feather for the
+  // server to apply), and an erase that cut a blob in two ships two layers. Erase
+  // strokes never cross the wire — their effect is already baked into which pixels are
+  // left. Nothing here morphs: the server re-applies each layer's edge/feather exactly
+  // once (masks.normalize_layers, KIND_RULES), and the double-grow that comment exists
+  // to prevent is only avoided if the ship copy stays RAW pixels.
   function exportLayers() {
-    if (!maskC) return null;
-    var out = [], cur = null, curKey = null, curParams = null;
-    var tmp = document.createElement('canvas');
-    tmp.width = W; tmp.height = H;
-    var t = tmp.getContext('2d');
-    function flush() {
-      if (!cur) return;
-      // curParams, NOT curKey: curKey is the opaque comparison string built FROM these
-      // values. Reading .kind off it yields undefined, which the server then maps onto the
-      // strictest rule -- a bug that looks like "the brush got hard-edged again".
-      out.push({ png: (tmp.toDataURL('image/png').split(',')[1]) || '',
+    if (!maskC || !regions.length) return null;
+    var out = [];
+    for (var i = 0; i < regions.length; i++) {
+      var r = regions[i];
+      if (!r.area) continue;
+      var curParams = { kind: r.kind, edge: r.edge || 0,
+                        grow: (r.edge || 0) > 0 ? (r.edge || 0) : 0,
+                        shrink: (r.edge || 0) < 0 ? -(r.edge || 0) : 0,
+                        feather: r.feather || 0, erase: false };
+      var curKey = [curParams.kind, curParams.edge, curParams.grow, curParams.shrink,
+                    curParams.feather, r.bbox.x0, r.bbox.y0, r.area].join('|');
+      if (r._ck === curKey && r._cp) { out.push(r._cp); continue; }   // pixels+params unchanged
+      var png = regionRawCanvas(r, false).toDataURL('image/png').split(',')[1];
+      if (!png) continue;
+      r._ck = curKey;
+      // curParams, NOT curKey: curKey is the opaque comparison STRING built FROM these
+      // values. Reading .kind off it yields undefined, which the server then maps onto
+      // the strictest rule — a bug that looks like "the brush got hard-edged again".
+      r._cp = { png: png,
                  kind: curParams.kind, edge: curParams.edge,
                  grow: curParams.grow, shrink: curParams.shrink,
-                 feather: curParams.feather, erase: !!curParams.erase });
-      cur = null; curKey = null; curParams = null;
+                 feather: curParams.feather, erase: !!curParams.erase };
+      out.push(r._cp);
     }
-    for (var i = 0; i < strokes.length; i++) {
-      var o = strokes[i];
-      // A 'load' (smart-select / auto) stroke has no vertex list — its coverage IS the drawn
-      // PNG — so the !pts guard below must NOT skip it. It is a first-class 'auto' object
-      // (masks.KIND_RULES['auto'] = threshold+feather+morph). Skipping it meant a
-      // smart-select PLUS a brush stroke shipped layers WITHOUT the SAM3 mask, and because
-      // the server prefers layers over mask_png, the selected object silently vanished from
-      // the actual render even though it looked selected on screen.
-      if (o.mode !== 'load' && (!o.pts || !o.pts.length)) continue;
-      var k = { kind: o.kind || kindOf(o), edge: o.edge || 0,
-                grow: o.grow || 0, shrink: o.shrink || 0,
-                feather: o.feather || 0, erase: !!o.erase };
-      // edge is in the key as well as grow/shrink: two runs could share the derived pair and
-      // differ only in how they got there if a stamp were ever half-updated, and coalescing
-      // them would silently apply one run's geometry to the other's pixels.
-      var key = [k.kind, k.edge, k.grow, k.shrink, k.feather, k.erase ? 1 : 0].join('|');
-      if (curKey !== key) { flush(); curKey = key; curParams = k; cur = o; t.clearRect(0, 0, W, H); }
-      paintStroke(t, o);
-    }
-    flush();
-    for (var j = 0; j < out.length; j++) if (!out[j].png) out.splice(j--, 1);
     return out.length ? out : null;
   }
 
@@ -990,25 +1285,21 @@
     for (var k in (attrs || {})) { if (Object.prototype.hasOwnProperty.call(attrs, k)) i.setAttribute(k, attrs[k]); }
     i.value = value;
     var out = mk('span', 'tb-num', String(value));
-    // When a smart-select (auto) object is selected, the edge/feather sliders must edit THAT
-    // object: the per-object geometry is what the layered server path normalises (see
-    // masks.normalize_layers + api h_mask_preview), and the global mask_expand/feather the same
-    // sliders otherwise feed are IGNORED once layers exist. Routing the obvious slider to the
-    // selected auto object is what makes "grow/shrink/feather my selection" actually work. A
-    // brush is excluded (its edge is hardness) and an unselected canvas keeps the old meaning
-    // of these controls: defaults for the NEXT object.
+    // When a shape or auto REGION is selected, the edge/feather sliders must edit THAT
+    // object: per-object geometry is what the layered server path normalises (see
+    // masks.normalize_layers + api h_mask_preview), and the global mask_expand/feather
+    // these sliders otherwise feed are IGNORED once layers exist. Brush blobs are
+    // excluded — their edge is hardness, chosen by hand, and masks.KIND_RULES forbids
+    // any remote number from moving it; a slider that silently did nothing is the dead
+    // knob this project refuses to ship. An unselected canvas keeps the old meaning of
+    // these controls: defaults for the NEXT object.
     i.addEventListener('input', function () {
       out.textContent = i.value;
       var o = selObj();
-      if ((id === 'edge' || id === 'feather') && o && (o.kind || kindOf(o)) === 'auto') {
+      if ((id === 'edge' || id === 'feather') && o && o.kind && o.kind !== 'brush') {
         var v = parseFloat(i.value) || 0;
-        if (id === 'edge') {
-          o.edge = v; o.grow = v > 0 ? v : 0; o.shrink = v < 0 ? -v : 0;
-        } else {
-          o.feather = v;
-        }
-        rasterize();                 // maskC repaint + schedulePreview under the new geometry
-        if (typeof syncInspector === 'function') syncInspector();   // keep the inspector row honest
+        if (id === 'edge') { o.edge = v; } else { o.feather = v; }
+        touchObject();                 // parameters only: pixels untouched, view + cache refresh
         return;
       }
       refresh();
@@ -1102,7 +1393,7 @@
     el.tools.appendChild(tbtn('ellipse', 'Ellipse', 'Drag an ellipse'));
     el.tools.appendChild(btn('Close shape', function () {
       if (active && (active.mode === 'poly' || active.mode === 'draw') && active.pts.length > 2) {
-        strokes.push(stamp(active));
+        commitStroke(active);
       }
       active = null; rasterize(); status('Shape added.');
     }));
@@ -1195,7 +1486,7 @@
     // into the graph, remove it here -- the smoke suite FAILS if a knob is enabled but
     // unclaimed by the engine.
     var DEAD_KNOBS = ['strength', 'variants'];
-    var DEAD_EL = { blend_mode: 'blend', color_match: 'colormatch', preserve_detail: 'detail' };
+    var DEAD_EL = {};   // control-id overrides for knobs still on death row (none today)
     for (var di = 0; di < DEAD_KNOBS.length; di++) {
       var node = el[DEAD_EL[DEAD_KNOBS[di]] || DEAD_KNOBS[di]];
       if (node) {
@@ -1262,7 +1553,7 @@
         // Loaded as ONE entry on the vector stack, so the guess stays editable: the
         // eraser and undo still work on an auto mask exactly as on a brush stroke.
         active = null;
-        strokes.push(stamp({ mode: 'load', img: im, size: 0, hardness: 1, erase: false }));
+        commitStroke({ mode: 'load', img: im, size: 0, hardness: 1, erase: false });
         rasterize();
         status('Auto-mask loaded — refine it with brush/eraser, then Preview.');
       };
@@ -1321,12 +1612,17 @@
         active = null;
         if (obj.layer && strokes.indexOf(obj.layer) >= 0) {
           obj.layer.img = im; measureLoadBBox(obj.layer);   // refine in place: replace, never append
+          commitHintKind = 'auto';                    // re-guessed pixels; the object's params
+                                                      // ride over via ancestor overlap
         } else {
-          obj.layer = stamp({ mode: 'load', img: im, size: 0, hardness: 1, erase: false });
-          strokes.push(obj.layer); redoStack = [];
+          obj.layer = commitStroke({ mode: 'load', img: im, size: 0, hardness: 1, erase: false });
           measureLoadBBox(obj.layer);
         }
-        selectObj(strokes.indexOf(obj.layer));             // show the selection + open its editor
+        // Select the REGION the click landed in (the object the user pointed at),
+        // not the stroke index — after a merge the layer may be one of many parents.
+        var _lp = (obj.pos && obj.pos[0]) ? { x: obj.pos[0][0] * W, y: obj.pos[0][1] * H } : null;
+        var _hi = _lp ? hitTest(_lp) : -1;
+        selectObj(_hi >= 0 ? _hi : (regions.length ? regions.length - 1 : -1));
         rasterize();
         var c = 100 * (typeof r.coverage === 'number' ? r.coverage : 0);
         status('Selected ' + c.toFixed(1) + '% — Select-tool to grow/feather, shift+click to add, alt+click to remove, then Preview.');
@@ -1355,7 +1651,7 @@
         requestSmart(obj, mode);
       } else {
         active = null;
-        strokes.push(stamp({ mode: 'draw', pts: seedPts, size: 0, hardness: 1, erase: mode === 'neg' }));
+        commitStroke({ mode: 'draw', pts: seedPts, size: 0, hardness: 1, erase: mode === 'neg' });
         redoStack = []; rasterize();
         status((mode === 'neg' ? 'Removed' : 'Added') + ' that loop to the selection.');
       }
@@ -1364,8 +1660,7 @@
     // 'new'
     if (!smartAuto) {
       active = null;
-      var o = stamp({ mode: 'draw', pts: seedPts, size: 0, hardness: 1, erase: false });
-      strokes.push(o); redoStack = []; rasterize();
+      var o = commitStroke({ mode: 'draw', pts: seedPts, size: 0, hardness: 1, erase: false }); rasterize();
       status('Added that loop as a shape — Select-tool to grow/feather it.');
       return;
     }
@@ -1681,27 +1976,18 @@
       var p = toNatural(ev); lastPt = p; ringPt = p;
       var hard = hardness(), t = tool;
       if (t === 'select') {
-        // Handle first, then body, then nothing: grabbing the corner square means scale,
-        // grabbing the box means move, and an empty tap must CLEAR the selection —
-        // otherwise a hidden selected object keeps silently receiving edits.
-        var o = selObj(), grabbed = false;
-        if (o) {
-          var b = objBBox(o), hs = 12 / scale();
-          if (Math.abs(p.x - b.x1) <= hs && Math.abs(p.y - b.y1) <= hs) {
-            selDrag = { kind: 'scale', cx: (b.x0 + b.x1) / 2, cy: (b.y0 + b.y1) / 2,
-                        r0: Math.max(1, Math.hypot(p.x - (b.x0 + b.x1) / 2,
-                                                   p.y - (b.y0 + b.y1) / 2)) };
-            grabbed = true;
-          } else if (p.x >= b.x0 && p.x <= b.x1 && p.y >= b.y0 && p.y <= b.y1) {
-            selDrag = { kind: 'move', last: p };
-            grabbed = true;
-          }
-        }
-        if (!grabbed) {
-          var hit = hitTest(p);
-          if (hit >= 0) { selectObj(hit); selDrag = { kind: 'move', last: p }; }
-          else selectObj(-1);
-        }
+        // Objects are PIXELS under the finger now: tap the blob to grab it, drag to move
+        // the pixels, and an empty tap must CLEAR the selection (a hidden selected object
+        // silently receiving edits was the bug this branch exists to stop). The corner
+        // SCALE handle is gone for good — a blob that may BE a merge of several strokes
+        // has no vector left to resize, and an affordance that does something other than
+        // what it looks like it does is the death this project's dead-knob rule prevents.
+        var hit = hitTest(p);
+        if (hit >= 0) {
+          selectObj(hit);
+          _dragReg = selObj();
+          selDrag = { kind: 'move', last: p };
+        } else { selectObj(-1); _dragReg = null; }
         dragEnabled = !!selDrag;
         try { viewC.setPointerCapture(ev.pointerId); } catch (e) { /* not fatal */ }
         return;
@@ -1749,10 +2035,6 @@
         if (selDrag.kind === 'move') {
           translateSel(sp.x - selDrag.last.x, sp.y - selDrag.last.y);
           selDrag.last = sp;
-        } else {
-          var sr = Math.hypot(sp.x - selDrag.cx, sp.y - selDrag.cy);
-          var sf = sr / Math.max(1, selDrag.r0);
-          if (Math.abs(sf - 1) > 0.02) { scaleSel(sf); selDrag.r0 = Math.max(1, sr); }
         }
         return;
       }
@@ -1792,7 +2074,15 @@
       }
       if (Date.now() - pinchEnd < 400) { restIfEmpty(); return; }
       dragEnabled = false;
-      if (tool === 'select') { selDrag = null; return; }
+      if (tool === 'select') {
+        // selDrag ALWAYS clears on release: a leftover handle keeps the Select tool
+        // latched in drag state (the region rebuild gate stays closed, and a button-up
+        // pointermove would still translate the object).
+        var wasMove = selDrag && selDrag.kind === 'move';
+        selDrag = null;
+        if (wasMove) bakeMove(); else _dragReg = null;
+        return;
+      }
       if (tool === 'smart') {
         // A barely-moved press is a point prompt; a traced path is a lasso. Neither commits
         // through the generic shape path below — runSmart/smartLasso own it (Auto reuses the
@@ -1811,11 +2101,11 @@
       }
       if (!active) return;
       var m = active.mode;
-      if (m === 'free') { if (active.pts.length) strokes.push(stamp(active)); }
-      else if (m === 'draw') { if (active.pts.length > 2) strokes.push(stamp(active)); }   // auto-close
+      if (m === 'free') { if (active.pts.length) commitStroke(active); }
+      else if (m === 'draw') { if (active.pts.length > 2) commitStroke(active); }   // auto-close
       else if (m === 'rect' || m === 'ellipse') {
         var a = active.pts[0], b = active.pts[1];
-        if (Math.abs(b.x - a.x) > 2 && Math.abs(b.y - a.y) > 2) strokes.push(stamp(active));
+        if (Math.abs(b.x - a.x) > 2 && Math.abs(b.y - a.y) > 2) commitStroke(active);
       }
       if (m !== 'poly') active = null;           // polygon stays open until "Close shape"
       if (ev && ev.pointerType === 'touch') hideRing();
@@ -1964,6 +2254,19 @@
   }
   window.ToolboxEditor = { boot: boot, status: status, params: params,
                            reportHeight: reportHeight, contentHeight: contentHeight };
+  // Read-only introspection for the browser suite (and for anyone debugging an embed):
+  // it exposes WHAT the editor considers the selection objects without reaching into
+  // private state or perturbing it. The suite's region-model assertions run on this; no
+  // shipped code path reads it back, so it can never change behaviour.
+  window.ToolboxEditor.state = function () {
+    return { regions: regions.length, strokes: strokes.length, rev: regionRev,
+             tool: tool, sel: sel,
+             ink: (function () { var c = 0; for (var i = 0; i < maskA.length; i++) if (maskA[i] > REGION_ALPHA_MIN) c++; return c; })(),
+             all: regions.map(function (q) {
+               return { kind: q.kind, edge: q.edge, feather: q.feather, area: q.area,
+                        bbox: { x0: q.bbox.x0, y0: q.bbox.y0, x1: q.bbox.x1, y1: q.bbox.y1 } };
+             }) };
+  };
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
   else boot();
 })();
