@@ -284,6 +284,31 @@
   // mask commits as ONE editable 'auto' layer (not a union of prior guesses). The fetch stub
   // answers /mask/click with a left-half mask, so an 'auto' layer genuinely appearing (and
   // disappearing on Undo) proves the load-stroke seam is wired, not just that a fetch fired.
+  function decodeLayer(l) {
+    return new Promise(function (res) {
+      if (!l || !l.png) return res(null);
+      var im = new Image();
+      im.onload = function () {
+        var c = document.createElement('canvas'); c.width = im.width; c.height = im.height;
+        var g = c.getContext('2d'); g.drawImage(im, 0, 0);
+        var d = g.getImageData(0, 0, im.width, im.height).data;
+        var any = 0, x0 = 1e9, y0 = 1e9, x1 = -1, y1 = -1, x, y;
+        for (y = 0; y < im.height; y++) for (x = 0; x < im.width; x++)
+          if (d[(y * im.width + x) * 4 + 3] > 8) {
+            any++; if (x < x0) x0 = x; if (y < y0) y0 = y; if (x > x1) x1 = x; if (y > y1) y1 = y;
+          }
+        res({ kind: l.kind, w: im.width, h: im.height, any: any, px: im.width * im.height,
+              bb: any ? [x0, y0, x1, y1] : null });
+      };
+      im.onerror = function () { res(null); };
+      im.src = 'data:image/png;base64,' + l.png;
+    });
+  }
+  function lastRealLayers(urlRe) {
+    var q = window.__LREAL || [];
+    for (var i = q.length - 1; i >= 0; i--) if (urlRe.test(q[i].url)) return q[i].layers;
+    return null;
+  }
   step('smart select tool + plain click selects the object', function () {
     clearForDraw();
     var b = toolButton('smart');
@@ -306,6 +331,22 @@
       });
       T('the selection landed as ONE editable auto layer',
         anyAuto, 'last=' + JSON.stringify(L.map(function (l) { return l.kind; })));
+      // The reported defect's wire-level witness: a layer shipped as a bbox CROP gets
+      // LANCZOS-stretched over the whole photo by masks._layer_coverage (it resamples any
+      // png whose size disagrees), so the smart-select's left-half mask painted the
+      // ENTIRE image. Every layer must cross the wire at full-canvas size, with its ink
+      // where the user's object is — not smeared to fill its own bounding box.
+      var wire = lastRealLayers(/mask\/preview$/);
+      var autoL = null;
+      if (wire) for (var wi = 0; wi < wire.length; wi++)
+        if (wire[wi].kind === 'auto') autoL = wire[wi];
+      return decodeLayer(autoL).then(function (d) {
+        T('the auto layer ships FULL-CANVAS with its ink in place (never a stretched crop)',
+          !!d && d.w === view.width && d.h === view.height &&
+          d.any / d.px > 0.2 && d.any / d.px < 0.75 &&
+          d.bb && d.bb[0] <= 2 && d.bb[2] <= view.width * 0.65,
+          d ? JSON.stringify(d) : 'no auto layer on the wire');
+      });
     });
   });
   step('smart select: alt+click adds a negative point', function () {

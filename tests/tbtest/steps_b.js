@@ -531,6 +531,25 @@
     return true;
   });
 
+  step('layer wire shape', function () {
+    // Same contract, measured mid-session on a two-object paint: each region ships at
+    // CANVAS size with ink confined to roughly its own extent. A crop (or a stretched
+    // stretch of one) trips both guards at once.
+    var wire = lastRealLayers(/mask\/preview$/) || [];
+    return Promise.all(wire.map(decodeLayer)).then(function (ds) {
+      var ok = ds.length >= 2;
+      for (var i = 0; ok && i < ds.length; i++) {
+        var d = ds[i];
+        ok = !!d && d.w === view.width && d.h === view.height && d.any > 0 &&
+             d.any / d.px < 0.6 && d.bb && (d.bb[2] - d.bb[0]) < view.width - 4 &&
+             (d.bb[3] - d.bb[1]) < view.height - 4;
+      }
+      T('every shipped layer is a full-canvas raster, not a bbox crop', ok,
+        JSON.stringify(ds.map(function (d) { return d ? [d.kind, d.w, d.h, Math.round(100 * d.any / d.px)] : null; })));
+      return true;
+    });
+  });
+
   step('final fit', function () {
     var f = byText('Fit'); if (f) f.click();
     return wait(120);

@@ -1210,7 +1210,17 @@
       var curKey = [curParams.kind, curParams.edge, curParams.grow, curParams.shrink,
                     curParams.feather, r.bbox.x0, r.bbox.y0, r.area].join('|');
       if (r._ck === curKey && r._cp) { out.push(r._cp); continue; }   // pixels+params unchanged
-      var png = regionRawCanvas(r, false).toDataURL('image/png').split(',')[1];
+      // WIRE CONTRACT (learned the hard way from the reported "one smart select and
+      // the entire image is the mask"): a layer PNG is a FULL-CANVAS raster of that
+      // object — the server's masks._layer_coverage decodes the PNG and resamples it
+      // whenever its size disagrees with the working canvas, which for a bbox crop
+      // means LANCZOS-STRETCHING the tight crop across the WHOLE photo: a 10% blob
+      // inflates into a full-frame mask, in the preview overlay AND the render. The
+      // bbox-cropped ship copy is an export STAGE only; it must be pasted back at its
+      // offset onto a full-size canvas before the encode.
+      var fc = document.createElement('canvas'); fc.width = W; fc.height = H;
+      fc.getContext('2d').drawImage(regionRawCanvas(r, false), r.bbox.x0, r.bbox.y0);
+      var png = fc.toDataURL('image/png').split(',')[1];
       if (!png) continue;
       r._ck = curKey;
       // curParams, NOT curKey: curKey is the opaque comparison STRING built FROM these

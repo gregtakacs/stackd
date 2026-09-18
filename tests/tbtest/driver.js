@@ -37,6 +37,14 @@
     // dumped result JSON must not carry hundreds of KB of base64.
     var layersForLog = null;
     if (body.layers) {
+      // Keep the REAL pngs (base64 strings, by reference) on window for the wire-shape
+      // assertions to decode: the redacted copy below keeps the dumped JSON small, but a
+      // test that only sees 'xxxx'-runs can never catch a layer shipped at the WRONG
+      // SHAPE — that redaction is exactly how the bbox-crop export defect (a crop the
+      // server LANCZOS-stretches over the whole photo) sailed through 99 assertions.
+      window.__LREAL = window.__LREAL || [];
+      window.__LREAL.push({ url: String(url), layers: body.layers });
+      if (window.__LREAL.length > 60) window.__LREAL.shift();
       layersForLog = [];
       for (var _li = 0; _li < body.layers.length; _li++) {
         var _l = body.layers[_li] || {};

@@ -308,6 +308,19 @@ def LEGACY_POLLTOKEN(s):
     return s.replace(a, "    req('/toolbox/jobs/poll', { job_id: id })", 1)
 
 
+# The wire-contract break the region refactor shipped with (the user-reported "one
+# smart select and the entire image is the mask"): layers crossed as bbox CROPS, and
+# masks._layer_coverage LANCZOS-stretches any png whose size disagrees — a 10% blob
+# inflated to a full-frame overlay and mask. Restores the exact pre-fix line.
+def LEGACY_CROPSHIP(s):
+    a = "      fc.getContext('2d').drawImage(regionRawCanvas(r, false), r.bbox.x0, r.bbox.y0);\n"
+    a += "      var png = fc.toDataURL('image/png').split(',')[1];"
+    assert a in s, 'exportLayers full-canvas paste anchor moved'
+    return s.replace(a,
+        "      var png = regionRawCanvas(r, false).toDataURL('image/png').split(',')[1];", 1)
+
+
+MUTANTS["cropship"] = LEGACY_CROPSHIP
 MUTANTS["barwash"] = LEGACY_BARWASH
 MUTANTS["bar95"] = LEGACY_BAR95
 MUTANTS["polltoken"] = LEGACY_POLLTOKEN
@@ -363,7 +376,7 @@ def main():
         print('COMPOSE TRACE:')
         for i, d in enumerate(res['dbg'][:10]):
             print('  ', i, d)
-    EXPECT = 99
+    EXPECT = 101
     if len(res["tests"]) != EXPECT:
         print("TRUNCATED RUN: got %d assertions, expected %d -- an early error stopped the "
               "steps (notes: %s). This is NOT a pass." %
