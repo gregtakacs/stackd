@@ -348,15 +348,21 @@ def test_layers():
           _selected(cerase) < _selected(cpaint),
           f"{_selected(cpaint)} -> {_selected(cerase)}")
 
-    # --- E2: the LAST-shipped erase layer re-seals a SPLIT's regrown skirts ----------
-    # The client ships a user's eraser as an erase layer AFTER the object layers, and
-    # this is the contract that makes it right: when an erase splits a feathered blob,
-    # the two fragments each grow+feather OUTWARD from their new cut edges. Pinned
-    # first WITHOUT the eraser layer: the server genuinely heals the channel shut
-    # (the reported 'two halves bigger than the original and overlapping' — that was
-    # not a client drawing bug, it is what per-fragment morphology must produce when
-    # the cut never ships). Then WITH the erase layer appended last, the union punch
-    # must win: the channel stays cut at exactly the sweep.
+    # --- E2: what per-fragment morphology does to a split, and where erase layers fit --
+    # Server semantics the client depends on, pinned as facts (not as the client's
+    # strategy — the client stopped shipping erase layers for the eraser, see
+    # toolbox.js foldLiveGeometry):
+    #   * Give the server two feathered/grown fragments of a split blob and it genuinely
+    #     HEALS the channel: each fragment dilates outward from its own cut edge, which is
+    #     exactly what the user reported as "the two halves are bigger and overlap". No
+    #     client-side drawing bug — it is what per-layer morphology must produce. The fix
+    #     is therefore to hand the server a silhouette that already IS the object, i.e. to
+    #     fold grow into the pixels at the split, not to keep punching afterwards.
+    #   * A punch that ships LAST does seal it, and that path stays correct for whole
+    #     OBJECT deletions (deleteSel) — but it must never be used for a cut the user can
+    #     undo by moving objects: the punch sits still in canvas space while the objects
+    #     move, which is how a "latent gap" appears in the middle of a joined object.
+    #   * The punch must spare the fragments themselves (it lifts, it does not halve).
     frag_t = rect_mask(SIZE, (110, 110, 210, 149))     # split at rows 150..160
     frag_b = rect_mask(SIZE, (110, 161, 210, 200))
     sweep = rect_mask(SIZE, (100, 147, 220, 163))      # a 6-px-wide eraser is thin; 16 is decisive

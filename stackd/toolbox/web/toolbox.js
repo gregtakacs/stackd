@@ -31,16 +31,22 @@
    * What the user selects, tunes and deletes is a REGION (an 8-connected blob of the
    * final mask pixels), not the stroke that painted it: a brush touch that lands on a
    * smart-select becomes PART of that object (one object, one edge/feather adjuster),
-   * an eraser slice that cuts a blob in two splits the object into two (each fragment
-   * retains the parent's edge and feather — the feather across the fresh cut is the
-   * seam-hider), and two blobs bridged by one stroke become one (edge resets to its
-   * actual size, feather the ancestor-weighted average of the two). Strokes remain
-   * only as the paint history rasterize() replays — that keeps undo push/pop honest
-   * without the user ever touching a vector parameter after commit.
-   * Contiguity is measured on the RAW composited pixels, never on the displayed
-   * morphology: grow/feather are adjustments ON TOP, and if they decided identity a
-   * slider drag that made two objects touch would silently merge them (and average
-   * their feathers) under the user's own finger.
+   * an eraser slice that cuts a blob in two splits the object into two, and two blobs
+   * bridged by one stroke or a move become one. At either of those topology changes the
+   * grow/shrink the user had set is FOLDED INTO THE PIXELS (foldLiveGeometry): the new
+   * object is the silhouette that was on screen, and its edge knob starts at 0, because
+   * a grow re-measured from a fresh cut or merge boundary grows the object past what the
+   * user approved. Feather is NOT folded — softness belongs to the boundary that exists
+   * now, so it recomputes around each new fragment (that seam is the point of it), and
+   * the eraser itself leaves nothing behind: it removes pixels once, it is not a
+   * permanent feature the objects then have to live around.
+   * Strokes remain only as the paint history rasterize() replays — that keeps undo
+   * push/pop honest without the user ever touching a vector parameter after commit.
+   * Contiguity is measured on the composited pixels, never on the displayed morphology:
+   * if a live adjustment decided identity, a slider drag that made two objects touch
+   * would silently merge them (and average their feathers) under the user's own finger.
+   * After a fold the pixels do include the grow that was applied at that moment, which
+   * is exactly the intent — what was on screen is what the object now is.
    */
   var MAX_REGIONS = 64;             // blobs past this are painted but not selectable
   var REGION_ALPHA_MIN = 50;        // mirrors masks.COVERAGE_BRIGHTNESS_THRESHOLD: the
@@ -146,7 +152,7 @@
     var parts = [];
     for (var i = 0; i < regions.length; i++) {
       var r = regions[i], b = r.bbox || { x0: 0, y0: 0, x1: 0, y1: 0 };
-      parts.push([r.kind, r.edge, r.feather, r.area >> 4,
+      parts.push([r.kind, effEdge(r), r.feather, r.area >> 4,
                   Math.round(b.x0 / 4), Math.round(b.y0 / 4),
                   Math.round(b.x1 / 4), Math.round(b.y1 / 4)].join(':'));
     }
@@ -352,7 +358,9 @@
     // it works: the first drag onto a brush blob retires the handwork edge (setObjParam).
     var o = selObj();
     if (o) {
-      if (el.edge) { el.edge.value = (typeof o.edge === 'number') ? o.edge : 0;
+      // effEdge: after a split/merge the grow is inside the pixels, so the honest knob
+      // reading is 0 (and dragging from there adds to the folded silhouette).
+      if (el.edge) { el.edge.value = String(effEdge(o));
                      if (el.edge_out) el.edge_out.textContent = String(el.edge.value); }
       if (el.feather) { el.feather.value = (typeof o.feather === 'number') ? o.feather : 0;
                         if (el.feather_out) el.feather_out.textContent = String(el.feather.value); }
@@ -380,6 +388,11 @@
     var o = selObj(); if (!o) return;
     if (o.kind === 'brush') o.kind = 'auto';
     o[key] = v;
+    // The knob is a LIVE adjustment, so taking a number on it unfolds THIS object: from
+    // now on this number (not the parent's) is what grow/shrink means, measured from the
+    // silhouette already in the pixels. Objects the user never touched stay folded, so a
+    // split does not quietly re-grow every one of them.
+    if (key === 'edge') o.foldIdx = null;
     touchObject();
   }
 
@@ -406,14 +419,26 @@
     strokes.push({ mode: 'move', cv: cv, ox: r.bbox.x0, oy: r.bbox.y0, dx: dx, dy: dy,
                    kind: 'shape', edge: 0, grow: 0, shrink: 0, feather: 0,
                    size: 0, hardness: 1, erase: false,
-                   pKind: r.kind, pEdge: r.edge, pFeather: r.feather });
+                   pKind: r.kind, pEdge: r.edge, pFeather: r.feather,
+                   pFold: (r.foldIdx == null ? null : r.foldIdx) });
     // Identity rides EXPLICITLY: the moved pixels have (by definition) no overlap with
     // where they used to be, so pixel-ancestry cannot vote for them — an unrepresented
     // blob loses the vote outright (drag a feathered object onto a plain one and the
     // merge took the PLAIN object's parameters wholesale: the reported feather loss).
-    noteMoveIdentity(strokes[strokes.length - 1], true);
+    var st = strokes[strokes.length - 1];
+    noteMoveIdentity(st, true);
     rasterize();
-    status('Moved.');
+    // A move that made two objects ONE is the other topology change (the user's rule:
+    // shrinkage/grow belongs to the rasterized blob, and merging makes a new blob). The
+    // merged object would otherwise inherit one parent's grow and apply it to the UNION,
+    // bulging the seam and the outer silhouette at once. Fold, then rebuild once more so
+    // the shipped copy, the outline and the numbers all agree on the folded silhouette.
+    var merged = false;
+    for (var mi = 0; mi < regions.length; mi++) if (regions[mi].nAnc >= 2) merged = true;
+    if (merged) {
+      foldLiveGeometry(st); rasterize();
+      status('Joined into one object. Its edge setting is now part of the shape.');
+    } else status('Moved.');
   }
 
   // The inspector is what makes per-object parameters *legible*: the global sliders are
@@ -471,7 +496,7 @@
     var wrap = mk('span', 'tb-num');
     var inp = mk('input');
     inp.type = 'range'; inp.min = -60; inp.max = 60; inp.step = 2;
-    inp.value = (typeof o.edge === 'number') ? o.edge : 0;
+    inp.value = effEdge(o);
     var out = mk('span', 'tb-v', String(inp.value));
     var rel = mk('span', 'tb-hint', '');
     function paint(v) {
@@ -535,15 +560,16 @@
       head.textContent = kl + ' — ' + (o.area || 0) + ' px';
       if (o._hintE) o._hintE.style.display = (o.kind === 'brush') ? '' : 'none';
       if (o._hintF) o._hintF.style.display = (o.kind === 'brush') ? '' : 'none';
-      if (o._ipE && String(o._ipE.value) !== String(o.edge)) {
-        o._ipE.value = o.edge; if (o._outE) o._outE.textContent = String(o.edge);
+      var _ee = effEdge(o);
+      if (o._ipE && String(o._ipE.value) !== String(_ee)) {
+        o._ipE.value = _ee; if (o._outE) o._outE.textContent = String(_ee);
       }
       if (o._ipF && String(o._ipF.value) !== String(o.feather)) {
         o._ipF.value = o.feather; if (o._outF) o._outF.textContent = String(o.feather);
       }
       // toolbar mirror follows inspector edits (selectObj did the other direction)
-      if (el.edge && String(el.edge.value) !== String(o.edge)) {
-        el.edge.value = o.edge; if (el.edge_out) el.edge_out.textContent = String(o.edge);
+      if (el.edge && String(el.edge.value) !== String(effEdge(o))) {
+        el.edge.value = effEdge(o); if (el.edge_out) el.edge_out.textContent = String(effEdge(o));
       }
       if (el.feather && String(el.feather.value) !== String(o.feather)) {
         el.feather.value = o.feather; if (el.feather_out) el.feather_out.textContent = String(o.feather);
@@ -568,7 +594,8 @@
                    // Undo re-materialises exactly these pixels where they stood; without
                    // the stamped identity the rebuild would re-roll their params from
                    // the global sliders (they have no pixel ancestors — they were gone).
-                   pRestore: true, pKind: r.kind, pEdge: r.edge, pFeather: r.feather });
+                   pRestore: true, pKind: r.kind, pEdge: r.edge, pFeather: r.feather,
+                   pFold: (r.foldIdx == null ? null : r.foldIdx) });
     sel = -1; selDrag = null; _dragReg = null;
     redoStack = [];                                  // a deletion is a real edit; redo is stale
     syncInspector(); rasterize(); status('Object removed.');
@@ -587,10 +614,11 @@
   }
 
   // A committed USER erase: the eraser tool's strokes and a smart negative-seed carve.
-  // Synthetic erases (deleteSel's stamped-out object copy: mode 'load' + pRestore) are
-  // NOT this — shipping those would punch a hole through whatever neighbour happens to
-  // sit where the deleted object stood. Everything else that removes pixels is already
-  // gone from the region pixels themselves.
+  // These are the strokes that ARE a topology change, and so the ones that must carry a
+  // bake (foldLiveGeometry). Synthetic erases — deleteSel's stamped-out object copy, the
+  // move's own lift-and-replace — are NOT: the object they remove is already absent from
+  // the region pixels, and folding at those moments would freeze a canvas that is in the
+  // middle of being edited for reasons the user did not act on.
   function isUserErase(s) {
     return !!s && s.erase && s.mode !== 'load' && s.mode !== 'move' && !s.pRestore;
   }
@@ -603,6 +631,17 @@
     var r = s.size / 2, hard = s.hardness;
     m.save();
     m.globalCompositeOperation = s.erase ? 'destination-out' : 'source-over';
+    if (s.bake) {
+      // A topology change (an erase that split, a move that merged) carries the raster as
+      // the user saw it, with grow/shrink already folded in: lay that down FIRST, then let
+      // this stroke do its own work on top (the eraser's punch, the moved blob's copy).
+      // Everything replayed before this entry is intentionally overwritten — it is the
+      // history, not the geometry, and popping this stroke pops the bake with it.
+      m.globalCompositeOperation = 'source-over';
+      m.clearRect(0, 0, W, H);
+      m.drawImage(s.bake, s.bakeX || 0, s.bakeY || 0);
+      m.globalCompositeOperation = s.erase ? 'destination-out' : 'source-over';
+    }
     // The white fill/stroke styles belong to the DIRECT-geometry branches only, NOT to
     // the shared scratch buffer: the freehand branch c.save()s after these assignments,
     // so a caller that had left a fillStyle on m (the eraser-ship canvas: erase:false
@@ -847,8 +886,12 @@
     } catch (e) { return }                  // tainted/undecodable copy: fall back to ancestry
     if (!area) return;
     pendingMove = { x0: x0, y0: y0, w: cv.width, h: cv.height, bits: bits,
+                    // foldIdx rides with the identity: a restored/undone object that was
+                    // folded stays folded while its bake is still in the stack, and
+                    // unfolds with the bake exactly as the live object would.
                     old: { kind: st.pKind || 'shape', edge: st.pEdge || 0,
-                           feather: st.pFeather || 0, area: area } };
+                           feather: st.pFeather || 0, area: area,
+                           foldIdx: (st.pFold === undefined ? null : st.pFold) } };
   }
 
   function rebuildRegions() {
@@ -931,26 +974,46 @@
           if (cnt >= 6 && (cnt >= 0.2 * st2.area || cnt >= 0.2 * (old.area || 1))) q.push({ old: old, cnt: cnt });
         }
       }
-      var kind, edge, feather;
+      var kind, edge, feather, fold = null;
       if (q && q.length === 1) {
         kind = q[0].old.kind; edge = q[0].old.edge; feather = q[0].old.feather;
+        fold = q[0].old.foldIdx;
       } else if (q && q.length > 1) {
-        var ws = 0, wf = 0, sawAuto = false, sawShape = false;
+        var ws = 0, wf = 0, we = 0, sawAuto = false, sawShape = false;
         for (var qi = 0; qi < q.length; qi++) {
           ws += q[qi].cnt; wf += q[qi].cnt * (q[qi].old.feather || 0);
+          we += q[qi].cnt * (q[qi].old.edge || 0);
           if (q[qi].old.kind === 'auto') sawAuto = true;
           else if (q[qi].old.kind === 'shape') sawShape = true;
         }
         feather = ws ? Math.round(wf / ws) : 0;
-        edge = 0;
+        // Two DIFFERENT live grows cannot be averaged into one number (and were not: the
+        // old code always chose 0 here). But the same object re-appearing as several
+        // ancestors — which is exactly what an undone split rebuilds, all siblings from one
+        // parent — agrees on its grow, and dropping it there silently amputated the object
+        // the user had grown before the erase. Same number in, same number out.
+        var sameE = true;
+        for (var qe = 1; qe < q.length; qe++)
+          if ((q[qe].old.edge || 0) !== (q[0].old.edge || 0)) sameE = false;
+        edge = sameE ? (q[0].old.edge || 0) : (ws ? Math.round(we / ws) : 0);
+        if (!sameE) edge = 0;
         kind = sawAuto ? 'auto' : (sawShape ? 'shape' : 'brush');
+        // A merge of mixed states takes the EARLIEST fold (the smallest index): the older
+        // bake is the one whose silhouette is under the most pixels, and every real merge
+        // is folded again by foldLiveGeometry at its own commit, so this is a transient
+        // that the caller immediately overwrites.
+        for (var qf = 0; qf < q.length; qf++) {
+          var fo = q[qf].old.foldIdx;
+          if (fo != null && (fold === null || fo < fold)) fold = fo;
+        }
       } else {
         kind = commitHintKind || 'shape';
         edge = kind === 'brush' ? 0 : val('tb_edge', 0);
         feather = kind === 'brush' ? 0 : val('tb_feather', 8);
       }
       var reg = { id: regionSeq++, kind: kind, edge: edge, feather: feather,
-                  area: st2.area, mvx: 0, mvy: 0,
+                  area: st2.area, mvx: 0, mvy: 0, foldIdx: fold,
+                  nAnc: q ? q.length : 0,
                   bbox: { x0: st2.x0, y0: st2.y0, x1: st2.x1, y1: st2.y1 } };
       if (q) for (var qj = 0; qj < q.length; qj++) {
         if (q[qj].old === selReg) newSel = regions.length;
@@ -1010,13 +1073,101 @@
     return res;
   }
 
+  // WHICH edge number this object currently answers to. A topology change (an erase that
+  // split a blob, a move that merged two) folds the grow/shrink the user had set INTO the
+  // rasterized pixels, because grow/shrink is a correction to a silhouette and a split or
+  // merge makes it a NEW silhouette: re-applying the parent's grow to a fragment grows it
+  // from the fresh cut edge, which is what made the halves come out wider than the object
+  // the user drew and overlap each other's skirt. Once folded, the silhouette in the
+  // pixels IS what the user approved; the knob restarts at 0 and any new number is a live
+  // delta on top of that raster. r.edge itself is never destroyed: foldIdx is compared
+  // against the LIVE stroke stack, so undoing the stroke that carried the bake unfolds the
+  // object again and the original number returns with its old shape.
+  //
+  // Feather is deliberately NOT folded — softness is a property of the boundary that must
+  // be recomputed around whatever the new object(s) are, which is the whole request.
+  function folded(r) {
+    return !!(r && r.foldIdx != null && r.foldIdx < strokes.length);
+  }
+  function effEdge(r) {
+    return folded(r) ? 0 : (r.edge || 0);
+  }
+
+  // The raster as the user SEES it right now: every object's pixels with its live
+  // grow/shrink folded in, no feather. This is what a topology change bakes, and it is
+  // built with the SAME kernels and the same per-kind split as regionDispCanvas so the
+  // bake cannot shift the silhouette by a pixel (a bake that disagreed with the display
+  // would read as the object jumping when the stroke commits).
+  //
+  // Partial alpha SURVIVES for a brush at edge 0 (its hardness ramp is content the server
+  // is forbidden to touch — masks.KIND_RULES['brush']); every other kind is binarised at
+  // REGION_ALPHA_MIN exactly as the server binarises it, so folding it is lossless.
+  //
+  // Returned cropped to the union bbox: coverage outside it is empty by definition, and a
+  // phone-sized canvas committed per erase would otherwise park a full-canvas copy in the
+  // undo stack every time.
+  function bakeSnapshot() {
+    if (!regions.length || !compLabel || !maskA) return null;
+    var i, r, x0 = W, y0 = H, x1 = -1, y1 = -1;
+    for (i = 0; i < regions.length; i++) {
+      r = regions[i]; if (!r.area) continue;
+      var pp = Math.max(0, effEdge(r)) + 1;
+      if (r.bbox.x0 - pp < x0) x0 = r.bbox.x0 - pp;
+      if (r.bbox.y0 - pp < y0) y0 = r.bbox.y0 - pp;
+      if (r.bbox.x1 + pp > x1) x1 = r.bbox.x1 + pp;
+      if (r.bbox.y1 + pp > y1) y1 = r.bbox.y1 + pp;
+    }
+    if (x1 < 0) return null;
+    x0 = Math.max(0, x0); y0 = Math.max(0, y0);
+    x1 = Math.min(W - 1, x1); y1 = Math.min(H - 1, y1);
+    var w = x1 - x0 + 1, h = y1 - y0 + 1;
+    var buf = new Uint8ClampedArray(w * h * 4);
+    for (i = 0; i < regions.length; i++) {
+      r = regions[i]; if (!r.area) continue;
+      var e = effEdge(r), keep = (r.kind === 'brush' && !e);
+      var on = new Uint8Array(w * h), k, x, y;
+      for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+          var g = (y + y0) * W + (x + x0);
+          on[y * w + x] = (compLabel[g] === i + 1 && maskA[g] > REGION_ALPHA_MIN) ? 1 : 0;
+        }
+      }
+      if (e) on = (r.kind === 'auto' ? _discOn : _boxOn)(
+                    on, w, h, Math.min(96, Math.max(1, Math.abs(e))), e > 0);
+      for (k = 0; k < w * h; k++) {
+        if (!on[k]) continue;
+        var ox = (k % w), oy = (k - ox) / w;
+        var a = keep ? maskA[(oy + y0) * W + (ox + x0)] : 255;
+        var o = k * 4;
+        if (a <= 0) continue;
+        if (buf[o + 3] < a) { buf[o] = 255; buf[o + 1] = 255; buf[o + 2] = 255; buf[o + 3] = a; }
+      }
+    }
+    var cv = document.createElement('canvas'); cv.width = w; cv.height = h;
+    cv.getContext('2d').putImageData(new ImageData(buf, w, h), 0, 0);
+    return { cv: cv, x0: x0, y0: y0 };
+  }
+
+  // Attach a bake to a committed stroke (and record the generation on every object it
+  // folds). The stroke index is the fold's identity: popped from the stack, the objects
+  // unfold; anything still above it in the stack keeps them folded.
+  function foldLiveGeometry(st) {
+    var bk = bakeSnapshot();
+    if (!bk) return false;
+    st.bake = bk.cv; st.bakeX = bk.x0; st.bakeY = bk.y0;
+    var fi = strokes.indexOf(st);
+    if (fi < 0) fi = strokes.length;      // not pushed yet: that is the index it will take
+    for (var i = 0; i < regions.length; i++) regions[i].foldIdx = fi;
+    return true;
+  }
+
   function regionGeom(r) {
     // The pad must cover the WHOLE display skirt: edge grows the silhouette by e, then
     // _feather_out grows a further f AND blurs f — tails to roughly 2f past the grown
     // edge. A pad of only (e + f + 2) CLIPPED the wash right where the feathering
     // lives, so the preview read tighter than the render on every side — the second
     // report. 2f + 4 covers the >=128 footprint (f + ~0.5f) with the visible tail.
-    var pad = Math.max(0, (r.edge || 0)) + 2 * (r.feather || 0) + 4;
+    var pad = Math.max(0, effEdge(r)) + 2 * (r.feather || 0) + 4;
     var px0 = Math.max(0, r.bbox.x0 - pad), py0 = Math.max(0, r.bbox.y0 - pad);
     var px1 = Math.min(W - 1, r.bbox.x1 + pad), py1 = Math.min(H - 1, r.bbox.y1 + pad);
     return { px0: px0, py0: py0, w: px1 - px0 + 1, h: py1 - py0 + 1 };
@@ -1060,7 +1211,7 @@
   // only the object being dragged. Radii are TRUE (what the server paints) — display
   // only, never exported; the server overlay replaces these pixels with identical ones.
   function regionDispCanvas(r) {
-    var key = regionRev + '|' + r.kind + '|' + r.edge + '|' + r.feather + '|'
+    var key = regionRev + '|' + r.kind + '|' + effEdge(r) + '|' + r.feather + '|'
             + r.bbox.x0 + ',' + r.bbox.y0 + ',' + r.bbox.x1 + ',' + r.bbox.y1;
     if (r._cDispKey === key) return r._cDisp;
     var dg = regionGeom(r);
@@ -1087,7 +1238,7 @@
     // harder skirt than the server ever paints (feather 30 drawn as ~7 on a phone-sized
     // canvas). The slider caps (edge 60, feather 64) bound the cost; the kernels are
     // separable O(n) and the whole canvas is cached per (params, generation) anyway.
-    var e = Math.round(r.edge || 0);
+    var e = Math.round(effEdge(r));
     if (e) on = (r.kind === 'auto' ? _discOn : _boxOn)(on, w, h, Math.min(96, Math.max(1, Math.abs(e))), e > 0);
     var im = cx.createImageData(w, h), d = im.data;
     for (k = 0; k < w * h; k++) {
@@ -1137,6 +1288,21 @@
     commitHintKind = s.kind === 'brush' ? 'brush' : (s.kind === 'auto' ? 'auto' : 'shape');
     strokes.push(s);
     redoStack = [];
+    // A user erase is a TOPOLOGY change, so the geometry is frozen at this instant: the
+    // raster this stroke replays from is the silhouette the user was looking at (their
+    // grow/shrink already in it), and the eraser's destination-out then removes the
+    // channel from that. Two things follow, and both are the reported defect: the cut
+    // happens on the object as displayed (so the feather recomputes around the two new
+    // boundaries instead of leaving the old halo), and the eraser leaves no remnant — it
+    // is a one-time removal from the pixels, not a permanent feature of the canvas.
+    // The strokes below this one stay in the replay (they are the history); Undo pops
+    // this entry and the canvas unfolds to exactly what it was before the cut.
+    if (isUserErase(s) && foldLiveGeometry(s)) {
+      // Say what just happened to the knob, or a 0 reading after a split looks like the
+      // editor forgot the object. It did not: the grow is in the shape now.
+      status('Cut made. The edge setting is now part of the shape; feather still '
+             + 'applies around the new edges.');
+    }
     return s;
   }
 
@@ -1171,19 +1337,15 @@
       var disp = regionDispCanvas(r), dg = r._dg;
       wc.drawImage(disp, dg.px0 + (r.mvx || 0), dg.py0 + (r.mvy || 0));
     }
-    // The eraser cuts the FINISHED objects, not the raw pixels they grew from.
-    // Without this punch, an erase that splits a blob leaves two fragments whose
-    // per-object edge-grow + outward feather reach straight back into the channel —
-    // the two halves re-widen past the original silhouette and their skirts overlap
-    // (the reported 'cut in two but both halves are bigger and overlap'). The channel
-    // the user dragged open must be the channel that survives, at exactly eraser
-    // width, so the committed user erases replay against the wash AFTER every region
-    // copy — and BEFORE the live stroke, which is painted on top (pixels added after
-    // an erase are above it, so an in-progress reconnection over a channel stays lit,
-    // matching what commit will do).
-    for (var ei = 0; ei < strokes.length; ei++) {
-      if (strokes[ei] !== active && isUserErase(strokes[ei])) paintStroke(wc, strokes[ei]);
-    }
+    // No eraser replay here, deliberately, and this is a load-bearing absence. The
+    // eraser removes pixels from the raster and then it is GONE — it is not a permanent
+    // feature of the canvas. The first version of this fix punched every committed erase
+    // against the finished objects, which of course kept the channel open... and then
+    // would not let it close: dragging the two halves back together re-merged them with
+    // a latent hole where the sweep had been (the reported 'some kind of latent gap').
+    // Removing the cut from the pixels at erase time instead (rasterize replays the
+    // punch once, into the raster the regions are derived from) means the channel exists
+    // exactly as long as its pixels are absent, and a move that fills it merges cleanly.
     if (active) paintStroke(wc, active);   // the in-progress shape, at full liveness
     wc.globalCompositeOperation = 'source-in';
     wc.fillStyle = 'rgba(232,62,62,' + val('tb_wash', 0.45) + ')';
@@ -1368,9 +1530,13 @@
     for (var i = 0; i < regions.length; i++) {
       var r = regions[i];
       if (!r.area) continue;
-      var curParams = { kind: r.kind, edge: r.edge || 0,
-                        grow: (r.edge || 0) > 0 ? (r.edge || 0) : 0,
-                        shrink: (r.edge || 0) < 0 ? -(r.edge || 0) : 0,
+      // effEdge, not r.edge: a folded object already carries its grow/shrink in the
+      // pixels being shipped, so the number sent must be 0 or the server grows it a
+      // SECOND time from the new cut/merged boundary — the reported defect exactly.
+      var ee = effEdge(r);
+      var curParams = { kind: r.kind, edge: ee,
+                        grow: ee > 0 ? ee : 0,
+                        shrink: ee < 0 ? -ee : 0,
                         feather: r.feather || 0, erase: false };
       var curKey = [curParams.kind, curParams.edge, curParams.grow, curParams.shrink,
                     curParams.feather, r.bbox.x0, r.bbox.y0, r.area].join('|');
@@ -1397,32 +1563,12 @@
                  feather: curParams.feather, erase: !!curParams.erase };
       out.push(r._cp);
     }
-    // User erases ship as their OWN layers, appended LAST: masks.normalize_layers
-    // composites in list order and an erase layer punches the union beneath it
-    // (Image.composite lifts by the layer's own coverage), so punching after every
-    // object re-seals the channel the per-fragment grow/feather would otherwise open
-    // again — the render agrees with the display above instead of healing the cut.
-    // kind 'brush' on purpose: KIND_RULES leaves it raw — no threshold, no morphology,
-    // no feather — so the punch is exactly the sweep as dragged (server-side it is a
-    // partial-alpha cut wherever the hardness ramp was soft; display and wire match
-    // because both replay the SAME paintStroke geometry).
-    for (var si = 0; si < strokes.length; si++) {
-      var es = strokes[si];
-      if (es === active || !isUserErase(es)) continue;
-      if (es._ep) { out.push(es._ep); continue; }   // committed geometry is frozen; encode once
-      var ec = document.createElement('canvas'); ec.width = W; ec.height = H;
-      // Same mode/pts/size, erase=false: paint the sweep WHITE on a blank canvas — the
-      // coverage itself is what the server's composite lifts, not a pre-punched image.
-      paintStroke(ec.getContext('2d'),
-                  { mode: es.mode, pts: es.pts, size: es.size, hardness: es.hardness,
-                    erase: false });
-      var epng = ec.toDataURL('image/png').split(',')[1];
-      if (!epng) continue;
-
-      es._ep = { png: epng, kind: 'brush', edge: 0, grow: 0, shrink: 0, feather: 0,
-                 erase: true };
-      out.push(es._ep);
-    }
+    // And no erase layers, because there is nothing left to punch: the cut lives in the
+    // region pixels themselves (bakeSnapshot folded the silhouette into the raster, the
+    // eraser's destination-out then removed the channel from it). Shipping a permanent
+    // punch would be the latent-gap bug reincarnated on the wire — an erase layer sits
+    // still in canvas space while the objects move, so re-merged halves would come back
+    // with a hole through the middle in the render but not in the preview.
     return out.length ? out : null;
   }
 
@@ -2471,13 +2617,19 @@
     return { regions: regions.length, strokes: strokes.length, rev: regionRev,
              tool: tool, sel: sel,
              ink: (function () { var c = 0; for (var i = 0; i < maskA.length; i++) if (maskA[i] > REGION_ALPHA_MIN) c++; return c; })(),
+             // edge is the number the SERVER will be handed (effEdge), edgeSet is the
+             // number the knob holds: reading them apart is what makes a fold that never
+             // happened, or a grow applied twice, visible instead of deniable.
              all: regions.map(function (q) {
-               return { kind: q.kind, edge: q.edge, feather: q.feather, area: q.area,
+               return { kind: q.kind, edge: effEdge(q), edgeSet: q.edge || 0,
+                        feather: q.feather, area: q.area, folded: folded(q),
+                        nAnc: q.nAnc || 0,
                         bbox: { x0: q.bbox.x0, y0: q.bbox.y0, x1: q.bbox.x1, y1: q.bbox.y1 } };
              }),
-             // Read-only view of the erases that will ship as punch layers — the suite
-             // (and anyone debugging a 'the channel healed itself' report) can see the
-             // sweep geometry the exporter actually replays.
+             bakes: strokes.filter(function (q) { return !!q.bake; }).length,
+             // Read-only view of the user erases: the suite (and anyone debugging a
+             // 'the channel will not stay cut' report) can see the sweep geometry the
+             // replay actually applies, including the pinned hardness.
              erases: strokes.filter(isUserErase).map(function (q) {
                var n = q.pts.length;
                return { mode: q.mode, n: n, size: q.size, hardness: q.hardness,

@@ -258,6 +258,7 @@
    * preview debounce so only the browser's own wash can be on screen.
    */
   function region() { return window.ToolboxEditor && window.ToolboxEditor.state && window.ToolboxEditor.state(); }
+  var _erParent = null;   // the grown parent's silhouette, probed before the cut
   step('REG prelude: clear', function () {
     var eg = document.getElementById('tb_edge');
     if (eg) { eg.value = '0'; eg.dispatchEvent(new Event('input', { bubbles: true })); }
@@ -893,107 +894,245 @@
   });
 
   /* =====================================================================================
-   * THE ERASER CUTS THE FINISHED OBJECTS, NOT THE PIXELS THEY GREW FROM.
-   * The eraser only lived in the composited mask, so an erase that split a blob left two
-   * fragments whose per-object edge-grow + outward feather reached straight back into
-   * the channel: both halves re-widened past the original silhouette and their skirts
-   * overlapped (the user's report). Committed user erases now replay against the wash
-   * AFTER the region copies, and ship as erase layers LAST so normalize_layers' union
-   * punch re-seals the channel the fragments' geometry would reopen.
+   * THE ERASER REMOVES PIXELS AND NOTHING ELSE; MORPHOLOGY HANGS OFF THE RASTER.
+   *
+   * The model the user asked for, and the one shipped now: draw an object -> its pixels
+   * are the raster; the eraser removes pixels from that raster and is then GONE (no
+   * permanent punch, no erase layer on the wire); grow/shrink is folded INTO the raster at
+   * the moment the topology changes (an erase that splits, a move that merges); feather
+   * stays a live post-op so it recomputes around whatever boundaries exist now.
+   *
+   * Two shipped defects live here, and the gates are separated so each one goes red on its
+   * own mutant:
+   *   1. the parent's grow re-applied to each fragment from its fresh cut edge, which is
+   *      what sealed the channel and made the halves overlap (mutant: nofold);
+   *   2. a persistent punch that would not let the channel close, so dragging the halves
+   *      back together left a latent hole where the sweep had been (mutant: latentpunch).
+   * A third gate guards the fold itself against drifting from the display by a pixel
+   * (mutant: bakepad) and a fourth against the feather being baked (mutant: bakefeather).
    * ===================================================================================== */
-  step('ER clear + knobs', function () {
+  function lastWashedRow(x0, x1, y0, y1) {   // bottom-most row that still reads as masked
+    if (!refData || !view.width) return -1;
+    var d = px(view), W0 = view.width, last = -1, y;
+    for (y = Math.max(0, y0); y <= Math.min(view.height - 1, y1); y++) {
+      var t = 0, x;
+      for (x = x0; x <= x1; x++) {
+        var i = (y * W0 + x) * 4;
+        t += Math.max(Math.abs(d[i] - refData[i]), Math.abs(d[i + 1] - refData[i + 1]),
+                      Math.abs(d[i + 2] - refData[i + 2]));
+      }
+      if (t / (x1 - x0 + 1) > 60) last = y;
+    }
+    return last;
+  }
+  function washRow(y, x0, x1) {   // washed columns on one natural row, vs the photo
+    if (!refData || !view.width) return null;
+    var d = px(view), W0 = view.width, n = 0, f = -1, l = -1, x;
+    for (x = Math.max(0, x0); x <= Math.min(W0 - 1, x1); x++) {
+      var i = (y * W0 + x) * 4;
+      var dl = Math.max(Math.abs(d[i] - refData[i]), Math.abs(d[i + 1] - refData[i + 1]),
+                        Math.abs(d[i + 2] - refData[i + 2]));
+      if (dl > 100) { n++; if (f < 0) f = x; l = x; }
+    }
+    return { cols: n, first: f, last: l };
+  }
+
+  step('ER clear + knobs (grow 12, feather 0)', function () {
     clearForDraw();
-    knobSet('tb_edge', 0); knobSet('tb_feather', 30);
+    knobSet('tb_edge', 12); knobSet('tb_feather', 0);
     knobSet('tb_wash', 1); knobSet('tb_hardness', 0);
-    return wait(150);
+    // quiesce first: a debounced preview belatedly fired by the virtual-time scheduler
+    // would paint the stub's magenta over the whole canvas and poison every pixel gate.
+    return wait(650);
   });
-  step('ER paint wide rect', function () {
+  step('ER paint parent + probe it', function () {
     var b = toolButton('rect'); if (b) b.click();
-    fire('pointerdown', 750, 20, 140, { isPrimary: true });
-    var pxs = [[40,147],[60,153],[80,160],[100,167],[120,173],[140,180]];
+    fire('pointerdown', 750, 40, 140, { isPrimary: true });
+    var pxs = [[55, 148], [70, 156], [85, 164], [100, 172], [110, 180]];
     for (var i = 0; i < pxs.length; i++) fire('pointermove', 750, pxs[i][0], pxs[i][1], {});
-    fire('pointerup', 750, 140, 180, {});
-    return wait(150);
+    fire('pointerup', 750, 110, 180, {});
+    return wait(140).then(function () {          // inside the 420ms debounce: local wash only
+      var r = region();
+      _erParent = washRow(150, 0, 159);
+      out.note.push('ER_PARENT ' + JSON.stringify(_erParent) + ' state=' + JSON.stringify(r && r.all));
+      T('fixture: one grown object, live edge 12 (nothing folded yet)',
+        !!r && r.regions === 1 && r.all[0].edge === 12 && r.all[0].folded === false,
+        JSON.stringify(r && r.all));
+      T('fixture: the grown silhouette is on screen before any cutting',
+        !!_erParent && _erParent.cols > 60, JSON.stringify(_erParent));
+    });
   });
-  step('ER erase the channel', function () {
+  step('ER cut the channel (grow case)', function () {
     var b = toolButton('eraser'); if (b) b.click();
-    knobSet('tb_brush', 24);  /*probe*/                      // brushR = slider*scale()/2; scale~0.27
-    // (the stage is left zoomed by the pinch groups) -> r~3.2 natural px.
-    // OVER-TRACE the full width: the sweep must run past BOTH edges of the rect
-    // (x 20..139) or thin end-columns bridge the halves and the blob never splits
-    // (measured: a 25..135 sweep left regions=1 through two 3px shoulders).
-    fire('pointerdown', 751, 14, 160, { isPrimary: true });
-    for (var i = 1; i <= 14; i++) fire('pointermove', 751, 14 + i * 10, 160, {});
-    fire('pointerup', 751, 146, 160, {});
-    out.note.push('ER_ERASES ' + JSON.stringify((region() || {}).erases));
-    window.__ERMARK = (window.__LREAL || []).length;   // the wire gate only trusts entries after this
-    return wait(130);                             // before the 420ms preview debounce
+    knobSet('tb_brush', 24);                     // ~6.4 natural px across, a thin honest cut
+    // OVER-TRACE past both edges (x 40..110): shoulders left inside the rect bridge the
+    // halves and the blob never splits (measured: regions=1 through two 3px stubs).
+    // Over-trace past the GROWN silhouette, not the raw rect: once the grow is folded
+    // into the pixels the object really is 28..121 wide, and a sweep that stops at the
+    // raw edge leaves a shoulder bridging the halves (measured: regions=1 through a
+    // 4-column bridge at x=28..31).
+    fire('pointerdown', 751, 20, 160, { isPrimary: true });
+    for (var i = 1; i <= 13; i++) fire('pointermove', 751, 20 + i * 9, 160, {});
+    fire('pointerup', 751, 137, 160, {});
+    window.__ERMARK = (window.__LREAL || []).length;   // the wire gate trusts only later POSTs
+    return wait(140);
   });
-  step('ER channel asserts', function () {
+  step('ER grow-case asserts: folded, cut, unmoved', function () {
     var r = region();
-    out.note.push('ER_STATE ' + JSON.stringify(r && r.all));
-    T('the eraser cut the blob into two objects',
-      !!r && r.regions === 2, 'regions=' + (r && r.regions));
-    var halves = r && r.all || [];
-    T('both halves keep the parent feather and kind (the knobs still own softness)',
-      halves.length === 2 && halves.every(function (q) {
-        return q.kind === 'shape' && q.feather >= 25; }), JSON.stringify(halves));
-    T('fixture: far canvas shows the bare photo (local wash, no stale server overlay)',
-      bandAvg(145, 155, 280, 300) < 8, 'far=' + bandAvg(145, 155, 280, 300));
-    // The heart of the report: rows 158..162 (the 6px sweep, center 160) across the
-    // rect's interior must be OPEN. Pre-fix, both fragments' grow+feather skirts drew
-    // them shut (bandAvg measured ~150 there with feather 30).
-    var chan = bandAvg(40, 120, 158, 162);
-    var midAbove = bandAvg(40, 120, 146, 152);   // the half above: still washed
-    out.note.push('ER_BANDS channel=' + chan.toFixed(1) + ' above=' + midAbove.toFixed(1));
-    T('the erased channel stays CUT: no wash inside the sweep (skirts cannot re-glue)',
-      chan < 25 && midAbove > 120, 'channel=' + chan + ' above=' + midAbove);
+    out.note.push('ER_STATE ' + JSON.stringify(r && r.all) + ' bakes=' + (r && r.bakes));
+    var two = r && r.regions === 2 ? r.all : null;
+    T('the eraser cut the blob into two objects', !!two, 'regions=' + (r && r.regions));
+    T('the grow was FOLDED into the raster at the split (knob 0 live, 12 remembered)',
+      !!two && two.every(function (q) {
+        return q.folded === true && q.edge === 0 && q.edgeSet === 12 && q.feather === 0; }),
+      JSON.stringify(two));
+    if (!two) return true;
+    // The heart of report 1: with the parent's grow still live, each half dilates from
+    // its own cut edge and the channel seals shut. Folded, the cut stays the cut.
+    var chan = bandAvg(50, 100, 158, 162);
+    var above = bandAvg(50, 100, 145, 150);
+    out.note.push('ER_GROWBANDS channel=' + chan.toFixed(1) + ' above=' + above.toFixed(1));
+    T('the erased channel stays CUT (a re-applied grow would heal it shut)',
+      chan < 25 && above > 120, 'channel=' + chan + ' above=' + above);
+    // Report 1's other half: the halves must not be wider than what was drawn. Same row,
+    // measured before and after, so the comparison cannot drift with the fixture.
+    var now = washRow(150, 0, 159);
+    out.note.push('ER_EDGES before=' + JSON.stringify(_erParent) + ' after=' + JSON.stringify(now));
+    T('the outer boundary did not move when the cut happened (bake == display)',
+      !!now && !!_erParent && Math.abs(now.first - _erParent.first) <= 2 &&
+      Math.abs(now.last - _erParent.last) <= 2,
+      'before=' + JSON.stringify(_erParent) + ' after=' + JSON.stringify(now));
     return true;
   });
-  step('ER wire: erase layer present', function () {
-    function eraseLayers() {
-      // FRESHNESS-PINNED: only a POST appended after this group's erase commit counts
-      // (window.__ERMARK). An unmarked 'last entry' let a stale REGSPLIT-era export,
-      // belatedly fired by the virtual-time scheduler, pose as this group's wire — it
-      // shipped a vertical sweep and the gate could never tell. A wire gate that can
-      // green on an answer from another era is not a gate.
-      var q = window.__LREAL || [], mk = window.__ERMARK || 0, found = null;
-      for (var i = q.length - 1; i >= mk; i--) {
-        if (!/mask\/preview$/.test(q[i].url)) continue;
-        var wire = q[i].layers || [];
-        for (var j = 0; j < wire.length; j++) if (wire[j] && wire[j].erase) found = wire[j];
-        if (found) return found;
-      }
-      return null;
-    }
+  step('ER wire: no permanent punch ships', function () {
     function poll(tries) {
-      var found = eraseLayers();
-      if (found) return Promise.resolve(found);
+      var q = window.__LREAL || [], mk = window.__ERMARK || 0, seen = 0, punch = null;
+      for (var i = mk; i < q.length; i++) {
+        if (!/mask\/preview$/.test(q[i].url)) continue;
+        seen++; var ls = q[i].layers || [];
+        for (var j = 0; j < ls.length; j++) if (ls[j] && ls[j].erase) punch = ls[j];
+      }
+      if (seen) return Promise.resolve({ seen: seen, punch: punch });
       if (tries <= 0) return Promise.resolve(null);
       return wait(120).then(function () { return poll(tries - 1); });
     }
-    return poll(18).then(function (found) {
-      T('the wire ships the eraser as its own ERASE layer, full-canvas',
-        !!found && found.kind === 'brush' && found.grow === 0 && found.feather === 0 &&
-        !!found.png,
-        JSON.stringify(found && { kind: found.kind, erase: found.erase,
-                                  grow: found.grow, feather: found.feather }));
-      if (!found) return true;
-      // The sweep punched SOLID across the whole width even with the hardness slider
-      // at 0: the eraser's cut is hard, softness is the per-object knobs' job. The
-      // erasesoft mutant (honoring the slider) drops these pixels into the gradient
-      // ring (~85) — a fuzzy channel the graph's round() would seal shut.
-      return decodeAlpha(found, 90, 158).then(function (a) {
-        return decodeRows(found, 90, 155, 165).then(function (rows) {
-          out.note.push('ER_ERASE_ROWS ' + JSON.stringify(rows));
-          var solid = (rows[2] || 0) >= 200 && (rows[3] || 0) >= 200 &&
-                      (rows[4] || 0) >= 200 && (rows[5] || 0) >= 200 &&
-                      (rows[6] || 0) >= 200 && (rows[7] || 0) >= 200;
-          T('the erase layer punches solid across the sweep (hard cut, slider irrelevant)',
-            a >= 200 && solid, 'alphaAt(90,158)=' + a + ' rows=' + JSON.stringify(rows));
-          return true;
-        });
-      });
+    return poll(18).then(function (w) {
+      out.note.push('ER_WIRE ' + JSON.stringify(w && { seen: w.seen, punch: !!w.punch }));
+      T('a preview POST went out after the cut', !!w && w.seen >= 1, JSON.stringify(w));
+      // The eraser is not a feature of the canvas, so nothing on the wire says it was
+      // ever there. A shipped erase layer sits still while objects move: that is defect 2
+      // reincarnated as a render the preview cannot explain.
+      T('the shipped layers carry NO erase punch (the cut lives in the pixels)',
+        !!w && !w.punch, JSON.stringify(w && w.punch));
+      return true;
+    });
+  });
+
+  step('ERf clear + knobs (feather 8, grow 0)', function () {
+    clearForDraw();
+    knobSet('tb_edge', 0); knobSet('tb_feather', 8);
+    knobSet('tb_wash', 1); knobSet('tb_hardness', 0);
+    return wait(650);
+  });
+  step('ERf paint tall rect + wide channel', function () {
+    var b = toolButton('rect'); if (b) b.click();
+    fire('pointerdown', 754, 60, 120, { isPrimary: true });
+    fire('pointermove', 754, 70, 140, {});
+    fire('pointermove', 754, 85, 165, {});
+    fire('pointermove', 754, 100, 199, {});
+    fire('pointerup', 754, 100, 199, {});
+    return wait(140).then(function () {
+      var eb = toolButton('eraser'); if (eb) eb.click();
+      knobSet('tb_brush', 150);                  // ~40 natural px: a channel far wider than 2f
+      fire('pointerdown', 755, 48, 160, { isPrimary: true });
+      for (var i = 1; i <= 8; i++) fire('pointermove', 755, 48 + i * 9, 160, {});
+      fire('pointerup', 755, 120, 160, {});
+      window.__ERMARK = (window.__LREAL || []).length;
+      return wait(140);
+    });
+  });
+  step('ERf feather recomputes around the trimmed objects', function () {
+    var r = region();
+    out.note.push('ERF_STATE ' + JSON.stringify(r && r.all));
+    var two = r && r.regions === 2 ? r.all : null;
+    T('the wide cut split the object in two, both still feathered and unfurled-in-kind',
+      !!two && two.every(function (q) { return q.feather === 8 && q.edge === 0; }),
+      JSON.stringify(two));
+    T('the eraser cut HARD despite hardness 0 (its sweep leaves no soft residue)',
+      !!r && (r.erases || []).length >= 1 &&
+      r.erases[r.erases.length - 1].hardness === 1,
+      JSON.stringify((r && r.erases || []).slice(-1)));
+    if (!two) return true;
+    // The cut spans roughly rows 140..180. Four px inside it from a cut edge must still be
+    // washed — that soft ring can ONLY come from a feather recomputed around the NEW
+    // boundary. And the middle of a 40px channel (20px from either edge, past ~12 of
+    // reach) must be bare: nothing of the old outer halo survives the cut.
+    var nearTop = bandAvg(65, 95, 143, 145);
+    var midChan = bandAvg(65, 95, 158, 162);
+    var nearBot = bandAvg(65, 95, 177, 179);
+    // The live tail past the outer edge: present at ~6px (inside f), gone by ~16px
+    // (> ~1.5f). If the feather were ever folded into the raster this reads solid at 215.
+    var tail = bandAvg(65, 95, 201, 205), far = bandAvg(65, 95, 219, 223);   // tail: inside f; far: past ~1.5f
+    out.note.push('ERF_BANDS top=' + nearTop.toFixed(0) + ' mid=' + midChan.toFixed(0) +
+                  ' bot=' + nearBot.toFixed(0) + ' tail=' + tail.toFixed(0) + ' far=' + far.toFixed(0));
+    T('the feather wraps each NEW cut edge (skirt beside the cut, none down the middle)',
+      nearTop > 100 && nearBot > 100 && midChan < 25,
+      'top=' + nearTop + ' bot=' + nearBot + ' mid=' + midChan);
+    // The reach of the skirt is the honest discriminator, not a sample row: feather f is
+    // grow f + blur f, so the >=128 silhouette ends at the blob edge and the visible tail
+    // dies about 1.5f past it (measured: ~12 past row 198 for f=8). A feather ever folded
+    // into the raster pushes that boundary out by another f, and no row choice catches it
+    // as unambiguously as the distance itself.
+    var reach = lastWashedRow(65, 95, 199, 240);
+    out.note.push('ERF_REACH=' + reach);
+    T('the feather is LIVE, not baked: the tail reaches ~1.5f past the silhouette and stops',
+      tail > 60 && reach >= 203 && reach <= 215, 'tail=' + tail + ' reach=' + reach);
+    return true;
+  });
+
+  step('ERr re-merge: drag the top half down over the channel', function () {
+    var sb = toolButton('select'); if (sb) sb.click();
+    return wait(120).then(function () {
+      fire('pointerdown', 756, 80, 130, { isPrimary: true });   // inside the TOP half's pixels
+      for (var i = 1; i <= 5; i++) fire('pointermove', 756, 80, 130 + i * 10, {});
+      fire('pointerup', 756, 80, 180, {});
+      window.__ERMARK = (window.__LREAL || []).length;
+      return wait(160);
+    });
+  });
+  step('ERr no-remnant asserts', function () {
+    var r = region();
+    out.note.push('ERR_STATE ' + JSON.stringify(r && r.all) + ' bakes=' + (r && r.bakes));
+    T('dragging the halves back onto each other merges them into ONE object',
+      !!r && r.regions === 1, 'regions=' + (r && r.regions));
+    // The old sweep sat at rows ~140..180; the moved half now covers ~160..179 there. A
+    // permanent punch would carve exactly this band and the user would see a hole through
+    // the middle of the object they just joined (the reported 'latent gap').
+    var joined = bandAvg(65, 95, 171, 178);
+    out.note.push('ERR_JOINED=' + joined.toFixed(1));
+    T('the re-merged object has NO latent gap where the eraser used to be',
+      joined > 120, 'joinedBand=' + joined);
+    // The wire check has to come AFTER the pixel gate, and it has to wait: the pixel
+    // gate must be measured inside the 420ms preview debounce (once the stub's answer
+    // lands the whole canvas is magenta), so the POST it inspects does not exist yet.
+    function poll(tries) {
+      var q = (window.__LREAL || []).slice(window.__ERMARK || 0), punch = null, seen = 0, n = 0;
+      for (var i = 0; i < q.length; i++) {
+        if (!/mask\/preview$/.test(q[i].url)) continue;
+        seen++; var ls = q[i].layers || [];
+        n = ls.length;
+        for (var j = 0; j < ls.length; j++) if (ls[j] && ls[j].erase) punch = ls[j];
+      }
+      if (seen) return Promise.resolve({ seen: seen, punch: punch, n: n });
+      if (tries <= 0) return Promise.resolve(null);
+      return wait(120).then(function () { return poll(tries - 1); });
+    }
+    return poll(18).then(function (w) {
+      out.note.push('ERR_WIRE ' + JSON.stringify(w && { seen: w.seen, layers: w.n, punch: !!w.punch }));
+      T('the merged object ships as pixels alone (one layer, no punch)',
+        !!w && w.seen >= 1 && !w.punch && w.n === 1,
+        JSON.stringify(w && { seen: w.seen, layers: w.n, punch: !!w.punch }));
+      return true;
     });
   });
 

@@ -3,7 +3,7 @@
     python3 tests/tbtest/run_tbtest.py [--mutate NAME] [--width 420] [--height 620]
     (--mutate: sticky ctlorder softpunch brushfeather kindstr autoslider widetol
      rawwash allmerge nosig selguard twoslider noderive blendblank seldbg
-     barwash bar95 polltoken movelost shrinkrad padsniped erasenoshop erasesoft legacy)
+     barwash bar95 polltoken movelost shrinkrad padsniped erasesoft nofold latentpunch bakepad bakefeather erasepaints legacy)
 
 --mutate rebuilds the page with a deliberately broken copy of the shipped JS, so the suite
 proves it can actually see the two bugs it claims to have fixed. A green test that cannot
@@ -403,37 +403,125 @@ MUTANTS["shrinkrad"] = LEGACY_SHRINKRAD
 # corners; the _boxOn/_discOn kind split this replaces was faithful-to-server only, and
 # no honest gate could tell the difference. The clip could, and does.
 def LEGACY_PADSNIP(s):
-    an = "    var pad = Math.max(0, (r.edge || 0)) + 2 * (r.feather || 0) + 4;"
+    an = "    var pad = Math.max(0, effEdge(r)) + 2 * (r.feather || 0) + 4;"
     assert an in s, 'regionGeom pad anchor moved'
     return s.replace(an,
-        "    var pad = Math.max(0, (r.edge || 0)) + (r.feather || 0) + 2;", 1)
+        "    var pad = Math.max(0, effEdge(r)) + (r.feather || 0) + 2;", 1)
 
 
 MUTANTS["padsniped"] = LEGACY_PADSNIP
 
 
-# THE ERASER ONLY LIVED IN THE COMPOSITED MASK, restored: isUserErase->false removes both
-# halves of the same fix at once (the wash punch and the erase-layer ship), exactly like
-# the shipped defect — an erase that splits a blob leaves fragments whose grow+feather
-# reach back into the channel; the halves re-widen and their skirts overlap.
-def LEGACY_ERASENOSHOP(s):
-    an = "  function isUserErase(s) {\n    return !!s && s.erase"
-    assert an in s, 'isUserErase anchor moved'
-    return s.replace(an,
-        "  function isUserErase(s) {\n    if (1) return false;   // MUTANT: eraser invisible to wash+wire\n    return !!s && s.erase", 1)
-
-
-# THE HARD CUT SOFTENED, restored: the eraser honors the hardness slider, leaving
-# partial-alpha residue the region model binarises unpredictably (membership at
-# REGION_ALPHA_MIN) and a fuzzy channel the graph's round() seals shut.
+# THE HARD CUT SOFTENED: the eraser honours the hardness slider, leaving partial-alpha
+# residue whose blob membership then hinges on crossing REGION_ALPHA_MIN - a stair-stepped,
+# zoom-dependent cut that the region model can fail to split at all.
 def LEGACY_ERASESOFT(s):
     an = "hardness: (t === 'eraser' ? 1 : hard),"
     assert an in s, 'eraser hardness pin moved'
     return s.replace(an, "hardness: hard,", 1)
 
 
-MUTANTS["erasenoshop"] = LEGACY_ERASENOSHOP
 MUTANTS["erasesoft"] = LEGACY_ERASESOFT
+
+
+# THE FOLD NEVER HAPPENS, restored: an erase (or a merge) leaves the parent live, so each
+# fragment dilates from its own fresh cut edge and the channel heals shut — the reported
+# 'two halves bigger than the original and overlapping'. Mutating this one function takes
+# both call sites, which is exactly how the shipped bug behaved.
+NL = chr(10)
+def LEGACY_NOFOLD(s):
+    an = '  function foldLiveGeometry(st) {' + NL + '    var bk = bakeSnapshot();'
+    assert an in s, 'foldLiveGeometry anchor moved'
+    return s.replace(an, '  function foldLiveGeometry(st) {' + NL +
+        '    if (1) return false;   // MUTANT: geometry stays live' + NL +
+        '    var bk = bakeSnapshot();', 1)
+
+
+# THE PERSISTENT PUNCH, restored (the first attempt at this fix, reverted after the
+# user found the latent gap): the eraser replays against the finished wash AND ships as
+# an erase layer, so the channel can never be re-filled - objects move, the punch does
+# not. Kills the re-merge gate (a hole through the joined object) and the wire gate.
+def LEGACY_LATENTPUNCH(s):
+    NL = chr(10)
+    an1 = '    if (active) paintStroke(wc, active);   // the in-progress shape, at full liveness'
+    an2 = NL.join(['    return out.length ? out : null;', '  }', '',
+                   '  function int0(id, dflt) {'])
+    assert an1 in s and an2 in s, 'latentpunch anchors moved'
+    wash = NL.join([
+        '    for (var ei = 0; ei < strokes.length; ei++) {            // MUTANT: permanent punch',
+        '      if (strokes[ei] !== active && isUserErase(strokes[ei])) paintStroke(wc, strokes[ei]);',
+        '    }', '']) + an1
+    ship = NL.join([
+        "    for (var si = 0; si < strokes.length; si++) {            // MUTANT: punch on the wire",
+        '      var es = strokes[si];',
+        '      if (es === active || !isUserErase(es)) continue;',
+        "      var ec = document.createElement('canvas'); ec.width = W; ec.height = H;",
+        "      paintStroke(ec.getContext('2d'), { mode: es.mode, pts: es.pts, size: es.size,",
+        '                                          hardness: es.hardness, erase: false });',
+        "      var epng = ec.toDataURL('image/png').split(',')[1];",
+        '      if (!epng) continue;',
+        "      out.push({ png: epng, kind: 'brush', edge: 0, grow: 0, shrink: 0,",
+        '                 feather: 0, erase: true });',
+        '    }', '']) + an2
+    s = s.replace(an1, wash, 1)
+    return s.replace(an2, ship, 1)
+
+
+# THE BAKE DRIFTS FROM THE DISPLAY: the folded silhouette is built with more slack than
+# the kernels give, so the object fattens the moment a cut lands on it. Gate: the outer
+# boundary, same row, measured before and after the cut.
+def LEGACY_BAKEPAD(s):
+    an = '                    on, w, h, Math.min(96, Math.max(1, Math.abs(e))), e > 0);'
+    assert an in s, 'bake kernel anchor moved'
+    s = s.replace(an,
+        '                    on, w, h, Math.min(96, Math.max(1, Math.abs(e) + 4)), e > 0);'
+        '   // MUTANT', 1)
+    # The crop window caps how far a bake can reach, so a faithful "bake drifts" mutation
+    # has to widen it too - otherwise the tight crop clips the drift into invisibility and
+    # the mutant survives for a reason that is not a gate.
+    an2 = 'var pp = Math.max(0, effEdge(r)) + 1;'
+    assert an2 in s, 'bake pad anchor moved'
+    return s.replace(an2, 'var pp = Math.max(0, effEdge(r)) + 5;   // MUTANT', 1)
+
+
+# THE FEATHER GETS BAKED IN: softness stops being a property of the current boundary and
+# becomes permanent geometry, which re-feathers on every later edit (a ratcheting skirt).
+# The pad grows with it on purpose: anyone who really made this change would size their
+# own crop window, so a mutation that left the crop tight would be clipped into harmlessness
+# and "survive" for a reason that has nothing to do with the gates.
+def LEGACY_BAKEFEATHER(s):
+    NL = chr(10)
+    an = NL.join([
+        "      if (e) on = (r.kind === 'auto' ? _discOn : _boxOn)(",
+        '                    on, w, h, Math.min(96, Math.max(1, Math.abs(e))), e > 0);'])
+    assert an in s, 'bake morph anchor moved'
+    add = NL.join([
+        '',
+        '      var _f = Math.round(r.feather || 0);',
+        '      if (_f > 0) on = _discOn(on, w, h, Math.min(96, Math.max(1, _f)), true);   // MUTANT'])
+    s = s.replace(an, an + add, 1)
+    an2 = 'var pp = Math.max(0, effEdge(r)) + 1;'
+    assert an2 in s, 'bake pad anchor moved'
+    return s.replace(an2, 'var pp = Math.max(0, effEdge(r)) + Math.round(r.feather || 0) + 1;', 1)
+
+
+# THE ERASER PAINTS INSTEAD OF REMOVING: destination-out lost, so a sweep ADDS coverage
+# and the object never splits. Gate: the split itself, and the channel.
+def LEGACY_ERASEPAINTS(s):
+    NL = chr(10)
+    an = "    m.globalCompositeOperation = s.erase ? 'destination-out' : 'source-over';" + NL
+    assert s.count(an) == 2, 'expected two gCO sites (entry + post-bake), got ' + str(s.count(an))
+    # BOTH: the bake branch restores the mode, so mutating only the entry leaves the
+    # eraser honest - an ineffective mutant is not a killed gate, it is a fake one.
+    i = s.rindex(an)
+    return s[:i] + "    m.globalCompositeOperation = 'source-over';   // MUTANT" + NL + s[i + len(an):]
+
+
+MUTANTS["nofold"] = LEGACY_NOFOLD
+MUTANTS["latentpunch"] = LEGACY_LATENTPUNCH
+MUTANTS["bakepad"] = LEGACY_BAKEPAD
+MUTANTS["bakefeather"] = LEGACY_BAKEFEATHER
+MUTANTS["erasepaints"] = LEGACY_ERASEPAINTS
 
 
 def main():
@@ -486,7 +574,8 @@ def main():
         print('COMPOSE TRACE:')
         for i, d in enumerate(res['dbg'][:10]):
             print('  ', i, d)
-    EXPECT = 124   # +6: eraser-split group (regions, halves-keep-feather, far-photo fixture, channel-stays-cut, wire erase layer, solid punch)
+    EXPECT = 133   # +15: eraser model group - parent probe (2), split+fold+channel+boundary (4),
+                 # wire-no-punch (2), feather-live group (4), re-merge no-remnant (3)
     if len(res["tests"]) != EXPECT:
         print("TRUNCATED RUN: got %d assertions, expected %d -- an early error stopped the "
               "steps (notes: %s). This is NOT a pass." %
