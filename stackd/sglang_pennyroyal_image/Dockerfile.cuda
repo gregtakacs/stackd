@@ -80,10 +80,28 @@ ARG SGLANG_FORK_REPO=https://github.com/jpezzulli/sglang-rtxpro6000.git
 #              SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR in every model YAML that
 #              changed cmd_extra/env identity (coding-long -v5->-v6; coding-img
 #              is new, starts at -v1).
-# BUILD.md @ v2.5.0 keeps the toolchain this Dockerfile uses (Python 3.12,
+#   v2.5.1   — Bumped 2026-09-17. SAME CUDA/PyTorch/FlashInfer/NIXL stack as
+#              v2.5.0 (its own CHANGES.md says so explicitly) — this bump is
+#              purely to pick up native fixes for two bugs this repo was
+#              carrying local patches/workarounds for:
+#              (a) the reasoning_parser tool_start_token false-positive
+#                  (jpezzulli/sglang-rtxpro6000#6) — retired
+#                  patches/qwen3-reasoning-tool-mention.patch, see the
+#                  RETIRED note at the git-checkout step below;
+#              (b) qwen3_coder tool examples inside fenced code blocks now
+#                  stay as text (a sibling of the phantom-tool-call bug
+#                  v2.4.0 already fixed for the unfenced case).
+#              Also: host-cache eviction keeps recurrent-state endpoints over
+#              redundant checkpoints (jpezzulli/sglang-rtxpro6000#3), skips
+#              donating an unfinished-request checkpoint when cache slots are
+#              busy instead of aborting (adapted from sglang#37619), a QSA
+#              chunked-prefill boundary fix (adapted from sglang#39575), and
+#              an optional C6 (1,048,576 shared KV token) Flash-Next launch
+#              profile — opt-in, not used by any model YAML here.
+# BUILD.md @ v2.5.1 keeps the toolchain this Dockerfile uses (Python 3.12,
 # CUDA 13.3, GCC 15, PyTorch 2.13.0+cu130) and the same NIXL_REF below. The
 # git-checkout layer changes, so a from-scratch ~20 min sm120 rebuild.
-ARG SGLANG_FORK_REF=pennyroyal-v2.5.0
+ARG SGLANG_FORK_REF=pennyroyal-v2.5.1
 # NIXL commit from the fork's BUILD.md (POSIX FILE plugin for the HiCache
 # storage backend). Only needed once phase-2 NIXL persistence is turned on, but
 # built now so the image is complete.
@@ -152,52 +170,36 @@ RUN git clone --recursive ${SGLANG_FORK_REPO} . \
     && git checkout ${SGLANG_FORK_REF} \
     && git submodule update --init --recursive
 
-# Vendor our own copy of the fork's bundled Froggeric v22.5 chat template
-# (extracted from the sglang-pennyroyal:local image built at pennyroyal-v2.5.0,
-# 2026-09-17) instead of trusting it silently on every future SGLANG_FORK_REF
-# bump — this file controls the exact tool-call instructions/format the model
-# is prompted with (qwen3.8-flash-next.yaml's cmd_extra selects `xml` vs
-# `json` via chat_template_kwargs.tool_call_format; --tool-call-parser must
-# match: qwen3_coder for xml, hermes for json). Before ever bumping
-# SGLANG_FORK_REF, diff this file against a fresh clone's
-# configs/pennyroyal/templates/froggeric-v22.5.jinja and re-vendor deliberately
-# — same discipline as the patches/ directory below.
-COPY templates/froggeric-v22.5.jinja configs/pennyroyal/templates/froggeric-v22.5.jinja
-
-# TEMPORARY local hotfix, same shape as the retired qwen3_coder phantom
-# tool-call patch above (v2.4.0 note): patches/qwen3-reasoning-tool-mention.patch
-# fixes python/sglang/srt/parser/reasoning_parser.py's `Qwen3Detector` (and its
-# `<tool_call>`-sharing subclasses). Root cause: `BaseReasoningFormatDetector`'s
-# tool_start_token interruption does a bare `"<tool_call>" in buffer` substring
-# match with no validation -- so the model merely QUOTING that literal tag while
-# reasoning about tool-call formatting (observed live: narrating a system
-# prompt's own "output the <tool_call> block IMMEDIATELY after thinking" rule)
-# permanently flips `_in_reasoning` off, and the real closing `</think>` a few
-# paragraphs later sails through unstripped into visible content. Verified this
-# is upstream sglang code, byte-identical in the affected region on this pin
-# (not a pennyroyal-introduced bug): sgl-project/sglang main's
-# python/sglang/srt/parser/reasoning_parser.py matches this fork through the
-# whole BaseReasoningFormatDetector + Qwen3Detector region. Patch adds a
-# `_tool_start_confirmed` hook (default True, zero behavior change for every
-# OTHER detector) and overrides it on Qwen3Detector to require the text right
-# after the tag match qwen3_coder's real opening, `<function=`, character by
-# character (or a bare `{` for a plain Hermes-JSON caller) -- NOT a first-
-# character-only check: v1 of this patch checked `after[0] in "<{"`, which a
-# model quoting the WHOLE empty pair together, `<tool_call></tool_call>`,
-# still satisfied (`</tool_call>` also starts with `<`) -- caught live in the
-# same Cline session a second time, quoting the same system-prompt rule a
-# different way. verified against upstream's own
-# test/registered/unit/parser/test_reasoning_parser.py (134 tests, zero
-# regressions) plus 4 targeted cases: both quoted-tag failures (bare tag,
-# empty pair), a genuine no-</think> tool call, and parallel tool calls.
-# Filed as jpezzulli/sglang-rtxpro6000#6 with the patch attached, asking it be folded
-# into the fork (as v2.4.0 did for the qwen3_coder sibling bug) until sglang's
-# own ~4k-PR backlog gets to a fix upstream. REMOVE this block once either
-# lands and this fork's pin carries it natively -- re-verify the same way v2.4.0
-# was (grep the built image's reasoning_parser.py for `_tool_start_confirmed`).
-COPY patches/qwen3-reasoning-tool-mention.patch /tmp/patches/
-RUN git apply /tmp/patches/qwen3-reasoning-tool-mention.patch \
-    && rm -rf /tmp/patches
+# RETIRED 2026-09-17: patches/qwen3-reasoning-tool-mention.patch (the
+# reasoning_parser tool_start_token false-positive fix -- a bare/malformed
+# <tool_call> mention during reasoning no longer ends thinking early or leaks
+# </think> -- filed as jpezzulli/sglang-rtxpro6000#6) is now incorporated
+# natively in pennyroyal-v2.5.1 per that release's CHANGES.md. Patch file
+# deleted; git history has it if it's ever needed against an older pin.
+# Re-verify after any future rebase the same way v2.4.0's retired qwen3_coder
+# patch was: grep the built image's reasoning_parser.py for
+# `_tool_start_confirmed`. VERIFIED PRESENT at v2.5.1 (2026-09-17) -- the fork
+# adopted our contributed fix's own implementation (CHANGES.md credits
+# "community issue #6"), same hook name, just native now instead of a
+# git-apply. If a future rebase ever DROPS this hook entirely, that's the
+# signal the fix regressed or was reimplemented differently -- re-check the
+# actual behavior (quoting a bare/malformed <tool_call> during reasoning must
+# not end thinking early), not just the symbol's presence.
+#
+# The Froggeric v22.5 chat template used to be vendored right here, right
+# after checkout -- moved to the END of this file (with the other late COPY
+# steps) 2026-09-17: copying it this early invalidated Docker's build cache
+# for EVERY step after it (venv, all the pip installs, NIXL, the Rust PLE
+# reader) on every template-only edit, forcing the full from-scratch reinstall
+# that's normally only expected on a real SGLANG_FORK_REF bump (see that ARG's
+# comment above). Root-caused live: the second such edit (2026-09-17, the
+# tool-name anti-example) triggered exactly that full reinstall via the `uv
+# pip install --prerelease=allow --index-strategy unsafe-best-match` below
+# resolving something differently than the already-running image, and the
+# resulting container hung mid-boot in FlashInfer's MXFP8 autotune --
+# reproduced twice. Fixed by moving the COPY, not by touching the install
+# command (that flag combo is the fork's own documented BUILD.md recipe, not
+# something to tighten blind).
 
 RUN uv python install ${PYTHON_VERSION} \
     && uv venv --python ${PYTHON_VERSION} .venv
@@ -282,6 +284,22 @@ COPY nixl-posix.toml /etc/pennyroyal/nixl-posix.toml
 
 COPY entrypoint.sh /usr/local/bin/pennyroyal-entrypoint
 RUN chmod +x /usr/local/bin/pennyroyal-entrypoint
+
+# Vendor our own copy of the fork's bundled Froggeric v22.5 chat template
+# (extracted from the sglang-pennyroyal:local image built at pennyroyal-v2.5.0,
+# 2026-09-17) instead of trusting it silently on every future SGLANG_FORK_REF
+# bump — this file controls the exact tool-call instructions/format the model
+# is prompted with (qwen3.8-flash-next.yaml's cmd_extra selects `xml` vs
+# `json` via chat_template_kwargs.tool_call_format; --tool-call-parser must
+# match: qwen3_coder for xml, hermes for json). Before ever bumping
+# SGLANG_FORK_REF, diff this file against a fresh clone's
+# configs/pennyroyal/templates/froggeric-v22.5.jinja and re-vendor
+# deliberately. Placed HERE (last, after every dependency-install step)
+# deliberately — see the RETIRED note near the git-checkout step above for
+# why: this exact COPY used to sit right after checkout and forced a full
+# from-scratch dependency reinstall on every template-only edit, which is
+# what caused the 2026-09-17 boot hang.
+COPY templates/froggeric-v22.5.jinja configs/pennyroyal/templates/froggeric-v22.5.jinja
 
 # The qwen3_coder phantom tool-call hotfix that lived here (a local git-apply of
 # patches/qwen3-coder-streaming-phantom-toolcall.patch, our upstream PR
