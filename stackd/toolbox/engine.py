@@ -320,7 +320,8 @@ def comfy_render(job: dict, source: bytes, mask: bytes, *, on_prompt_id=None,
         crop_plan = None
     if crop_plan and max(crop_plan["size"]) > _m.RENDER_MAX_SIDE:
         # Cannot happen while the box is bounded by the working canvas, but the ceiling is
-        # an invariant worth defending at the boundary rather than by argument.
+        # an invariant worth defending at the boundary rather than by argument. (The use-time
+        # render_budget clamps to the grid-floored ceiling independently of this guard.)
         crop_plan = None
 
     base, note = comfyui_base()
@@ -347,11 +348,23 @@ def comfy_render(job: dict, source: bytes, mask: bytes, *, on_prompt_id=None,
         # close together could clobber each other's source before LoadImage read it
         # (confirmed in comfyui_client's own comment). Same rule applies to source+mask.
         if crop_plan:
-            src_b, (rw, rh) = _m.crop_for_render(source, crop_plan)
+            # USE-time budget (masks.render_budget): the box mapped into SOURCE pixels and
+            # capped at the ceiling. The plan's canvas-space size would render a 4x photo
+            # crop at a quarter of the detail it actually holds, and paste_back's upscale
+            # would bake that softness into the artifact that becomes the NEXT edit's
+            # source — the ratchet, smuggled back in one round trip at a time.
+            try:
+                rw, rh = _m.render_budget(crop_plan, _m.image_size(source))
+            except Exception:  # noqa: BLE001 — an unmeasurable photo falls back to the plan,
+                rw, rh = crop_plan["size"]  # and crop_for_render itself fails honestly if it
+                                             # truly cannot decode the bytes
+            src_b, _used = _m.crop_for_render(source, crop_plan, size=(rw, rh))
             msk_b = _m.crop_mask(mask, crop_plan, size=(rw, rh))
             # The photo is the paste base: it is the only thing that still holds the detail
             # outside the crop, so the artifact comes back at the PHOTO's resolution.
-            base_bytes, paste_plan = source, crop_plan
+            # (paste_plan carries the RENDER size for provenance; paste_back only reads the
+            # canvas box+frame, so recording size here is honesty in _crop_json, not geometry.)
+            base_bytes, paste_plan = source, dict(crop_plan, size=(rw, rh))
         else:
             rw, rh = w, h
             src_b = _prepare_source(source, w, h)

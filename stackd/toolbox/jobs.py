@@ -196,7 +196,9 @@ class JobStore:
 class JobQueue:
     """The worker thread + in-flight blob store, wired to a JobStore.
 
-    Why blobs live in memory and not the DB: a source+mask pair is a few MB each and is
+    Why blobs live in memory and not the DB: a source+mask pair is a few MB (the source is
+    the RAW photo bytes now — the crop-and-paste path composites against them, so the
+    queue is deliberately given what the browser-canvas ceiling did NOT shrink) and is
     only ever needed for the seconds between submit and the ComfyUI upload. Persisting a
     finished job's *result* (the artifact) is worth it — that is what survives a restart
     for a page reopened later — but persisting in-flight inputs buys nothing and drags a

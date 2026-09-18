@@ -127,7 +127,7 @@ green run is evidence about the real system rather than about a throwaway imitat
 ## Verify
 
 ```bash
-python3 tests/smoke_toolbox.py       # 493 checks: tokens, mask semantics, routes, contract,
+python3 tests/smoke_toolbox.py       # 507 checks: tokens, mask semantics, routes, contract,
                                      # harness wiring, and the shipped JS/CSS as the build
                                      # serves them (attribute whitelist, dead-knob ledger,
                                      # brace/paren balance, DOM-id cross-checks)

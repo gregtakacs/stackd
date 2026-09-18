@@ -216,7 +216,11 @@ def shrink_to_max_side(image_bytes: bytes, max_side: int = RENDER_MAX_SIDE, *,
 #   canvas  the working grid the browser paints on and the canonical mask lives on,
 #           (cw, ch) == the job's working_w/h, always <= RENDER_MAX_SIDE
 #   box     the crop rect, held in CANVAS px, grid-aligned
-#   render  what ComfyUI runs at — the box itself (never upscaled)
+#   render  what ComfyUI runs at — the box MAPPED TO SOURCE PIXELS at use time,
+#           floor-aligned to the latent grid and capped at the ceiling
+#           (render_budget). Canvas-box size for a photo that holds more real
+#           pixels under the box is the ratchet, not a saving.
+#           When source == canvas (already inside the ceiling) it is the box itself.
 #   source  the photo as the user loaded it, (sw, sh). Mapping canvas -> source is
 #           PROPORTIONAL (see _scale_box) and only ever happens where the source is
 #           actually in hand, so a stale canvas size cannot quietly skew a crop.
@@ -311,7 +315,8 @@ def crop_for_render(source_bytes: bytes, plan: dict, *, size=None):
     """The photo crop the GPU is given — the plan's rect out of whatever source it is
     handed (the full-resolution photo, proportionally), resampled to the render size.
     Returns (bytes, (rw, rh)) so the caller patches the graph's width/height nodes with
-    the SAME numbers it cropped at. Resize-to-exact is deliberate: it matches
+    the SAME numbers it cropped at. Pass size=render_budget(plan, source_size) to spend
+    the photo's real pixels; the default (plan size) keeps the canvas-box geometry. Resize-to-exact is deliberate: it matches
     comfyui_client.downscale_to_exact_size and the graph's own ImageScale(crop="disabled")
     stretch, so source and mask arrive with identical geometry."""
     _require_pil()
@@ -335,6 +340,54 @@ def crop_mask(mask_bytes: bytes, plan: dict, *, size=None) -> bytes:
         sub = sub.resize(want, Image.LANCZOS)
     buf = io.BytesIO(); sub.save(buf, DEFAULT_FORMAT)
     return buf.getvalue()
+
+
+def render_budget(plan: dict, source_size, *, max_side: int = RENDER_MAX_SIDE,
+                  grid: int = LATENT_GRID):
+    """The pixel size a crop ACTUALLY RENDERS AT — decided at USE time, when the photo
+    is in hand, never at plan time (the plan stays photo-free so a stale or missing
+    photo cannot silently move a crop; this is the one number that legitimately needs
+    the photo, and it is computed from its size alone).
+
+    plan["size"] is a CANVAS-space box: on a 1024 canvas it tops out around 300 px even
+    when the photo under that box holds four times as many real pixels. Rendering at
+    canvas size and letting paste_back upscale the artifact to the photo-sized region is
+    the ratchet this module exists to stop: the model paints 256 latents' worth of
+    detail, the artifact comes back at PHOTO size through an upscale, and the NEXT edit
+    inherits that softness as its source. Mapping the box to source pixels (the same
+    per-axis proportion as _scale_box) and clamping to the ceiling spends the canvas's
+    whole budget where the user is looking at it.
+
+    Two rules the ratchet taught:
+      * floor to the latent grid, NEVER round up — rounding up fabricates rows the photo
+        never had (see the 2048x1584 -> 1024x800 incident documented at
+        shrink_to_max_side), and a non-multiple is a flat Flux-graph rejection;
+      * never below plan["size"] — a photo that arrives SMALLER than the canvas (ingest
+        fails open without pillow) must not shrink the box below the comfort floor the
+        plan already chose; that was the old behaviour and it was fine.
+
+    Pure integer math, like fit_within: no decoder needed, fully testable, and the
+    caller only has to measure the bytes it already holds.
+    """
+    fw, fh = (int(plan["frame"][0]), int(plan["frame"][1]))
+    bw, bh = (int(plan["size"][0]), int(plan["size"][1]))
+    try:
+        sw, sh = int(source_size[0]), int(source_size[1])
+    except (TypeError, ValueError, IndexError):
+        return (bw, bh)
+    if fw <= 0 or fh <= 0 or sw <= 0 or sh <= 0 or bw <= 0 or bh <= 0:
+        return (bw, bh)                       # junk geometry falls back to the plan, never to a guess
+    cap_side = max(grid * 2, (int(max_side) // grid) * grid)   # the ceiling, pre-floored to the grid
+
+    def one(v, floorv):
+        v = min(v, cap_side)
+        v = (v // grid) * grid                # floor: rounding up invents pixels
+        return max(floorv, min(v, cap_side))  # the floor itself can never exceed the cap
+
+    # per-axis truncation (NOT round) — _scale_box's rounding maps a corner, this maps a
+    # side length, and a side may only claim pixels the photo actually has
+    return (one(bw * sw // fw, min(bw, cap_side)),
+            one(bh * sh // fh, min(bh, cap_side)))
 
 
 def _seam_alpha(size, feather: int = SEAM_FEATHER_PX) -> "Image.Image":

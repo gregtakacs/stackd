@@ -1304,6 +1304,7 @@ def main() -> int:
     test_working_size()
     test_crop_pipeline()
     test_crop_wiring()
+    test_paste_back_resolution()
     test_render_seam()
     test_render_timeout()
     bad = [(n, d) for n, ok, d in CHECKS if not ok]
@@ -1836,8 +1837,15 @@ def test_working_size():
     check("job create caps what the CLIENT asked for (the old 4096-wide hole)",
           r.status == 200 and max(r.payload["working_size"]) <= CEIL, str(r.payload))
     enq_size = Image.open(_io.BytesIO(fw.enqueued[0][1])).size if fw.enqueued else None
-    check("job create caps what the PHOTO was, in the bytes it enqueues",
-          enq_size is not None and max(enq_size) <= CEIL, str(enq_size))
+    # The bytes handed to the QUEUE are deliberately NOT ceiling-capped any more: they are
+    # BOTH the graph input AND the photo the crop-and-paste composites back into, and the
+    # graph sizes itself (engine._prepare_source / crop_for_render). A pre-shrunk enqueue
+    # made the ceiling the OUTPUT resolution too — the paste-back ratchet defect. What must
+    # stay capped is the size the GRAPH runs at: pinned by working_size below, by the
+    # upload checks in test_render_seam / test_paste_back_resolution, and enforced at the
+    # handover itself by engine.render_size().
+    check("job create enqueues the RAW photo (the paste-back base), unshrunk",
+          enq_size == BIG_NAT and fw.enqueued[0][1] == BIG, str(enq_size))
     check("job create SAYS it shrank, and echoes the size it shrank from",
           "auto-shrunk" in (r.payload.get("size_note") or "")
           and r.payload.get("source_size") == list(BIG_NAT), str(r.payload.get("size_note")))
@@ -2009,6 +2017,28 @@ def test_crop_pipeline():
     check("plan_crop bails when the box saves nothing (no seam for nothing)",
           M.plan_crop(mask_at((CW, CH), (6, 6, CW - 6, CH - 6))) is None)
 
+    # ---------------- render_budget: the use-time spend of the photo's detail ----------
+    # The defect it retires: rendering at CANVAS-space plan size when the photo under the
+    # box holds more real pixels, then upscaling that soft artifact at paste time — and
+    # because the artifact seeds the NEXT edit, each round trip lost detail (the ratchet).
+    RB = {"box": (96, 96, 384, 384), "frame": (512, 384), "size": (288, 288)}
+    check("render_budget: a photo SMALLER than the frame never shrinks the planned box",
+          M.render_budget(RB, (128, 96)) == (288, 288), str(M.render_budget(RB, (128, 96))))
+    check("render_budget: source==frame renders the box itself (no gratuitous upscale)",
+          M.render_budget(RB, (512, 384)) == (288, 288), str(M.render_budget(RB, (512, 384))))
+    rb4 = M.render_budget(RB, (2048, 1536))
+    check("render_budget: a 4x photo spends the whole ceiling on the crop",
+          rb4 == (M.RENDER_MAX_SIDE // G * G,) * 2, "%s vs ceiling %s" % (rb4, M.RENDER_MAX_SIDE))
+    # truncation, never round-up: 256 x 1177/512 = 588.5 -> 576. Round-up (592) would
+    # fabricate a column the photo never had — the 2048x1584 -> 1024x800 incident again,
+    # documented at shrink_to_max_side. This check exists for that, not for the numbers.
+    rbx = M.render_budget({"box": (0, 0, 256, 160), "frame": (512, 384),
+                           "size": (256, 160)}, (1177, 883))
+    check("render_budget FLOORS to the grid (588.5x367.9 maps to 576x352, never up)",
+          rbx == (576, 352), "%s; round-up would give (592, 368)" % (rbx,))
+    check("render_budget falls back to the plan on junk input instead of guessing",
+          M.render_budget(RB, None) == (288, 288))
+
     # The margin ring, asserted where it is the ONLY thing that can produce the result.
     # A small selection cannot test this: the widen-to-MIN_CROP_SIDE step inflates the box
     # past the selection all by itself, so "the box surrounds the selection" passes even with
@@ -2125,6 +2155,157 @@ def test_crop_pipeline():
     check("luminosity and color are distinct operations, not one shared fallback",
           diff(lum, col) > 1.0 and lum_note == "" and col_note == "",
           "diff=%r %r %r" % (diff(lum, col), lum_note, col_note))
+def test_paste_back_resolution():
+    """create -> queue -> render, E2E, on the bytes the REAL route produced.
+
+    Why a third crop test, after test_crop_pipeline (masks.py in isolation) and
+    test_render_seam (comfy_render driven directly): the paste-back base defect never
+    lived in comfy_render — it lived in the ONE handover before it, api._ingest_source
+    shrinking the photo BEFORE enqueue. A seam test that feeds comfy_render its own
+    full-resolution photo physically cannot see an API that never delivers one. This
+    drives the real POST /toolbox/jobs, captures what the queue was handed, and carries
+    THOSE bytes to the render: photo raw in, artifact at photo resolution out.
+    """
+    import copy
+    import types
+    from stackd.toolbox import engine as E
+    from stackd.toolbox import jobs as J
+    if not M.HAS_PIL:
+        check("paste-back resolution: PIL present", False, "skipped")
+        return
+    CEIL = M.RENDER_MAX_SIDE
+    SIDE = max(2048, CEIL * 2)                       # comfortably over the ceiling, whatever it is
+    BIGPNG = flat_png((SIDE, int(SIDE * 0.77)))
+    BIG_NAT = M.image_size(BIGPNG)
+
+    class CaptureWorker:
+        """The FakeWorker pattern from test_working_size: records exactly what the queue
+        is handed, because THAT is what the render will composite against."""
+        def __init__(self):
+            self.store = J.JobStore(":memory:")
+            self.enqueued = []
+        def enqueue(self, job_id, *, source, mask):
+            self.enqueued.append((job_id, source, mask))
+
+    fw = CaptureWorker()
+    tb = make_tb(source=lambda email, ref: BIGPNG, worker=fw)
+    r = post(tb, "/toolbox/jobs", {"mask_png": MASK_B64, "spec": {"kind": "heal"}},
+             token=fresh_token())
+    check("paste-back resolution: the job created through the real route",
+          r.status == 200 and bool(fw.enqueued), str(r.payload)[:140])
+    if not fw.enqueued:
+        for n in ("the queue is given the unshrunk photo",
+                  "that mask crop-renders (this is the crop path)",
+                  "the render seam ran on the enqueued bytes",
+                  "the upload spends the budget on the crop",
+                  "the ARTIFACT returns at the photo's resolution (anti-ratchet)",
+                  "provenance states the render size it actually ran"):
+            check("paste-back resolution: " + n, False, "skipped: nothing enqueued")
+        return
+    src_bytes, msk_bytes = fw.enqueued[0][1], fw.enqueued[0][2]
+    check("paste-back resolution: the queue is given the UNSHRUNK photo",
+          M.image_size(src_bytes) == BIG_NAT, "%s vs %s" % (M.image_size(src_bytes), BIG_NAT))
+    check("paste-back resolution: the canonical mask sits on the working grid, not the photo",
+          M.image_size(msk_bytes) == tuple(r.payload["working_size"]),
+          "%s vs %s" % (M.image_size(msk_bytes), r.payload["working_size"]))
+    plan = M.plan_crop(msk_bytes)
+    check("paste-back resolution: that mask crop-renders (this is the crop path)",
+          plan is not None)
+
+    def absent(reason):
+        for n in ("the render seam ran on the enqueued bytes",
+                  "the upload spends the budget on the crop",
+                  "the ARTIFACT returns at the photo's resolution (anti-ratchet)",
+                  "provenance states the render size it actually ran"):
+            check("paste-back resolution: " + n, False, reason)
+    if plan is None:
+        absent("skipped: no crop plan — pixels cannot be probed")
+        return
+
+    # fake GPU clients, same shapes as test_render_seam's (signatures mirror the real ones)
+    state = {}
+    cc = types.ModuleType("stackd.imagegen.comfyui_client")
+
+    async def upload_to_comfy(image_bytes, filename_prefix, base):
+        state.setdefault("uploads", []).append(image_bytes)
+        return "%s-%d.png" % (filename_prefix, len(state["uploads"]))
+
+    async def submit_workflow(workflow, base):
+        return "pid-pbr"
+
+    async def wait_and_fetch(prompt_id, include_node_ids, base, timeout_s=None, on_poll=None):
+        w, h = M.image_size(state["uploads"][0])
+        return {node: [flat_png((w, h))] for node in include_node_ids}
+
+    def downscale_to_exact_size(image_bytes, width, height):
+        im = Image.open(io.BytesIO(image_bytes)).convert("RGB").resize(
+            (width, height), Image.LANCZOS)
+        buf = io.BytesIO(); im.save(buf, "PNG"); return buf.getvalue()
+
+    cc.upload_to_comfy = upload_to_comfy
+    cc.submit_workflow = submit_workflow
+    cc.wait_and_fetch = wait_and_fetch
+    cc.downscale_to_exact_size = downscale_to_exact_size
+    cc.get_json = lambda *a, **k: None
+    ow = types.ModuleType("stackd.imagegen.openwebui_client")
+
+    async def save_image(image_bytes, filename, api_key):
+        return "http://owu/x/" + filename
+    ow.save_image = save_image
+
+    pkg = sys.modules.get("stackd.imagegen") or __import__("stackd.imagegen")
+    saved = {k: sys.modules.get(k) for k in
+             ("stackd.imagegen.comfyui_client", "stackd.imagegen.openwebui_client")}
+    saved_attr = (getattr(pkg, "comfyui_client", "$"), getattr(pkg, "openwebui_client", "$"))
+    sys.modules["stackd.imagegen.comfyui_client"] = cc
+    sys.modules["stackd.imagegen.openwebui_client"] = ow
+    pkg.comfyui_client, pkg.openwebui_client = cc, ow
+
+    class FakeRuntime:
+        def resolve_user_key(self, email):
+            return "key-for-" + (email or "")
+    real_runtime, real_base = E._runtime, E.comfyui_base
+    E._runtime = lambda: FakeRuntime()
+    E.comfyui_base = lambda: ("http://comfy:8188", "")
+    job = {"email": EMAIL, "spec": {"kind": "heal"},
+           "working_w": r.payload["working_size"][0],
+           "working_h": r.payload["working_size"][1]}
+    art = None
+    try:
+        b64, _t = E.comfy_render(job, src_bytes, msk_bytes, on_prompt_id=lambda pid, b: None)
+        art = base64.b64decode(b64) if b64 else None
+    except Exception as e:  # noqa: BLE001 — reported as a red check, not a traceback
+        state["raised"] = e
+    finally:
+        E._runtime, E.comfyui_base = real_runtime, real_base
+        for k, v in saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+        pkg.comfyui_client, pkg.openwebui_client = saved_attr
+
+    check("paste-back resolution: the render seam ran on the enqueued bytes",
+          art is not None, repr(state.get("raised")))
+    if art is None:
+        absent("skipped: seam raised")
+        return
+    budget = M.render_budget(plan, BIG_NAT)
+    up = M.image_size(state["uploads"][0])
+    check("paste-back resolution: the upload spends the budget on the crop",
+          up == tuple(budget) and max(up) > max(plan["size"]) and max(up) <= CEIL,
+          "upload %s budget %s plan %s" % (up, budget, plan["size"]))
+    check("paste-back resolution: the ARTIFACT returns at the photo's resolution (anti-ratchet)",
+          M.image_size(art) == BIG_NAT,
+          "%s vs photo %s — smaller means the queue was handed a shrunk base again"
+          % (M.image_size(art), BIG_NAT))
+    cj = json.loads(job.get("_crop_json") or "{}")
+    check("paste-back resolution: provenance states the render size it actually ran",
+          bool(cj.get("cropped")) and tuple(cj.get("rendered_at") or ()) == up
+          and tuple(cj.get("size") or ()) == up and cj.get("composited") is True,
+          str(cj)[:160])
+
+
 def test_render_seam():
     """comfy_render's geometry, driven end-to-end with FAKE GPU clients.
 
@@ -2301,8 +2482,19 @@ def test_render_seam():
     if plan:
         state, art, job = drive(small)
         up_w, up_h = M.image_size(state["uploads"][0])
-        check("render seam: what the graph is GIVEN is the crop, at the plan's size",
-              (up_w, up_h) == tuple(plan["size"]), "uploaded %dx%d plan %s" % (up_w, up_h, plan["size"]))
+        # The OLD pin here read `(up_w, up_h) == plan["size"]` — it PINS the ratchet defect:
+        # the plan's size is CANVAS space, so a 4x photo crop rendered at a quarter of the
+        # detail it held and came back soft through paste_back's upscale. The graph is now
+        # given the use-time SOURCE-MAPPED budget; the plan stays the FLOOR, the ceiling
+        # the cap, and the latent grid binds both.
+        budget = M.render_budget(plan, PHOTO)
+        check("render seam: the graph is GIVEN the crop at its source-mapped budget",
+              (up_w, up_h) == tuple(budget) and up_w % G_ == 0 and up_h % G_ == 0
+              and up_w >= plan["size"][0] and up_h >= plan["size"][1],
+              "uploaded %dx%d budget %s plan %s" % (up_w, up_h, budget, plan["size"]))
+        check("render seam: a 4x photo SPENDS the ceiling on the crop (the ratchet is shut)",
+              max(up_w, up_h) > max(plan["size"]) and max(up_w, up_h) == M.RENDER_MAX_SIDE,
+              "uploaded %dx%d, plan %s, canvas %dx%d" % (up_w, up_h, plan["size"], CANVAS[0], CANVAS[1]))
         msk_w, msk_h = M.image_size(state["uploads"][1])
         check("render seam: the mask is cropped to the SAME geometry as the source",
               (msk_w, msk_h) == (up_w, up_h), "mask %dx%d vs source %dx%d" % (msk_w, msk_h, up_w, up_h))

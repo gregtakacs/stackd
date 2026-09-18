@@ -287,7 +287,7 @@ class Toolbox:
             raise ValueError("the source image could not be found for this user")
         return data
 
-    def _ingest_source(self, email, body, query):
+    def _ingest_source(self, email, body, query, give_raw=False):
         """Resolve the photo AND bring it inside the render ceiling, in one step, so no
         handover — the browser's <img>, the SAM3 segmenter, the ComfyUI upload, the no-GPU
         preview overlay — can be reached by a code path that simply forgot to resize.
@@ -296,6 +296,15 @@ class Toolbox:
         Returns (bytes, size_after, size_before). "before" is carried because the editor
         has to be able to tell the user WHAT IT DID — a photo that quietly comes back at
         half resolution looks like a defect, not a policy.
+
+        give_raw=True is the render job's exception to the resize: the enqueued bytes are
+        BOTH the graph input AND the photo paste_back composites against, and the graph
+        shrinks what IT needs (engine._prepare_source / crop_for_render, each to exact
+        working dims in one LANCZOS hop). Handing the queue a pre-shrunk copy instead makes
+        the ceiling the resolution ceiling of every crop-and-paste output — a 4000px photo
+        would paste back into its own 1024px ghost and the artifact, which seeds the next
+        edit, ratchets down a little every round. "size_after" still reports the size the
+        GRAPH runs at, so the honesty note the editor shows is unchanged.
 
         Fails OPEN on a pillow-less host or an undecodable photo: without a decoder we
         cannot resize, and handing the raw bytes through is strictly better than breaking
@@ -307,6 +316,8 @@ class Toolbox:
             return data, (0, 0), (0, 0)
         try:
             out, size = _masks.shrink_to_max_side(data, _masks.RENDER_MAX_SIDE)
+            if give_raw:
+                return data, size, _masks.image_size(data)
             return out, size, _masks.image_size(data)
         except Exception as e:  # noqa: BLE001 — a resize failure must not sink the request
             self._note(f"toolbox: source not resized on ingest ({e.__class__.__name__}: {e})")
@@ -796,7 +807,10 @@ class Toolbox:
         # iGPU" failure mode cannot be reached by a photo that arrived bigger than the
         # resident engine can afford (masks.RENDER_MAX_SIDE). Normalising the mask against
         # these same bytes is what keeps preview and render in agreement.
-        source, _after, before = self._ingest_source(email, body, {})
+        # give_raw: these bytes feed BOTH the graph (which sizes itself) and the paste-back
+        # photo, and the paste must composite against the user's real resolution, not the
+        # ceiling's. See _ingest_source.
+        source, _after, before = self._ingest_source(email, body, {}, give_raw=True)
         w, h = self._dims(spec, source)
         if layers:
             canon, info = _masks.normalize_layers(layers, w, h,
