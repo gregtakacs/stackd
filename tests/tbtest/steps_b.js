@@ -437,6 +437,100 @@
     return true;
   });
 
+  /* ---- progress bar: the ladder the user watches for ten minutes -----------------
+     Zero browser coverage until now (string-grep only). These assertions watch the
+     REAL DOM while the fake server walks queued -> running -> (est. ETA) -> done,
+     and gate on what the honesty comments in renderBar()/pollJob() promise:
+     indeterminate wash with no ETA, determinate fill capped short of 100%, and a
+     bar that is GONE (not parked at 95%) next to a finished image. They also pin
+     the token discipline: create redeems the launch token, so every poll must
+     carry the JOB token create minted - a regression there is a silent 403. */
+  function barState() {
+    var host = document.querySelector('.tb-status');
+    host = host && host.parentNode;
+    var bar = host && host.querySelector('#tb-progbar');
+    if (!bar) return null;
+    var f = bar.firstChild;
+    return { w: parseFloat(f.style.width) || 0, op: parseFloat(f.style.opacity) };
+  }
+  function lineNow() {
+    var n = document.querySelector('.tb-status');
+    return n ? n.textContent : '';
+  }
+  step('render start', function () {
+    // fresh paint so exportMask() has ink: the render gate refuses an empty mask,
+    // and the delete/clear steps above just emptied it (mirrors a user painting a
+    // spot and hitting Render)
+    var bb = toolButton('brush'); if (bb) bb.click();
+    fire('pointerdown', 400, 220, 320, { isPrimary: true });
+    fire('pointermove', 400, 240, 330, {});
+    fire('pointerup', 400, 260, 340, {});
+    window.__POLLS = [
+      { ok: true, state: 'progress', progress: { elapsed_s: 2.0, stage: 'queued', ahead: 2 } },
+      { ok: true, state: 'progress', progress: { elapsed_s: 6.0, stage: 'running' } },
+      { ok: true, state: 'progress', progress: { elapsed_s: 11.0, stage: 'running', eta_s: 20, eta_samples: 3 } },
+      { ok: true, state: 'progress', progress: { elapsed_s: 18.0, stage: 'running', eta_s: 20, eta_samples: 3 } },
+      { ok: true, state: 'done', seed: 77, elapsed_s: 20.0,
+        artifacts: [{ png: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==' }],
+        crop: { cropped: true, size: [512, 512], artifact: [2048, 1536], composited: true, knobs: { color_match: 0.4 } } }
+    ];
+    window.__BARLOG = [];
+    var seen = {};
+    window.__BAROBS = new MutationObserver(function () {
+      setTimeout(function () {
+        var b = barState();
+        var key = b ? (b.op >= 0.9 ? 'D' : 'I') : 'N';
+        if (seen[key]) return;
+        seen[key] = true;
+        window.__BARLOG.push({ phase: key, bar: b, line: lineNow() });
+      }, 0);
+    });
+    var sn = document.querySelector('.tb-status');
+    if (sn) window.__BAROBS.observe(sn.parentNode, { childList: true, subtree: true,
+      attributes: true, attributeFilter: ['style', 'class'], characterData: true });
+    var rb = byText('Render'); if (rb) rb.click();
+    return wait(5200);   // past the queued + running indeterminate polls
+  });
+  step('progress indeterminate asserts', function () {
+    var log = window.__BARLOG || [];
+    var ind = log.filter(function (e) { return e.phase === 'I'; });
+    T('render starts an INDETERMINATE wash while there is no timing history',
+      ind.length > 0 && ind[0].bar && ind[0].bar.w >= 99 && ind[0].bar.op < 0.9,
+      JSON.stringify(ind[0] || log[0] || null));
+    T('the progress line names the stage and the elapsed seconds (never a fake percent)',
+      ind.length > 0 && /Rendering/.test(ind[0].line) &&
+      (/queued, 2 ahead/.test(ind[0].line) || /generating/.test(ind[0].line)) &&
+      !/\d+%\s*(done|complete)/i.test(ind[0].line),
+      ind.length ? ind[0].line : 'no indeterminate observation');
+    return wait(1700);   // ETA polls land at ~4s and ~6s; assert inside that window
+  });
+  step('progress determinate asserts', function () {
+    var b = barState();
+    T('an ETA-calibrated render fills the bar DETERMINATE, capped short of 100%',
+      !!b && b.op >= 0.9 && b.w > 40 && b.w <= 95, JSON.stringify(b));
+    var det = (window.__BARLOG || []).filter(function (e) { return e.phase === 'D'; });
+    T('the ETA line says left (est.) with its sample count',
+      det.length > 0 && /s left \(est\., 3 prior renders\)/.test(det[0].line),
+      det.length ? det[0].line : 'no determinate observation');
+    return wait(2500);   // the done poll fires at ~8s (2s cadence, 5 answers)
+  });
+  step('render done asserts', function () {
+    var b = barState();
+    var st = document.querySelector('.tb-status');
+    var outimgs = document.querySelectorAll('.tb-out img');
+    var done = st && /Rendered 1 image/.test(st.textContent) && /crop-rendered 512/.test(st.textContent);
+    T('the finished render clears the bar (a 95% bar next to a done image is a lie) and shows the artifact',
+      b === null && !!done && outimgs.length > 0,
+      'bar=' + JSON.stringify(b) + ' status=' + (st ? st.textContent.slice(0, 90) : 'none') +
+      ' imgs=' + outimgs.length);
+    var polls = out.fetches.filter(function (f) { return f.poll; });
+    T('polls carry the JOB-scope token create minted (launch token stays redeemed)',
+      polls.length > 2 && polls.every(function (f) { return f.auth === 'Bearer JOBSCOPE-TOKEN'; }),
+      polls.length + ' polls, auths ' + JSON.stringify(polls.slice(0, 3).map(function (f) { return f.auth; })));
+    if (window.__BAROBS) window.__BAROBS.disconnect();
+    return true;
+  });
+
   step('final fit', function () {
     var f = byText('Fit'); if (f) f.click();
     return wait(120);

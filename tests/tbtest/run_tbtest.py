@@ -2,7 +2,8 @@
 
     python3 tests/tbtest/run_tbtest.py [--mutate NAME] [--width 420] [--height 620]
     (--mutate: sticky ctlorder softpunch brushfeather kindstr autoslider widetol
-     rawwash allmerge nosig selguard twoslider noderive blendblank seldbg legacy)
+     rawwash allmerge nosig selguard twoslider noderive blendblank seldbg
+     barwash bar95 polltoken legacy)
 
 --mutate rebuilds the page with a deliberately broken copy of the shipped JS, so the suite
 proves it can actually see the two bugs it claims to have fixed. A green test that cannot
@@ -281,6 +282,37 @@ MUTANTS["blendblank"] = LEGACY_BLENDBLANK
 
 
 
+# ---- progress-bar mutants: the ladder's three promises, each un-done faithfully ----
+
+# The determinate branch disabled: the bar stays a permanent wash even when a
+# calibrated ETA exists (the "we never believe the bar" regression class).
+def LEGACY_BARWASH(s):
+    a = "    if (p && p.eta_s) {\n      fill.style.opacity = '1';"
+    assert a in s, 'renderBar eta anchor moved'
+    return s.replace(a, "    if (false) {\n      fill.style.opacity = '1';", 1)
+
+
+# The terminal clearBar removed: a bar parked at 95% next to a finished image —
+# reproduced exactly as the honesty comment in pollJob() describes the defect.
+def LEGACY_BAR95(s):
+    a = "        clearBar();   // a bar parked at 95%"
+    assert a in s, 'pollJob clearBar anchor moved'
+    return s.replace(a, "        /* mutant: leave it parked */   // a bar parked at 95%", 1)
+
+
+# Poll on the LAUNCH token instead of the job token create minted (the historic
+# 403-on-poll class: the real server answers this with a token error).
+def LEGACY_POLLTOKEN(s):
+    a = "    req('/toolbox/jobs/poll', { job_id: id }, tok)"
+    assert a in s, 'pollJob req anchor moved'
+    return s.replace(a, "    req('/toolbox/jobs/poll', { job_id: id })", 1)
+
+
+MUTANTS["barwash"] = LEGACY_BARWASH
+MUTANTS["bar95"] = LEGACY_BAR95
+MUTANTS["polltoken"] = LEGACY_POLLTOKEN
+
+
 def main():
     a = sys.argv[1:]
     mutate = doc_mutate = None
@@ -331,7 +363,7 @@ def main():
         print('COMPOSE TRACE:')
         for i, d in enumerate(res['dbg'][:10]):
             print('  ', i, d)
-    EXPECT = 93
+    EXPECT = 99
     if len(res["tests"]) != EXPECT:
         print("TRUNCATED RUN: got %d assertions, expected %d -- an early error stopped the "
               "steps (notes: %s). This is NOT a pass." %

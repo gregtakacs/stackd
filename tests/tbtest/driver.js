@@ -75,6 +75,28 @@
         return Promise.resolve({ ok: true, mask_png: cb, coverage: 0.5, empty: false });
       }});
     }
+    if (/toolbox\/jobs\/poll$/.test(String(url))) {
+      // The JOB token is minted by create and must ride every poll; recording the header
+      // is what lets the suite assert it (a poll on the spent launch token is a 403 the
+      // real server answers, and that class of token bug has bitten this seam before).
+      out.fetches.push({ url: String(url), poll: true,
+                         auth: ((opts || {}).headers || {}).authorization || '' });
+      var q = window.__POLLS || [];
+      var answer = q.length ? q.shift()
+             : { ok: true, state: 'progress', progress: { elapsed_s: 0 } };
+      return Promise.resolve({ ok: true, status: 200, json: function () {
+        return Promise.resolve(answer);
+      }});
+    }
+    if (/toolbox\/jobs$/.test(String(url))) {
+      out.fetches.push({ url: String(url), job_create: true,
+                         has_layers: !!body.layers, has_spec: !!body.spec,
+                         auth: ((opts || {}).headers || {}).authorization || '' });
+      return Promise.resolve({ ok: true, status: 200, json: function () {
+        return Promise.resolve({ ok: true, job_id: 'JOBPROGRESS1234', seed: 77,
+                                 token: 'JOBSCOPE-TOKEN' });
+      }});
+    }
     return Promise.resolve({ ok: true, status: 200, json: function () { return Promise.resolve({ ok: true }); } });
   };
   var b64s = [];   // side map: base64 stays OUT of the dumped JSON (a multi-KB
