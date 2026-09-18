@@ -1609,19 +1609,29 @@ def _extract_leaked_toolcall(content: str, tools: list) -> dict | None:
     return {"name": candidates[0], "arguments": params}
 
 
-def _toolcall_args_self_wrapped(name: str | None, parsed) -> bool:
+def _toolcall_args_self_wrapped(name: str | None, parsed, tool_schema: dict | None = None) -> bool:
     """True if a successfully-PARSED ``arguments`` value is still the wrong shape —
     the model re-wrapped a whole call envelope inside its own arguments instead of
     emitting the flat parameter object the tool's schema declares. Distinct from (and
     not caught by) the plain JSON-parseability check below: this is valid JSON, just
-    self-referential. Observed live on real Cline history replays against both
-    tool-call formats (see AI-STACK/scripts/tool-call-probes/replay_real_session.py):
+    wrong. Observed live on real Cline history replays against both tool-call formats
+    (see AI-STACK/scripts/tool-call-probes/replay_real_session.py):
     qwen3_coder/xml producing ``{"arguments": "{\\"commands\\": [...]}"}`` and (while
     A/B-testing hermes/json, since reverted — see qwen3.8-flash-next.yaml) a nested
     ``{"name": "run_commands", "arguments": {"name": "run_commands", "arguments":
     {...}}}``. Exact-set matches only (not a subset check) to avoid flagging a real
     tool whose schema happens to declare an "arguments" or "name" parameter alongside
-    others."""
+    others.
+
+    `tool_schema` (the matching declared tool's own ``parameters`` object, i.e.
+    ``{"properties": {...}, "required": [...]}``, from the request's own `tools` —
+    None if unavailable or the name has no declared match) catches two further real,
+    observed shapes that are valid JSON but not a self-wrap: a mangled parameter name
+    outside the declared schema entirely (live example: ``{"command__01": "..."}``
+    instead of ``{"commands": [...]}``), and a call missing a declared REQUIRED
+    parameter altogether (live example: ``{}`` for a tool whose schema requires
+    "commands"). Conservative here too: skipped when the schema declares no
+    properties/required at all, so a genuinely argument-less tool is never flagged."""
     if not isinstance(parsed, dict):
         return False
     keys = set(parsed.keys())
@@ -1631,18 +1641,32 @@ def _toolcall_args_self_wrapped(name: str | None, parsed) -> bool:
         return True
     if name and name in parsed:
         return True
+    if tool_schema:
+        props = set((tool_schema.get("properties") or {}).keys())
+        if props and not keys <= props:
+            return True                             # a key the schema never declared
+        required = set(tool_schema.get("required") or [])
+        if required and not required <= keys:
+            return True                             # missing a declared required param
     return False
 
 
-def _completion_toolcall_state(buf: bytes):
+def _completion_toolcall_state(buf: bytes, tools: list | None = None):
     """Scan a chat/completions response (JSON body OR an SSE capture) and rebuild the
     assistant tool calls. Returns ``(has_tool_calls, finish_reasons, bad_args)`` where
     ``bad_args`` is True if any tool call's accumulated ``arguments`` is non-empty but
     either not valid JSON (i.e. truncated) or valid JSON in the wrong SHAPE — a
-    self-wrapped envelope, see _toolcall_args_self_wrapped. Deliberately conservative:
-    never raises, and an empty ``arguments`` (a genuinely argument-less call) is NOT
-    flagged — only unparseable/wrongly-shaped content or a finish_reason of "length"
-    alongside a tool call marks it broken."""
+    self-wrapped envelope or a schema mismatch, see _toolcall_args_self_wrapped
+    (`tools`, the request's own declared list, is what makes the schema-mismatch half
+    of that check possible — omit it and only the self-wrap shapes get caught).
+    Deliberately conservative: never raises, and an empty ``arguments`` (a genuinely
+    argument-less call) is NOT flagged — only unparseable/wrongly-shaped content or a
+    finish_reason of "length" alongside a tool call marks it broken."""
+    schemas = {
+        fn["name"]: (fn.get("parameters") or {})
+        for fn in (((t or {}).get("function") or {}) for t in (tools or []))
+        if fn.get("name")
+    }
     finish: set[str] = set()
     acc: dict[int, list] = {}     # index -> [name, arguments-so-far]
 
@@ -1694,7 +1718,7 @@ def _completion_toolcall_state(buf: bytes):
         except (json.JSONDecodeError, ValueError):
             bad = True
             continue
-        if _toolcall_args_self_wrapped(name, parsed):
+        if _toolcall_args_self_wrapped(name, parsed, schemas.get(name)):
             bad = True
     return bool(acc), finish, bad
 
@@ -1792,7 +1816,7 @@ class _ToolCallGate:
             return ()                                  # still accumulating the call
         self.resolved = True
         held, self.pending = self.pending, []
-        has, finish, bad = _completion_toolcall_state(b"".join(held))
+        has, finish, bad = _completion_toolcall_state(b"".join(held), self.tools)
         if has and (("length" in finish) or bad):
             events.record("toolcall-swallowed", stack=self.model_name,
                           detail=f"finish_reason={finish_reason}")
@@ -1824,7 +1848,7 @@ def _sanitize_toolcall_body(data: bytes, model_name: str, tools: list | None = N
     case, unchanged. If there's no tool call at all, try to recover one leaked into
     plain `message.content` under a hallucinated name (see _extract_leaked_toolcall)
     before giving up. None if nothing needs to change."""
-    has, finish, bad = _completion_toolcall_state(data)
+    has, finish, bad = _completion_toolcall_state(data, tools)
     if not has:
         try:
             doc = json.loads(data)
