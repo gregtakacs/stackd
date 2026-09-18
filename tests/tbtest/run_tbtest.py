@@ -3,7 +3,7 @@
     python3 tests/tbtest/run_tbtest.py [--mutate NAME] [--width 420] [--height 620]
     (--mutate: sticky ctlorder softpunch brushfeather kindstr autoslider widetol
      rawwash allmerge nosig selguard twoslider noderive blendblank seldbg
-     barwash bar95 polltoken movelost shrinkrad padsniped legacy)
+     barwash bar95 polltoken movelost shrinkrad padsniped erasenoshop erasesoft legacy)
 
 --mutate rebuilds the page with a deliberately broken copy of the shipped JS, so the suite
 proves it can actually see the two bugs it claims to have fixed. A green test that cannot
@@ -412,6 +412,30 @@ def LEGACY_PADSNIP(s):
 MUTANTS["padsniped"] = LEGACY_PADSNIP
 
 
+# THE ERASER ONLY LIVED IN THE COMPOSITED MASK, restored: isUserErase->false removes both
+# halves of the same fix at once (the wash punch and the erase-layer ship), exactly like
+# the shipped defect — an erase that splits a blob leaves fragments whose grow+feather
+# reach back into the channel; the halves re-widen and their skirts overlap.
+def LEGACY_ERASENOSHOP(s):
+    an = "  function isUserErase(s) {\n    return !!s && s.erase"
+    assert an in s, 'isUserErase anchor moved'
+    return s.replace(an,
+        "  function isUserErase(s) {\n    if (1) return false;   // MUTANT: eraser invisible to wash+wire\n    return !!s && s.erase", 1)
+
+
+# THE HARD CUT SOFTENED, restored: the eraser honors the hardness slider, leaving
+# partial-alpha residue the region model binarises unpredictably (membership at
+# REGION_ALPHA_MIN) and a fuzzy channel the graph's round() seals shut.
+def LEGACY_ERASESOFT(s):
+    an = "hardness: (t === 'eraser' ? 1 : hard),"
+    assert an in s, 'eraser hardness pin moved'
+    return s.replace(an, "hardness: hard,", 1)
+
+
+MUTANTS["erasenoshop"] = LEGACY_ERASENOSHOP
+MUTANTS["erasesoft"] = LEGACY_ERASESOFT
+
+
 def main():
     a = sys.argv[1:]
     mutate = doc_mutate = None
@@ -462,7 +486,7 @@ def main():
         print('COMPOSE TRACE:')
         for i, d in enumerate(res['dbg'][:10]):
             print('  ', i, d)
-    EXPECT = 118   # 115 + FR trio (precondition, skirt-continuity x2)
+    EXPECT = 124   # +6: eraser-split group (regions, halves-keep-feather, far-photo fixture, channel-stays-cut, wire erase layer, solid punch)
     if len(res["tests"]) != EXPECT:
         print("TRUNCATED RUN: got %d assertions, expected %d -- an early error stopped the "
               "steps (notes: %s). This is NOT a pass." %

@@ -586,6 +586,15 @@
     return _sc;
   }
 
+  // A committed USER erase: the eraser tool's strokes and a smart negative-seed carve.
+  // Synthetic erases (deleteSel's stamped-out object copy: mode 'load' + pRestore) are
+  // NOT this — shipping those would punch a hole through whatever neighbour happens to
+  // sit where the deleted object stood. Everything else that removes pixels is already
+  // gone from the region pixels themselves.
+  function isUserErase(s) {
+    return !!s && s.erase && s.mode !== 'load' && s.mode !== 'move' && !s.pRestore;
+  }
+
   function paintStroke(m, s) {
     // s.size is stored in NATURAL px (see down: size = brushR()*2). Do NOT multiply by
     // scale() here — that was the drift bug: a stroke painted at one display width would
@@ -594,9 +603,15 @@
     var r = s.size / 2, hard = s.hardness;
     m.save();
     m.globalCompositeOperation = s.erase ? 'destination-out' : 'source-over';
-    m.fillStyle = 'rgba(255,255,255,1)';
-    m.strokeStyle = 'rgba(255,255,255,1)';
+    // The white fill/stroke styles belong to the DIRECT-geometry branches only, NOT to
+    // the shared scratch buffer: the freehand branch c.save()s after these assignments,
+    // so a caller that had left a fillStyle on m (the eraser-ship canvas: erase:false
+    // + source-over + white) saw the scratch's composite flattened through it — measured
+    // as a 13/255 ghost sweep with the solid shape eaten by an accidental rect fill.
+    // Scoping the styles per-branch keeps the scratch composite's alpha honest.
     var i, a, b;
+    function directWhite() { m.fillStyle = 'rgba(255,255,255,1)';
+                             m.strokeStyle = 'rgba(255,255,255,1)'; }
     if (s.mode === 'load' && s.img) {
       // An auto-mask arrives as a ready PNG (white RGB + alpha coverage, the same
       // canonical shape masks.normalize() emits) and is committed as ONE stack entry, so
@@ -629,14 +644,17 @@
       // 'poly' = click-built polygon; 'draw' = freehand lasso trace. Both close+fill the
       // vertex list. (While a 'draw' lasso is still being traced, drawActiveOutline also
       // shows the live yellow outline, so the region fills in as you go.)
+      directWhite();
       m.beginPath(); m.moveTo(s.pts[0].x, s.pts[0].y);
       for (i = 1; i < s.pts.length; i++) m.lineTo(s.pts[i].x, s.pts[i].y);
       m.closePath(); m.fill();
     } else if (s.mode === 'rect' && s.pts.length > 1) {
       a = s.pts[0]; b = s.pts[s.pts.length - 1];
+      directWhite();
       m.fillRect(Math.min(a.x, b.x), Math.min(a.y, b.y), Math.abs(b.x - a.x), Math.abs(b.y - a.y));
     } else if (s.mode === 'ellipse' && s.pts.length > 1) {
       a = s.pts[0]; b = s.pts[s.pts.length - 1];
+      directWhite();
       m.beginPath();
       m.ellipse((a.x + b.x) / 2, (a.y + b.y) / 2, Math.abs(b.x - a.x) / 2, Math.abs(b.y - a.y) / 2, 0, 0, 6.2832);
       m.fill();
@@ -1153,6 +1171,19 @@
       var disp = regionDispCanvas(r), dg = r._dg;
       wc.drawImage(disp, dg.px0 + (r.mvx || 0), dg.py0 + (r.mvy || 0));
     }
+    // The eraser cuts the FINISHED objects, not the raw pixels they grew from.
+    // Without this punch, an erase that splits a blob leaves two fragments whose
+    // per-object edge-grow + outward feather reach straight back into the channel —
+    // the two halves re-widen past the original silhouette and their skirts overlap
+    // (the reported 'cut in two but both halves are bigger and overlap'). The channel
+    // the user dragged open must be the channel that survives, at exactly eraser
+    // width, so the committed user erases replay against the wash AFTER every region
+    // copy — and BEFORE the live stroke, which is painted on top (pixels added after
+    // an erase are above it, so an in-progress reconnection over a channel stays lit,
+    // matching what commit will do).
+    for (var ei = 0; ei < strokes.length; ei++) {
+      if (strokes[ei] !== active && isUserErase(strokes[ei])) paintStroke(wc, strokes[ei]);
+    }
     if (active) paintStroke(wc, active);   // the in-progress shape, at full liveness
     wc.globalCompositeOperation = 'source-in';
     wc.fillStyle = 'rgba(232,62,62,' + val('tb_wash', 0.45) + ')';
@@ -1366,6 +1397,32 @@
                  feather: curParams.feather, erase: !!curParams.erase };
       out.push(r._cp);
     }
+    // User erases ship as their OWN layers, appended LAST: masks.normalize_layers
+    // composites in list order and an erase layer punches the union beneath it
+    // (Image.composite lifts by the layer's own coverage), so punching after every
+    // object re-seals the channel the per-fragment grow/feather would otherwise open
+    // again — the render agrees with the display above instead of healing the cut.
+    // kind 'brush' on purpose: KIND_RULES leaves it raw — no threshold, no morphology,
+    // no feather — so the punch is exactly the sweep as dragged (server-side it is a
+    // partial-alpha cut wherever the hardness ramp was soft; display and wire match
+    // because both replay the SAME paintStroke geometry).
+    for (var si = 0; si < strokes.length; si++) {
+      var es = strokes[si];
+      if (es === active || !isUserErase(es)) continue;
+      if (es._ep) { out.push(es._ep); continue; }   // committed geometry is frozen; encode once
+      var ec = document.createElement('canvas'); ec.width = W; ec.height = H;
+      // Same mode/pts/size, erase=false: paint the sweep WHITE on a blank canvas — the
+      // coverage itself is what the server's composite lifts, not a pre-punched image.
+      paintStroke(ec.getContext('2d'),
+                  { mode: es.mode, pts: es.pts, size: es.size, hardness: es.hardness,
+                    erase: false });
+      var epng = ec.toDataURL('image/png').split(',')[1];
+      if (!epng) continue;
+
+      es._ep = { png: epng, kind: 'brush', edge: 0, grow: 0, shrink: 0, feather: 0,
+                 erase: true };
+      out.push(es._ep);
+    }
     return out.length ? out : null;
   }
 
@@ -1503,6 +1560,10 @@
     // crosshair and the size ring fight each other and the size is still ambiguous.
     if (viewC) viewC.style.cursor = (t === 'brush' || t === 'eraser') ? 'none'
       : (t === 'select' ? 'default' : 'crosshair');
+    // The eraser takes SIZE alone: its sweep is hard-pinned (paintStroke can only ramp
+    // what it lifts via the scratch composite), so a knob the tool ignores would be a
+    // second lie next to the first. Brush keeps hardness — there the ramp IS content.
+    if (el.hardness) el.hardness.parentNode.style.display = (t === 'eraser') ? 'none' : '';
     status(msg || ('Tool: ' + t));
   }
 
@@ -2151,7 +2212,14 @@
         return;
       }
       if (t === 'brush' || t === 'eraser') {
-        active = { mode: 'free', size: brushR() * 2, hardness: hard, pts: [p], erase: t === 'eraser' };
+        // The cut made by the eraser is NOT a design surface: per-object edge/feather
+        // do softness after the fact, and a soft eraser leaves partial-alpha residue
+        // whose membership then hinges on crossing REGION_ALPHA_MIN — a stair-stepped,
+        // zoom-dependent cut. A hard sweep punches exactly what it covers. (Hardness
+        // stays live for the BRUSH: its ramp IS the edge of a brush object until a knob
+        // number retires it — setObjParam.)
+        active = { mode: 'free', size: brushR() * 2, hardness: (t === 'eraser' ? 1 : hard),
+                   pts: [p], erase: t === 'eraser' };
       } else if (t === 'lasso') {               // freehand: one point now, more on move
         active = { mode: 'draw', size: 0, hardness: 1, erase: false, pts: [p] };
       } else {                                  // rect / ellipse: [start, current]
@@ -2406,6 +2474,15 @@
              all: regions.map(function (q) {
                return { kind: q.kind, edge: q.edge, feather: q.feather, area: q.area,
                         bbox: { x0: q.bbox.x0, y0: q.bbox.y0, x1: q.bbox.x1, y1: q.bbox.y1 } };
+             }),
+             // Read-only view of the erases that will ship as punch layers — the suite
+             // (and anyone debugging a 'the channel healed itself' report) can see the
+             // sweep geometry the exporter actually replays.
+             erases: strokes.filter(isUserErase).map(function (q) {
+               var n = q.pts.length;
+               return { mode: q.mode, n: n, size: q.size, hardness: q.hardness,
+                        p0: n ? { x: q.pts[0].x, y: q.pts[0].y } : null,
+                        pN: n ? { x: q.pts[n - 1].x, y: q.pts[n - 1].y } : null };
              }) };
   };
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);

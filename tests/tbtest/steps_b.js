@@ -653,6 +653,34 @@
    * so the merge takes the NEIGHBOUR's parameters wholesale — feather 30 -> 0).
    * The move/delete stroke now stamps its own identity into the next rebuild.
    * ===================================================================================== */
+  function decodeRows(l, x, y0, y1) {   // alpha column dump of a shipped layer PNG
+    return new Promise(function (res) {
+      if (!l || !l.png) return res(null);
+      var im = new Image();
+      im.onload = function () {
+        var c = document.createElement('canvas'); c.width = im.width; c.height = im.height;
+        var g = c.getContext('2d'); g.drawImage(im, 0, 0);
+        var d = g.getImageData(0, 0, im.width, im.height).data, o = [], y;
+        for (y = y0; y <= y1; y++) o.push(d[(y * im.width + x) * 4 + 3]);
+        res(o);
+      };
+      im.onerror = function () { res(null); };
+      im.src = 'data:image/png;base64,' + l.png;
+    });
+  }
+  function decodeAlpha(l, x, y) {   // alpha of ONE pixel of a shipped layer PNG
+    return new Promise(function (res) {
+      if (!l || !l.png) return res(-1);
+      var im = new Image();
+      im.onload = function () {
+        var c = document.createElement('canvas'); c.width = im.width; c.height = im.height;
+        var g = c.getContext('2d'); g.drawImage(im, 0, 0);
+        res(g.getImageData(x, y, 1, 1).data[3]);
+      };
+      im.onerror = function () { res(-2); };
+      im.src = 'data:image/png;base64,' + l.png;
+    });
+  }
   function bandAvg(x0, x1, y0, y1) {   // mean |channel delta| vs the photo over a column band
     if (!refData || !view.width) return -1;
     var d = px(view), W0 = view.width, t = 0, n = 0;
@@ -861,6 +889,111 @@
       T('the corner keeps its skirt too: the clip cut the diagonals into a square',
         noClipCorner > 15, 'cornerBeyondOldClip=' + noClipCorner);
       return true;
+    });
+  });
+
+  /* =====================================================================================
+   * THE ERASER CUTS THE FINISHED OBJECTS, NOT THE PIXELS THEY GREW FROM.
+   * The eraser only lived in the composited mask, so an erase that split a blob left two
+   * fragments whose per-object edge-grow + outward feather reached straight back into
+   * the channel: both halves re-widened past the original silhouette and their skirts
+   * overlapped (the user's report). Committed user erases now replay against the wash
+   * AFTER the region copies, and ship as erase layers LAST so normalize_layers' union
+   * punch re-seals the channel the fragments' geometry would reopen.
+   * ===================================================================================== */
+  step('ER clear + knobs', function () {
+    clearForDraw();
+    knobSet('tb_edge', 0); knobSet('tb_feather', 30);
+    knobSet('tb_wash', 1); knobSet('tb_hardness', 0);
+    return wait(150);
+  });
+  step('ER paint wide rect', function () {
+    var b = toolButton('rect'); if (b) b.click();
+    fire('pointerdown', 750, 20, 140, { isPrimary: true });
+    var pxs = [[40,147],[60,153],[80,160],[100,167],[120,173],[140,180]];
+    for (var i = 0; i < pxs.length; i++) fire('pointermove', 750, pxs[i][0], pxs[i][1], {});
+    fire('pointerup', 750, 140, 180, {});
+    return wait(150);
+  });
+  step('ER erase the channel', function () {
+    var b = toolButton('eraser'); if (b) b.click();
+    knobSet('tb_brush', 24);  /*probe*/                      // brushR = slider*scale()/2; scale~0.27
+    // (the stage is left zoomed by the pinch groups) -> r~3.2 natural px.
+    // OVER-TRACE the full width: the sweep must run past BOTH edges of the rect
+    // (x 20..139) or thin end-columns bridge the halves and the blob never splits
+    // (measured: a 25..135 sweep left regions=1 through two 3px shoulders).
+    fire('pointerdown', 751, 14, 160, { isPrimary: true });
+    for (var i = 1; i <= 14; i++) fire('pointermove', 751, 14 + i * 10, 160, {});
+    fire('pointerup', 751, 146, 160, {});
+    out.note.push('ER_ERASES ' + JSON.stringify((region() || {}).erases));
+    window.__ERMARK = (window.__LREAL || []).length;   // the wire gate only trusts entries after this
+    return wait(130);                             // before the 420ms preview debounce
+  });
+  step('ER channel asserts', function () {
+    var r = region();
+    out.note.push('ER_STATE ' + JSON.stringify(r && r.all));
+    T('the eraser cut the blob into two objects',
+      !!r && r.regions === 2, 'regions=' + (r && r.regions));
+    var halves = r && r.all || [];
+    T('both halves keep the parent feather and kind (the knobs still own softness)',
+      halves.length === 2 && halves.every(function (q) {
+        return q.kind === 'shape' && q.feather >= 25; }), JSON.stringify(halves));
+    T('fixture: far canvas shows the bare photo (local wash, no stale server overlay)',
+      bandAvg(145, 155, 280, 300) < 8, 'far=' + bandAvg(145, 155, 280, 300));
+    // The heart of the report: rows 158..162 (the 6px sweep, center 160) across the
+    // rect's interior must be OPEN. Pre-fix, both fragments' grow+feather skirts drew
+    // them shut (bandAvg measured ~150 there with feather 30).
+    var chan = bandAvg(40, 120, 158, 162);
+    var midAbove = bandAvg(40, 120, 146, 152);   // the half above: still washed
+    out.note.push('ER_BANDS channel=' + chan.toFixed(1) + ' above=' + midAbove.toFixed(1));
+    T('the erased channel stays CUT: no wash inside the sweep (skirts cannot re-glue)',
+      chan < 25 && midAbove > 120, 'channel=' + chan + ' above=' + midAbove);
+    return true;
+  });
+  step('ER wire: erase layer present', function () {
+    function eraseLayers() {
+      // FRESHNESS-PINNED: only a POST appended after this group's erase commit counts
+      // (window.__ERMARK). An unmarked 'last entry' let a stale REGSPLIT-era export,
+      // belatedly fired by the virtual-time scheduler, pose as this group's wire — it
+      // shipped a vertical sweep and the gate could never tell. A wire gate that can
+      // green on an answer from another era is not a gate.
+      var q = window.__LREAL || [], mk = window.__ERMARK || 0, found = null;
+      for (var i = q.length - 1; i >= mk; i--) {
+        if (!/mask\/preview$/.test(q[i].url)) continue;
+        var wire = q[i].layers || [];
+        for (var j = 0; j < wire.length; j++) if (wire[j] && wire[j].erase) found = wire[j];
+        if (found) return found;
+      }
+      return null;
+    }
+    function poll(tries) {
+      var found = eraseLayers();
+      if (found) return Promise.resolve(found);
+      if (tries <= 0) return Promise.resolve(null);
+      return wait(120).then(function () { return poll(tries - 1); });
+    }
+    return poll(18).then(function (found) {
+      T('the wire ships the eraser as its own ERASE layer, full-canvas',
+        !!found && found.kind === 'brush' && found.grow === 0 && found.feather === 0 &&
+        !!found.png,
+        JSON.stringify(found && { kind: found.kind, erase: found.erase,
+                                  grow: found.grow, feather: found.feather }));
+      if (!found) return true;
+      // The sweep punched SOLID across the whole width even with the hardness slider
+      // at 0: the eraser's cut is hard, softness is the per-object knobs' job. The
+      // erasesoft mutant (honoring the slider) drops these pixels into the gradient
+      // ring (~85) — a fuzzy channel the graph's round() would seal shut.
+      return decodeAlpha(found, 90, 158).then(function (a) {
+        return decodeRows(found, 90, 155, 165).then(function (rows) {
+          out.note.push('ER_ERASE_ROWS ' + JSON.stringify(rows));
+          var solid = (rows[2] || 0) >= 200 && (rows[3] || 0) >= 200 &&
+                      (rows[4] || 0) >= 200 && (rows[5] || 0) >= 200 &&
+                      (rows[6] || 0) >= 200 && (rows[7] || 0) >= 200;
+          T('the erase layer punches solid across the sweep (hard cut, slider irrelevant)',
+            a >= 200 && solid, 'alphaAt(90,158)=' + a + ' rows=' + JSON.stringify(rows));
+          return true;
+        });
+      });
     });
   });
 

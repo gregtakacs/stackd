@@ -348,6 +348,36 @@ def test_layers():
           _selected(cerase) < _selected(cpaint),
           f"{_selected(cpaint)} -> {_selected(cerase)}")
 
+    # --- E2: the LAST-shipped erase layer re-seals a SPLIT's regrown skirts ----------
+    # The client ships a user's eraser as an erase layer AFTER the object layers, and
+    # this is the contract that makes it right: when an erase splits a feathered blob,
+    # the two fragments each grow+feather OUTWARD from their new cut edges. Pinned
+    # first WITHOUT the eraser layer: the server genuinely heals the channel shut
+    # (the reported 'two halves bigger than the original and overlapping' — that was
+    # not a client drawing bug, it is what per-fragment morphology must produce when
+    # the cut never ships). Then WITH the erase layer appended last, the union punch
+    # must win: the channel stays cut at exactly the sweep.
+    frag_t = rect_mask(SIZE, (110, 110, 210, 149))     # split at rows 150..160
+    frag_b = rect_mask(SIZE, (110, 161, 210, 200))
+    sweep = rect_mask(SIZE, (100, 147, 220, 163))      # a 6-px-wide eraser is thin; 16 is decisive
+    def _row_sel(canon, y=155):
+        ch = Image.open(io.BytesIO(canon)).convert("RGBA").split()[3]
+        return sum(1 for x in range(115, 206) if ch.getpixel((x, y)) > 128)
+    healed, _ = M.normalize_layers(
+        [{"png": frag_t, "kind": "shape", "grow": 4, "feather": 12},
+         {"png": frag_b, "kind": "shape", "grow": 4, "feather": 12}], *SIZE)
+    sealed, _ = M.normalize_layers(
+        [{"png": frag_t, "kind": "shape", "grow": 4, "feather": 12},
+         {"png": frag_b, "kind": "shape", "grow": 4, "feather": 12},
+         {"png": sweep, "kind": "brush", "erase": True}], *SIZE)
+    check("layers: WITHOUT the shipped erase the server heals the split (defect pinned)",
+          _row_sel(healed) > 80, f"mid-gap selected={_row_sel(healed)}")
+    check("layers: an erase layer shipped LAST keeps the split channel CUT (union punch wins)",
+          _row_sel(sealed) < 10, f"mid-gap selected={_row_sel(sealed)}")
+    check("layers: that punch spares the fragments themselves (both halves survive)",
+          _selected(sealed) > _selected(healed) * 0.5,
+          f"selected={_selected(sealed)} vs healed {_selected(healed)}")
+
     # --- F: invert acts on the union, never per layer -------------------------------
     # Overlapping inverted layers max-composited would resurrect the overlap, which is
     # not what "edit everything outside what I marked" means.
