@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import uuid
 
 from stackd.toolbox import graphs as _graphs
@@ -201,6 +202,7 @@ def comfy_render(job: dict, source: bytes, mask: bytes, *, on_prompt_id=None):
     the shared MCP/daemon loop."""
     from stackd.imagegen import comfyui_client, openwebui_client
     from stackd.toolbox import graphs as G
+    from stackd.toolbox import masks as _m
 
     email = (job or {}).get("email") or ""
     spec = (job or {}).get("spec") or {}
@@ -211,11 +213,35 @@ def comfy_render(job: dict, source: bytes, mask: bytes, *, on_prompt_id=None):
         # applies no grow/feather, because normalize_layers already applied each object's
         # geometry exactly once and applying it twice is the double-grow bug this package
         # has already fixed once. Source and mask must disagree by exactly nothing.
-        from stackd.toolbox import masks as _m
         mask = _m.resize_canonical(mask, w, h)
     seed = int(spec.get("seed") if spec.get("seed") is not None else -1)
     if seed < 0:
         seed = uuid.uuid4().int % (2 ** 32 - 1)
+
+    # ---- crop-and-paste: render the selection, not the whole frame ------------------
+    # At the render ceiling a 3%-coverage selection gets 3% of the latents, so the model
+    # paints it soft — and because the artifact becomes the source of the NEXT edit, the
+    # image ratchets down a little more every round. plan_crop confines the graph to the
+    # selection plus a context ring (spending the canvas's whole budget where it is looked
+    # at), and paste_back composites the result into the FULL-RESOLUTION photo, which is
+    # the only place that detail still exists. The photo is needed at use time but NOT at
+    # plan time: the box lives in canvas px and maps to source proportionally later, so a
+    # stale or missing photo cannot silently move a crop.
+    #
+    # Unconditional, with CROP_AFFORDABLE as the escape hatch, rather than a user toggle:
+    # whether cropping would help is a function of geometry the user cannot evaluate, and a
+    # sixth knob is one more thing that can quietly stop doing anything. What the user does
+    # get is provenance — crop_json states plainly that the artifact is a composite of the
+    # model output and their own photo, not a pure model output.
+    crop_plan = None
+    try:
+        crop_plan = _m.plan_crop(mask)
+    except Exception:  # noqa: BLE001 — no plan means the old full-frame path, not a failed job
+        crop_plan = None
+    if crop_plan and max(crop_plan["size"]) > _m.RENDER_MAX_SIDE:
+        # Cannot happen while the box is bounded by the working canvas, but the ceiling is
+        # an invariant worth defending at the boundary rather than by argument.
+        crop_plan = None
 
     base, note = comfyui_base()
     if not base:
@@ -240,13 +266,28 @@ def comfy_render(job: dict, source: bytes, mask: bytes, *, on_prompt_id=None):
         # Unique filename per upload: a fixed name with overwrite=true meant two renders
         # close together could clobber each other's source before LoadImage read it
         # (confirmed in comfyui_client's own comment). Same rule applies to source+mask.
-        src_b = _prepare_source(source, w, h)
+        if crop_plan:
+            src_b, (rw, rh) = _m.crop_for_render(source, crop_plan)
+            msk_b = _m.crop_mask(mask, crop_plan, size=(rw, rh))
+            # The photo is the paste base: it is the only thing that still holds the detail
+            # outside the crop, so the artifact comes back at the PHOTO's resolution.
+            base_bytes, paste_plan = source, crop_plan
+        else:
+            rw, rh = w, h
+            src_b = _prepare_source(source, w, h)
+            msk_b = mask
+            # Full-frame: base at the graph's own size, NOT the raw photo. Upscaling a
+            # whole-image 1024 render to 4000x3000 adds no information, multiplies the
+            # artifact's bytes ~10x, and slows the OWU save — for nothing. Here the paste
+            # pass exists to serve the compositing knobs, not to change resolution.
+            base_bytes = src_b
+            paste_plan = {"box": (0, 0, w, h), "frame": (w, h), "size": (rw, rh)}
         src_name = await comfyui_client.upload_to_comfy(src_b, "toolbox_src", base=base)
         # _graph_mask flips the alpha to the graph's mask convention (edit where mask is 0);
         # see that function for why the server mask and the graph mask are opposite.
-        msk_name = await comfyui_client.upload_to_comfy(_graph_mask(mask), "toolbox_mask", base=base)
+        msk_name = await comfyui_client.upload_to_comfy(_graph_mask(msk_b), "toolbox_mask", base=base)
         _patch_graph(graph, spec, source_filename=src_name, mask_filename=msk_name,
-                     w=w, h=h, seed=seed)
+                     w=rw, h=rh, seed=seed)
         prompt_id = await comfyui_client.submit_workflow(graph, base=base)
         if on_prompt_id is not None:
             on_prompt_id(prompt_id, base)        # so a cancel can interrupt the wait below
@@ -255,6 +296,36 @@ def comfy_render(job: dict, source: bytes, mask: bytes, *, on_prompt_id=None):
         if not images:
             return None, None
         png = images[0]
+        # The paste pass ALWAYS runs, on both paths, because the four compositing knobs are
+        # arguments to it. If they were applied only when cropping, they would be live in
+        # the panel yet silently inert on every large selection -- the exact "worse than an
+        # absent control" failure this package's dead-knob registry exists to prevent. At
+        # their defaults (opacity 1, normal, no match, no detail) the pass is a no-op on
+        # pixels, so the unconditional form costs nothing when the user touches nothing.
+        try:
+            png, paste_note = _m.paste_back(
+                base_bytes, png, paste_plan,
+                opacity=spec.get("opacity"), blend_mode=spec.get("blend_mode"),
+                color_match=spec.get("color_match"),
+                preserve_detail=spec.get("preserve_detail"),
+                # No border fade when the box IS the frame: a feathered edge would keep the
+                # original's outermost ring and read as a halo around a wholly regenerated
+                # image. There is no seam to hide at full frame.
+                feather=(_m.SEAM_FEATHER_PX if crop_plan else 0))
+        except Exception as e:  # noqa: BLE001 — hand back SOMETHING, never a blank
+            paste_note = (f"the render could not be composited ({e.__class__.__name__}); "
+                          "returning the model output alone")
+        job["_crop_json"] = json.dumps({
+            "cropped": bool(crop_plan),
+            "box": list(paste_plan["box"]), "frame": list(paste_plan["frame"]),
+            "size": list(paste_plan["size"]), "rendered_at": [rw, rh],
+            "artifact": list(_m.image_size(png)) if _m.HAS_PIL else [rw, rh],
+            "composited": "could not be" not in paste_note,
+            "knobs": {k: spec.get(k) for k in
+                      ("opacity", "blend_mode", "color_match", "preserve_detail")
+                      if spec.get(k) not in (None, "", 0)},
+            "note": paste_note,
+        })
         url = await openwebui_client.save_image(png, "toolbox-edit.png", key)
         return base64.b64encode(png).decode(), url
 

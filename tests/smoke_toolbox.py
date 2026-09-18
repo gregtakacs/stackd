@@ -1303,6 +1303,8 @@ def main() -> int:
     test_jobs()
     test_working_size()
     test_crop_pipeline()
+    test_crop_wiring()
+    test_render_seam()
     bad = [(n, d) for n, ok, d in CHECKS if not ok]
     for n, d in bad:
         print(f"  FAIL  {n}" + (f"\n          → {d}" if d else ""))
@@ -2122,6 +2124,371 @@ def test_crop_pipeline():
     check("luminosity and color are distinct operations, not one shared fallback",
           diff(lum, col) > 1.0 and lum_note == "" and col_note == "",
           "diff=%r %r %r" % (diff(lum, col), lum_note, col_note))
+def test_render_seam():
+    """comfy_render's geometry, driven end-to-end with FAKE GPU clients.
+
+    Why this exists separately: the masks-level suite proves paste_back is correct, and the
+    store-level checks prove provenance persists, but neither proves the RENDER SEAM chooses
+    the right geometry. Two mutants survived the first mutation run precisely because the
+    only assertions there were string greps over engine.py -- disabling the crop branch
+    outright kept every name present and the suite green. A check that cannot fail is worse
+    than none, so this drives the real function and measures the bytes it uploads and returns.
+
+    No GPU and no httpx are needed: engine imports comfyui_client/openwebui_client LAZILY
+    inside _run (the documented [imagegen] extra), so fakes injected into sys.modules reach
+    the seam while the rest of the package stays stdlib-only.
+    """
+    import copy
+    import types
+    from stackd.toolbox import engine as E
+    from stackd.toolbox import graphs as GG
+    if not M.HAS_PIL:
+        check("render seam: PIL present", False, "skipped")
+        return
+
+    G_ = M.LATENT_GRID
+    CANVAS = (G_ * 32, G_ * 24)                       # 512x384
+    PHOTO = (CANVAS[0] * 4, CANVAS[1] * 4)            # a phone-resolution original
+
+    def solid_png(size, rgb):
+        buf = io.BytesIO()
+        Image.new("RGB", size, rgb).save(buf, "PNG")
+        return buf.getvalue()
+
+    def mask_png(size, box):
+        im = Image.new("RGBA", size, (0, 0, 0, 0))
+        ImageDraw.Draw(im).rectangle(list(box), fill=(255, 255, 255, 255))
+        buf = io.BytesIO(); im.save(buf, "PNG")
+        return buf.getvalue()
+
+    def build_fakes(state):
+        cc = types.ModuleType("stackd.imagegen.comfyui_client")
+
+        async def upload_to_comfy(image_bytes, filename_prefix, base):
+            state.setdefault("uploads", []).append(image_bytes)
+            return "%s-%d.png" % (filename_prefix, len(state["uploads"]))
+
+        async def submit_workflow(workflow, base):
+            state["graph"] = copy.deepcopy(workflow)
+            state["base"] = base
+            return "pid-seam-1"
+
+        async def wait_and_fetch(prompt_id, include_node_ids, base):
+            # the model returns whatever the graph was TOLD to render, so a seam that
+            # uploads the wrong geometry produces a visibly wrong artifact size here
+            w, h = M.image_size(state["uploads"][0]) if state.get("uploads") else (64, 64)
+            state["model_size"] = (w, h)
+            img = solid_png((w, h), (250, 10, 10))
+            return {node: [img] for node in include_node_ids}
+
+        def downscale_to_exact_size(image_bytes, width, height):
+            im = Image.open(io.BytesIO(image_bytes)).convert("RGB").resize(
+                (width, height), Image.LANCZOS)
+            buf = io.BytesIO(); im.save(buf, "PNG")
+            return buf.getvalue()
+
+        async def get_json(url, timeout=30):
+            return {}
+
+        async def post_json(url, body, timeout=30):
+            return {}
+
+        cc.upload_to_comfy = upload_to_comfy
+        cc.submit_workflow = submit_workflow
+        cc.wait_and_fetch = wait_and_fetch
+        cc.downscale_to_exact_size = downscale_to_exact_size
+        cc.get_json = get_json
+        cc.post_json = post_json
+
+        ow = types.ModuleType("stackd.imagegen.openwebui_client")
+
+        async def save_image(image_bytes, filename, api_key):
+            state["saved"] = image_bytes
+            state["saved_name"] = filename
+            state["saved_key"] = api_key
+            return "http://owu/x/" + filename
+
+        ow.save_image = save_image
+        return cc, ow
+
+    class FakeRuntime:
+        def resolve_user_key(self, email):
+            return "key-for-" + (email or "")
+
+    def drive(mask_bytes, spec=None):
+        """Run the real comfy_render with fakes; returns (state, artifact_bytes, job)."""
+        state = {}
+        # The PACKAGE, never the submodules: naming them in a fromlist would import the real
+        # httpx-backed clients, which this suite must not need. Plain package import is
+        # already satisfied via workflows.
+        pkg = sys.modules.get("stackd.imagegen") or __import__("stackd.imagegen")
+        cc, ow = build_fakes(state)
+        saved = {k: sys.modules.get(k) for k in
+                 ("stackd.imagegen.comfyui_client", "stackd.imagegen.openwebui_client")}
+        saved_attr = (getattr(pkg, "comfyui_client", "$"), getattr(pkg, "openwebui_client", "$"))
+        sys.modules["stackd.imagegen.comfyui_client"] = cc
+        sys.modules["stackd.imagegen.openwebui_client"] = ow
+        pkg.comfyui_client, pkg.openwebui_client = cc, ow
+        real_runtime, real_base = E._runtime, E.comfyui_base
+        E._runtime = lambda: FakeRuntime()
+        E.comfyui_base = lambda: ("http://comfy:8188", "")
+        job = {"email": "a@b.c", "spec": spec or {}, "working_w": CANVAS[0],
+               "working_h": CANVAS[1]}
+        try:
+            b64, _type = E.comfy_render(job, solid_png(PHOTO, (10, 200, 10)), mask_bytes,
+                                       on_prompt_id=lambda pid, b: state.setdefault(
+                                           "prompt_id", pid))
+            art = base64.b64decode(b64) if b64 else None
+        finally:
+            E._runtime, E.comfyui_base = real_runtime, real_base
+            for k, v in saved.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+            pkg.comfyui_client, pkg.openwebui_client = saved_attr
+        return state, art, job
+
+
+    from stackd.imagegen import workflows as WF
+
+    # ---------------- the crop path -------------------------------------------------
+    small = mask_png(CANVAS, (120, 100, 210, 190))
+    plan = M.plan_crop(small)
+    check("render seam: a small selection produces a crop plan", plan is not None)
+    if plan:
+        state, art, job = drive(small)
+        up_w, up_h = M.image_size(state["uploads"][0])
+        check("render seam: what the graph is GIVEN is the crop, at the plan's size",
+              (up_w, up_h) == tuple(plan["size"]), "uploaded %dx%d plan %s" % (up_w, up_h, plan["size"]))
+        msk_w, msk_h = M.image_size(state["uploads"][1])
+        check("render seam: the mask is cropped to the SAME geometry as the source",
+              (msk_w, msk_h) == (up_w, up_h), "mask %dx%d vs source %dx%d" % (msk_w, msk_h, up_w, up_h))
+        # The PrimitiveInt front-ends store under "value" (set_node resolves the key from
+        # the class_type), so read it the way the graph actually holds it -- and assert the
+        # FRAME size is absent, which is what makes "patched at the crop, not the frame" a
+        # real claim rather than a tautology about whichever key happens to exist.
+        wnode = state["graph"][WF.MASK_WIDTH_NODE]["inputs"]
+        hnode = state["graph"][WF.MASK_HEIGHT_NODE]["inputs"]
+        gw, gh = wnode["value"], hnode["value"]
+        check("render seam: the graph's width/height nodes are the crop size, not the frame",
+              (gw, gh) == (up_w, up_h), "graph %sx%s uploaded %dx%d" % (gw, gh, up_w, up_h))
+        check("render seam: the frame size never leaks into the graph (no silent full-frame render)",
+              CANVAS[0] not in wnode.values() and CANVAS[1] not in hnode.values()
+              if plan["size"] != CANVAS else True,
+              "w=%s h=%s frame=%s" % (wnode, hnode, CANVAS))
+        check("render seam: nothing oversized reaches the process",
+              max(up_w, up_h) <= M.RENDER_MAX_SIDE, "%dx%d" % (up_w, up_h))
+        check("render seam: prompt id is recorded for cancel",
+              state.get("prompt_id") == "pid-seam-1", repr(state.get("prompt_id")))
+        check("render seam: the artifact saved to OWU is the one returned",
+              state.get("saved") == art)
+        # registration: the model's crop must land where the plan says, on the photo.
+        # Guarded on size deliberately: main() prints FAIL lines only after EVERY test has
+        # run, so probing pixels on a wrong-sized artifact would raise IndexError and hide
+        # every named failure that had already failed -- the suite aborts with a traceback
+        # and reports nothing about WHAT broke.
+        out_w, out_h = M.image_size(art)
+        right_size = (out_w, out_h) == PHOTO
+        check("render seam: the ARTIFACT comes back at the photo's resolution (anti-ratchet)",
+              right_size, "%dx%d from a %dx%d render" % (out_w, out_h, up_w, up_h))
+        if right_size:
+            px = Image.open(io.BytesIO(art)).convert("RGB").load()
+            bx0, by0, bx1, by1 = plan["box"]
+            fx, fy = PHOTO[0] / float(CANVAS[0]), PHOTO[1] / float(CANVAS[1])
+            cx, cy = int((bx0 + bx1) / 2 * fx), int((by0 + by1) / 2 * fy)
+            check("render seam: the model output lands inside the planned box",
+                  px[cx, cy] == (250, 10, 10), "centre %s = %s" % ((cx, cy), px[cx, cy]))
+            check("render seam: everything outside the box stays the user's photo",
+                  px[4, 4] == (10, 200, 10) and px[PHOTO[0] - 5, PHOTO[1] - 5] == (10, 200, 10),
+                  "corner=%s %s" % (px[4, 4], px[PHOTO[0] - 5, PHOTO[1] - 5]))
+        else:
+            check("render seam: the model output lands inside the planned box", False,
+                  "skipped: artifact is %dx%d, not %s -- cannot probe pixels"
+                  % (out_w, out_h, PHOTO))
+            check("render seam: everything outside the box stays the user's photo", False,
+                  "skipped: artifact is %dx%d, not %s" % (out_w, out_h, PHOTO))
+        prov = json.loads(job["_crop_json"])
+        check("render seam: provenance says this was a crop, and records the geometry",
+              prov["cropped"] is True and prov["composited"] is True
+              and prov["rendered_at"] == [up_w, up_h] and prov["artifact"] == list(PHOTO),
+              repr(prov)[:150])
+
+    # ---------------- the full-frame path -------------------------------------------
+    full = mask_png(CANVAS, (2, 2, CANVAS[0] - 2, CANVAS[1] - 2))
+    check("render seam: a whole-frame selection plans no crop", M.plan_crop(full) is None)
+    st2, art2, job2 = drive(full)
+    up2 = M.image_size(st2["uploads"][0])
+    check("render seam: the full-frame path uploads the working size",
+          up2 == CANVAS, "%s vs %s" % (up2, CANVAS))
+    out2 = M.image_size(art2)
+    check("render seam: a full-frame artifact stays at the working size (no needless upscale)",
+          out2 == CANVAS, "%s" % (out2,))
+    # The halo mutant: any border fade at full frame keeps a ring of the ORIGINAL (green)
+    # around a wholly regenerated image (red). Asserting EVERY pixel is the model's output
+    # is what makes that mutant die -- _seam_alpha's own unit test cannot see it, because
+    # the bug is which feather value the seam passes, not what the helper does with it.
+    px2 = Image.open(io.BytesIO(art2)).convert("RGB")
+    flat = px2.resize((1, 1)).getpixel((0, 0))
+    corners = [px2.getpixel(p) for p in [(0, 0), (out2[0] - 1, 0), (0, out2[1] - 1),
+                                         (out2[0] - 1, out2[1] - 1)]]
+    check("render seam: a full-frame render has NO ring of the original surviving at its edge",
+          all(c == (250, 10, 10) for c in corners) and flat == (250, 10, 10),
+          "corners=%s mean=%s" % (corners, flat))
+    prov2 = json.loads(job2["_crop_json"])
+    check("render seam: a full-frame render records cropped=false",
+          prov2["cropped"] is False, repr(prov2)[:120])
+
+
+
+
+
+def test_crop_wiring():
+    """The crop/paste pipeline is WIRED, not merely implemented: provenance must survive
+    engine -> queue -> row -> poll payload, and the compositing knobs must reach the paste
+    pass on BOTH render paths.
+
+    Counterpart to test_crop_pipeline, which tests masks.py in isolation. What this pins is
+    the SEAMS: a correct paste_back whose provenance the job never persists is the same class
+    of bug as the dead knobs this package has already been bitten by twice.
+    """
+    import tempfile
+    import time as _t
+    from stackd.toolbox import jobs as J
+    if not M.HAS_PIL:
+        check("crop wiring: PIL present", False, "skipped")
+        return
+    PROV = json.dumps({"cropped": True, "box": [0, 0, 256, 256], "size": [256, 256],
+                       "composited": True, "note": ""})
+
+    def settle(store, jid, timeout=3.0):
+        end = _t.time() + timeout
+        while _t.time() < end:
+            row = store.get(jid)
+            if row["state"] in ("done", "error", "cancelled"):
+                return row
+            _t.sleep(0.02)
+        return store.get(jid)
+
+    def render_crop(job, source, mask, *, on_prompt_id=None):
+        # mirrors engine.comfy_render: the seam sets job["_crop_json"] and the queue has to
+        # carry it to the row rather than drop it next to the artifact.
+        job["_crop_json"] = PROV
+        on_prompt_id("p-crop", "http://comfy:8188")
+        return (base64.b64encode(b"PNGDATA").decode(), "image/png")
+
+    store = J.JobStore(":memory:")
+    q = J.JobQueue(store, render=render_crop)
+    q.start()
+    jid = store.create(email="a@b.c", kind="retouch", w=512, h=384,
+                       spec={"seed": 3}, mask_info={"coverage_paint": 0.1})
+    q.enqueue(jid, source=b"SRC", mask=b"MSK")
+    row = settle(store, jid)
+    q.stop()
+    check("crop wiring: a crop render reaches done", row["state"] == "done", row["state"])
+    check("crop wiring: crop_json persists on the row",
+          row.get("crop_json") == PROV, repr(row.get("crop_json"))[:90])
+    check("crop wiring: the persisted provenance parses and says cropped",
+          json.loads(row["crop_json"])["cropped"] is True)
+
+    store2 = J.JobStore(":memory:")
+    q2 = J.JobQueue(store2, render=lambda job, s, m, **kw: (
+        kw["on_prompt_id"]("p2", "http://x") or (base64.b64encode(b"X").decode(), "image/png")))
+    q2.start()
+    j2 = store2.create(email="a@b.c", kind="retouch", w=512, h=384, spec={}, mask_info={})
+    q2.enqueue(j2, source=b"S", mask=b"M")
+    row2 = settle(store2, j2)
+    q2.stop()
+    check("crop wiring: a render that never cropped stores NULL provenance",
+          row2.get("crop_json") is None, repr(row2.get("crop_json"))[:60])
+
+    # The column must be ADDED to a database an older deploy already wrote: CREATE TABLE
+    # IF NOT EXISTS does not alter an existing table, so without the migration every
+    # already-deployed jobs.db raises on its first crop render.
+    with tempfile.TemporaryDirectory() as td:
+        path = str(pathlib.Path(td) / "jobs.db")
+        s1 = J.JobStore(path)
+        s1.create(email="e@f.g", kind="k", w=8, h=8, spec={}, mask_info={})
+        s1.conn.close()
+        s2 = J.JobStore(path)
+        cols = {r[1] for r in s2.conn.execute("PRAGMA table_info(jobs)")}
+        check("crop wiring: reopening an existing DB gains crop_json (ALTER, not just CREATE)",
+              "crop_json" in cols, sorted(cols))
+        s2.conn.close()
+
+    # ---- feather: the full-frame paste must not leave a halo ---------------------
+    # ---- the poll payload exposes provenance, and omits it when there is none ----
+    tb = make_tb(worker=J.JobQueue(J.JobStore(":memory:"),
+                                  render=lambda job, s, m, **kw: (None, None)))
+    r = post(tb, "/toolbox/jobs", {"mask_png": MASK_B64, "spec": {"seed": 1}},
+             token=fresh_token())
+    job_id, job_tok = r.payload.get("job_id"), r.payload.get("token")
+    worker = getattr(tb, "_worker", None)
+    check("poll provenance: a worker is mounted for this fixture", worker is not None,
+          "job create returned %r" % (r.payload or {}) if not worker else "")
+    if worker is not None and job_id and job_tok:
+        worker.store.set(job_id, state="done",
+                         artifact_b64=base64.b64encode(b"Z").decode(),
+                         artifact_type="image/png", crop_json=PROV)
+        pr = post(tb, "/toolbox/jobs/poll", {"job_id": job_id}, token=job_tok)
+        crop = pr.payload.get("crop")
+        check("poll returns the crop provenance as an object, not a raw string",
+              isinstance(crop, dict) and crop.get("cropped") is True, repr(crop)[:90])
+        worker.store.set(job_id, crop_json=None)
+        pr2 = post(tb, "/toolbox/jobs/poll", {"job_id": job_id}, token=job_tok)
+        check("poll omits crop entirely for a full-frame render (absence, not emptiness)",
+              "crop" not in pr2.payload, repr(sorted(pr2.payload))[:130])
+        # Corrupt provenance must not take the whole poll down: the artifact is the
+        # valuable thing on the row, and a lost note is not worth a 500.
+        worker.store.set(job_id, crop_json="{not json")
+        pr3 = post(tb, "/toolbox/jobs/poll", {"job_id": job_id}, token=job_tok)
+        check("unparseable provenance degrades without losing the poll or the artifact",
+              pr3.status == 200 and pr3.payload.get("artifacts"),
+              "status=%s keys=%s" % (pr3.status, sorted(pr3.payload or {}))[:110])
+
+    # ---- the panel must no longer grey out what is now wired ----------------------
+    root = pathlib.Path(__file__).resolve().parent.parent
+    js = (root / "stackd" / "toolbox" / "web" / "toolbox.js").read_text()
+    dead_m = re.search(r"var DEAD_KNOBS = \[([^\]]*)\]", js)
+    dead = set(re.findall(r"'([^']+)'", dead_m.group(1))) if dead_m else set()
+    for knob in ("opacity", "blend_mode", "color_match", "preserve_detail"):
+        check("%s is no longer dead-marked (it is wired now)" % knob,
+              knob not in dead, str(sorted(dead)))
+    for knob in ("strength", "variants"):
+        check("%s stays dead-marked (still not wired)" % knob, knob in dead, str(sorted(dead)))
+    check("the panel hint no longer claims ONLY prompt/seed/geometry affect the image",
+          "only prompt, seed and the mask geometry" not in js)
+    # Provenance must REACH THE USER. A helper that exists but is never called is the same
+    # failure as a dead knob, so the call site is asserted, not just the definition.
+    check("client renders crop provenance (cropNote defined and actually called)",
+          "function cropNote(" in js and "cropNote(r.crop)" in js)
+    check("client provenance states what was rendered and what it was composited into",
+          "crop-rendered" in js and "composited into" in js)
+    check("client provenance stays silent for a full-frame render (no false claim)",
+          "if (!crop.cropped) return '';" in js)
+    check("client flags a failed composite loudly rather than hiding it",
+          "compositing FAILED" in js)
+    check("client provenance survives an absent crop object",
+          "if (!crop || typeof crop !== 'object') return '';" in js)
+    # engine must actually pass the knobs through, or the registry edit is a lie: this is
+    # the check that makes "removed from DEAD_KNOBS" mean wired, not merely un-dulled.
+    eng = (root / "stackd" / "toolbox" / "engine.py").read_text()
+    check("engine passes all four compositing knobs to paste_back",
+          all(("spec.get(\"%s\")" % k) in eng or ('spec.get(\'%s\')' % k) in eng
+              for k in ("opacity", "blend_mode", "color_match", "preserve_detail")))
+    check("the crop path is wired into the render seam (crop_for_render + crop_mask + paste_back)",
+          all(n in eng for n in ("plan_crop", "crop_for_render", "crop_mask", "paste_back")))
+
+
+
+    solid = M._seam_alpha((64, 64), 0)
+    check("feather 0 gives a SOLID alpha (no ring of the original survives a full-frame edit)",
+          set(solid.tobytes()) == {255}, sorted(set(solid.tobytes()))[:5])
+    feathered = M._seam_alpha((64, 64), M.SEAM_FEATHER_PX)
+    check("the crop path still feathers its seam",
+          min(feathered.tobytes()) == 0 and max(feathered.tobytes()) == 255)
+
+
 
 
 

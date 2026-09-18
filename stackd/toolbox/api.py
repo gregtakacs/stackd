@@ -894,6 +894,17 @@ class Toolbox:
                                  "type": row.get("artifact_type") or "image/png"}]
         else:
             out["artifacts"] = []
+        # Crop provenance: when the render was crop-and-pasted, the artifact is a COMPOSITE
+        # of the model output and the user's own photo, not a pure model output. Say so on
+        # the row rather than letting "done" imply otherwise — this is what lets a
+        # photorealism workflow tell the two apart after the fact. Absent (not empty) for a
+        # full-frame render, so the client can test presence rather than truthiness.
+        if row.get("crop_json"):
+            try:
+                out["crop"] = json.loads(row["crop_json"])
+            except (ValueError, TypeError):
+                out["crop"] = None
+                out["crop_note"] = "provenance for this render could not be parsed"
         if row["state"] == "error":
             out["error_message"] = row.get("error") or "render failed"
         # elapsed_s from the row timestamps, so the status line can say how long it took.

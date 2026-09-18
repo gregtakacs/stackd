@@ -76,11 +76,20 @@ class JobStore:
                 artifact_b64 TEXT,
                 artifact_type TEXT,
                 error TEXT,
-                note TEXT
+                note TEXT,
+                crop_json TEXT
             );
             CREATE INDEX IF NOT EXISTS ix_jobs_email ON jobs(email, created_at);
             """
         )
+        # CREATE TABLE IF NOT EXISTS does not touch a table that already exists, so a
+        # column added here is invisible to every DB written by an earlier deploy until it
+        # is ALTERed in. Idempotent and cheap; a pre-existing jobs.db keeps its rows and
+        # gains the column NULL-filled (a job that never cropped has no provenance, which
+        # is exactly what NULL should mean here).
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(jobs)")}
+        if "crop_json" not in cols:
+            self.conn.execute("ALTER TABLE jobs ADD COLUMN crop_json TEXT")
         self._lock = threading.Lock()
 
     def create(self, *, email, kind, w, h, spec, mask_info, job_id=None) -> str:
@@ -97,7 +106,7 @@ class JobStore:
 
     def set(self, job_id, **fields) -> None:
         allowed = {"state", "prompt_id", "engine_base", "artifact_b64",
-                   "artifact_type", "error", "note"}
+                   "artifact_type", "error", "note", "crop_json"}
         bad = set(fields) - allowed
         if bad:
             raise ValueError(f"unknown job field(s): {sorted(bad)}")
@@ -293,6 +302,12 @@ class JobQueue:
         cur = self.store.pending_states(job_id)
         if cur and cur[0] == "cancelled":
             return
-        self.store.set(job_id, state="done", artifact_b64=art_b64, artifact_type=art_type)
+        fields = {"state": "done", "artifact_b64": art_b64, "artifact_type": art_type}
+        # Crop provenance, if this render was crop-and-pasted: the artifact is a composite
+        # of the model output and the user's own photo, and "done" must be able to say so
+        # later rather than implying a pure model output. Absent for a full-frame render.
+        if job.get("_crop_json"):
+            fields["crop_json"] = job["_crop_json"]
+        self.store.set(job_id, **fields)
 
 

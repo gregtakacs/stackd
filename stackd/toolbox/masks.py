@@ -340,8 +340,15 @@ def crop_mask(mask_bytes: bytes, plan: dict, *, size=None) -> bytes:
 def _seam_alpha(size, feather: int = SEAM_FEATHER_PX) -> "Image.Image":
     """An 'L' mask, 255 across the crop, fading to 0 at its border. This border fade is
     the ONLY edge the paste has to hide — the selection's own edge was already honoured by
-    ImageCompositeMasked inside the crop — so the seam is a rectangle, not a silhouette."""
+    ImageCompositeMasked inside the crop — so the seam is a rectangle, not a silhouette.
+
+    feather <= 0 means NO fade (fully solid): used by the full-frame paste, where a border
+    fade would keep the ORIGINAL's outermost ring and show it as a halo around a wholly
+    regenerated image. There is no seam to hide when the box is the frame.
+    """
     w, h = int(size[0]), int(size[1])
+    if int(feather) <= 0:
+        return Image.new("L", (w, h), 255)
     f = max(1, min(int(feather), max(1, min(w, h) // 3)))
     a = Image.new("L", (w, h), 0)
     a.paste(Image.new("L", (max(1, w - 2 * f), max(1, h - 2 * f)), 255), (f, f))
@@ -378,7 +385,8 @@ def _color_match(src: "Image.Image", ref: "Image.Image") -> "Image.Image":
 
 def paste_back(source_bytes: bytes, artifact_png: bytes, plan: dict, *,
                opacity: float = 1.0, blend_mode: str = "normal",
-               color_match: float = 0.0, preserve_detail: float = 0.0):
+               color_match: float = 0.0, preserve_detail: float = 0.0,
+               feather: int = SEAM_FEATHER_PX):
     """Paste a regenerated crop back over the FULL-RESOLUTION photo. (bytes, note).
 
     Server-side rather than graph nodes, because the graph never sees the uncropped
@@ -460,7 +468,7 @@ def paste_back(source_bytes: bytes, artifact_png: bytes, plan: dict, *,
     op = frac(opacity, 1.0)
     if op <= 0.0:
         return source_bytes, "opacity 0 — the paste was skipped"
-    alpha = _seam_alpha(want)
+    alpha = _seam_alpha(want, feather)
     if op < 1.0:
         alpha = alpha.point(lambda p, k=op: int(round(p * k)))
     out = base.copy()

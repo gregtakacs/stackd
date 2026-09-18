@@ -1194,7 +1194,7 @@
     // row in the inspector). DELETING this list is the discipline: when a knob is wired
     // into the graph, remove it here -- the smoke suite FAILS if a knob is enabled but
     // unclaimed by the engine.
-    var DEAD_KNOBS = ['strength', 'opacity', 'blend_mode', 'color_match', 'preserve_detail', 'variants'];
+    var DEAD_KNOBS = ['strength', 'variants'];
     var DEAD_EL = { blend_mode: 'blend', color_match: 'colormatch', preserve_detail: 'detail' };
     for (var di = 0; di < DEAD_KNOBS.length; di++) {
       var node = el[DEAD_EL[DEAD_KNOBS[di]] || DEAD_KNOBS[di]];
@@ -1205,7 +1205,8 @@
     }
     root.appendChild(mk('div', 'tb-hint tb-deadnote',
       'greyed knobs are recorded with the job but not wired into the render graph yet — ' +
-      'only prompt, seed and the mask geometry affect the image today'));
+      'prompt, seed, the mask geometry and the compositing knobs (opacity, blend, colour ' +
+      'match, detail) affect the image today'));
     return root;
   }
 
@@ -1402,6 +1403,26 @@
     }).catch(function (e) { status('Render failed: ' + e.message, 'bad'); });
   }
 
+  function cropNote(crop) {
+    // Provenance, not decoration. A crop-rendered artifact is a COMPOSITE of the model
+    // output and the user's own photo -- not a pure model output -- and a photorealism
+    // workflow needs to be able to tell the two apart after the fact. Absent for a
+    // full-frame render, so nothing is claimed when nothing was done.
+    if (!crop || typeof crop !== 'object') return '';
+    if (!crop.cropped) return '';
+    var sz = crop.size || [], ar = crop.artifact || [];
+    var bits = ' · crop-rendered ' + (sz[0] || '?') + '×' + (sz[1] || '?');
+    if (ar.length === 2) bits += ' → composited into ' + ar[0] + '×' + ar[1];
+    if (crop.composited === false) {
+      // Say so plainly: the pixels the user is looking at are the bare crop.
+      bits += ' (compositing FAILED — showing the crop alone)';
+    }
+    var k = crop.knobs || {}, used = [];
+    for (var key in k) { if (Object.prototype.hasOwnProperty.call(k, key)) used.push(key); }
+    if (used.length) bits += ' · ' + used.sort().join(', ');
+    return bits;
+  }
+
   function pollJob(id, tries, tok) {
     // Poll rather than hold a connection open: an editor session should not depend on a
     // 10-minute in-flight request surviving a daemon restart or a proxy idle timeout.
@@ -1422,7 +1443,8 @@
         reportHeightSoon();
 
         status('Rendered ' + list.length + ' image(s)' + (r.seed !== undefined ? ' · seed ' + r.seed : '')
-               + (r.elapsed_s ? ' · ' + r.elapsed_s.toFixed(0) + 's' : ''), 'ok');
+               + (r.elapsed_s ? ' · ' + r.elapsed_s.toFixed(0) + 's' : '')
+               + cropNote(r.crop), 'ok');
         return;
       }
       status('Rendering… (' + (r.state || 'queued') + ', ' + (tries * 2) + 's)');
