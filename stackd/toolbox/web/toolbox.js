@@ -344,11 +344,12 @@
   function selectObj(i) {
     sel = (i >= 0 && i < regions.length) ? i : -1;
     // Mirror the object's edge/feather into the toolbar sliders so the obvious slider
-    // reads (and then edits) THIS object. Brush objects are excluded: the server forbids
-    // any morphology on a hand-painted edge (KIND_RULES['brush']), and a live slider that
-    // silently did nothing is the exact lie this project exists to prevent.
+    // reads (and then edits) THIS object — for EVERY object, brush included. The old
+    // exclusion ("a live slider that silently did nothing is the lie we refuse") removed
+    // the knob; the user's answer was that the knob is WANTED, so the honest fix is that
+    // it works: the first drag onto a brush blob retires the handwork edge (setObjParam).
     var o = selObj();
-    if (o && o.kind !== 'brush') {
+    if (o) {
       if (el.edge) { el.edge.value = (typeof o.edge === 'number') ? o.edge : 0;
                      if (el.edge_out) el.edge_out.textContent = String(el.edge.value); }
       if (el.feather) { el.feather.value = (typeof o.feather === 'number') ? o.feather : 0;
@@ -357,9 +358,27 @@
     syncInspector();
     compose();
     if (sel < 0) status('Nothing selected.');
-    else status(o.kind === 'auto'
-      ? 'Selected an auto selection — use edge / feather to grow, shrink or soften it.'
-      : 'Selected a ' + o.kind + ' selection — drag to move it.');
+    else status(o.kind === 'brush'
+      ? 'Selected a brush selection — drag to move it; edge/feather make its edge numeric.'
+      : 'Selected a ' + o.kind + ' selection — use edge / feather to grow, shrink or soften it.');
+  }
+
+  // One route for every object-parameter edit (toolbar sliders AND inspector rows), so the
+  // retiring of a brush edge is decided in exactly one place. A brush blob's edge is its
+  // hardness ramp — UNTIL the user drags a number onto it. That first drag converts the
+  // object to the 'auto' contract, whose server rules are the SAFE way to number an
+  // organic edge: KIND_RULES binarises at the SAME alpha>50 the client already uses to
+  // decide blob membership (REGION_ALPHA_MIN, mirroring COVERAGE_BRIGHTNESS_THRESHOLD),
+  // grows on a disc, and feathers OUTWARD (masks._feather_out: grown UNION blurred — the
+  // >=128 footprint can only match or exceed the approved selection, so softening can
+  // never shrink it, which was the original brush-erosion complaint). After the drag the
+  // object is no longer handwork — it has a numeric edge, and display morphology, ship
+  // copy and layer export all follow from r.kind alone.
+  function setObjParam(key, v) {
+    var o = selObj(); if (!o) return;
+    if (o.kind === 'brush') o.kind = 'auto';
+    o[key] = v;
+    touchObject();
   }
 
   function translateSel(dx, dy) {
@@ -408,17 +427,20 @@
     var inp = mk('input');
     inp.type = 'range'; inp.min = min; inp.max = max; inp.step = step; inp.value = val_;
     var out = mk('span', 'tb-v', String(val_));
-    inp.disabled = !!disabled;
+    // NEVER disabled — the first drag onto a brush blob retires the handwork edge
+    // (setObjParam). The old disabled-with-reason row was the user's complaint: the knob
+    // is wanted, so it has to work rather than advertise its own inertness.
     inp.addEventListener('input', function () {
       out.textContent = inp.value;
-      var o = selObj(); if (!o) return;
-      if (inp.disabled) return;
-      o[key] = parseFloat(inp.value);
-      touchObject();               // a parameter change: pixels untouched, view + cache refresh
+      setObjParam(key, parseFloat(inp.value) || 0);
     });
     wrap.appendChild(inp); wrap.appendChild(out);
     lab.appendChild(wrap);
-    if (disabled) lab.appendChild(mk('span', 'tb-hint', 'hardness sets this edge'));
+    var hintF = mk('span', 'tb-hint', 'hardness set this edge — this knob replaces it');
+    if (obj.kind !== 'brush') hintF.style.display = 'none';
+    lab.appendChild(hintF);
+    // refs the in-place sync reads (touchObject updates them; rebuilds re-stamp them)
+    obj._ipF = inp; obj._outF = out; obj._hintF = hintF;
     return lab;
   }
 
@@ -442,10 +464,6 @@
     var inp = mk('input');
     inp.type = 'range'; inp.min = -60; inp.max = 60; inp.step = 2;
     inp.value = (typeof o.edge === 'number') ? o.edge : 0;
-    if (o.kind === 'brush') {                        // handwork edge: KIND_RULES forbids morphing it
-      inp.disabled = true;
-      lab.appendChild(mk('span', 'tb-hint', 'hardness sets this edge'));
-    }
     var out = mk('span', 'tb-v', String(inp.value));
     var rel = mk('span', 'tb-hint', '');
     function paint(v) {
@@ -462,36 +480,67 @@
       rel.classList.toggle('tb-warn', !!risky);
     }
     inp.addEventListener('input', function () {
-      if (inp.disabled) return;
       var v = parseInt(inp.value, 10) || 0;
-      var t = selObj(); if (!t) return;
-      t.edge = v;                     // the derived grow/shrink pair is built at export
-      paint(v);
-      touchObject();
+      setObjParam('edge', v);         // retires a brush's handwork edge on the first drag
+      paint(v);                       // the derived grow/shrink pair is built at export
     });
     paint(parseInt(inp.value, 10) || 0);
     wrap.appendChild(inp); wrap.appendChild(out);
     lab.appendChild(wrap); lab.appendChild(rel);
+    var hintE = mk('span', 'tb-hint', 'hardness set this edge — this knob replaces it');
+    if (o.kind !== 'brush') hintE.style.display = 'none';
+    lab.appendChild(hintE);
+    o._ipE = inp; o._outE = out; o._relE = rel; o._hintE = hintE;
     return lab;
   }
 
   function syncInspector() {
     if (!el_inspect) return;
     var o = selObj();
-    if (!o) { el_inspect.innerHTML = ''; el_inspect.style.display = 'none'; return; }
+    if (!o) { el_inspect.innerHTML = ''; el_inspect.style.display = 'none';
+              el_inspect._sync = null; return; }
     el_inspect.style.display = '';
     el_inspect.innerHTML = '';
     var kind = o.kind;
-    var brush = kind === 'brush';
     // The inspector edits the OBJECT (the connected blob), not the strokes that made it:
     // after commit there is no size/hardness vertex left to re-tune — the pixels are the
-    // selection. A brush blob shows its edge/feather rows disabled with the reason,
-    // because the server refuses morphology on handwork (masks.KIND_RULES['brush']).
-    el_inspect.appendChild(mk('div', 'tb-inspect-h',
-      (brush ? 'Brush selection' : (kind === 'auto' ? 'Auto selection' : 'Shape selection')) +
-      ' — ' + (o.area || 0) + ' px'));
+    // selection. Every kind gets LIVE edge/feather rows; dragging a number onto a brush
+    // blob retires the hardness-chosen edge (setObjParam flips it to the 'auto' rules).
+    var head = mk('div', 'tb-inspect-h',
+      (kind === 'brush' ? 'Brush selection' : (kind === 'auto' ? 'Auto selection' : 'Shape selection')) +
+      ' — ' + (o.area || 0) + ' px');
+    el_inspect.appendChild(head);
     el_inspect.appendChild(edgePair(o));
-    el_inspect.appendChild(ipair('feather', 'feather', o, 0, 64, 1, o.feather || 0, brush));
+    el_inspect.appendChild(ipair('feather', 'feather', o, 0, 64, 1, o.feather || 0));
+    // The in-place refresher the slider handlers drive. Rebuilding the inspector here
+    // would KILL the gesture: the browser delivers a range input's stream of events to
+    // the element it grabbed at mousedown, so replacing that node on the first event
+    // ends the drag — click-to-jump still works, dragging dies. That is the exact bug
+    // the user reported ("only clickable to a new value"): update TEXT and VALUES, never
+    // the structure. If the selected region object was replaced under us (a commit
+    // rebuilt the table), rebind by rebuilding ONCE, at rest, not mid-event.
+    el_inspect._for = o;
+    el_inspect._sync = function () {
+      if (selObj() !== o) { syncInspector(); return; }
+      var kl = o.kind === 'brush' ? 'Brush selection'
+             : (o.kind === 'auto' ? 'Auto selection' : 'Shape selection');
+      head.textContent = kl + ' — ' + (o.area || 0) + ' px';
+      if (o._hintE) o._hintE.style.display = (o.kind === 'brush') ? '' : 'none';
+      if (o._hintF) o._hintF.style.display = (o.kind === 'brush') ? '' : 'none';
+      if (o._ipE && String(o._ipE.value) !== String(o.edge)) {
+        o._ipE.value = o.edge; if (o._outE) o._outE.textContent = String(o.edge);
+      }
+      if (o._ipF && String(o._ipF.value) !== String(o.feather)) {
+        o._ipF.value = o.feather; if (o._outF) o._outF.textContent = String(o.feather);
+      }
+      // toolbar mirror follows inspector edits (selectObj did the other direction)
+      if (el.edge && String(el.edge.value) !== String(o.edge)) {
+        el.edge.value = o.edge; if (el.edge_out) el.edge_out.textContent = String(o.edge);
+      }
+      if (el.feather && String(el.feather.value) !== String(o.feather)) {
+        el.feather.value = o.feather; if (el.feather_out) el.feather_out.textContent = String(o.feather);
+      }
+    };
     var rowb = mk('div', 'tb-row');
     rowb.appendChild(btn('Delete object', deleteSel, 'Remove this object from the mask'));
     rowb.appendChild(btn('Deselect', function () { selectObj(-1); }));
@@ -986,7 +1035,12 @@
   }
 
   // A pure parameter change (edge/feather): pixels untouched, view + preview cache updated.
-  function touchObject() { compose(); schedulePreview(); syncInspectorSoon(); }
+  // NO inspector DOM rebuild here, load-bearing not cosmetic: see el_inspect._sync —
+  // a rebuild between drag events steals the gesture from the finger/mouse.
+  function touchObject() {
+    compose(); schedulePreview();
+    if (el_inspect && el_inspect._sync && el_inspect.offsetParent !== null) el_inspect._sync();
+  }
 
   function commitStroke(s) {
     s = stamp(s);                       // slider defaults read AT COMMIT, as ever
@@ -1137,7 +1191,7 @@
     redoStack.push(strokes.pop());
     rasterize(); status('Undo');
   }
-  function syncInspectorSoon() { if (el_inspect) syncInspector(); }
+  // (retired: touchObject refreshes the panel IN PLACE — see el_inspect._sync)
 
   function redoStep() {
     active = null;
@@ -1295,22 +1349,19 @@
     for (var k in (attrs || {})) { if (Object.prototype.hasOwnProperty.call(attrs, k)) i.setAttribute(k, attrs[k]); }
     i.value = value;
     var out = mk('span', 'tb-num', String(value));
-    // When a shape or auto REGION is selected, the edge/feather sliders must edit THAT
-    // object: per-object geometry is what the layered server path normalises (see
-    // masks.normalize_layers + api h_mask_preview), and the global mask_expand/feather
-    // these sliders otherwise feed are IGNORED once layers exist. Brush blobs are
-    // excluded — their edge is hardness, chosen by hand, and masks.KIND_RULES forbids
-    // any remote number from moving it; a slider that silently did nothing is the dead
-    // knob this project refuses to ship. An unselected canvas keeps the old meaning of
-    // these controls: defaults for the NEXT object.
+    // When a REGION is selected, the edge/feather sliders edit THAT object: per-object
+    // geometry is what the layered server path normalises (see masks.normalize_layers +
+    // api h_mask_preview), and the global mask_expand/feather these sliders otherwise
+    // feed are IGNORED once layers exist. Brush blobs are NOT excluded — the first drag
+    // retires their handwork edge (setObjParam); the old exclusion is what the user
+    // reported as "can't set the feather afterwards". An unselected canvas keeps the old
+    // meaning of these controls: defaults for the NEXT object.
     i.addEventListener('input', function () {
       out.textContent = i.value;
       var o = selObj();
-      if ((id === 'edge' || id === 'feather') && o && o.kind && o.kind !== 'brush') {
-        var v = parseFloat(i.value) || 0;
-        if (id === 'edge') { o.edge = v; } else { o.feather = v; }
-        touchObject();                 // parameters only: pixels untouched, view + cache refresh
-        return;
+      if ((id === 'edge' || id === 'feather') && o && o.kind) {
+        setObjParam(id === 'edge' ? 'edge' : 'feather', parseFloat(i.value) || 0);
+        return;                        // parameters only: pixels untouched, view + cache refresh
       }
       refresh();
     });

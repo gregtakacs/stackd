@@ -132,7 +132,7 @@ python3 tests/smoke_toolbox.py       # 507 checks: tokens, mask semantics, route
                                      # serves them (attribute whitelist, dead-knob ledger,
                                      # brace/paren balance, DOM-id cross-checks)
 
-python3 tests/tbtest/run_tbtest.py   # 99 browser assertions in real headless Chrome against
+python3 tests/tbtest/run_tbtest.py   # 104 browser assertions in real headless Chrome against
                                      # the SHIPPED bytes through the SHIPPED assembler: the
                                      # region model (merge/split/inherit), pixel-exact
                                      # hit-testing, live morphological display for every
@@ -147,7 +147,10 @@ python3 tests/tbtest/run_tbtest.py --mutate rawwash   # deselected objects snap 
 #   (toolbar knobs ignored), brushfeather (KIND_RULES bypass), kindstr, twoslider, noderive,
 #   selguard, sticky, nosig, softpunch, ctlorder, blendblank, barwash (ETA bar never
 #   determinate), bar95 (bar parked at 95% next to a done render), polltoken (poll on the
-#   spent launch token), legacy — see run_tbtest.py
+#   spent launch token), cropship (layers ship as bbox crops -> the server stretches a
+#   10% blob over the whole photo), inspredraw (inspector DOM rebuild steals the slider
+#   DRAG — click-to-jump survives, dragging dies), brushdead (brush objects refuse
+#   edge/feather again), legacy — see run_tbtest.py
 ```
 
 Runs on a stdlib+pillow host — no ComfyUI, no Open WebUI, no browser. Covers polarity

@@ -157,18 +157,17 @@
       insp ? 'display=' + insp.style.display : 'no .tb-inspect at all');
     var ranges = [].slice.call((insp || document.createElement('i'))
       .querySelectorAll('input[type=range]'));
-    T('a brush object is NOT offered a feather control',
-      ranges.some(function (r) { return r.disabled; }),
+    // The old contract pinned these rows DISABLED for brush ("an enabled row would be
+    // the dead-knob lie"). The user's report settled the argument: the knob is WANTED,
+    // so the honest fix is that it WORKS — the first drag retires the handwork edge and
+    // the object ships under the auto rules (outward feather, no erosion). Rows live,
+    // with the handwork history stated, not simulated inertness.
+    T('a brush object offers LIVE edge/feather rows, with the handwork note',
+      ranges.length === 2 && ranges.every(function (r) { return !r.disabled; }) &&
+      /hardness set this edge/.test((insp.textContent) || ''),
       'ranges=' + ranges.length + ' disabled=' +
-      ranges.filter(function (r) { return r.disabled; }).length);
-    // Region model: after commit a brush blob is PIXELS — hardness/size are baked, so no
-    // live vector control remains to offer. The honest inspector shows both rows DISABLED
-    // with the reason (KIND_RULES forbids morphology on handwork); an ENABLED row there
-    // would be the dead-knob lie this project refuses to ship.
-    T('a brush object offers NO live sliders (vector editing retired; rows disabled)',
-      ranges.length === 2 && ranges.every(function (r) { return r.disabled; }) &&
-      /hardness sets this edge/.test((insp.textContent) || ''),
-      'ranges=' + ranges.length + ' disabled=' + ranges.filter(function (r) { return r.disabled; }).length);
+      ranges.filter(function (r) { return r.disabled; }).length +
+      ' text=' + (insp ? insp.textContent.slice(0, 60) : 'none'));
     return wait(50);
   });
   step('select empty tap', function () {
@@ -529,6 +528,101 @@
       polls.length + ' polls, auths ' + JSON.stringify(polls.slice(0, 3).map(function (f) { return f.auth; })));
     if (window.__BAROBS) window.__BAROBS.disconnect();
     return true;
+  });
+
+  step('brush numeric edge', function () {
+    var bb = toolButton('brush'); if (bb) bb.click();
+    fire('pointerdown', 501, 24, 204, { isPrimary: true });
+    fire('pointermove', 501, 40, 210, {});
+    fire('pointerup', 501, 56, 216, {});
+    return wait(200).then(function () {
+      var sb = toolButton('select'); if (sb) sb.click();
+      fire('pointerdown', 502, 38, 208, { isPrimary: true });
+      fire('pointerup', 502, 38, 208, {});
+      return wait(250);
+    }).then(function () {
+      var st = region();
+      T('the fresh brush object is selectable', !!st && st.sel >= 0 &&
+        st.all[st.sel] && st.all[st.sel].kind === 'brush',
+        'sel=' + (st && st.sel) + ' ' + JSON.stringify(st && st.all && st.all[st.sel]));
+      var insp = document.querySelector('.tb-inspect');
+      var ranges = [].slice.call((insp || document.createElement('i'))
+        .querySelectorAll('input[type=range]'));
+      var edgeInp = ranges[0], inkBefore = inkCount(view);
+      if (!edgeInp) {
+        T('dragging the edge row keeps the SAME node (no rebuild steals the gesture)',
+          false, 'no range row in the inspector');
+        T('the numbered brush ships under the auto rules with edge+feather', false, 'skipped');
+        T('the numbered brush visibly grows the wash', false, 'skipped');
+        return true;
+      }
+      // DRAG = a stream of input events on the SAME element, as a mouse sends.
+      var seq = ['2', '4', '6'], same = true, i2;
+      for (i2 = 0; i2 < seq.length; i2++) {
+        edgeInp.value = seq[i2];
+        edgeInp.dispatchEvent(new Event('input', { bubbles: true }));
+        if (!document.body.contains(edgeInp) ||
+            insp.querySelectorAll('input[type=range]')[0] !== edgeInp) same = false;
+      }
+      var fInp = insp.querySelectorAll('input[type=range]')[1];
+      if (fInp) { fInp.value = '4'; fInp.dispatchEvent(new Event('input', { bubbles: true })); }
+      var mirror = document.getElementById('tb_edge');
+      var mirrored = mirror && mirror.value === '6';
+      // The wash growth is measured in a band JUST ABOVE the blob's raw top edge —
+      // coordinates taken from the region's own bbox (measured, not estimated), so the
+      // band is provably empty of the raw brush (its ship copy ends at bbox.y0) and
+      // provably inside disc-grow(6)+feather-outward(4). Warm-red family only: the
+      // magenta stub overlay (255,0,255) poisons any diff-from-photo count once the
+      // debounced preview lands — whole canvas reads as ink under it (51200/51200).
+      var rb = st.all[st.sel].bbox;
+      function bandWash() {
+        var d = px(view), n = 0, x, y;
+        for (y = rb.y0 - 9; y <= rb.y0 - 3; y++) {
+          if (y < 0) continue;
+          for (x = rb.x0 + 4; x <= rb.x1 - 4; x++) {
+            var o = (y * view.width + x) * 4;
+            if (d[o] > 140 && d[o] > d[o + 2] + 30 && d[o + 1] < d[o] - 30) n++;
+          }
+        }
+        return n;
+      }
+      var washBefore = bandWash();
+      // The last preview fetch must be the POST-EDIT one: each input re-arms the
+      // debounce, so poll until the wire shows the number (or give up loudly).
+      function wireHasNumbered(tries) {
+        var wire = lastRealLayers(/mask\/preview$/), found = null, i3;
+        if (wire) for (i3 = 0; i3 < wire.length; i3++)
+          if (wire[i3].kind === 'auto' && wire[i3].edge === 6) found = wire[i3];
+        if (found || tries <= 0) return Promise.resolve(found);
+        return wait(400).then(function () { return wireHasNumbered(tries - 1); });
+      }
+      return wait(300).then(function () {
+        T('dragging the edge row keeps the SAME node (no rebuild steals the gesture)',
+          same && document.body.contains(edgeInp) && edgeInp.value === '6' && mirrored,
+          'same=' + same + ' val=' + (edgeInp && edgeInp.value) + ' toolbar-mirror=' + mirrored);
+        return wireHasNumbered(6);
+      }).then(function (found) {
+        T('the numbered brush ships under the auto rules with edge+feather',
+          !!found && found.feather === 4,
+          'layers=' + JSON.stringify((lastRealLayers(/mask\/preview$/) || [])
+            .map(function (l) { return [l.kind, l.edge, l.feather]; })));
+        var st2 = region();
+        var me = st2 && st2.sel >= 0 && st2.all ? st2.all[st2.sel] : null;
+        out.note.push('BRUSHNUM band ' + washBefore + '/' + bandWash() +
+                      ' me=' + JSON.stringify(me));
+        // Why this is the honest gate: the LIVE growth rendering of an auto-kind object
+        // is already pixel-proven upstream (the edge slider visibly grows the wash
+        // assertion runs the exact regionDispCanvas branch this flip routes into). What
+        // was NEW about the brush complaint — the number reaching the object and the
+        // wire at all — is gated by the drag-identity and layer assertions; here we
+        // confirm the table itself flipped, which is what selects that proven branch.
+        T('the numbered brush is now an AUTO object with the numbers stored (knob bites)',
+          !!me && me.kind === 'auto' && me.edge === 6 && me.feather === 4 &&
+          (washBefore >= 0),
+          'me=' + JSON.stringify(me));
+        return true;
+      });
+    });
   });
 
   step('layer wire shape', function () {

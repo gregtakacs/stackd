@@ -151,7 +151,7 @@ def LEGACY_ALLMERGE(s):
 # global mask_expand/feather, which the LAYERED server path ignores. Reproduce by making
 # the region-routing guard always false, so the sliders behave exactly as pre-fix.
 def LEGACY_AUTOSLIDER(s):
-    g = "if ((id === 'edge' || id === 'feather') && o && o.kind && o.kind !== 'brush') {"
+    g = "if ((id === 'edge' || id === 'feather') && o && o.kind) {"
     assert g in s, 'toolbar region-routing guard anchor moved'
     return s.replace(g, "if (false) {", 1)
 
@@ -321,6 +321,40 @@ def LEGACY_CROPSHIP(s):
 
 
 MUTANTS["cropship"] = LEGACY_CROPSHIP
+# The slider-drag thief: touchObject() rebuilt the inspector DOM on every input event,
+# and the browser delivers a range input's event stream to the node it grabbed at
+# mousedown - the node vanishes and the drag dies (click-to-jump survives; the user
+# reported exactly "only clickable to a new value"). Restores the rebuild per edit.
+def LEGACY_INSPREDRAW(s):
+    a = "    if (el_inspect && el_inspect._sync && el_inspect.offsetParent !== null) el_inspect._sync();"
+    assert a in s, 'touchObject in-place sync anchor moved'
+    return s.replace(a, "    if (el_inspect) syncInspector();", 1)
+
+
+# The dead brush knobs, restored FAITHFULLY: both halves at once - the toolbar guard
+# excluding brush AND the inspector rows disabled for brush. Either half alone still
+# leaves one working route to edit the object, so a one-sided mutant would reproduce
+# nothing and pass for the wrong reason.
+def LEGACY_BRUSHDEAD(s):
+    g = "      if ((id === 'edge' || id === 'feather') && o && o.kind) {"
+    assert g in s, 'toolbar routing anchor moved'
+    s = s.replace(g,
+        "      if ((id === 'edge' || id === 'feather') && o && o.kind && o.kind !== 'brush') {" + chr(10) +
+        "        if (o.kind === 'brush') return;", 1)
+    h = "      setObjParam('edge', v);"
+    assert s.count(h) == 1, 'edgePair live handler anchor moved'
+    s = s.replace(h,
+        "      if (o.kind === 'brush') { inp.disabled = true; return; }" + chr(10) + h, 1)
+    f = "      setObjParam(key, parseFloat(inp.value) || 0);"
+    assert s.count(f) == 1, 'ipair live handler anchor moved'
+    s = s.replace(f,
+        "      if (obj.kind === 'brush') { inp.disabled = true; return; }" + chr(10) + f, 1)
+    return s
+
+
+MUTANTS["inspredraw"] = LEGACY_INSPREDRAW
+MUTANTS["brushdead"] = LEGACY_BRUSHDEAD
+
 MUTANTS["barwash"] = LEGACY_BARWASH
 MUTANTS["bar95"] = LEGACY_BAR95
 MUTANTS["polltoken"] = LEGACY_POLLTOKEN
@@ -376,7 +410,7 @@ def main():
         print('COMPOSE TRACE:')
         for i, d in enumerate(res['dbg'][:10]):
             print('  ', i, d)
-    EXPECT = 101
+    EXPECT = 104
     if len(res["tests"]) != EXPECT:
         print("TRUNCATED RUN: got %d assertions, expected %d -- an early error stopped the "
               "steps (notes: %s). This is NOT a pass." %
