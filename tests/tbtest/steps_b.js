@@ -644,6 +644,164 @@
     });
   });
 
+  /* =====================================================================================
+   * MOVE IDENTITY — the 'sometimes loses its feathering' report.
+   * A blob whose pixels land with no ancestor overlap votes with NOTHING: the rebuild
+   * silently re-rolled its kind/edge/feather from commitHintKind + the toolbar sliders.
+   * 'Sometimes' = whenever a brush stroke was painted earlier (hint=brush) or the blob
+   * lands adjacent to a foreign blob (only the neighbour's pixels are under the blob,
+   * so the merge takes the NEIGHBOUR's parameters wholesale — feather 30 -> 0).
+   * The move/delete stroke now stamps its own identity into the next rebuild.
+   * ===================================================================================== */
+  function bandAvg(x0, x1, y0, y1) {   // mean |channel delta| vs the photo over a column band
+    if (!refData || !view.width) return -1;
+    var d = px(view), W0 = view.width, t = 0, n = 0;
+    x0 = Math.max(0, x0 | 0); x1 = Math.min(W0 - 1, x1 | 0);
+    for (var y = Math.max(0, y0 | 0); y <= Math.min(view.height - 1, y1 | 0); y++) {
+      for (var x = x0; x <= x1; x++) {
+        var i = (y * W0 + x) * 4;
+        t += Math.max(Math.abs(d[i] - refData[i]), Math.abs(d[i + 1] - refData[i + 1]),
+                      Math.abs(d[i + 2] - refData[i + 2]));
+        n++;
+      }
+    }
+    return n ? t / n : 0;
+  }
+  function knobSet(id, v) {            // toolbar sliders at REST (nothing selected)
+    var e = document.getElementById(id); if (!e) return;
+    e.value = String(v); e.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+  step('ID clear + knobs', function () {
+    clearForDraw();
+    knobSet('tb_edge', 0); knobSet('tb_feather', 30);
+    return wait(150);
+  });
+  step('ID paint A', function () {
+    var b = toolButton('rect'); if (b) b.click();
+    fire('pointerdown', 720, 18, 26, { isPrimary: true });
+    for (var i = 1; i <= 6; i++) fire('pointermove', 720, 18 + i * 5, 26 + i * 5, {});
+    fire('pointerup', 720, 46, 54, {});
+    return wait(150);
+  });
+  step('ID brush poisons the commit hint', function () {
+    // A plain brush stroke somewhere far: it sets commitHintKind='brush', which is the
+    // state a real user is always in when they later nudge a feathered object.
+    var b = toolButton('brush'); if (b) b.click();
+    fire('pointerdown', 721, 100, 40, { isPrimary: true });
+    for (var i = 1; i <= 6; i++) fire('pointermove', 721, 100 + i * 5, 40, {});
+    fire('pointerup', 721, 130, 40, {});
+    return wait(150);
+  });
+  step('ID drag A far onto the brush blob', function () {
+    var st = toolButton('select'); if (st) st.click();
+    fire('pointerdown', 722, 32, 40, { isPrimary: true });   // tap A centre -> select
+    fire('pointerup', 722, 32, 40, {});
+    return wait(120).then(function () {
+      var r = region(), me = r && r.all && r.all.filter(function (q) { return q.bbox.x1 < 80; })[0];
+      out.note.push('ID_PRE ' + JSON.stringify(r && r.all));
+      T('the shape object carries edge 0 / feather 30 before the move',
+        !!me && me.kind === 'shape' && me.edge === 0 && me.feather === 30, JSON.stringify(me));
+      // Drag it 98 px right / 6 down: ZERO overlap with where it was (width 29), and
+      // its landing straddles the brush blob so the union-find merges them into ONE.
+      fire('pointerdown', 723, 32, 40, { isPrimary: true });
+      for (var j = 1; j <= 8; j++) fire('pointermove', 723, 32 + j * 12, 40 + j, {});
+      fire('pointerup', 723, 128, 46, {});
+      return wait(250);
+    });
+  });
+  step('ID merged-object asserts', function () {
+    var r = region();
+    var me = r && r.all && r.all[0];
+    out.note.push('ID_MERGED ' + JSON.stringify(r && r.all));
+    T('the dragged object merged with its neighbour into one region',
+      !!r && r.regions === 1, 'regions=' + (r && r.regions));
+    T('the merge kept the MOVER kind/edge (shape 0), not the plain brush blob',
+      !!me && me.kind === 'shape' && me.edge === 0, JSON.stringify(me));
+    T('the merge did NOT take the neighbour feather wholesale (>= 10 of the mover 30)',
+      !!me && me.feather >= 10, JSON.stringify(me));
+    return true;
+  });
+  step('ID undo', function () {
+    var u = byText('Undo'); if (u) u.click();
+    return wait(250);
+  });
+  step('ID undo asserts', function () {
+    var r = region();
+    var back = r && r.all && r.all.filter(function (q) { return q.bbox.x1 < 80; })[0];
+    out.note.push('ID_UNDO ' + JSON.stringify(r && r.all));
+    T('undo restored the object at its ORIGIN (two regions again)',
+      !!r && r.regions === 2 && !!back, 'regions=' + (r && r.regions));
+    T('the undone move keeps kind/edge/feather (origin has no pixel ancestors)',
+      !!back && back.kind === 'shape' && back.edge === 0 && back.feather === 30,
+      JSON.stringify(back));
+    return true;
+  });
+  step('ID redo', function () {
+    var u = byText('Redo'); if (u) u.click();
+    return wait(250);
+  });
+  step('ID redo asserts', function () {
+    var r = region();
+    var me = r && r.all && r.all[0];
+    out.note.push('ID_REDO ' + JSON.stringify(r && r.all));
+    T('redo re-merges and STILL keeps shape/0 and feather >= 10',
+      !!r && r.regions === 1 && !!me && me.kind === 'shape' && me.edge === 0 && me.feather >= 10,
+      JSON.stringify(r && r.all));
+    return true;
+  });
+
+  /* =====================================================================================
+   * PREVIEW FEATHER WIDTH — the 'preview looks tighter/denser than the render' report.
+   * The old display morphology multiplied every radius by _DISK_CAP/gridSide. The grid
+   * is NOT downsampled, so on any canvas bigger than the cap the preview drew a
+   * proportionally tighter, harder skirt than the server paints (a phone-sized canvas:
+   * feather 30 drawn as ~7). The mutant restores that shrinkage at a cap that stands in
+   * for the phone (harness view is only 160x320, where cap 256 would mask the defect).
+   * ===================================================================================== */
+  step('PT clear + knobs', function () {
+    clearForDraw();
+    knobSet('tb_edge', 0); knobSet('tb_feather', 30); knobSet('tb_wash', 1);
+    return wait(150);
+  });
+  step('PT paint tall rect', function () {
+    var b = toolButton('rect'); if (b) b.click();
+    fire('pointerdown', 730, 62, 4, { isPrimary: true });
+    for (var i = 1; i <= 6; i++) fire('pointermove', 730, 62 + i * 6, 4, {});   // wide
+    for (var j = 1; j <= 6; j++) fire('pointermove', 730, 98, 4 + j * 52, {});  // tall
+    fire('pointerup', 730, 98, 316, {});
+    return wait(150);
+  });
+  step('PT falloff probe', function () {
+    var r = region();
+    var me = r && r.all && r.all[0];
+    out.note.push('PT_PRE ' + JSON.stringify(r && r.all));
+    if (!me) { T('the tall shape object exists for the falloff probe', false,
+                 'no region — all=' + JSON.stringify(r && r.all)); return true; }
+    var st = toolButton('select'); if (st) st.click();
+    fire('pointerdown', 731, 150, 310, { isPrimary: true });   // tap empty -> deselect, ring gone
+    fire('pointerup', 731, 150, 310, {});
+    return wait(160).then(function () {
+      var b = me.bbox;
+      var bandH = [b.y0 + 16, Math.min(view.height - 1, b.y1 - 16)];
+      if (bandH[1] < bandH[0] + 8) bandH = [0, view.height - 1];
+      var near = bandAvg(b.x1 + 4, b.x1 + 8, bandH[0], bandH[1]);
+      var mid = bandAvg(b.x1 + 16, b.x1 + 22, bandH[0], bandH[1]);
+      var far = bandAvg(b.x1 + 24, b.x1 + 30, bandH[0], bandH[1]);
+      out.note.push('PT_BANDS near=' + near.toFixed(1) + ' mid=' + mid.toFixed(1) +
+                    ' far=' + far.toFixed(1) + ' bbox=' + JSON.stringify(b) +
+                    ' band=' + JSON.stringify(bandH));
+      T('the object carries feather 30 with edge 0',
+        me.kind === 'shape' && me.edge === 0 && me.feather === 30, JSON.stringify(me));
+      T('a feather-30 preview is genuinely WASHY right at the silhouette',
+        near > 120, 'near=' + near);
+      T('the wash reaches deep into the feather (mid skirt well lit)',
+        mid > 80, 'mid=' + mid);
+      T('the OUTER skirt stays visible: preview radius is the TRUE feather, not a shrunk proxy',
+        far >= 60, 'far=' + far);
+      return true;
+    });
+  });
+
   step('final fit', function () {
     var f = byText('Fit'); if (f) f.click();
     return wait(120);

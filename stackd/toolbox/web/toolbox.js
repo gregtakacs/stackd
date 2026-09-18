@@ -54,6 +54,8 @@
   var maskA = null;                 // Uint8Array W*H: composited alpha, one read per rebuild
   var commitHintKind = 'shape';     // kind a zero-ancestor (brand-new) blob inherits
   var _dragReg = null;              // region currently being dragged by the Select tool
+  var pendingMove = null;           // the just-baked/undone MOVE's own identity, told to
+                              // the NEXT rebuildRegions directly (see noteMoveIdentity)
   // Smart-select (SAM3) session state. Points are kept in NORMALISED 0..1 coords so a zoom
   // or resize never shifts a committed click. Each SUCCESSFUL selection is its own OBJECT in
   // smartObjs — {pos, neg, layer} — so "select a car, then select another car" yields TWO
@@ -403,7 +405,13 @@
     // the compound keeps vector-undo honest for something vectors could never express.
     strokes.push({ mode: 'move', cv: cv, ox: r.bbox.x0, oy: r.bbox.y0, dx: dx, dy: dy,
                    kind: 'shape', edge: 0, grow: 0, shrink: 0, feather: 0,
-                   size: 0, hardness: 1, erase: false });
+                   size: 0, hardness: 1, erase: false,
+                   pKind: r.kind, pEdge: r.edge, pFeather: r.feather });
+    // Identity rides EXPLICITLY: the moved pixels have (by definition) no overlap with
+    // where they used to be, so pixel-ancestry cannot vote for them — an unrepresented
+    // blob loses the vote outright (drag a feathered object onto a plain one and the
+    // merge took the PLAIN object's parameters wholesale: the reported feather loss).
+    noteMoveIdentity(strokes[strokes.length - 1], true);
     rasterize();
     status('Moved.');
   }
@@ -556,7 +564,11 @@
     strokes.push({ mode: 'load', img: cv, ox: r.bbox.x0, oy: r.bbox.y0,
                    w: cv.width, h: cv.height, erase: true,
                    kind: 'shape', edge: 0, grow: 0, shrink: 0, feather: 0,
-                   size: 0, hardness: 1 });
+                   size: 0, hardness: 1,
+                   // Undo re-materialises exactly these pixels where they stood; without
+                   // the stamped identity the rebuild would re-roll their params from
+                   // the global sliders (they have no pixel ancestors — they were gone).
+                   pRestore: true, pKind: r.kind, pEdge: r.edge, pFeather: r.feather });
     sel = -1; selDrag = null; _dragReg = null;
     redoStack = [];                                  // a deletion is a real edit; redo is stale
     syncInspector(); rasterize(); status('Object removed.');
@@ -693,9 +705,8 @@
    * what the sliders preview and what the server paints agree; when the server overlay
    * arrives it replaces these with identical pixels, so there is no flicker.
    */
-  var _DISK_CAP = 256;   // display-only: the browser caps lower than the server (masks.DISK_CAP
-                         // 2048) because this runs per slider-drag; it is never exported, so the
-                         // render still uses the full-resolution server kernel.
+  var _DISK_CAP = 256;   // legacy name, unread: kernels now run TRUE radii bounded by
+                         // the slider caps — nothing shrinks the display grid anymore.
   function _dt1d(f) {
     // Mirrors masks._dt1d EXACTLY, including the seed-awareness: only FINITE f entries are
     // seeds. Without the f[q] >= Infinity skip, an all-off line (every entry Infinity, which
@@ -787,8 +798,44 @@
    *                 feather default read from the sliders AT COMMIT (the sliders are
    *                 defaults for the NEXT object - the contract stamp() has honoured).
    */
+  // Read a move/delete stroke's own footprint into a compact occupancy grid, and hand
+  // it to the NEXT rebuildRegions as a synthetic ancestor (see bakeMove / undo / redo).
+  // applied=true: the stroke's pixels lie at their DESTINATION (a baked move in place,
+  // an undone delete still out); false: at the ORIGIN (a popped move restored, a
+  // restored delete). The footprint's ink count doubles as the ancestor's 'area', so
+  // the >=6 / >=20% majority gates weigh it exactly like a pixel-overlap ancestor.
+  function noteMoveIdentity(st, applied) {
+    pendingMove = null;
+    if (!st) return;
+    var cv = st.mode === 'move' ? st.cv : (st.pRestore ? st.img : null);
+    if (!cv || !cv.width || !cv.height) return;
+    var x0, y0, w, h;
+    if (st.mode === 'move') {
+      x0 = st.ox + (applied ? (st.dx || 0) : 0);
+      y0 = st.oy + (applied ? (st.dy || 0) : 0);
+      w = cv.width; h = cv.height;
+    } else {                       // restored delete: exactly where it was carved
+      x0 = st.ox || 0; y0 = st.oy || 0; w = st.w || cv.width; h = st.h || cv.height;
+    }
+    if (st.pRestore && applied) return;   // delete COMMITTED lifts pixels: no identity claim
+    var bits, area = 0;
+    try {
+      var g = cv.getContext('2d', { willReadFrequently: true });
+      var d = g.getImageData(0, 0, cv.width, cv.height).data;
+      bits = new Uint8Array(cv.width * cv.height);
+      for (var i = 0; i < bits.length; i++) {
+        if (d[i * 4 + 3] > 8) { bits[i] = 1; area++; }
+      }
+    } catch (e) { return }                  // tainted/undecodable copy: fall back to ancestry
+    if (!area) return;
+    pendingMove = { x0: x0, y0: y0, w: cv.width, h: cv.height, bits: bits,
+                    old: { kind: st.pKind || 'shape', edge: st.pEdge || 0,
+                           feather: st.pFeather || 0, area: area } };
+  }
+
   function rebuildRegions() {
     regionRev++;
+    var pm = pendingMove;
     var n = W * H;
     if (!maskA || maskA.length !== n) maskA = new Uint8Array(n);
     var m = maskC.getContext('2d', { willReadFrequently: true });
@@ -841,6 +888,13 @@
         var pa = prevLabel[i];
         if (pa) { if (!st.anc) st.anc = {}; st.anc[pa] = (st.anc[pa] || 0) + 1; }
       }
+      if (pm) {
+        var mx = px - pm.x0, my = py - pm.y0;
+        if (mx >= 0 && my >= 0 && mx < pm.w && my < pm.h && pm.bits[my * pm.w + mx]) {
+          if (!st.anc) st.anc = {};
+          st.anc.__mv = (st.anc.__mv || 0) + 1;
+        }
+      }
     }
     order.sort(function (p, q) { return p - q; });       // scan order == paint-order proxy
     var selReg = (sel >= 0 && sel < prevRegs.length) ? prevRegs[sel] : null;
@@ -853,7 +907,7 @@
       if (st2.anc && prevRegs.length) {
         q = [];
         for (var key in st2.anc) {
-          var old = prevRegs[(key | 0) - 1];
+          var old = (key === '__mv' && pm) ? pm.old : prevRegs[(key | 0) - 1];
           if (!old) continue;
           var cnt = st2.anc[key];
           if (cnt >= 6 && (cnt >= 0.2 * st2.area || cnt >= 0.2 * (old.area || 1))) q.push({ old: old, cnt: cnt });
@@ -900,6 +954,7 @@
       }
     }
     sel = newSel;
+    pendingMove = null;   // identity is single-use: it belongs to THIS rebuild
   }
 
   // Square-kernel binary morph — mirrors masks._morph (server-side, shapes use the
@@ -979,8 +1034,8 @@
   // bug it replaces only ever showed the SELECTED object's morphology, so a just-tuned
   // object snapped back to raw geometry the moment you reached for the next one.
   // Cached per (pixel generation, kind, edge, feather, bbox): a slider drag recomputes
-  // only the object being dragged. Grid capped at _DISK_CAP — display only, never
-  // exported; the server overlay replaces these pixels with identical ones.
+  // only the object being dragged. Radii are TRUE (what the server paints) — display
+  // only, never exported; the server overlay replaces these pixels with identical ones.
   function regionDispCanvas(r) {
     var key = regionRev + '|' + r.kind + '|' + r.edge + '|' + r.feather + '|'
             + r.bbox.x0 + ',' + r.bbox.y0 + ',' + r.bbox.x1 + ',' + r.bbox.y1;
@@ -1003,9 +1058,14 @@
         on[y * w + x] = (compLabel && compLabel[g] === id && maskA[g] > REGION_ALPHA_MIN) ? 1 : 0;
       }
     }
-    var sd = Math.min(1, _DISK_CAP / Math.max(1, Math.max(w, h)));
+    // TRUE radii, always. The old code shrank every kernel/blur radius by a
+    // _DISK_CAP/max(w,h) factor — but the grid is NOT downsampled, so a feathered
+    // object whose padded grid exceeded the cap previewed a proportionally TIGHTER,
+    // harder skirt than the server ever paints (feather 30 drawn as ~7 on a phone-sized
+    // canvas). The slider caps (edge 60, feather 64) bound the cost; the kernels are
+    // separable O(n) and the whole canvas is cached per (params, generation) anyway.
     var e = Math.round(r.edge || 0);
-    if (e) on = (r.kind === 'auto' ? _discOn : _boxOn)(on, w, h, Math.max(1, Math.round(Math.abs(e) * sd)), e > 0);
+    if (e) on = (r.kind === 'auto' ? _discOn : _boxOn)(on, w, h, Math.min(96, Math.max(1, Math.abs(e))), e > 0);
     var im = cx.createImageData(w, h), d = im.data;
     for (k = 0; k < w * h; k++) {
       if (on[k]) { var o = k * 4; d[o] = 255; d[o + 1] = 255; d[o + 2] = 255; d[o + 3] = 255; }
@@ -1015,7 +1075,7 @@
     if (f > 0) {
       // outward feather: solid core UNION blurred grown copy — the >=128 footprint can
       // only match or exceed the hard silhouette the user approved (masks._feather_out).
-      var grown = (r.kind === 'auto' ? _discOn : _boxOn)(on, w, h, Math.max(1, Math.round(f * sd)), true);
+      var grown = (r.kind === 'auto' ? _discOn : _boxOn)(on, w, h, Math.min(96, Math.max(1, f)), true);
       var gc = document.createElement('canvas'); gc.width = w; gc.height = h;
       var gx = gc.getContext('2d');
       var gi = gx.createImageData(w, h), gd = gi.data;
@@ -1023,7 +1083,9 @@
       gx.putImageData(gi, 0, 0);
       var bc = document.createElement('canvas'); bc.width = w; bc.height = h;
       var bx = bc.getContext('2d');
-      bx.filter = 'blur(' + Math.max(0.5, f * sd) + 'px)';
+      // blur sigma == grow radius: union(core, blur(grown by f)) tails off ~2f past
+      // the silhouette — the >=128 footprint matches masks._feather_out (grow f + blur f).
+      bx.filter = 'blur(' + Math.max(0.5, Math.min(96, f)) + 'px)';
       bx.drawImage(gc, 0, 0);
       cx.globalCompositeOperation = 'lighter';
       cx.drawImage(bc, 0, 0);
@@ -1188,7 +1250,13 @@
   function undo() {
     active = null;
     if (!strokes.length) { rasterize(); return; }
-    redoStack.push(strokes.pop());
+    var popped = strokes.pop();
+    redoStack.push(popped);
+    // Undoing a move teleports the blob back to its ORIGIN with zero pixel overlap
+    // where it lands; without the stroke's stamped identity the rebuild re-rolled its
+    // kind/edge/feather from the global sliders — the 'sometimes loses its feathering'
+    // report (arming those sliders between move and undo made the loss deterministic).
+    noteMoveIdentity(popped, false);
     rasterize(); status('Undo');
   }
   // (retired: touchObject refreshes the panel IN PLACE — see el_inspect._sync)
@@ -1196,12 +1264,14 @@
   function redoStep() {
     active = null;
     if (!redoStack.length) { rasterize(); return; }
-    strokes.push(redoStack.pop());
+    var re = redoStack.pop();
+    strokes.push(re);
+    noteMoveIdentity(re, true);      // the restored move votes with its stamped identity
     rasterize(); status('Redo');
   }
   function clearMask() {
     strokes = []; redoStack = []; active = null; preview = null; sel = -1; selDrag = null;
-    regions = []; compLabel = null; maskA = null; _dragReg = null;
+    regions = []; compLabel = null; maskA = null; _dragReg = null; pendingMove = null;
     smartObjs = []; smartCur = -1; smartDrag = null;   // a cleared canvas has no object to refine
     rasterize(); status('Mask cleared');
   }

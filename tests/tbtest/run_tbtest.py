@@ -3,7 +3,7 @@
     python3 tests/tbtest/run_tbtest.py [--mutate NAME] [--width 420] [--height 620]
     (--mutate: sticky ctlorder softpunch brushfeather kindstr autoslider widetol
      rawwash allmerge nosig selguard twoslider noderive blendblank seldbg
-     barwash bar95 polltoken legacy)
+     barwash bar95 polltoken movelost shrinkrad legacy)
 
 --mutate rebuilds the page with a deliberately broken copy of the shipped JS, so the suite
 proves it can actually see the two bugs it claims to have fixed. A green test that cannot
@@ -360,6 +360,43 @@ MUTANTS["bar95"] = LEGACY_BAR95
 MUTANTS["polltoken"] = LEGACY_POLLTOKEN
 
 
+# MOVE IDENTITY, pre-fix: the baked move/undo/redo strokes carry their params, but the
+# rebuild never receives them (noteMoveIdentity neutralised), so a blob whose pixels
+# land with no ancestor overlap re-rolls kind/edge/feather from commitHintKind + the
+# toolbar sliders. 'Sometimes loses its feathering' = always, once any brush stroke was
+# painted earlier in the session (hint=brush) or the blob lands onto a plain neighbour
+# (the merge takes the neighbour's feather wholesale).
+def LEGACY_MOVELOST(s):
+    an = "  function noteMoveIdentity(st, applied) {\n    pendingMove = null;"
+    assert an in s, 'noteMoveIdentity anchor moved'
+    return s.replace(an,
+        "  function noteMoveIdentity(st, applied) {\n    if (1) return;   // MUTANT: identity never reaches the rebuild\n    pendingMove = null;", 1)
+
+
+# PREVIEW FEATHER TIGHTNESS, pre-fix: every display kernel/blur radius multiplied by
+# CAP/grid-side. The shipped defect hid at cap 256 (only phone-sized canvases shrink);
+# the harness view is 160x320, so the mutant stands the cap in at 48 — the SAME relative
+# shrinkage the user sees at 1024 px (feather 30 drawn as ~4, visibly hard-edged).
+def LEGACY_SHRINKRAD(s):
+    an = "    var e = Math.round(r.edge || 0);\n"
+    an += "    if (e) on = (r.kind === 'auto' ? _discOn : _boxOn)(on, w, h, Math.min(96, Math.max(1, Math.abs(e))), e > 0);"
+    assert an in s, 'true-edge anchor moved'
+    s = s.replace(an,
+        "    var sd = Math.min(1, 48 / Math.max(1, Math.max(w, h)));\n" + an.replace(
+            'Math.min(96, Math.max(1, Math.abs(e)))', 'Math.max(1, Math.round(Math.abs(e) * sd))'), 1)
+    g2 = "var grown = (r.kind === 'auto' ? _discOn : _boxOn)(on, w, h, Math.min(96, Math.max(1, f)), true);"
+    assert g2 in s, 'true-grow anchor moved'
+    s = s.replace(g2, "var grown = (r.kind === 'auto' ? _discOn : _boxOn)(on, w, h, Math.max(1, Math.round(f * sd)), true);", 1)
+    b3 = "bx.filter = 'blur(' + Math.max(0.5, Math.min(96, f)) + 'px)';"
+    assert b3 in s, 'true-blur anchor moved'
+    s = s.replace(b3, "bx.filter = 'blur(' + Math.max(0.5, f * sd) + 'px)';", 1)
+    return s
+
+
+MUTANTS["movelost"] = LEGACY_MOVELOST
+MUTANTS["shrinkrad"] = LEGACY_SHRINKRAD
+
+
 def main():
     a = sys.argv[1:]
     mutate = doc_mutate = None
@@ -410,7 +447,7 @@ def main():
         print('COMPOSE TRACE:')
         for i, d in enumerate(res['dbg'][:10]):
             print('  ', i, d)
-    EXPECT = 104
+    EXPECT = 115
     if len(res["tests"]) != EXPECT:
         print("TRUNCATED RUN: got %d assertions, expected %d -- an early error stopped the "
               "steps (notes: %s). This is NOT a pass." %
