@@ -67,15 +67,27 @@
       var c = document.createElement('canvas'); c.width = 12; c.height = 12;
       var g = c.getContext('2d'); g.fillStyle = 'rgb(255,0,255)'; g.fillRect(0, 0, 12, 12);
       var b64 = c.toDataURL('image/png').split(',')[1];
-      return Promise.resolve({ ok: true, status: 200, json: function () {
+      var answer = function () {
         // FIXTURE HOOK: the empty/tiny verdicts are the SERVER's judgement; the suite
         // raises the flag on the window to make the stub answer as if the paint were
         // zero (the editor must report it without being asked).
-        if (window.__PVEMPTY) return Promise.resolve({ ok: true, overlay_png: b64,
-                                 coverage: 0, info: { size: [160, 320] }, empty: true, tiny: false });
-        return Promise.resolve({ ok: true, overlay_png: b64, coverage: 0.0314,
-                                 info: { size: [160, 320] }, empty: false, tiny: !!window.__PVTINY });
-      }});
+        if (window.__PVEMPTY) return { ok: true, overlay_png: b64,
+                                 coverage: 0, info: { size: [160, 320] }, empty: true, tiny: false };
+        return { ok: true, overlay_png: b64, coverage: 0.0314,
+                                 info: { size: [160, 320] }, empty: false, tiny: !!window.__PVTINY };
+      };
+      // FIXTURE HOOK: __PVHOLD keeps answers IN FLIGHT (pushed to __PVPEND) until a step
+      // drains and calls them — the only way to stage the stale-overlay race in-browser:
+      // an answer minted BEFORE a drag landing AFTER the object moved must be discarded
+      // by the client's freshness key (previewSig, objSig term and all).
+      if (window.__PVHOLD) {
+        return new Promise(function (res) {
+          (window.__PVPEND = window.__PVPEND || []).push(function () {
+            res({ ok: true, status: 200, json: answer });
+          });
+        });
+      }
+      return Promise.resolve({ ok: true, status: 200, json: answer });
     }
     if (String(url).indexOf('mask/click') !== -1) {
       // A left-half opaque mask: unmistakably NOT a default and NOT empty, so committing it
@@ -105,9 +117,22 @@
       out.fetches.push({ url: String(url), job_create: true,
                          has_layers: !!body.layers, has_spec: !!body.spec,
                          auth: ((opts || {}).headers || {}).authorization || '' });
+      var jp = { ok: true, job_id: 'JOBPROGRESS1234', seed: 77,
+                 token: 'JOBSCOPE-TOKEN' };
+      // The stub plays the SERVER's captioning step (imagegen.captioning, which the
+      // real api._create runs before persisting): when the hook is set, echo back a
+      // spec whose prompt is the reduced caption and whose prompt_raw is the words
+      // the client actually sent. That is the ONLY way the browser suite can see the
+      // reduced/sent split — the reducer itself lives server-side and is pinned
+      // offline (smoke_toolbox test_prompt_captioning).
+      if (window.__JOBSREWRITE && body && body.spec) {
+        jp.spec = {};
+        for (var sk in body.spec) { if (body.spec.hasOwnProperty(sk)) jp.spec[sk] = body.spec[sk]; }
+        jp.spec.prompt_raw = body.spec.prompt;
+        jp.spec.prompt = String(window.__JOBSREWRITE);
+      }
       return Promise.resolve({ ok: true, status: 200, json: function () {
-        return Promise.resolve({ ok: true, job_id: 'JOBPROGRESS1234', seed: 77,
-                                 token: 'JOBSCOPE-TOKEN' });
+        return Promise.resolve(jp);
       }});
     }
     return Promise.resolve({ ok: true, status: 200, json: function () { return Promise.resolve({ ok: true }); } });

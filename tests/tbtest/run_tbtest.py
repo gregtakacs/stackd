@@ -172,6 +172,10 @@ MUTANTS = {"sticky": LEGACY_STICKY, "ctlorder": LEGACY_CTL, "softpunch": LEGACY_
 # strokes.length + the global sliders only, so dragging a placed object (which changes
 # neither) let the debounce answer "same request" and keep painting the old overlay.
 def LEGACY_NOSIG(s):
+    # DIES to the DR __PVHOLD race: an answer minted pre-drag lands mid-drag, and with
+    # the object term dropped from previewSig, compose()'s sig check considers the
+    # frozen overlay still current and paints it over the finger (magenta gate goes
+    # red). The offline test_contract previewSig pin backstops the same term at source.
     a = "            val('tb_brush', 60), val('tb_hardness', 0.55), paramsSig(), objSig()].join('|');"
     assert a in s, "previewSig anchor moved"
     return s.replace(a, "            val('tb_brush', 60), val('tb_hardness', 0.55), paramsSig()].join('|');", 1)
@@ -583,6 +587,15 @@ def LEGACY_NOWARN(s):
     return s.replace(an, "      if (false && (r.empty || r.tiny)) {", 1)
 
 
+# THE SILENT REWRITE, restored: the server reduced the user's instruction to a caption
+# but the submit line still only says 'Queued' — the words that went to the model
+# differ from the words the user approved, and nobody says so.
+def LEGACY_NOECHO(s):
+    an = "      if (typeof sp.prompt_raw === 'string' && typeof sp.prompt === 'string'"
+    assert s.count(an) == 1, 'submit-echo anchor moved'
+    return s.replace(an, "      if (false && typeof sp.prompt_raw === 'string' && typeof sp.prompt === 'string'", 1)
+
+
 MUTANTS["nofold"] = LEGACY_NOFOLD
 # THE FEATHER-VANISHING-COMMIT, restored: the region rebuild hard-zeroed brush
 # edge/feather while stamp() had already given the stroke the slider numbers - the soft
@@ -658,10 +671,10 @@ def LEGACY_DASHBOX(s):
     DASH = [
         "      var _so = selObj();                     // MUTANT: dashed bbox is back",
         "      if (_so) { var _b = objBBox(_so);",
-        "        if (_b) { v.save(); v.strokeStyle = '#3ba7ff';",
-        "          v.lineWidth = Math.max(1.5, 2 * scale());",
-        "          v.setLineDash([6 * scale(), 4 * scale()]);",
-        "          v.strokeRect(_b.x0 + (_so.mvx || 0), _b.y0 + (_so.mvy || 0),",
+        "        if (_b) { v.save(); v.strokeStyle = '#3ba7ff'; v.globalAlpha = 1;",
+        "          v.lineWidth = Math.max(3.5, 2 * (scale() || 1));",
+        "          v.setLineDash([6, 4]);",
+        "          v.strokeRect(_b.x0 + (_so.mvx || 0) + .5, _b.y0 + (_so.mvy || 0) + .5,",
         "                       _b.x1 - _b.x0 + 1, _b.y1 - _b.y0 + 1);",
         "          v.restore(); } }"]
     an = NL.join(["      v.drawImage(preview.img, 0, 0, W, H);", "      drawActiveOutline(v);"])
@@ -702,6 +715,7 @@ MUTANTS["armleak"] = LEGACY_ARMLEAK
 MUTANTS["dashbox"] = LEGACY_DASHBOX
 MUTANTS["previewbtn"] = LEGACY_PREVIEWBTN
 MUTANTS["nowarn"] = LEGACY_NOWARN
+MUTANTS["noecho"] = LEGACY_NOECHO
 MUTANTS["zoomlie"] = LEGACY_ZOOMLIE
 MUTANTS["fluidbox"] = LEGACY_FLUIDBOX
 
@@ -713,6 +727,17 @@ MUTANTS["erasepaints"] = LEGACY_ERASEPAINTS
 MUTANTS["brushsoft"] = LEGACY_BRUSHSOFT
 MUTANTS["wirebrush"] = LEGACY_WIREBRUSH
 MUTANTS["staleoverlay"] = LEGACY_STALEOVERLAY
+
+
+# Not every MUTANTS entry is a bug-restoration the suite must reject. This one is
+# EXPECTED to leave the suite green BY DESIGN, and a sweep must not report it alive:
+#   seldbg — a diagnostic event-trace injector (feeds window.__SEL for the select
+#            asserts). Its membership in the mutant registry exists to CRASH when the
+#            select anchors move, not to go red; running it clean is running it right.
+# nosig is NOT in this set and must die: compose() itself refuses an overlay whose
+# preview.sig mismatches the live previewSig, so the dropped objSig() term IS
+# observable — once the DR __PVHOLD hook can strand an answer across the move.
+EXPECTED_ALIVE = {"seldbg"}
 
 
 def main():
@@ -765,7 +790,7 @@ def main():
         print('COMPOSE TRACE:')
         for i, d in enumerate(res['dbg'][:10]):
             print('  ', i, d)
-    EXPECT = 160   # 158 + 2 preview-button removal: button gone x1, unprompted-empty-verdict x1: visibility x6 (pair NEVER shown), KF promise x2,
+    EXPECT = 161   # 160 + 1 caption-handover gate (submit line names the sent caption): visibility x6 (pair NEVER shown), KF promise x2,
                    # fresh-hard x1, no-arm-leak x1, no-dashed-box x1, ZM honesty x3, A3 belt x1
                  # wire-no-punch (2), feather-live group (4), re-merge no-remnant (3)
     if len(res["tests"]) != EXPECT:

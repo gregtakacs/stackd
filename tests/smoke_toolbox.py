@@ -1160,6 +1160,16 @@ def test_contract():
     dead_m = re.search(r"var DEAD_KNOBS = \[([^\]]*)\]", js)
     dead = set(re.findall(r"'([^']+)'", dead_m.group(1))) if dead_m else set()
     check("the client keeps a dead-knob registry", dead_m is not None)
+    # THE FRESHNESS KEY'S OBJECT TERM: previewSig is what makes a late preview answer
+    # stale — compose() refuses to paint an overlay whose sig no longer matches, and it
+    # is the objSig() term that invalidates an answer minted BEFORE an object moved.
+    # The browser suite kills the dropped term with the DR __PVHOLD race (stale answer
+    # released mid-drag); this is the source-level backstop so the term cannot silently
+    # vanish again while some future fixture loses the race's timing teeth.
+    mps = re.search(r"function previewSig\(\)[\s\S]{0,320}?\.join\(", js)
+    check("the preview freshness key covers the SELECTED OBJECT, not just the knobs",
+          mps is not None and "objSig()" in mps.group(0),
+          mps and '...' + mps.group(0)[-70:])
     check("dead-marked controls are disabled in the built panel",
           re.search(r"node\.disabled\s*=\s*true", js) is not None)
     for knob in ("kind", "prompt", "strength", "opacity", "blend_mode",
@@ -1236,6 +1246,133 @@ def test_contract():
     r = post(tb, "/toolbox/mask/preview", {"mask_png": MASK_B64, "spec": {}}, token=fresh_token())
     check("preview returns the fields the status line reads",
           {"coverage", "empty", "tiny", "info", "overlay_png"} <= set(r.payload))
+
+
+def test_prompt_captioning():
+    """The MASKED-PATH CAPTIONING CONTRACT, shared with MCP edit_image. Flux.2 is a
+    caption model: an instruction-phrased prompt keeps the source object's tokens in
+    the conditioning and drags the inpaint back toward the photo, and the CLIP-class
+    encoder attends ~77 tokens, so both masked paths reduce the instruction frame to
+    a caption of the WANTED result and cap the length — through the ONE module
+    (stackd/imagegen/captioning.py), never a copy. Pinned: reducer unit behaviour,
+    that api._create applies it BEFORE persisting (row/echo/graph carry the words
+    that actually ran), that the user's own words survive as prompt_raw, that an
+    already-good prompt mutates NOTHING (the exact-spec echo contract depends on it),
+    and the negative controls."""
+    import time as _t2
+    from stackd.imagegen import captioning as cap
+    from stackd.toolbox import jobs as J
+    SIZE = (640, 480)          # the module-level PHOTO's dims; specs send them explicitly
+
+    check("captioning: substitution frame reduces to the wanted-result caption",
+          cap.describe_edit_target("Replace the red Lamborghini with a blue Audi R8.")
+          == "a blue Audi R8")
+    check("captioning: make-it frame reduces",
+          cap.describe_edit_target("make it a snowy evening") == "a snowy evening")
+    check("captioning: add/remove phrasing left alone (no instruction frame to shed)",
+          cap.describe_edit_target("remove the trash cans") == "remove the trash cans")
+    check("captioning: a plain caption is untouched",
+          cap.describe_edit_target("a red bicycle leaning on a wall")
+          == "a red bicycle leaning on a wall")
+    check("captioning: a too-short reduction is noise, prompt survives intact",
+          cap.describe_edit_target("turn it to ok") == "turn it to ok")
+    sent_w, note_w = cap.caption_prompt("replace the wall with a sunlit stone garden")
+    check("captioning: pipeline returns the reduction and says so",
+          sent_w == "a sunlit stone garden" and "caption" in note_w, (sent_w, note_w))
+    sent_s, note_s = cap.caption_prompt("a calm lake at dawn")
+    check("captioning: unchanged text reports no change with an empty note",
+          sent_s == "a calm lake at dawn" and note_s == "", (sent_s, note_s))
+    longp = " ".join("w%d" % i for i in range(90))
+    sent_l, note_l = cap.caption_prompt(longp)
+    check("captioning: caption capped at the model's attention window (~77)",
+          len(sent_l.split()) == cap.PROMPT_TOKEN_CAP == 77
+          and sent_l.startswith("w0 w1") and "77" in note_l, note_l)
+    check("captioning: empty/whitespace prompts are inert, never crash the route",
+          cap.caption_prompt("") == ("", "") and cap.caption_prompt("   ") == ("", ""))
+
+    # -- THE ROUTE: api._create captions BEFORE persisting --
+    tb = make_tb()
+    r = post(tb, "/toolbox/jobs", {"mask_png": MASK_B64, "spec": {
+        "width": SIZE[0], "height": SIZE[1], "kind": "replace",
+        "prompt": "replace the car with a sunlit red mustang"}}, token=fresh_token())
+    sp = (r.payload or {}).get("spec") or {}
+    check("create: an instruction ships as the caption the model can follow",
+          r.status == 200 and sp.get("prompt") == "a sunlit red mustang", sp)
+    check("create: the user's own words are preserved beside it, never overwritten",
+          sp.get("prompt_raw") == "replace the car with a sunlit red mustang"
+          and sp.get("prompt_note"), sp)
+    r2 = post(tb, "/toolbox/jobs", {"mask_png": MASK_B64, "spec": {
+        "width": SIZE[0], "height": SIZE[1], "prompt": "a calm lake at dusk"}},
+        token=fresh_token())
+    check("create: a caption already good is echoed EXACTLY as sent (no keys added)",
+          r2.status == 200 and r2.payload.get("spec") == {
+              "width": SIZE[0], "height": SIZE[1], "prompt": "a calm lake at dusk"},
+          r2.payload.get("spec"))
+    r3 = post(tb, "/toolbox/jobs", {"mask_png": MASK_B64, "spec": {
+        "width": SIZE[0], "height": SIZE[1], "prompt": ""}}, token=fresh_token())
+    check("create: empty prompt (bare cleanup) passes through inert",
+          r3.status == 200 and r3.payload.get("spec", {}).get("prompt") == ""
+          and "prompt_raw" not in r3.payload.get("spec", {}), r3.payload.get("spec"))
+
+    # -- THE ROW HOLDS THE SAME TRUTH as the echo --
+    captured = []
+    def render_cap(job, source, mask, *, on_prompt_id=None):
+        captured.append(job)
+        return (base64.b64encode(b"R").decode(), "image/png")
+    qw = J.JobQueue(J.JobStore(":memory:"), render=render_cap)
+    qw.start()
+    tbw = make_tb(worker=qw)
+    rw = post(tbw, "/toolbox/jobs", {"mask_png": MASK_B64, "spec": {
+        "width": SIZE[0], "height": SIZE[1], "kind": "edit",
+        "prompt": "change the sky to a stormy dusk"}}, token=fresh_token())
+    _end = _t2.time() + 3.0
+    while _t2.time() < _end and not captured:
+        _t2.sleep(0.02)
+    jspec = (captured[0].get("spec") if captured else {}) or {}
+    check("the persisted job row carries the reduced caption the render ran on",
+          rw.status == 200 and bool(captured) and jspec.get("prompt") == "a stormy dusk",
+          jspec)
+    check("and the row keeps the user's raw words next to it (no silent rewrite)",
+          jspec.get("prompt_raw") == "change the sky to a stormy dusk", jspec)
+
+    # -- NEGATIVE CONTROLS: the checks above must be able to fail --
+    orig = cap.describe_edit_target
+    cap.describe_edit_target = lambda p: p
+    try:
+        ttm = make_tb()
+        rm = post(ttm, "/toolbox/jobs", {"mask_png": MASK_B64, "spec": {
+            "width": SIZE[0], "height": SIZE[1], "prompt":
+                "replace the car with a sunlit red mustang"}}, token=fresh_token())
+        check("MUTANT identity-reducer: the raw instruction survives (so the route "
+              "checks really test the reducer)",
+              rm.payload.get("spec", {}).get("prompt")
+              == "replace the car with a sunlit red mustang")
+    finally:
+        cap.describe_edit_target = orig
+    orig_cap_n = cap.PROMPT_TOKEN_CAP
+    cap.PROMPT_TOKEN_CAP = 10000
+    try:
+        ttc = make_tb()
+        rc = post(ttc, "/toolbox/jobs", {"mask_png": MASK_B64, "spec": {
+            "width": SIZE[0], "height": SIZE[1], "prompt": longp}}, token=fresh_token())
+        check("MUTANT uncapped encoder: the 90-word essay survives (the cap bites)",
+              rc.payload.get("spec", {}).get("prompt") == longp)
+    finally:
+        cap.PROMPT_TOKEN_CAP = orig_cap_n
+
+    # -- SHARED BRAIN, not a copy: imagegen.tools is heavyweight (anyio/mcp/uvicorn,
+    # NOT a toolbox dependency and not installed in this offline env), so pin by
+    # SOURCE that MCP's masked path routes through the one captioning module — the
+    # reducer's behaviour is pinned above, the alias' existence is pinned here, and
+    # the regexes existing in exactly ONE file is what "same words, same behaviour"
+    # means mechanically. A forked copy in tools.py fails the third clause.
+    import pathlib as _p
+    it_src = (_p.Path(__file__).resolve().parents[1] / "stackd" / "imagegen" /
+              "tools.py").read_text()
+    check("MCP edit_image masked path captions through the ONE module (no forked regex)",
+          "_captioning.describe_edit_target(prompt)" in it_src
+          and "captioning as _captioning" in it_src
+          and "_EDIT_INSTR_RE = re.compile" not in it_src)
 
 
 def test_graphs():
@@ -1377,6 +1514,7 @@ def main() -> int:
     test_routes()
     test_web()
     test_contract()
+    test_prompt_captioning()
     test_spike_wiring()
     test_graphs()
     test_jobs()

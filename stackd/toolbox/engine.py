@@ -188,6 +188,11 @@ def _patch_graph(graph: dict, spec: dict, *, source_filename: str, mask_filename
     from stackd.imagegen import workflows as wf
     graph[_graphs.LOAD_IMAGE_NODE]["inputs"]["image"] = source_filename
     graph[_graphs.SEGMENT_NODE]["inputs"]["image"] = mask_filename
+    # The prompt arrives ALREADY CAPTIONED: api._create ran it through
+    # stackd.imagegen.captioning (the same reduction imagegen.tools' masked edit_image
+    # applies) before persisting the row, so the graph executes exactly the stored
+    # prompt and this layer does NO text handling of its own. Drift between the two
+    # masked paths is the bug this pin exists to prevent.
     wf.set_node(graph, wf.MASK_POSITIVE_NODE, "positive", str((spec or {}).get("prompt") or ""))
     wf.set_node(graph, wf.MASK_WIDTH_NODE, "width", int(w))
     wf.set_node(graph, wf.MASK_HEIGHT_NODE, "height", int(h))

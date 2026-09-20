@@ -1882,7 +1882,7 @@
       'reimagines the mask from the prompt. Either way only the area you paint is touched.'));
     el.prompt = document.createElement('textarea');
     el.prompt.id = 'tb_prompt'; el.prompt.rows = 2;
-    el.prompt.placeholder = 'What to put there (for Replace). For Edit, name the change. Empty = clean up.';
+    el.prompt.placeholder = 'Describe what should be there as a short caption ("sunlit empty lawn where the cans were"). The model follows captions, not commands: words naming what to REMOVE pull the edit back toward the photo. Empty = clean up.';
     el.prompt.value = CFG.prompt || '';
     root.appendChild(labelled('prompt', el.prompt));
 
@@ -2096,6 +2096,20 @@
       if (!r.job_id) throw new Error('job was not created');
       if (el.seed && r.seed !== undefined) el.seed.value = r.seed;
       status('Queued as job ' + String(r.job_id).slice(0, 8) + '…');
+      // HONEST HANDOVER: the server reduced the prompt to a caption (the shared MCP
+      // masked-path contract — imagegen.captioning, applied at job creation in
+      // api._create). The user approved the words THEY typed; the render runs on
+      // these. When the two differ, the status line must say which words went to
+      // the model — a silent rewrite is the same class of lie as a fake progress
+      // bar, and the spec echo is where a dropped field would surface.
+      var sp = r.spec || {};
+      if (typeof sp.prompt_raw === 'string' && typeof sp.prompt === 'string'
+          && sp.prompt !== sp.prompt_raw) {
+        var _ps = String(sp.prompt);
+        status('Queued as job ' + String(r.job_id).slice(0, 8)
+               + ' · sent to the model as "'
+               + (_ps.length > 48 ? _ps.slice(0, 48) + '…' : _ps) + '"');
+      }
       // Poll with the JOB-scope token the create response minted, NOT the launch token:
       // create redeemed the launch token single-use, and the poll/cancel routes require
       // scope="job" (a launch token there is a 403). This token is bound to this job_id.

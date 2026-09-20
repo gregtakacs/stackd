@@ -485,8 +485,37 @@
     var sn = document.querySelector('.tb-status');
     if (sn) window.__BAROBS.observe(sn.parentNode, { childList: true, subtree: true,
       attributes: true, attributeFilter: ['style', 'class'], characterData: true });
+    // Caption-handover gate: type an INSTRUCTION-phrased prompt and arm the jobs
+    // stub's server-role hook (driver.js) to echo back the reduced caption the real
+    // api._create would have stored (imagegen.captioning). The submit line must
+    // then name the words the render actually runs on — see the assert below.
+    // The first poll lands with ZERO delay (try 0), clobbering the submit line
+    // before any timed snapshot could read it, so record EVERY status transition
+    // with an observer (same trick __BARLOG uses) and assert from the log.
+    var ta = document.getElementById('tb_prompt');
+    if (ta) ta.value = 'replace the car with a sunlit red mustang';
+    window.__JOBSREWRITE = 'a sunlit red mustang';
+    window.__STATUSLOG = [];
+    var stn = document.querySelector('.tb-status');
+    if (stn) {
+      var so = new MutationObserver(function () {
+        window.__STATUSLOG.push(stn.textContent || '');
+      });
+      so.observe(stn, { childList: true, characterData: true, subtree: true });
+    }
     var rb = byText('Render'); if (rb) rb.click();
     return wait(5200);   // past the queued + running indeterminate polls
+  });
+  step('submit caption echo assert', function () {
+    var lines = window.__STATUSLOG || [];
+    var hit = '';
+    for (var i = 0; i < lines.length; i++) {
+      if (/sent to the model as/.test(lines[i])) { hit = lines[i]; break; }
+    }
+    out.note.push('STATUSLOG ' + JSON.stringify(lines.slice(0, 4)).slice(0, 160));
+    T('the submit line names the caption the render ACTUALLY runs on (no silent rewrite)',
+      /sent to the model as "a sunlit red mustang"/.test(hit), hit || ('no sent-as line in ' + JSON.stringify(lines.slice(0, 4))));
+    return true;
   });
   step('progress indeterminate asserts', function () {
     var log = window.__BARLOG || [];
@@ -1063,48 +1092,67 @@
   });
   step('SB the selection shows the boundary, not a dashed box', function () {
     var sb = toolButton('select'); if (sb) sb.click();
-    fire('pointerdown', 785, 45, 250, { isPrimary: true });      // reselect the FIRST rect
-    fire('pointerup', 785, 45, 250, {});
-    return wait(200).then(function () {
+    // BBOX-DRIVEN, the ERf/ERr lesson: panel-height changes move rows by a hair, and a
+    // hardcoded tap row silently stops hitting the object — which greens this gate by
+    // ACCIDENT (nothing selected, the dashed-bbox mutant draws nothing, "no dashes" is
+    // vacuously true; the round-2 sweep caught it exactly that way). Measure the rect,
+    // tap its CENTRE, and refuse to sample unless the selection is verifiably LIVE.
+    var q0 = null;
+    (function () { var st0 = region();
+      (st0 && st0.all || []).forEach(function (q) { if (q.bbox.x0 < 60) q0 = q; }); })();
+    if (!q0) { T('no dashed rectangle ever paints around a selected object', false,
+                 'fixture lost the first rect'); return true; }
+    var cx = Math.round((q0.bbox.x0 + q0.bbox.x1) / 2), cy = Math.round((q0.bbox.y0 + q0.bbox.y1) / 2);
+    // The motion gate runs against THIS DESELECTED FRAME (the KF group pressed Deselect
+    // just above; this tap is the act of selecting), NOT against the photo: the fixture
+    // image has its own azure-family pixels, and a photo-relative gate read real 3.5px
+    // dashes over that blue as travel=0 — the mutant sailed through at hits=0 while a
+    // raw canvas scan saw every one of them (round-3 postmortem).
+    var base = px(view);
+    fire('pointerdown', 785, cx, cy, { isPrimary: true });       // reselect the FIRST rect
+    fire('pointerup', 785, cx, cy, {});
+    return wait(220).then(function () {
+      var insp = document.querySelector('.tb-inspect');
+      var live = !!insp && insp.style.display !== 'none' && insp.offsetParent !== null;
       var st = region(), me = null;
       (st && st.all || []).forEach(function (q) { if (q.bbox.x0 < 60) me = q; });
-      if (!me) { T('no dashed rectangle ever paints around a selected object', false,
-                   'fixture lost the first rect'); return true; }
+      if (!live || !me) { T('no dashed rectangle ever paints around a selected object',
+        false, 'fixture had no LIVE selection to decorate (inspect=' + live + ' obj=' + !!me + ')');
+        return true; }
       // Sample the row the dashed bbox would have stroked at bbox.y0 (that is exactly
       // where the old #3ba7ff dashes lived) and count pixels PUSHED TOWARD that blue
       // versus the untouched photo. The cyan boundary ring (60,220,255) and the wash
       // (232,62,62) are both outside the blue-family window.
-      var d = px(view), ref = refData, W0 = view.width, H0 = view.height;
+      var d = px(view), W0 = view.width, H0 = view.height;
       var xl = Math.max(0, me.bbox.x0 | 0), xh = Math.min(W0 - 1, me.bbox.x1 | 0);
       var yl = Math.max(0, me.bbox.y0 | 0), yh = Math.min(H0 - 1, me.bbox.y1 | 0);
-      // Sample ALL FOUR sides — a bbox edge that happens to lie in empty ink is precisely
-      // where a resurrected rectangle shows itself, and an early version sampling only the
-      // top row let a faithful dashbox mutant sail through on an L-shaped brush blob.
-      // ABSOLUTE match on the dash colour, not a delta-vs-photo: the stub's magenta
-      // overlay sits under the selection border and poisons any photo-relative test.
-      // Nothing else the editor paints is (59,167,255)-family: the wash is (232,62,62),
-      // the boundary ring (60,220,255) — the 120..210 green band excludes it — the
-      // overlay tint (255,0,255) and the polygon dots are far away in RGB.
-      // The azure corridor of the dash itself: r~59 g~167 b~255, tolerant to AA against
-      // the base photo, and the photo must have MOVED (>=40 summed channel travel) —
-      // a static blue photo pixel cannot vote. The cyan boundary ring (g 210..255 even
-      // at its 0.95 alpha over any base) and the magenta overlay (r 255) cannot reach
-      // g<=200 while keeping r<=110. (Two lessons were learned the hard way here: a
-      // photo-delta-only window let the anti-aliased dashes escape; a g<=216 window let
-      // the 0.95-alpha ring in — hits=70 on shipped code. The corridor must exclude both.)
-      function side(xx, yy) {
+      // THE TEST IS THE BUG'S OWN DEFINITION: selecting an object must add ZERO
+      // azure-family pixels to the canvas. Count them SELECTED-VERSUS-DESELECTED (the
+      // base frame captured above, same wash, same tool, one tap ago) — never against
+      // the photo (the fixture image has its own azure-family pixels; a photo-relative
+      // gate read real dashes over that blue as travel=0 at hits=0), and never by
+      // probing exact integer bbox rows (a half-pixel-centered 3.5px dash straddles
+      // them; three detector generations died on that knife-edge — the g<=216 window
+      // let the cyan ring pose as dash-blue at hits=70, an integer-row window let a
+      // faithful mutant escape at 0/35). The dash core is (59,167,255)-family; nothing
+      // the shipped editor paints on selection enters this corridor and MOVES: the
+      // ring's AA tail over the b=128 photo cannot satisfy b>=235 and g<=185 at once,
+      // the wash is (232,62,62), the stub overlay magenta (r=255).
+      function azure(d0, xx, yy) {
         var o = (yy * W0 + xx) * 4;
-        var travel = Math.abs(d[o] - ref[o]) + Math.abs(d[o + 1] - ref[o + 1]) +
-                     Math.abs(d[o + 2] - ref[o + 2]);
-        return d[o] <= 110 && d[o + 1] >= 130 && d[o + 1] <= 200 &&
-               d[o + 2] >= 225 && travel >= 40;
+        var travel = Math.abs(d0[o] - base[o]) + Math.abs(d0[o + 1] - base[o + 1]) +
+                     Math.abs(d0[o + 2] - base[o + 2]);
+        return d0[o] <= 110 && d0[o + 1] >= 130 && d0[o + 1] <= 185 &&
+               d0[o + 2] >= 235 && travel >= 40;
       }
       var hits = 0, n = 0, x, y;
-      for (x = xl; x <= xh; x++) { n++; if (side(x, yl)) hits++; if (side(x, yh)) hits++; }
-      for (y = yl; y <= yh; y++) { n++; if (side(xl, y)) hits++; if (side(xh, y)) hits++; }
-      out.note.push('SB row ' + y + ' hits=' + hits + '/' + n);
+      for (y = Math.max(0, yl - 3); y <= Math.min(H0 - 1, yh + 3); y++)
+        for (x = Math.max(0, xl - 3); x <= Math.min(W0 - 1, xh + 3); x++) {
+          n++; if (azure(d, x, y)) hits++;
+        }
+      out.note.push('SB newazure hits=' + hits + '/' + n);
       T('no dashed rectangle ever paints around a selected object',
-        n > 8 && hits / n < 0.12, 'hits=' + hits + '/' + n);
+        n > 8 && hits === 0, 'new azure pixels when selected: ' + hits + '/' + n);
       return true;
     });
   });
@@ -1285,9 +1333,23 @@
   step('DR drag it while the stale overlay is current', function () {
     T('the fixture reached the state the bug needs: a matching server preview on screen',
       magentaCount(view) > 0, 'magenta=' + magentaCount(view));
-    fire('pointerdown', 771, 40, 67, { isPrimary: true });      // grab inside the blob
-    for (var i = 1; i <= 6; i++) fire('pointermove', 771, 40 + i * 8, 67 + i * 10, {});
-    return wait(60);                                            // STILL MID-DRAAG
+    // Stage the REAL stale-answer race: re-request a preview (__PVHOLD keeps its answer
+    // in flight in the stub), let the debounced fetch fire, then MOVE THE OBJECT under
+    // it and release. The answer was minted pre-drag; it lands mid-drag and must be
+    // DISCARDED by the freshness key — an answer that lands after the object moved must
+    // never paint over the finger.
+    window.__PVHOLD = true; window.__PVPEND = [];
+    inspSet(1, 6);                                   // same value; the point is the request
+    return wait(500).then(function () {              // the debounced fetch fires and HANGS
+      fire('pointerdown', 771, 40, 67, { isPrimary: true });      // grab inside the blob
+      for (var i = 1; i <= 6; i++) fire('pointermove', 771, 40 + i * 8, 67 + i * 10, {});
+      return wait(60);
+    }).then(function () {
+      var q = window.__PVPEND || []; window.__PVPEND = [];
+      for (var j = 0; j < q.length; j++) q[j]();     // the stale answer lands MID-DRAG
+      window.__PVHOLD = false;
+      return wait(120);                              // STILL MID-DRAAG
+    });
   });
   step('DR the mask follows the finger', function () {
     var st = region();

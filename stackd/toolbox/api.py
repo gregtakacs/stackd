@@ -33,6 +33,7 @@ import json
 import time
 import urllib.parse
 
+from stackd.imagegen import captioning as _cap
 from stackd.toolbox import masks as _masks
 from stackd.toolbox import tokens as _tokens
 from stackd.toolbox import web as _web
@@ -826,6 +827,25 @@ class Toolbox:
             raise ValueError("the mask selects nothing at all, so nothing would be "
                              "painted — paint the area to change; the live mask preview "
                              "shows what the server sees")
+        # THE MCP-MASKED-PATH CONTRACT, SHARED: Flux.2 is a caption model, so an
+        # instruction-phrased prompt keeps the source object's tokens in the
+        # conditioning and drags the inpaint back toward the photo. Reduce it to a
+        # caption of the wanted result and keep the caption inside the encoder's
+        # attention window — via the SAME module imagegen.tools' masked edit_image
+        # uses (stackd/imagegen/captioning.py), so the same words cannot behave
+        # differently in chat vs the editor. Applied HERE, at job creation, BEFORE
+        # the row is persisted: the job record, the create echo and the graph all
+        # carry the caption that was actually run. The user's own words are kept
+        # beside it as prompt_raw — a rewrite is only honest if the original text
+        # survives in the record and the editor can show both. Unchanged prompts
+        # mutate NOTHING (the exact-spec echo contract test pins that).
+        raw_prompt = spec.get("prompt")
+        if isinstance(raw_prompt, str):
+            sent_prompt, _pnote = _cap.caption_prompt(raw_prompt)
+            if sent_prompt != raw_prompt:
+                spec["prompt"] = sent_prompt
+                spec["prompt_raw"] = raw_prompt
+                spec["prompt_note"] = _pnote
         job_id = hashlib.sha256(f"{email}|{time.time_ns()}|{w}|{h}".encode()).hexdigest()[:16]
         seed = _as_int(spec.get("seed"), -1)
         kind = str(spec.get("kind") or "edit")

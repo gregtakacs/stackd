@@ -58,6 +58,7 @@ from mcp.server.mcpserver import Context, MCPServer
 from starlette.responses import JSONResponse
 
 from stackd.imagegen import (
+    captioning as _captioning,
     comfyui_client,
     config,
     openwebui_client,
@@ -951,15 +952,11 @@ async def generate_image(
 # -----------------------------------------------------------------------------
 
 
-_EDIT_INSTR_RE = re.compile(
-    r"\b(?:replace|swap(?:\s+out)?|change|turn|convert|transform)\b.*?"
-    r"\b(?:with|to|into|for)\b\s+(.+)",
-    re.IGNORECASE | re.DOTALL,
-)
-_MAKE_IT_RE = re.compile(
-    r"^\s*make\s+(?:it|the\s+\S+(?:\s+\S+)?)\s+(?:into\s+|look\s+like\s+)?(.+)",
-    re.IGNORECASE | re.DOTALL,
-)
+# The masked-path instruction reduction lives in ONE module (stackd/imagegen/
+# captioning.py) shared with the toolbox render, so the same words behave the SAME in
+# a chat edit_image and in an editor job. The regexes moved with it; the private
+# module-level names below stay as thin aliases because the tool docs and the tests
+# reference this function's behaviour, not its file. 2026-09.
 
 # Guards a same-turn edit_image retry spiral: every edit_image call in one turn
 # re-resolves to the SAME source (edits don't commit to chat history until the
@@ -973,23 +970,15 @@ _EDIT_REPEAT_WINDOW_S = 900
 
 
 def _describe_edit_target(prompt: str) -> str:
-    """Generic backstop for the masked path (which feeds `prompt` straight into
-    the inpaint conditioning -- no _maybe_rewrite there). Flux.2 is a caption
-    model, not an instruction model: an instruction-phrased prompt ('Replace the
-    red Lamborghini with a blue Audi R8 ...') leaves BOTH subjects in the
-    conditioning and the original-object words drag the result back toward the
-    source. Reduce 'replace/change/turn X with/to/into Y ...' (and 'make it
-    Y ...') to 'Y ...'. Not an enumeration -- just the instruction frame. Left
-    unchanged if it doesn't match (already a description, or an add/remove
-    edit). tool_docs/edit_image.md tells the model to phrase it this way in the
-    first place; this only catches the cases where it doesn't. 2026-09-02."""
-    p = (prompt or "").strip()
-    m = _EDIT_INSTR_RE.search(p) or _MAKE_IT_RE.match(p)
-    if m:
-        cand = m.group(1).strip().rstrip(". ").strip()
-        if len(cand) >= 8:
-            return cand
-    return p
+    """Thin alias onto the shared captioning module -- see
+    stackd/imagegen/captioning.describe_edit_target for the full contract (Flux.2
+    is a caption model: instruction phrasing leaves the source object's tokens in
+    the conditioning and drags the inpaint back toward the photo, so the masked
+    path reduces 'replace/change/turn X with/to/into Y ...' and 'make it Y ...' to
+    'Y ...', and leaves descriptions and add/remove edits alone). Kept as this
+    module's name so edit_image and the toolbox provably run the SAME reduction.
+    2026-09-02, moved to captioning 2026-09."""
+    return _captioning.describe_edit_target(prompt)
 
 
 def _submit_edit(
