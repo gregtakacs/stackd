@@ -28,20 +28,31 @@ DECODE_NODE = "25"                # VAEDecodeTiled — the raw model output
 COLOR_MATCH_NODE = "26"           # ColorMatchV2 — see engine._apply_mask_geometry
 SAVE_NODE = _wf.MASK_SAVE_NODE                   # "27"
 LOAD_IMAGE_NODE = _wf.MASK_LOAD_IMAGE_NODE       # "5", the photo
+# Hard noise gate (see _mask_source_node's second consumer): the mask fed to
+# VAEEncodeForInpaint must be the paint FOOTPRINT, not the feathered ramp. The
+# 128-round() cliff that the dog round-3 proved for brush cores bites identically
+# at any feather edge: a ramp pixel below 128 is "not inpaint at all", the source
+# latents ride through under the soft paste, and ReferenceLatent (node 22) then
+# conditions the sampler on the very subject the user painted out (live: fire-truck
+# remnants inside a replace-mode repaint whose auto layer feathered at 17 px).
+NOISE_GATE_LOAD_NODE = "51"       # LoadImageMask on the binarised footprint PNG
+NOISE_GATE_GROW_NODE = "52"       # GrowMask (user mask_expand) -> VAEEncodeForInpaint
 
 
 class GraphUnavailable(RuntimeError):
     """The requested model has no builtin masked-inpaint graph, or the layout is off."""
 
 
-def _mask_source_node(mask_filename: str) -> dict:
+def _mask_source_node(mask_filename: str, title: str = "Painted Mask (from the editor)") -> dict:
     """The node that replaces CLIPSegMask: a LoadImageMask reading the uploaded painted
     mask. Output index 0 is a MASK exactly as CLIPSegMask's was, so node 16 (GrowMask) and
-    the whole soft-edge / VAEEncodeForInpaint chain downstream are untouched."""
+    the whole soft-edge chain downstream are untouched. Reused for the hard noise gate
+    (node 51) with a different uploaded file: LoadImageMask is the only mask loader in
+    core, and the binarisation lives in the PNG the server uploads, not in a graph node."""
     return {
         "class_type": "LoadImageMask",
         "inputs": {"image": mask_filename, "channel": "alpha"},
-        "_meta": {"title": "Painted Mask (from the editor)"},
+        "_meta": {"title": title},
     }
 
 
@@ -59,6 +70,20 @@ def painted_mask_graph(model: str = "flux2-klein", *, mask_filename: str = "__MA
     if SEGMENT_NODE not in graph:
         raise GraphUnavailable(f"mask graph {model!r} has no segmentation node {SEGMENT_NODE}")
     graph[SEGMENT_NODE] = _mask_source_node(mask_filename)
+    # Hard noise gate: a second copy of the SAME paint footprint, binarised server-side
+    # (engine._graph_mask_pair), loaded and fed to VAEEncodeForInpaint instead of the
+    # feathered node-16 output. The feather then governs only the composite's blend,
+    # never WHICH latents get renoised — see the NOISE_GATE_* constants above.
+    graph[NOISE_GATE_LOAD_NODE] = _mask_source_node(
+        mask_filename, title="Painted Mask — hard noise gate (footprint)")
+    graph[NOISE_GATE_GROW_NODE] = {
+        "class_type": "GrowMask",
+        "inputs": {"expand": 0, "tapered_corners": True, "mask": [NOISE_GATE_LOAD_NODE, 0]},
+        "_meta": {"title": "Noise-Gate Grow (rides mask_expand)"},
+    }
+    for node in graph.values():
+        if node.get("class_type") == "VAEEncodeForInpaint":
+            node["inputs"]["mask"] = [NOISE_GATE_GROW_NODE, 0]
     # Node 6 (PrimitiveString "Mask Prompt") fed CLIPSeg's text; with the swap nothing
     # consumes it. ComfyUI still executes unreferenced nodes, so drop it rather than leave
     # a dangling node that could log a validation warning. Deep-safe: only remove if truly
@@ -97,6 +122,27 @@ def validate_painted_mask_graph(graph: dict) -> list[str]:
         problems.append(f"missing grow node {GROW_NODE}")
     elif (grow.get("inputs") or {}).get("mask") != [SEGMENT_NODE, 0]:
         problems.append(f"node {GROW_NODE} must consume [{SEGMENT_NODE}, 0]")
+    # The hard noise gate is part of the scaffold contract now: VAEEncodeForInpaint must
+    # never read the feathered branch (sub-128 ramp pixels would ride their source latents
+    # through — the fire-truck-remnant defect). A graph that lost the gate fails here, not
+    # on someone's GPU render.
+    gate_load = graph.get(NOISE_GATE_LOAD_NODE)
+    if not gate_load:
+        problems.append(f"missing noise-gate mask node {NOISE_GATE_LOAD_NODE}")
+    elif (gate_load.get("class_type") != "LoadImageMask"
+          or (gate_load.get("inputs") or {}).get("channel") != "alpha"):
+        problems.append(f"node {NOISE_GATE_LOAD_NODE} must be a LoadImageMask on channel alpha")
+    gate_grow = graph.get(NOISE_GATE_GROW_NODE)
+    if not gate_grow or gate_grow.get("class_type") != "GrowMask" \
+            or (gate_grow.get("inputs") or {}).get("mask") != [NOISE_GATE_LOAD_NODE, 0]:
+        problems.append(f"node {NOISE_GATE_GROW_NODE} must be a GrowMask consuming "
+                        f"[{NOISE_GATE_LOAD_NODE}, 0]")
+    for nid, node in graph.items():
+        if node.get("class_type") == "VAEEncodeForInpaint" \
+                and (node.get("inputs") or {}).get("mask") != [NOISE_GATE_GROW_NODE, 0]:
+            problems.append(f"node {nid} (VAEEncodeForInpaint) must consume the hard noise "
+                            f"gate [{NOISE_GATE_GROW_NODE}, 0], never the feathered "
+                            f"[{GROW_NODE}, 0] — sub-128 feather pixels are not inpainted")
     if SAVE_NODE not in graph:
         problems.append(f"missing save node {SAVE_NODE}")
     if LOAD_IMAGE_NODE not in graph:

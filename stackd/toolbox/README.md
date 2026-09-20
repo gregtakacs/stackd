@@ -482,6 +482,38 @@ treatment — plus the `retouch_image` MCP tool for assistant-driven flows.
     Suite +7 (608/608) — the checks fake the OWU client and re-implement the server's
     tip-walk, so "posted" now means REACHABLE; mutants — detached root → 3 red, tip
     not advanced → 2 red.
+  - **"It still needs a manual refresh" — the fire-truck session, chat side (round 5 of
+    the hand-back).** Round 4's proof held in the DB (`_chat_post: "posted"` on the live
+    rows, reachable by the tip-walk) yet the OPEN tab showed nothing until F5: OWU only
+    socket-pushes from its own completion pipeline, and a REST-committed append is
+    invisible to a tab that is not polling. This is OWU architecture, not a broken
+    append — but OWU also carries the door: `SendChatMessageEventById`
+    (`POST /chats/{id}/messages/{mid}/event`) emits ANY event payload to room
+    `user:<chat_owner>`, and the deployed SPA's `events` handler answers
+    `type: "chat:reload"` by re-fetching the thread (`build/_app` chunk:
+    `Pe==="chat:reload" -> await ts()`, verbatim from the minified bundle). So
+    `post_chat_message` now fires exactly that nudge after a 200 append. Best-effort by
+    construction: the event POST's outcome NEVER flips the verdict — the append is the
+    contract, the nudge is the courtesy; a dead event route leaves round 4's behaviour
+    (visible on reload) rather than a false failure. Suite +3 (618/618).
+  - **The fire-truck session, render side: the feather was choosing WHICH latents
+    survived the renoise.** The remnant render was NOT the dead knob people suspected
+    (`strength 0.25` is greyed and never reaches the masked graph — denoise is pinned 1
+    there) and not the mode either (the row says `kind: "replace"`, nodes 21/23 dropped,
+    sampler conditioned on the masked-region latent alone). The culprit: one canonical
+    mask fed BOTH `VAEEncodeForInpaint` (whose ComfyUI maths is `m = 1 - mask.round()` —
+    everything under alpha 128 is "not inpaint at all") and the soft-edge composite. An
+    auto layer feathered at 17 px therefore rode the SOURCE truck latents through the
+    outer half of its own edge, and ReferenceLatent (node 22) fed them straight back to
+    the sampler — the dog round-3 128-cliff, generalised from brush cores to feather
+    edges. Fix: `graphs.py` adds the hard noise gate (node 51 LoadImageMask + node 52
+    GrowMask, uploaded beside the feathered file by `engine._graph_mask_pair` — paint
+    footprint >0 → FULL inpaint), and `VAEEncodeForInpaint` reads ONLY that; the feather
+    keeps exactly one job, blending the paste. `mask_expand` moves gate and composite
+    together (a gate that lags the paste re-creates the remnant from the other side).
+    The validator refuses a graph whose sampler gate reads the feathered ramp, so the
+    fix cannot silently drift. Suite +7 (618/618; mutants — gate rewired to node 16 →
+    red, gate node deleted → red), browser 162/162.
   - **Blend modes are live AND explained** (user: "I don't know why it's even there"):
     the dropdown was wired all along (paste_back's ImageChops ops) but unlabelled; the
     panel now carries a one-line explanation per mode under the selector.

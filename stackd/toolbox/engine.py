@@ -179,15 +179,22 @@ def _pick_model(spec: dict) -> str:
 
 
 def _patch_graph(graph: dict, spec: dict, *, source_filename: str, mask_filename: str,
+                 mask_hard_filename: str | None = None,
                  w: int, h: int, seed: int) -> dict:
     """Point the derived painted-mask graph at this job's uploaded files + parameters.
     The LOAD_IMAGE (photo), the mask filename on the LoadImageMask node, the
     PrimitiveString front-ends (prompt / width / height / seed) and the KSampler
     conditioning (per the mode, see _apply_mode) change -- the rest of the MASK_*
-    scaffold stays put, which is what keeps workflows' id-based rewiring valid."""
+    scaffold stays put, which is what keeps workflows' id-based rewiring valid.
+
+    mask_hard_filename is the binarised FOOTPRINT uploaded beside the feathered mask
+    (see _graph_mask_pair) and lands on the noise-gate node; it defaults to the soft
+    file so an offline patch without it still yields a runnable graph."""
     from stackd.imagegen import workflows as wf
     graph[_graphs.LOAD_IMAGE_NODE]["inputs"]["image"] = source_filename
     graph[_graphs.SEGMENT_NODE]["inputs"]["image"] = mask_filename
+    graph.setdefault(_graphs.NOISE_GATE_LOAD_NODE, {})\
+        .setdefault("inputs", {})["image"] = mask_hard_filename or mask_filename
     # The prompt arrives ALREADY CAPTIONED: api._create ran it through
     # stackd.imagegen.captioning (the same reduction imagegen.tools' masked edit_image
     # applies) before persisting the row, so the graph executes exactly the stored
@@ -241,6 +248,13 @@ def _apply_mask_geometry(graph: dict, spec: dict) -> None:
         edge = 0
 
     graph[wf.MASK_GROW_NODE]["inputs"]["expand"] = expand
+    # The noise gate grows with the paint: "expand the paint region" means the FOOTPRINT
+    # moves outward, so the renoise gate and the composite must dilate together — a gate
+    # left at 0 while the paste expands re-creates the remnant from the other side (fresh
+    # generation the composite refuses to paste, source pixels pasted over fresh pixels).
+    _gate = graph.get(_graphs.NOISE_GATE_GROW_NODE)
+    if _gate is not None:
+        _gate["inputs"]["expand"] = expand
     # tapered_corners left EXACTLY as the scaffold ships it: at expand 0 it is inert
     # (nothing grows), and mutating an input the user never asked about is how a
     # "geometry" patch drifts into changing corner-rounding on someone's next request.
@@ -334,12 +348,36 @@ def _graph_mask(mask: bytes) -> bytes:
     coverage keep their correct 255=edit-here meaning, and the guarded graph scaffold is
     untouched. The editor's invert toggle composes on top: it inverts the server mask
     first, so "edit everything outside the paint" still selects the complement."""
+    return _graph_mask_pair(mask)[0]
+
+
+def _graph_mask_pair(mask: bytes) -> tuple[bytes, bytes]:
+    """(soft, hard) graph-convention PNGs of one canonical server mask.
+
+    SOFT is _graph_mask's inverted ramp — it feeds the composite (the feather is the
+    paste's blend) and the node-28 preview. HARD is the paint FOOTPRINT: every pixel the
+    user selected (server alpha > 0) becomes a full "edit here", everything else stays a
+    full "keep". Only VAEEncodeForInpaint reads it (graphs.NOISE_GATE_* nodes), and the
+    reason is the same cliff the dog round-3 proved for brush cores: ComfyUI computes
+    `m = 1 - mask.round()`, so a feather ramp's sub-128 outer band is NOT inpainted at
+    all — the source latents ride through under the soft paste and the region-reference
+    conditioning hands them back to the sampler (live: fire-truck remnants inside a
+    replace-mode repaint feathered at 17 px). The feather must only ever choose HOW the
+    generation blends over the photo, never WHICH latents survive the renoise. Hardening
+    the gate costs nothing where the mask is already binary (feather 0 → the two PNGs are
+    identical), and the gate's own grow still follows mask_expand, so the user's
+    "expand the paint region" knob keeps moving the whole footprint, edge included."""
     from PIL import Image
     import io
     im = Image.open(io.BytesIO(mask)).convert("RGBA")
-    im.putalpha(im.getchannel("A").point(lambda p: 255 - p))
-    out = io.BytesIO(); im.save(out, format="PNG")
-    return out.getvalue()
+    a = im.getchannel("A")
+    soft = Image.new("RGBA", im.size, (255, 255, 255, 255))
+    soft.putalpha(a.point(lambda p: 255 - p))
+    hard = Image.new("RGBA", im.size, (255, 255, 255, 255))
+    hard.putalpha(a.point(lambda p: 0 if p > 0 else 255))
+    out = io.BytesIO(); soft.save(out, format="PNG"); soft_png = out.getvalue()
+    out = io.BytesIO(); hard.save(out, format="PNG"); hard_png = out.getvalue()
+    return soft_png, hard_png
 
 
 def render_size(job: dict) -> tuple[int, int, bool]:
@@ -469,11 +507,15 @@ def comfy_render(job: dict, source: bytes, mask: bytes, *, on_prompt_id=None,
             base_bytes = src_b
             paste_plan = {"box": (0, 0, w, h), "frame": (w, h), "size": (rw, rh)}
         src_name = await comfyui_client.upload_to_comfy(src_b, "toolbox_src", base=base)
-        # _graph_mask flips the alpha to the graph's mask convention (edit where mask is 0);
-        # see that function for why the server mask and the graph mask are opposite.
-        msk_name = await comfyui_client.upload_to_comfy(_graph_mask(msk_b), "toolbox_mask", base=base)
+        # _graph_mask_pair flips the alpha to the graph's mask convention (edit where mask
+        # is 0) and hardens a second copy to the paint FOOTPRINT for the noise gate; see
+        # that function for why the server mask and the graph mask are opposite, and why
+        # VAEEncodeForInpaint must never see the feather.
+        soft_png, hard_png = _graph_mask_pair(msk_b)
+        msk_name = await comfyui_client.upload_to_comfy(soft_png, "toolbox_mask", base=base)
+        msk_hard_name = await comfyui_client.upload_to_comfy(hard_png, "toolbox_maskhard", base=base)
         _patch_graph(graph, spec, source_filename=src_name, mask_filename=msk_name,
-                     w=rw, h=rh, seed=seed)
+                     mask_hard_filename=msk_hard_name, w=rw, h=rh, seed=seed)
         prompt_id = await comfyui_client.submit_workflow(graph, base=base)
         if on_prompt_id is not None:
             on_prompt_id(prompt_id, base)        # so a cancel can interrupt the wait below

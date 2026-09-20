@@ -315,7 +315,25 @@ async def post_chat_message(chat_id: str, content: str, api_key: str) -> bool:
             if isinstance(legacy, list):
                 legacy.append(dict(msg))
             r2 = await client.post(url, json={"chat": chat}, headers=headers)
-            return r2.status_code == 200
+            if r2.status_code != 200:
+                return False
+            # PUSH IT LIVE: a REST-committed append is invisible to an already-open tab —
+            # OWU only streams over the socket from its own completion pipeline, so round
+            # 2's honest "posted" still needed a manual refresh to be seen (live symptom:
+            # the render landed, the open chat sat there). OWU's own event route
+            # (routers/chats.py SendChatMessageEventById) emits ANY event payload to the
+            # chat owner's socket room, and the SPA's `events` handler answers
+            # type "chat:reload" by re-fetching the chat — the same refresh, from the
+            # server. Best-effort by construction: an OWU without that route simply
+            # leaves the tab as round 2 left it (visible on reload), never a failed
+            # hand-back — the append above is the contract, this is the courtesy.
+            try:
+                await client.post(f"{url}/messages/{mid}/event",
+                                  json={"type": "chat:reload", "data": {}},
+                                  headers=headers)
+            except Exception:  # noqa: BLE001 — the reload nudge can never cost the render
+                pass
+            return True
     except Exception:  # noqa: BLE001 — a lost hand-back must never cost a render
         return False
 

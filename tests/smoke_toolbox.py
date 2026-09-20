@@ -1875,13 +1875,26 @@ def test_graphs():
           painted[G.GROW_NODE]["inputs"]["mask"] == [G.SEGMENT_NODE, 0])
 
     # Drift guard: every node EXCEPT the swapped source (and the CLIPSeg-only prompt node it
-    # orphans) must be byte-identical to the canonical graph imagegen owns.
-    allowed = {G.SEGMENT_NODE, WF.MASK_REGION_NODE}
+    # orphans) must be byte-identical to the canonical graph imagegen owns — plus the
+    # deliberate noise-gate additions: the two hard-footprint nodes (LoadImageMask +
+    # GrowMask) and the ONE rewired input on VAEEncodeForInpaint (mask: feathered 16 ->
+    # hard 52). Everything else that changes here is drift, not design.
+    _vae_ids = {k for k, v in canon.items() if v.get("class_type") == "VAEEncodeForInpaint"}
+    allowed = ({G.SEGMENT_NODE, WF.MASK_REGION_NODE,
+                G.NOISE_GATE_LOAD_NODE, G.NOISE_GATE_GROW_NODE} | _vae_ids)
     sym = (set(painted) ^ set(canon)) - allowed
-    check("node-id set is canonical modulo the intended swap", not sym, str(sym))
+    check("node-id set is canonical modulo the intended swap (+ the hard noise gate)",
+          not sym, str(sym))
     diverged = sorted(k for k in (set(painted) & set(canon)) - allowed if painted[k] != canon[k])
     check("no node other than the mask source diverged: %s" % (",".join(diverged) or "none"),
           not diverged)
+    check("the only change on the canonical side is node %s reading the hard gate "
+          "(its pixels/model/conditioning inputs are untouched)" % (",".join(sorted(_vae_ids)) or "?"),
+          all(painted[k]["class_type"] == canon[k]["class_type"]
+              and {ik: iv for ik, iv in painted[k]["inputs"].items() if ik != "mask"} ==
+                  {ik: iv for ik, iv in canon[k]["inputs"].items() if ik != "mask"}
+              and painted[k]["inputs"]["mask"] == [G.NOISE_GATE_GROW_NODE, 0]
+              for k in _vae_ids))
     check("the CLIPSeg-only text-prompt node was dropped (fed only the replaced node)",
           WF.MASK_REGION_NODE not in painted)
     check("photo node + save node preserved (graph still loads the image and saves output)",
@@ -1934,7 +1947,8 @@ def test_graphs():
     _gp = G.painted_mask_graph("flux2-klein", mask_filename="m.png")
     _eng_g._patch_graph(_gp, {"prompt": "p", "mask_expand": 0, "mask_edge": 0,
                               "color_match": 0.9},
-                      source_filename="s.png", mask_filename="m.png", w=64, h=64, seed=1)
+                      source_filename="s.png", mask_filename="m.png",
+                      mask_hard_filename="mhard.png", w=64, h=64, seed=1)
     check("painted mask defaults to HARD geometry: no grow, no blur, no latent dilate",
           _gp[WF.MASK_GROW_NODE]["inputs"]["expand"] == 0
           and [n for n in _gp.values() if n.get("class_type") == "VAEEncodeForInpaint"][0]
@@ -1944,6 +1958,33 @@ def test_graphs():
           and _gp[WF.MASK_COMPOSITE_NODE]["inputs"]["mask"] == [WF.MASK_GROW_NODE, 0]
           and _gp["28"]["inputs"]["mask"] == [WF.MASK_GROW_NODE, 0],
           repr(_gp.get(WF.MASK_COMPOSITE_NODE))[:110])
+    # The fire-truck-remnant gate: VAEEncodeForInpaint decides WHICH latents get re-noised
+    # via `m = 1 - mask.round()`, so reading the feathered node-16 ramp means every sub-128
+    # edge pixel keeps its SOURCE latents (a 17 px feathered replace-mode repaint came back
+    # with the erased truck bleeding through the new firefighters). The graph must load a
+    # SECOND, binarised footprint for the sampler gate; the feather keeps only the paste.
+    _vai = [n for n in _gp.values() if n.get("class_type") == "VAEEncodeForInpaint"][0]
+    check("VAEEncodeForInpaint is gated by the HARD footprint, not the feathered ramp",
+          _vai["inputs"]["mask"] == [_G_g.NOISE_GATE_GROW_NODE, 0]
+          and _gp[_G_g.NOISE_GATE_GROW_NODE]["inputs"]["mask"] == [_G_g.NOISE_GATE_LOAD_NODE, 0]
+          and _gp[_G_g.NOISE_GATE_LOAD_NODE]["class_type"] == "LoadImageMask"
+          and _gp[_G_g.NOISE_GATE_LOAD_NODE]["inputs"]["channel"] == "alpha"
+          and _gp[_G_g.NOISE_GATE_LOAD_NODE]["inputs"]["image"] == "mhard.png"
+          and _gp[_G_g.SEGMENT_NODE]["inputs"]["image"] == "m.png",
+          repr(_vai["inputs"])[:130])
+    check("the composite/preview still take the SOFT mask (feather = paste blend)",
+          _gp[WF.MASK_COMPOSITE_NODE]["inputs"]["mask"] == [WF.MASK_GROW_NODE, 0]
+          and _gp["28"]["inputs"]["mask"] == [WF.MASK_GROW_NODE, 0])
+    _drift = G.painted_mask_graph("flux2-klein", mask_filename="m.png")
+    _drift[[k for k, v in _drift.items() if v.get("class_type") == "VAEEncodeForInpaint"][0]]\
+        ["inputs"]["mask"] = [WF.MASK_GROW_NODE, 0]
+    check("validator catches the remnant mutant: a gate wired to the feathered ramp fails "
+          "the layout gate, not someone's render",
+          any("noise" in p.lower() for p in G.validate_painted_mask_graph(_drift)))
+    _drift2 = G.painted_mask_graph("flux2-klein", mask_filename="m.png")
+    del _drift2[_G_g.NOISE_GATE_LOAD_NODE]
+    check("validator catches a missing hard gate outright",
+          any("noise" in p.lower() for p in G.validate_painted_mask_graph(_drift2)))
     check("patched graph keeps zero dangling references into the deleted soft-edge chain",
           all(v[0] in _gp for nd in _gp.values() for v in (nd.get("inputs") or {}).values()
               if isinstance(v, list) and len(v) == 2)
@@ -1953,6 +1994,7 @@ def test_graphs():
                       source_filename="s", mask_filename="m", w=64, h=64, seed=1)
     check("mask_expand/mask_edge restore the growth honestly (scale with the knobs)",
           _gp2[WF.MASK_GROW_NODE]["inputs"]["expand"] == 10
+          and _gp2[_G_g.NOISE_GATE_GROW_NODE]["inputs"]["expand"] == 10
           and [n for n in _gp2.values() if n.get("class_type") == "VAEEncodeForInpaint"][0]
                 ["inputs"]["grow_mask_by"] == 10
           and WF.MASK_BLUR_NODE in _gp2
@@ -1989,6 +2031,24 @@ def test_graphs():
     check("graph mask flips the alpha (server 255=edit-here -> graph edit-where-0)",
           _alpha_mean(_src_mask, 0, 4) > 200 and _alpha_mean(_src_mask, 4, 8) < 60
           and _alpha_mean(_inv, 0, 4) < 60 and _alpha_mean(_inv, 4, 8) > 200)
+    # The two-mask split (fire-truck remnants): SOFT keeps the ramp for the composite's
+    # blend; HARD opens the renoise gate across the WHOLE footprint — any selected pixel,
+    # even a 40/255 feather sliver ComfyUI's round() would have silently un-inpainted,
+    # carries generated (never source) latents into the sampler.
+    _soft, _hard = _eng._graph_mask_pair(_src_mask)
+    check("graph mask pair: hard footprint pins every selected pixel to full inpaint "
+          "(alpha>0 -> graph 0) and keeps the untouched field at keep (alpha 255)",
+          _alpha_mean(_hard, 0, 4) <= 1 and _alpha_mean(_hard, 4, 8) >= 254
+          and _alpha_mean(_soft, 0, 4) < 60 and _alpha_mean(_soft, 4, 8) > 200)
+    _im2 = _Img.new("RGBA", (4, 4), (255, 255, 255, 0))
+    _im2.putpixel((0, 0), (255, 255, 255, 40))   # the feather sliver round() throws away
+    _b2 = _io.BytesIO(); _im2.save(_b2, "PNG")
+    _s2, _h2 = _eng._graph_mask_pair(_b2.getvalue())
+    _sa = _Img.open(_io.BytesIO(_s2)).convert("RGBA").getchannel("A").load()
+    _ha = _Img.open(_io.BytesIO(_h2)).convert("RGBA").getchannel("A").load()
+    check("a 40/255 feather pixel ComfyUI would NOT inpaint (soft 215 rounds to keep) "
+          "is WIDE OPEN under the hard gate (0 -> re-noised, no source latents)",
+          _sa[0, 0] == 215 and _ha[0, 0] == 0 and _ha[3, 3] == 255)
 
     # Click-to-select graph (SAM3): a standalone tiny graph, GPU-free testable. Pin the
     # wiring that, if it drifted, would silently return the wrong pixels (or none) on paid
@@ -3420,6 +3480,7 @@ def test_render_seam():
 
     class _FakeClient:
         posts, posts_status = [], 200
+        events, event_status = [], 200
         def __init__(self, **kw): pass
         async def __aenter__(self): return self
         async def __aexit__(self, *a): return False
@@ -3429,6 +3490,10 @@ def test_render_seam():
             import copy
             return _Resp(200, copy.deepcopy(_FIX))
         async def post(self, url, json=None, headers=None):
+            if url.endswith("/event"):
+                # OWU's SendChatMessageEventById route — the live-refresh nudge lands here.
+                type(self).events.append((url, json))
+                return _Resp(type(self).event_status)
             type(self).posts.append(json)
             return _Resp(type(self).posts_status)
 
@@ -3498,7 +3563,27 @@ def test_render_seam():
         check("post_chat_message: the legacy top-level list is mirrored (doc keeps both shapes)",
               isinstance(posted.get("messages"), list)
               and posted["messages"][-1].get("model") == "Comfy Toolbox")
-        _FakeClient.posts.clear()
+        # ---- the LIVE-REFRESH nudge (round 3 of the hand-back) -----------------------
+        # "It is in the DB" was round 1's lie, "it is reachable" round 2's fix — the live
+        # symptom that survived both: the open chat tab still showed nothing until the
+        # user pressed F5, because OWU only socket-pushes from its own completion
+        # pipeline. The deployed SPA's events handler answers type "chat:reload" by
+        # re-fetching the chat (build/_app chunk: Pe==="chat:reload" -> await ts()), and
+        # the event route emits to room user:<chat_owner>. So the append must be followed
+        # by exactly that nudge — once, on the new message's own event URL.
+        check("post_chat_message: emits ONE chat:reload event so the open tab refetches "
+              "(no manual refresh — the live round-3 symptom)",
+              len(_FakeClient.events) == 1
+              and _FakeClient.events[0][0].endswith("/messages/" + (new[0]["id"] if new else "?") + "/event")
+              and _FakeClient.events[0][1].get("type") == "chat:reload",
+              repr(_FakeClient.events)[:120])
+        _FakeClient.posts.clear(); _FakeClient.events.clear()
+        _FakeClient.event_status = 500
+        ok_ev_dead = _aio.run(_owu_real.post_chat_message("CH-OK", "x", "k"))
+        _FakeClient.event_status = 200
+        check("post_chat_message: a dead event route is STILL True — the append is the "
+              "contract, the live-refresh nudge is a courtesy", ok_ev_dead is True)
+        _FakeClient.posts.clear(); _FakeClient.events.clear()
         ok404 = _aio.run(_owu_real.post_chat_message("CH-MISSING", "x", "k"))
         check("post_chat_message: an unknown chat is False, not a raise", ok404 is False)
         _FakeClient.posts.clear(); _FakeClient.posts_status = 500
@@ -3506,6 +3591,9 @@ def test_render_seam():
         _FakeClient.posts_status = 200
         check("post_chat_message: a 5xx POST is False — _chat_post turns that into the "
               "editor's honest 'did NOT go through' line", ok500 is False)
+        check("post_chat_message: no reload nudge is fired when the append itself failed "
+              "(nudging a tab toward a message that never landed is a lie, again)",
+              ok500 is False and not _FakeClient.events)
         # broken tip (not in the map): degrade to a fresh ROOT the way the SPA's first
         # message does — and STILL be the tip, so it is visible.
         _FakeClient.posts.clear()
