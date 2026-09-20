@@ -50,6 +50,7 @@ import os
 import random
 import re
 import time
+import urllib.parse
 
 import anyio
 import httpx
@@ -1465,6 +1466,72 @@ async def stylize_image(
         detail += " (this pipeline's graph is not yet live-validated on this install)"
     return _success_response(detail, urls, note=model_note,
                              timing=_timing(t0, _g0, _g1))
+
+
+# -----------------------------------------------------------------------------
+# retouch_image — open the Comfy Toolbox mask editor (no render, no GPU here)
+# -----------------------------------------------------------------------------
+
+# The daemon hands the mounted Toolbox to the MCP layer at start (serve.py calls
+# set_toolbox_ref right after start_mcp_server). In-process by design: retouch mints
+# through toolbox.api.mint_launch — the ONE mint path — instead of learning a second
+# way to make tokens, and the admin bearer never has to leave the daemon for this
+# (the HTTP /toolbox/mint seam exists for the OUT-of-process OWU Tool only). If the
+# toolbox failed to mount, the tool says so plainly and points at edit_image.
+_TOOLBOX_REF: dict = {}
+
+
+def set_toolbox_ref(tb) -> None:
+    _TOOLBOX_REF["tb"] = tb
+
+
+@mcp.tool(description=_load_tool_doc("retouch_image.md"))
+async def retouch_image(ctx: Context) -> str:
+    """Opens the mask editor for the chat's most recent image — the user paints the
+    mask themselves, which is the whole difference from edit_image (where the model
+    describes the region and SAM guesses at it). No image is rendered by this call:
+    it resolves the source exactly like edit_image does (own key, own branch,
+    auto-detect, no model-suppliable override) and returns a link whose ONE-TIME
+    launch token rides inside, minted by the toolbox's own mint_launch."""
+    tb = _TOOLBOX_REF.get("tb")
+    if tb is None:
+        return ("The Comfy Toolbox mask editor is not mounted on this server. If the "
+                "edit can be described in words, do it with edit_image instead; if the "
+                "user truly needs to paint the mask, tell them the toolbox is not "
+                "available (STACKD_TOOLBOX_PUBLIC_URL / toolbox mount).")
+    try:
+        api_key = await openwebui_client.resolve_user_api_key(ctx)
+    except openwebui_client.UserNotRegisteredError as e:
+        return _not_registered_response(e)
+    headers = ctx.headers or {}
+    email = (headers.get("X-OpenWebUI-User-Email") or "").strip().lower()
+    if not email:
+        return ("Cannot open the mask editor: no user email was forwarded by Open "
+                "WebUI (requires ENABLE_FORWARD_USER_INFO_HEADERS). Tell the user to "
+                "use edit_image with a described region instead.")
+    try:
+        image_ref = await _resolve_image_url(ctx, api_key)
+    except ValueError as e:
+        return str(e)
+    try:
+        token = tb.mint_launch(email, image_ref)
+    except ValueError as e:
+        return f"Cannot open the mask editor: {e}"
+    base = (getattr(tb, "public_base", "") or "").rstrip("/")
+    if not base:
+        return ("Cannot open the mask editor: this stackd has no "
+                "STACKD_TOOLBOX_PUBLIC_URL configured, so there is no browser-reachable "
+                "address to send the user to. edit_image still works for described edits.")
+    url = (base + "/toolbox/embed?token="
+           + urllib.parse.quote(token, safe="")
+           + "&source_ref=" + urllib.parse.quote(image_ref, safe=""))
+    return (f"Mask editor ready for the most recent image in this chat.\n\n"
+            f"[Open the Comfy Toolbox]({url})\n\n"
+            "Tell the user: the link opens the editor ONCE (its access is single-use and "
+            "expires in ~15 minutes; ask for a fresh link if it goes stale). They paint "
+            "the area to change, tune each object's edge/feather in the Selection box, "
+            "choose Edit or Replace, and press Render; the result saves under their own "
+            "Open WebUI files. Do not call edit_image for this same request in this turn.")
 
 
 class BearerAuthMiddleware:

@@ -77,6 +77,12 @@ services:
       # file, deliberately NOT the cost ledger, so a toolbox bug can never skew savings.
       - STACKD_TOOLBOX_SECRET=${STACKD_TOOLBOX_SECRET:-${STACKD_API_KEY}}
       - STACKD_TOOLBOX_DB=/data/toolbox_jobs.db
+      # Mint caller-auth reuses STACKD_API_KEY (OWU already holds it as OPENAI_API_KEY,
+      # so the in-chat Tool needs no new secret); this is the browser-reachable base the
+      # embed iframe and retouch links are built from — NO container-internal fallback
+      # (the iframe fetches from the user's machine), and /toolbox/health reports
+      # mint:false until it is set.
+      - STACKD_TOOLBOX_PUBLIC_URL=${STACKD_TOOLBOX_PUBLIC_URL:-}
       - LLM_BASE_URL=http://localhost:11444/v1     # self-loop for image-prompt rewriting
       - LLM_MODEL=${LLM_REWRITE_MODEL:-assistant}   # a pass-through name; prompt_llm.py forces no-think
       - LLM_API_KEY=${STACKD_API_KEY}

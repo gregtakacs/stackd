@@ -2469,6 +2469,27 @@ def serve(mgr: Manager, host: str, port: int, api_key: str | None,
         # toolbox still mounts but every token route 403s (health reports tokens:false).
         tb_secret = _secret_or_file("STACKD_TOOLBOX_SECRET") or (api_key or "")
         tb_db = os.environ.get("STACKD_TOOLBOX_DB") or _toolbox_db_path(store)
+        # The Open WebUI mounts (in-chat Tool, MCP retouch) mint through the internal
+        # seam; its caller-auth bearer is the daemon's own admin key — the SAME value
+        # OWU already holds as OPENAI_API_KEY, so OWU-side setup introduces no new
+        # secret. The browser-reachable base is a dedicated env because the iframe
+        # fetches its API from the user's machine, not from OWU's docker network.
+        tb_public = os.environ.get("STACKD_TOOLBOX_PUBLIC_URL", "").strip()
+
+        def _tb_chat_source(email, chat_id, message_id):
+            # Same branch-aware lookup edit_image auto-detects with, reused for
+            # "open the editor on this chat's latest image". Lazy imports keep the
+            # async OWU client out of every path that never mints.
+            import asyncio
+            from stackd.imagegen import openwebui_client, runtime as _rt
+            key = _rt.resolve_user_key(email)
+            if not key:
+                return None
+            return asyncio.run(openwebui_client.lookup_recent_image(chat_id, message_id, key))
+
+        def _tb_registered(email):
+            from stackd.imagegen import runtime as _rt
+            return bool(_rt.resolve_user_key(email))
         jobs_q = _tb_jobs.JobQueue(
             _tb_jobs.JobStore(tb_db),
             render=_tb_engine.comfy_render, cancel=_tb_engine.comfy_cancel,
@@ -2482,9 +2503,12 @@ def serve(mgr: Manager, host: str, port: int, api_key: str | None,
             click_segmenter=_tb_engine.comfy_segment_click,
             worker=jobs_q, prewarm=_tb_engine.prewarm_edit,
             logger=logging.getLogger("stackd.toolbox"),
+            mint_key=api_key or "", chat_source=_tb_chat_source,
+            user_registered=_tb_registered, public_base=tb_public,
         )
         print(f"comfy toolbox mounted at /toolbox/* (queue {tb_db}, "
-              f"tokens {'on' if tb_secret else 'OFF — set STACKD_TOOLBOX_SECRET'})")
+              f"tokens {'on' if tb_secret else 'OFF — set STACKD_TOOLBOX_SECRET'}, "
+              f"mint {'on' if (api_key and tb_public) else 'OFF — needs STACKD_API_KEY + STACKD_TOOLBOX_PUBLIC_URL'})")
     except ImportError as e:
         print(f"[toolbox] not mounted ({e})")
     except Exception as e:  # noqa: BLE001 — never let the image surface sink the daemon
@@ -2723,8 +2747,12 @@ def serve(mgr: Manager, host: str, port: int, api_key: str | None,
     # keeps `import stackd.serve` — and the stdlib-only smoke suite — free of mcp/httpx.
     try:
         from stackd.imagegen import config as _ig_config
-        from stackd.imagegen.tools import start_mcp_server
+        from stackd.imagegen.tools import start_mcp_server, set_toolbox_ref
         start_mcp_server(mgr, store, lock)
+        # The MCP retouch_image tool mints through the mounted Toolbox in-process (the
+        # ONE mint path; see tools.set_toolbox_ref's note). None is a valid value: the
+        # tool then reports the toolbox as unavailable instead of inventing tokens.
+        set_toolbox_ref(toolbox)
         print(f"stackd MCP image tools on http://{host}:{_ig_config.MCP_PORT}/mcp")
     except ImportError as e:
         print(f"[mcp] image tools unavailable ({e}) — install stackd[imagegen]")

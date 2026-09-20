@@ -21,6 +21,7 @@ import json
 import pathlib
 import re
 import sys
+import urllib.parse
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
@@ -1248,6 +1249,142 @@ def test_contract():
           {"coverage", "empty", "tiny", "info", "overlay_png"} <= set(r.payload))
 
 
+def test_mint_seam():
+    """THE INTERNAL MINT SEAM — the Open WebUI mounts (in-chat Tool, retouch link).
+    Pinned: caller-auth deny-first (no bearer / wrong bearer / unconfigured seam all
+    403 BEFORE any body handling), the registry gate, chat auto-detect through the
+    injected resolver (the same lookup edit_image uses), the loud no-public-base 503
+    (a wrong-but-200 mint would hand out an editor that cannot reach its own API), and
+    — the part that makes the seam worth having — that the minted token is the SAME
+    single-use artifact /toolbox/launch mints: reads ride it, first submit redeems it,
+    the replay is refused."""
+    tb = make_tb(mint_key="minty", public_base="https://lab.example")
+
+    def mint(body, key="minty"):
+        return post(tb, "/toolbox/mint", body,
+                    headers=({"authorization": "Bearer " + key} if key else {}))
+
+    r = mint({"email": EMAIL, "source_ref": "/api/v1/files/x/content"}, key=None)
+    check("mint: no bearer is refused outright", r.status == 403
+          and r.payload.get("reason") == "mint_requires_caller_auth", r.payload)
+    r = mint({"email": EMAIL, "source_ref": "/api/v1/files/x/content"}, key="wrong")
+    check("mint: wrong caller-auth bearer is refused", r.status == 403
+          and r.payload.get("reason") == "mint_requires_caller_auth", r.payload)
+    tb_off = make_tb(public_base="https://lab.example")   # seam never configured
+    r = post(tb_off, "/toolbox/mint", {"email": EMAIL, "source_ref": "files/x"},
+             headers={"authorization": "Bearer minty"})
+    check("mint: an unconfigured seam is dead even with a guessed key (deny-by-default)",
+          r.status == 403 and r.payload.get("reason") == "mint_not_configured", r.payload)
+    r = mint({"source_ref": "/api/v1/files/x/content"})
+    check("mint: no email is a 400, never an unattributable token",
+          r.status == 400 and "email" in (r.payload.get("error") or ""), r.payload)
+    tb_reg = make_tb(mint_key="minty", public_base="https://lab.example",
+                     user_registered=lambda e: e == EMAIL)
+    r = post(tb_reg, "/toolbox/mint", {"email": "ghost@x.io", "source_ref": "files/g"},
+             headers={"authorization": "Bearer minty"})
+    check("mint: an unregistered email is refused with the register-page pointer",
+          r.status == 403 and r.payload.get("reason") == "user_not_registered", r.payload)
+    r = mint({"email": EMAIL})
+    check("mint: neither source_ref nor chat_id is an honest 400",
+          r.status == 400 and "source_ref" in (r.payload.get("error") or ""), r.payload)
+    tb_nobase = make_tb(mint_key="minty")
+    r = post(tb_nobase, "/toolbox/mint", {"email": EMAIL, "source_ref": "files/x"},
+             headers={"authorization": "Bearer minty"})
+    check("mint: without STACKD_TOOLBOX_PUBLIC_URL the seam 503s its reason",
+          r.status == 503 and r.payload.get("reason") == "no_public_base", r.payload)
+
+    # the happy path through an explicit source_ref
+    r = mint({"email": EMAIL, "source_ref": "/api/v1/files/photo/content"})
+    p = r.payload or {}
+    check("mint: source_ref path returns link, token and a full editor document",
+          r.status == 200 and p.get("ok")
+          and p.get("url", "").startswith("https://lab.example/toolbox/embed?token=")
+          and urllib.parse.quote("/api/v1/files/photo/content", safe="") in p.get("url", "")
+          and p.get("token") and "createElement('canvas')" in (p.get("html") or "")
+          and p.get("expires_in") == 900,
+          {k: str(v)[:80] for k, v in p.items()})
+    tok = p.get("token") or ""
+    # The single-use launch contract bites ONLY when a queue is mounted — the stub
+    # echo path deliberately does not redeem (there is no GPU spend to protect; see
+    # h_job_create). Mount the established no-GPU fake so this really tests the
+    # redemption, not just the echo.
+    from stackd.toolbox import jobs as J
+    tbw = make_tb(worker=J.JobQueue(J.JobStore(":memory:"),
+                                    render=lambda job, s, m, **kw: (None, None)))
+    soft = brush_ramp_mask((640, 480), (20, 20, 70, 70), 0.5)
+    prev = post(tbw, "/toolbox/mask/preview",
+                {"mask_png": base64.b64encode(soft).decode(), "spec": {}},
+                headers={"authorization": "Bearer " + tok})
+    check("minted token: a mask preview (a read) rides it without spending it",
+          prev.status == 200 and prev.payload.get("overlay_png"), prev.payload)
+    job_body = {"mask_png": base64.b64encode(soft).decode(),
+                "spec": {"prompt": "a calm lake at dusk"}}
+    c1 = post(tbw, "/toolbox/jobs", job_body, headers={"authorization": "Bearer " + tok})
+    check("minted token: the first render submit redeems it",
+          c1.status == 200 and c1.payload.get("state") == "queued", c1.payload)
+    c2 = post(tbw, "/toolbox/jobs", job_body, headers={"authorization": "Bearer " + tok})
+    check("minted token: a replayed submit is refused (single-use is the launch contract)",
+          c2.status == 403, c2.payload)
+
+    # chat auto-detect runs THROUGH the injected resolver (serve wires the OWU walk)
+    seen = {}
+    def resolver(email, chat_id, message_id):
+        seen.update(email=email, chat_id=chat_id, message_id=message_id)
+        return "/api/v1/files/from-chat/content"
+    tb_chat = make_tb(mint_key="minty", public_base="https://lab.example",
+                      chat_source=resolver)
+    r = post(tb_chat, "/toolbox/mint",
+             {"email": EMAIL, "chat_id": "CH1", "message_id": "M2"},
+             headers={"authorization": "Bearer minty"})
+    check("mint: chat_id path resolves the branch image through the ONE lookup seam",
+          r.status == 200 and seen.get("chat_id") == "CH1"
+          and seen.get("message_id") == "M2"
+          and "from-chat" in (r.payload or {}).get("url", ""), (seen, r.payload))
+    tb_none = make_tb(mint_key="minty", public_base="https://lab.example")
+    r = post(tb_none, "/toolbox/mint", {"email": EMAIL, "chat_id": "CH1"},
+             headers={"authorization": "Bearer minty"})
+    check("mint: resolution unmounted is a 400 with its reason, not a photo-less editor",
+          r.status == 400 and r.payload.get("reason") == "chat_resolution_not_mounted",
+          r.payload)
+    tb_empty = make_tb(mint_key="minty", public_base="https://lab.example",
+                       chat_source=lambda e, c, m: None)
+    r = post(tb_empty, "/toolbox/mint", {"email": EMAIL, "chat_id": "CH1"},
+             headers={"authorization": "Bearer minty"})
+    check("mint: a chat with no image says so (attach/generate first), never mints blind",
+          r.status == 400 and r.payload.get("reason") == "no_chat_image", r.payload)
+
+    # health tells the operator WHICH half of the seam is missing
+    r = get(make_tb(mint_key="k"), "/toolbox/health")
+    check("health: mint_key on with no public base reads mint:false / mint_key:true",
+          r.payload.get("mint") is False and r.payload.get("mint_key") is True, r.payload)
+    r = get(tb, "/toolbox/health")
+    check("health: a fully configured seam reads mint:true",
+          r.payload.get("mint") is True, r.payload)
+
+    # ---- the two MOUNTS, pinned at source (imagegen.tools drags mcp/anyio/uvicorn;
+    # owu_tool.py drags fastapi/pydantic — both run only in their own containers) ----
+    import pathlib as _p
+    root = _p.Path(__file__).resolve().parents[1] / "stackd"
+    it_src = (root / "imagegen" / "tools.py").read_text()
+    sv_src = (root / "serve.py").read_text()
+    check("the MCP retouch tool mints through the ONE mint_launch path, in-process",
+          "def retouch_image(" in it_src and "tb.mint_launch(email, image_ref)" in it_src
+          and "def set_toolbox_ref(" in it_src
+          and "set_toolbox_ref(toolbox)" in sv_src)
+    check("retouch never grows its own token code (only toolbox.api may mint)",
+          "_tokens.mint(" not in it_src.split("def retouch_image(")[-1][:4000])
+    owu = (root / "toolbox" / "owu_tool.py").read_text()
+    check("the OWU Tool speaks the verified 0.11.3 embed contract",
+          "HTMLResponse" in owu
+          and 'headers={"Content-Disposition": "inline"}' in owu
+          and "/toolbox/mint" in owu
+          and 'headers.get("x-openwebui-user-email")' in owu)
+    check("the OWU Tool hands the MODEL a neutral context, not the editor HTML",
+          "result_context" in owu or "mask editor is open" in owu)
+    check("the OWU Tool carries the mint key from valve-or-env, never from the browser",
+          "os.environ.get(\"OPENAI_API_KEY\"" in owu and "self.valves.mint_key" in owu)
+
+
 def test_prompt_captioning():
     """The MASKED-PATH CAPTIONING CONTRACT, shared with MCP edit_image. Flux.2 is a
     caption model: an instruction-phrased prompt keeps the source object's tokens in
@@ -1515,6 +1652,7 @@ def main() -> int:
     test_web()
     test_contract()
     test_prompt_captioning()
+    test_mint_seam()
     test_spike_wiring()
     test_graphs()
     test_jobs()

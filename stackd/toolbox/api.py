@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
 import time
 import urllib.parse
@@ -115,7 +116,8 @@ class Toolbox:
 
     def __init__(self, *, secret: str = "", spike_enabled: bool = False, source=None,
                  segmenter=None, image_engine_up=None, logger=None, worker=None,
-                 prewarm=None, click_segmenter=None):
+                 prewarm=None, click_segmenter=None, mint_key: str = "",
+                 chat_source=None, user_registered=None, public_base: str = ""):
         self.secret = secret or ""
         self.spike_enabled = bool(spike_enabled)
         self._source = source
@@ -133,6 +135,33 @@ class Toolbox:
         # explicit (see _launch_email) and matches whatever the lab router actually sets.
         self.launch_email_headers = ("x-auth-request-user", "x-auth-request-email",
                                      "x-forwarded-user")
+        # ---- THE MINT SEAM (the Open WebUI mounts) --------------------------------
+        # The in-chat Tool and the MCP retouch flow both need a launch token, but
+        # neither may hold the HMAC signing key and neither sits behind Traefik
+        # forward-auth (an OWU Function call has no oauth'd browser hop on it). The
+        # trust root there is Open WebUI's OWN server-vouched identity — the same
+        # headers the MCP image tools already trust (X-OpenWebUI-User-Email etc.) —
+        # so the mint route authenticates the CALLER (the OWU/daemon-side service)
+        # with the daemon's existing admin bearer, and takes the USER as a claimed
+        # email the caller asserts. Blast radius of a leaked mint key: minting
+        # launch tokens as any registered user (renders attributed to them) — it is
+        # deliberately NOT the signing secret, so it cannot forge tokens directly,
+        # and it never reaches a browser. Empty mint_key disables the route entirely
+        # (deny-by-default, health reports mint:false).
+        self.mint_key = mint_key or ""
+        # public_base: the browser-reachable base for minted embed URLs. Required
+        # for a usable link (an iframe fetches cfg.api from the USER's machine, so
+        # a container-internal Host header is useless there). No request-derived
+        # fallback is trusted for this path — see h_mint.
+        self.public_base = (public_base or "").rstrip("/")
+        # callable(email, chat_id, message_id) -> /api/v1/files/... ref | None —
+        # the same branch-aware lookup imagegen's edit_image uses, injected so the
+        # toolbox stays dependency-free of the async OWU client (serve.py wires it).
+        self._chat_source = chat_source
+        # callable(email) -> bool: the OWU-key registry gate at mint time, so a
+        # token is never minted for someone who could not possibly complete a
+        # render (the artifact save would deny anyway; fail before the GPU, not after).
+        self._user_registered = user_registered
 
 
     # ---------------- small helpers ----------------
@@ -394,7 +423,7 @@ class Toolbox:
         return True
 
     POST_ONLY = ("/toolbox/echo", "/toolbox/mask/preview", "/toolbox/mask/auto",
-                 "/toolbox/mask/click",
+                 "/toolbox/mask/click", "/toolbox/mint",
                  "/toolbox/jobs", "/toolbox/jobs/poll", "/toolbox/jobs/cancel")
     GET_ONLY = ("/toolbox/health", "/toolbox/spike", "/toolbox/embed", "/toolbox/source.png",
                 "/toolbox/launch")
@@ -432,6 +461,8 @@ class Toolbox:
                 self.h_mask_click(http)
             elif path == "/toolbox/jobs":
                 self.h_job_create(http)
+            elif path == "/toolbox/mint":
+                self.h_mint(http)
             elif path == "/toolbox/jobs/poll":
                 self.h_job_poll(http)
             elif path == "/toolbox/jobs/cancel":
@@ -464,6 +495,11 @@ class Toolbox:
             "ok": True, "version": VERSION, "milestone": MILESTONE,
             "pillow": bool(_masks.HAS_PIL),
             "tokens": bool(self.secret),
+            # Is the INTERNAL MINT SEAM live? mint:true requires both the caller-auth
+            # key and a browser-reachable public base — health says so in both fields
+            # so an operator sees WHICH half is missing (see h_mint's 503 reason).
+            "mint": bool(self.mint_key and self.public_base),
+            "mint_key": bool(self.mint_key),
             "spike": self.spike_enabled,
             "segmenter": self._segmenter is not None,
             "click_segmenter": self._click_segmenter is not None,
@@ -535,52 +571,151 @@ class Toolbox:
                 return v
         return ""
 
-    def h_embed(self, http, query):
-        email = self._identity(http, query, single_use=False)
-        # Warm the elastic image tier toward an edit-capable model the moment an editor
-        # opens, so the (possibly first) render does not pay the model-swap cold start on
-        # the user's clock. Fired on a daemon thread: request_capability takes the Manager
-        # lock and a swap can run tens of seconds — doing it inline would stall this shared
-        # HTTP handler (and with it the whole daemon front) for the duration. Best-effort;
-        # a failed pre-warm is not a failed editor (the render itself re-checks the engine).
-        if self._prewarm is not None:
-            import threading
-            threading.Thread(target=self._safe_prewarm, name="toolbox-prewarm",
-                             daemon=True).start()
-        # The M0 probe is reachable ONLY while the spike is explicitly enabled. The real
-        # mounts (the OWU Function, the lab page) run against a daemon where
-        # spike_enabled is False, so instrumentation cannot ship to users by someone
-        # remembering `?probe=1` in a URL.
-        probe = self.spike_enabled and (query.get("probe") or "") in ("1", "true", "yes")
+    def _fire_prewarm(self):
+        """Warm the elastic image tier toward an edit-capable model the moment an editor
+        is about to open, so the (possibly first) render does not pay the model-swap cold
+        start on the user's clock. Daemon-threaded (request_capability takes the Manager
+        lock and a swap can run tens of seconds; inline would stall the shared HTTP front).
+        Best-effort; a failed pre-warm is not a failed editor."""
+        if self._prewarm is None:
+            return
+        import threading
+        threading.Thread(target=self._safe_prewarm, name="toolbox-prewarm",
+                         daemon=True).start()
+
+    def mint_launch(self, email: str, ref: str | None = None) -> str:
+        """THE ONE mint path every non-forward-auth mount funnels through (h_mint and
+        the in-process MCP retouch tool). Empty email/secret raises ValueError -> an
+        honest 400/500, never a forgery-friendly token."""
+        email = (email or "").strip().lower()
+        if not email:
+            raise ValueError("a launch token must be bound to a real email")
+        if not self.secret:
+            raise ValueError("toolbox tokens are not configured (no shared secret)")
+        return _tokens.mint(self.secret, scope="launch", email=email,
+                            image_id=(ref or None))
+
+    def _embed_cfg(self, email: str, query: dict, *, api_base: str, token: str) -> dict:
+        """Build the editor's config: resolve the photo through the ONE ingest path
+        (see _ingest_source — the bytes the iframe shows are the bytes the mask is
+        normalised against and the graph runs at), then report the render ceiling
+        honestly. Shared by h_embed (browser-carried token) and h_mint (the Open WebUI
+        mounts) so the two can never render two different editors."""
         spec = {"width": 0, "height": 0}
         try:
-            # Ingest resize, not display resize: the photo the browser is handed is the
-            # same bytes the mask will be normalised against and the same size the graph
-            # runs at. Handing a 3000x4000 original to an iframe only moves the cost, and
-            # the editor's per-stroke morph is O(pixels) in JavaScript.
             source, _after, before = self._ingest_source(email, {}, query)
         except ValueError:
-            # A mount without a resolvable photo is still a valid document to load: the
-            # editor itself reports "no source image was handed to the editor", which is
-            # the honest state rather than a 400 the harness would misread as CORS.
+            # A mount without a resolvable photo is still a valid document to load:
+            # the editor itself reports "no source image was handed to the editor",
+            # which is the honest state rather than a 400 the harness would misread.
             source = b""
         w, h = self._dims(spec, source) if source else (1024, 1024)
-        cfg = {
-            "api": self._base_url(http),
-            "token": self._token_from(http, query),
+        return {
+            "api": api_base,
+            "token": token,
             "image": ("data:image/png;base64," + base64.b64encode(source).decode()) if source else None,
             "image_id": query.get("image_id") or query.get("source_ref") or "",
-            # The canvas ceiling the EDITOR must obey, which is now the same number the
-            # server renders at (it used to advertise workflows.MAX_SIDE=2048 while the
-            # engine choked on it). masks.RENDER_MAX_SIDE is the single source of truth.
+            # The canvas ceiling the EDITOR must obey, which is the same number the
+            # server renders at. masks.RENDER_MAX_SIDE is the single source of truth.
             "max_side": _masks.RENDER_MAX_SIDE,
             "working_size": [w, h],
             "size_note": self._size_note({"width": before[0], "height": before[1]}, w, h),
         }
 
+    def h_embed(self, http, query):
+        email = self._identity(http, query, single_use=False)
+        self._fire_prewarm()
+        # The M0 probe is reachable ONLY while the spike is explicitly enabled. The real
+        # mounts (the OWU Function, the lab page) run against a daemon where
+        # spike_enabled is False, so instrumentation cannot ship to users by someone
+        # remembering `?probe=1` in a URL.
+        probe = self.spike_enabled and (query.get("probe") or "") in ("1", "true", "yes")
+        cfg = self._embed_cfg(email, query, api_base=self._base_url(http),
+                              token=self._token_from(http, query))
         http._send_bytes(200, _web.embed_document(cfg, title="Comfy Toolbox",
                                                   probe=probe).encode("utf-8"),
                          "text/html", cache_s=0)
+
+    def h_mint(self, http):
+        """THE INTERNAL MINT SEAM — the Open WebUI mounts' entry point.
+
+        Who calls this: the in-chat Comfy-Toolbox Tool (running inside OWU's server,
+        holding the daemon admin bearer as its valve). NEVER a browser: the response
+        carries a minted launch token, and a token that ever transits caller-controlled
+        JS is a token that can be bookmarked, logged by an extension, or leaked in a
+        Referer header. The mint key is a server-to-server bearer (the daemon's own
+        STACKD_API_KEY, which OWU already holds as OPENAI_API_KEY) — no new secret
+        appears in any browser.
+
+        The USER is asserted by the caller (email + chat refs), which is exactly the
+        trust the MCP image tools already place in OWU's forwarded identity; the
+        registry gate makes asserting an unregistered user useless (the render would
+        deny at save anyway — deny at mint, before any GPU thought). The minted token
+        is the SAME single-use artifact /toolbox/launch mints, so the redemption rules
+        in this file's header apply unchanged."""
+        if not self.mint_key:
+            http._send_json(403, {"error": "mint is not configured on this server",
+                                  "reason": "mint_not_configured"}, self._cors())
+            return
+        hdr = (http.headers.get("authorization") or "").strip()
+        supplied = hdr[7:].strip() if hdr[:7].lower() == "bearer " else ""
+        # compare_digest, not ==: this is an attacker-reachable secret.
+        if not supplied or not hmac.compare_digest(supplied, self.mint_key):
+            http._send_json(403, {"error": "mint requires the server-to-server bearer",
+                                  "reason": "mint_requires_caller_auth"}, self._cors())
+            return
+        body = self._json_body(http)
+        email = str(body.get("email") or "").strip().lower()
+        if not email or "@" not in email:
+            raise ValueError("email (the Open WebUI user this editor is bound to) is required")
+        if self._user_registered is not None and not self._user_registered(email):
+            http._send_json(403, {"error": f"{email} has no Open WebUI API key registered — "
+                                           "register at the /register page first; renders "
+                                           "save under your own key",
+                                  "reason": "user_not_registered"}, self._cors())
+            return
+        ref = str(body.get("source_ref") or body.get("image_id") or "").strip()
+        if not ref:
+            chat_id = str(body.get("chat_id") or "").strip()
+            if not chat_id:
+                raise ValueError("pass source_ref (a /api/v1/files/... path) or chat_id "
+                                 "(to auto-detect the chat's most recent image)")
+            if self._chat_source is None:
+                http._send_json(400, {"error": "chat auto-detection is not mounted on this "
+                                               "server; pass source_ref explicitly",
+                                      "reason": "chat_resolution_not_mounted"}, self._cors())
+                return
+            message_id = str(body.get("message_id") or "").strip() or None
+            try:
+                ref = (self._chat_source(email, chat_id, message_id) or "").strip()
+            except Exception as e:  # noqa: BLE001 — an OWU walk failing is an honest 400
+                raise ValueError(f"chat image lookup failed ({e.__class__.__name__})")
+            if not ref:
+                http._send_json(400, {"error": "no image found in this chat's active branch — "
+                                               "attach or generate one first, or pass source_ref",
+                                      "reason": "no_chat_image"}, self._cors())
+                return
+        if not self.public_base:
+            # Deliberately NO request-derived fallback here: this request's Host is
+            # OWU's container (http://stackd:11444), while the iframe fetches cfg.api
+            # from the USER's machine. A wrong-but-200 response would hand out an
+            # editor that cannot reach its own API — fail loudly instead.
+            http._send_json(503, {"error": "STACKD_TOOLBOX_PUBLIC_URL is not set; minted "
+                                           "embed URLs would not be browser-reachable",
+                                   "reason": "no_public_base"}, self._cors())
+            return
+        self._fire_prewarm()
+        token = self.mint_launch(email, ref)
+        url = (self.public_base + "/toolbox/embed?token="
+               + urllib.parse.quote(token, safe="")
+               + "&source_ref=" + urllib.parse.quote(ref, safe=""))
+        cfg = self._embed_cfg(email, {"source_ref": ref},
+                              api_base=self.public_base, token=token)
+        html = _web.embed_document(cfg, title="Comfy Toolbox", probe=False)
+        http._send_json(200, {"ok": True, "email": email, "source_ref": ref,
+                              "token": token, "url": url,
+                              "expires_in": _tokens.DEFAULT_TTL_S.get("launch", 900),
+                              "html": html}, self._cors())
 
     def h_source(self, http, query):
         """The photo by URL, for the harness's same-origin panel A. The real in-chat mount
