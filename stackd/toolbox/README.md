@@ -344,6 +344,26 @@ treatment — plus the `retouch_image` MCP tool for assistant-driven flows.
     verified live from inside the OWU container: resolver returns a 64-char key equal to
     the daemon's own bearer, source label `secret file /run/secrets/ollama_token`, and
     the mint answers 200 with a 165 KB editor document for a registered user.
+    (That 165 KB was the bug below's alibi: with no photo inlined the document was small,
+    and the check only asserted the editor bundle was present — "document served" is not
+    "photo loaded". Ask which of the two a green check actually proves.)
+  - **A query `source_ref` never reached the resolver — and the two ways the suite hid
+    it.** `/toolbox/mint` and `/toolbox/e/<code>` hand the photo over as
+    `{"source_ref": ref}`, but `_source_bytes` read only `image_id` from the query, so the
+    resolver saw `""`, `engine.make_source` returned None, and the editor mounted with
+    *"No source image was handed to the editor"* — while the cfg LABEL read both keys and
+    cheerfully echoed the ref back. `_source_ref()` is now the one precedence shared by
+    fetch and label. Two lessons about the green suite, both fixed and more valuable than
+    the bug: (a) the fake resolver returned `PHOTO` for ANY ref including `""` — a fake
+    must mirror production's refusals (`blank ref -> None`) or "pixels arrived" is not
+    assertable; (b) a check asserted on `"data:image/png;base64"` appearing in the
+    document — **vacuous**, because `toolbox.js` contains that literal 5x as a
+    concatenation template, so it is in every document photo or not (a pre-existing check
+    in `test_routes` had been green since day one for the same reason). Assert the photo's
+    OWN base64 (`PHOTO_B64`). Reintroducing the original omission now fails 4 checks where
+    it previously failed 0. The silent no-photo fallback also now logs WHICH case it is
+    (`no reference was supplied` vs `ref would not open (…)`): identical in the browser,
+    opposite in blame, and with nothing in the log the second reads as a broken secret.
   - **Editor links are SHORT (`/toolbox/e/<code>`), and the reason is a live incident.**
     `retouch_image` used to hand the model a markdown link with the ~250-char launch
     token inside it. Models cannot retype long base64: a user clicked a link minted 14
