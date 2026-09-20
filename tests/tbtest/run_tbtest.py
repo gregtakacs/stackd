@@ -150,11 +150,17 @@ def LEGACY_ALLMERGE(s):
 # The grow/shrink/feather-does-nothing bug: the toolbar edge/feather sliders fed only the
 # global mask_expand/feather, which the LAYERED server path ignores. Reproduce by making
 # the region-routing guard always false, so the sliders behave exactly as pre-fix.
-def LEGACY_AUTOSLIDER(s):
-    g = "if ((id === 'edge' || id === 'feather') && o && o.kind) {"
-    assert g in s, 'toolbar region-routing guard anchor moved'
-    return s.replace(g, "if (false) {", 1)
 
+def LEGACY_AUTOSLIDER(s):
+    """The inspector rows go dead: dragging edge/feather changes no object (the numbers
+    reach the wire as nothing). The toolbar-routing code this mutant used to neuter no
+    longer exists - the inspector is now the one and only editor, so THAT is the kill."""
+    g = "      setObjParam(key, parseFloat(inp.value) || 0);"
+    assert s.count(g) == 1, 'ipair handler anchor moved'
+    s = s.replace(g, "      // MUTANT: the row edits nothing", 1)
+    h = "      setObjParam('edge', v);"
+    assert s.count(h) == 1, 'edgePair handler anchor moved'
+    return s.replace(h, "      void v;   // MUTANT: the row edits nothing", 1)
 
 MUTANTS = {"sticky": LEGACY_STICKY, "ctlorder": LEGACY_CTL, "softpunch": LEGACY_PUNCH,
            "brushfeather": LEGACY_BRUSHFEATHER, "kindstr": LEGACY_KINDSTR,
@@ -335,22 +341,19 @@ def LEGACY_INSPREDRAW(s):
 # excluding brush AND the inspector rows disabled for brush. Either half alone still
 # leaves one working route to edit the object, so a one-sided mutant would reproduce
 # nothing and pass for the wrong reason.
+
 def LEGACY_BRUSHDEAD(s):
-    g = "      if ((id === 'edge' || id === 'feather') && o && o.kind) {"
-    assert g in s, 'toolbar routing anchor moved'
-    s = s.replace(g,
-        "      if ((id === 'edge' || id === 'feather') && o && o.kind && o.kind !== 'brush') {" + chr(10) +
-        "        if (o.kind === 'brush') return;", 1)
+    """The dead brush knobs, restored where they now live: BOTH inspector rows go
+    disabled for a brush object (the toolbar half was retired with the panel pair, so
+    a one-sided mutant would reproduce nothing)."""
     h = "      setObjParam('edge', v);"
     assert s.count(h) == 1, 'edgePair live handler anchor moved'
     s = s.replace(h,
         "      if (o.kind === 'brush') { inp.disabled = true; return; }" + chr(10) + h, 1)
     f = "      setObjParam(key, parseFloat(inp.value) || 0);"
     assert s.count(f) == 1, 'ipair live handler anchor moved'
-    s = s.replace(f,
+    return s.replace(f,
         "      if (obj.kind === 'brush') { inp.disabled = true; return; }" + chr(10) + f, 1)
-    return s
-
 
 MUTANTS["inspredraw"] = LEGACY_INSPREDRAW
 MUTANTS["brushdead"] = LEGACY_BRUSHDEAD
@@ -589,17 +592,24 @@ def LEGACY_TOOLVIS(s):
 
 # THE SECOND LIVE FEATHER COPY, restored: the panel pair edits the selected object too,
 # so two UIs claim the same number with different labels and histories again.
+
 def LEGACY_PANEDITS(s):
-    NL = chr(10)
-    an = "      n.disabled = lock;"
-    assert an in s, 'syncKnobLock disable anchor moved'
-    s = s.replace(an, "      n.disabled = false;   // MUTANT: the pair edits whatever is selected", 1)
-    an2 = NL.join(["    i.addEventListener('input', function () {",
-                   "      out.textContent = i.value;",
-                   "      refresh();",
-                   "    });"])
-    assert an2 in s, 'ctl input handler anchor moved'
-    return s.replace(an2, NL.join([
+    """The second LIVE edge/feather UI, resurrected: the hidden pair becomes visible,
+    enabled, and routes onto the selected object again - the duplicate the user
+    pointed at ('showing the same stupid value I can adjust in the select window')."""
+    an = "      n.disabled = true;"
+    assert s.count(an) == 1, 'syncKnobLock disable anchor moved'
+    s = s.replace(an, "      n.disabled = false;   // MUTANT: edits whatever is touched", 1)
+    an2 = "      if (n.parentNode) n.parentNode.style.display = 'none';"
+    assert s.count(an2) == 1, 'syncKnobLock hide anchor moved'
+    s = s.replace(an2, "      // MUTANT: and the panel pair shows itself again", 1)
+    an3 = NL.join([
+        "    i.addEventListener('input', function () {",
+        "      out.textContent = i.value;",
+        "      refresh();",
+        "    });"])
+    assert s.count(an3) == 1, 'ctl input handler anchor moved'
+    return s.replace(an3, NL.join([
         "    i.addEventListener('input', function () {",
         "      out.textContent = i.value;",
         "      var o = selObj();",
@@ -610,22 +620,71 @@ def LEGACY_PANEDITS(s):
         "      refresh();",
         "    });"]), 1)
 
+# TUNING ARMS THE NEXT OBJECT: setObjParam writes the number into the hidden default
+# store too, so 'strictly post-generation' becomes 'set the feather once and every
+# later object inherits it' - the hidden twin of the visible mirror the user rejected.
+def LEGACY_ARMLEAK(s):
+    an = "    if (key === 'edge') o.foldIdx = null;"
+    assert an in s, 'setObjParam fold-reset anchor moved'
+    return s.replace(an, an + NL +
+        "    if (el[key]) { el[key].value = String(v); if (el[key + '_out']) el[key + '_out'].textContent = String(v); }   // MUTANT: arms the NEXT object", 1)
 
-# THE MIRROR LOST: the greyed pair stops following the selected object, so what the
-# user reads as 'what the next object inherits' is whatever was last typed at rest.
-def LEGACY_NOMIRROR(s):
-    NL = chr(10)
+
+# THE DASHED BOX, resurrected: compose() frames the selected object with a dashed blue
+# rectangle the object does not even fill - the indicator retired for the cyan ring.
+def LEGACY_DASHBOX(s):
+    # Injected into BOTH compositing branches. The SB gate measures inside the 420 ms
+    # preview debounce (the LOCAL WASH path) and after the stub answer lands (the overlay
+    # path) — and the overlay paints opaquely over the canvas, so a dashed box placed
+    # under it is hidden and the mutant survives: an early single-point version proved
+    # exactly that at 158/158. The historical defect drew on top of whatever composited.
+    DASH = [
+        "      var _so = selObj();                     // MUTANT: dashed bbox is back",
+        "      if (_so) { var _b = objBBox(_so);",
+        "        if (_b) { v.save(); v.strokeStyle = '#3ba7ff';",
+        "          v.lineWidth = Math.max(1.5, 2 * scale());",
+        "          v.setLineDash([6 * scale(), 4 * scale()]);",
+        "          v.strokeRect(_b.x0 + (_so.mvx || 0), _b.y0 + (_so.mvy || 0),",
+        "                       _b.x1 - _b.x0 + 1, _b.y1 - _b.y0 + 1);",
+        "          v.restore(); } }"]
+    an = NL.join(["      v.drawImage(preview.img, 0, 0, W, H);", "      drawActiveOutline(v);"])
+    assert s.count(an) == 1, 'compose overlay anchor moved'
+    s = s.replace(an, NL.join(["      v.drawImage(preview.img, 0, 0, W, H);"] + DASH +
+                              ["      drawActiveOutline(v);"]), 1)
+    an2 = NL.join(["    v.drawImage(wash, 0, 0);", "    var so = selObj();"])
+    assert s.count(an2) == 1, 'compose wash anchor moved'
+    s = s.replace(an2, NL.join(["    v.drawImage(wash, 0, 0);"] + DASH +
+                               ["    var so = selObj();"]), 1)
+    # (Injected-block indentation is cosmetic in JS — one block, both branches.)
+    return s
+
+
+# THE ZOOM LIE, restored: the label printed a hardcoded 100% in Fit mode regardless of
+# the real image:device pixel ratio.
+def LEGACY_ZOOMLIE(s):
+    an = "    if (el.zoomVal) el.zoomVal.textContent = Math.round(curZoom() * 100) + '%';"
+    assert s.count(an) == 1, 'zoom label anchor moved'
+    return s.replace(an,
+        "    if (el.zoomVal) el.zoomVal.textContent = (zoomFit ? '100' : String(Math.round(zoom * 100))) + '%';", 1)
+
+
+# THE LIQUID BOX: below fit the canvas silently stretches to the stage while the label
+# keeps a smaller number - percent and pixels must come from ONE equation.
+def LEGACY_FLUIDBOX(s):
     an = NL.join([
-        "      if (el.feather) { el.feather.value = (typeof o.feather === 'number') ? o.feather : 0;",
-        "                        if (el.feather_out) el.feather_out.textContent = String(el.feather.value); }"])
-    assert an in s, 'selectObj mirror anchor moved'
-    return s.replace(an, "      // MUTANT: no mirror - the greyed pair lies about the next object", 1)
+        "      el.box.style.width = zoomFit ? '100%'",
+        "        : Math.max(1, Math.round(W * zoom / dpr())) + 'px';"])
+    assert s.count(an) == 1, 'zoom box width anchor moved'
+    return s.replace(an, "      el.box.style.width = '100%';   // MUTANT: free mode silently re-fluids", 1)
 
 
 MUTANTS["commitzero"] = LEGACY_COMMITZERO
 MUTANTS["toolvis"] = LEGACY_TOOLVIS
 MUTANTS["panedits"] = LEGACY_PANEDITS
-MUTANTS["nomirror"] = LEGACY_NOMIRROR
+MUTANTS["armleak"] = LEGACY_ARMLEAK
+MUTANTS["dashbox"] = LEGACY_DASHBOX
+MUTANTS["zoomlie"] = LEGACY_ZOOMLIE
+MUTANTS["fluidbox"] = LEGACY_FLUIDBOX
 
 
 MUTANTS["latentpunch"] = LEGACY_LATENTPUNCH
@@ -687,8 +746,8 @@ def main():
         print('COMPOSE TRACE:')
         for i, d in enumerate(res['dbg'][:10]):
             print('  ', i, d)
-    EXPECT = 152   # 142 + 10 knob-ownership: visibility x4, bands x1, one-feather x1,
-                   # KF keeps-preview-promise x2, KNB lock/mirror x2, A3 panel-inert belt x1
+    EXPECT = 158   # 142 + 16 ownership round-2: visibility x6 (pair NEVER shown), KF promise x2,
+                   # fresh-hard x1, no-arm-leak x1, no-dashed-box x1, ZM honesty x3, A3 belt x1
                  # wire-no-punch (2), feather-live group (4), re-merge no-remnant (3)
     if len(res["tests"]) != EXPECT:
         print("TRUNCATED RUN: got %d assertions, expected %d -- an early error stopped the "

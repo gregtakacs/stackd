@@ -283,9 +283,15 @@
     });
     T('the panel says in words which knobs are unwired',
       /not wired into the render graph/.test(document.body.textContent));
+    // (tb_edge is deliberately, permanently disabled now — it is the hidden default
+    // store; the Selection inspector is the only edge/feather UI. Seed proves a genuinely
+    // live control still ships enabled.)
     T('live controls are NOT disabled',
-      (document.getElementById('tb_seed') || {}).disabled === false &&
-      (document.getElementById('tb_edge') || {}).disabled === false);
+      (document.getElementById('tb_seed') || {}).disabled === false);
+    T('the retired panel knobs stay hidden AND dead (never a second edge UI)',
+      (document.getElementById('tb_edge') || {}).disabled === true &&
+      (document.getElementById('tb_feather') || {}).disabled === true &&
+      (document.getElementById('tb_edge') || {parentNode:{style:{}}}).parentNode.style.display === 'none');
     return true;
   });
 

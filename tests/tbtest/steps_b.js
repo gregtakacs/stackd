@@ -555,6 +555,7 @@
         return true;
       }
       // DRAG = a stream of input events on the SAME element, as a mouse sends.
+      var mirrorPre = (document.getElementById('tb_edge') || {}).value;
       var seq = ['2', '4', '6'], same = true, i2;
       for (i2 = 0; i2 < seq.length; i2++) {
         edgeInp.value = seq[i2];
@@ -564,8 +565,12 @@
       }
       var fInp = insp.querySelectorAll('input[type=range]')[1];
       if (fInp) { fInp.value = '4'; fInp.dispatchEvent(new Event('input', { bubbles: true })); }
+      // The hidden default store must be UNTOUCHED by tuning a selected object:
+      // 'strictly post-generation' means editing THIS object can never secretly arm
+      // the NEXT one. Snapshot was taken before the drag, whatever the fixture had
+      // armed at rest.
       var mirror = document.getElementById('tb_edge');
-      var mirrored = mirror && mirror.value === '6';
+      var unprimed = !!mirror && mirror.value === mirrorPre;
       // The wash growth is measured in a band JUST ABOVE the blob's raw top edge —
       // coordinates taken from the region's own bbox (measured, not estimated), so the
       // band is provably empty of the raw brush (its ship copy ends at bbox.y0) and
@@ -596,8 +601,8 @@
       }
       return wait(300).then(function () {
         T('dragging the edge row keeps the SAME node (no rebuild steals the gesture)',
-          same && document.body.contains(edgeInp) && edgeInp.value === '6' && mirrored,
-          'same=' + same + ' val=' + (edgeInp && edgeInp.value) + ' toolbar-mirror=' + mirrored);
+          same && document.body.contains(edgeInp) && edgeInp.value === '6' && unprimed,
+          'same=' + same + ' val=' + (edgeInp && edgeInp.value) + ' default-store=' + (mirror && mirror.value));
         return wireHasNumbered(6);
       }).then(function (found) {
         T('the numbered brush ships under the auto rules with edge+feather',
@@ -937,16 +942,16 @@
   }
 
   /* =====================================================================================
-   * KNOB OWNERSHIP — the "which slider belongs to whom" report, made structural:
-   * three bands (Tool / Selection / Generation), and every visible slider has exactly
-   * ONE owner and ONE meaning. size+hardness appear only for the tools that use them;
-   * edge/feather exist in two UIs but only ever one of them is live — the inspector
-   * while an object is picked, the panel pair as the NEXT object's defaults (inert
-   * mirror otherwise). And a committed object keeps the numbers its preview promised:
-   * the brush's feather used to be hard-zeroed the moment the stroke lifted (the region
-   * rebuild disagreed with stamp()), which is the reported 'feather disappears on
-   * completion'. All three contracts die together in one group so a regression names
-   * itself.
+   * KNOB OWNERSHIP, round 2 — the follow-up: "greyed-out but still showing the same
+   * stupid value I can adjust in the select window — I don't need to see these values
+   * twice. When I use a tool I should see the settings for using the tool, that is it."
+   * So the panel pair is not a greyed mirror any more: it is NEVER SHOWN. edge/feather
+   * exist only inside the Selection inspector, only while an object is picked; the Tool
+   * band collapses for tools that use none of its knobs. A fresh object is HARD (0/0):
+   * growing/softening is a strictly post-generation act, and tuning one object must
+   * not arm the next (the hidden default store is fixture-only, never UI-fed).
+   * Also here: the dashed bbox is dead (the cyan boundary ring is the selection
+   * indicator), and the zoom label is the true image:device pixel ratio.
    * ===================================================================================== */
   function knobShown(id) {
     var e = document.getElementById('tb_' + id);
@@ -974,20 +979,26 @@
       'size=' + knobShown('brush') + ' hard=' + knobShown('hardness'));
     var bands = [].slice.call(document.querySelectorAll('.tb-band'))
       .map(function (n) { return n.textContent; }).join(' / ');
-    T('the three ownership bands are declared: Tool, Selection, Generation',
-      /TOOL|Tool/.test(bands) && /Selection/.test(bands) && /Generation/.test(bands), bands);
-    var pf = document.getElementById('tb_feather'), inspF = null;
-    // (ranges compared below after a select — just attribute caps here)
-    T('ONE feather: panel cap equals the inspector cap (was 40 vs 64)',
+    T('the panel bands are declared: Tool, Display, Generation',
+      /Tool/.test(bands) && /Display/.test(bands) && /Generation/.test(bands), bands);
+    var pf = document.getElementById('tb_feather');
+    T('ONE feather range everywhere it exists (max 64, the inspector cap)',
       !!pf && pf.max === '64' && pf.min === '0',
       'panel=' + (pf && pf.min) + '..' + (pf && pf.max));
+    var fe = document.getElementById('tb_feather'), ee = document.getElementById('tb_edge');
+    T('edge/feather are NEVER visible and NEVER enabled in the panel (see them once, in the inspector)',
+      !!fe && !!ee && knobShown('edge') === false && knobShown('feather') === false &&
+      fe.disabled === true && ee.disabled === true &&
+      fe.parentNode.parentNode.style.display === 'none',   // the whole row is gone
+      'edge vis=' + knobShown('edge') + ' feather vis=' + knobShown('feather') +
+      ' disabled=' + (fe && fe.disabled) + '/' + (ee && ee.disabled));
     return wait(60);
   });
-  step('KF paint a brush stroke while the sliders read edge 4 / feather 12', function () {
+  step('KF paint a brush stroke while the hidden defaults read edge 4 / feather 12', function () {
     var b = toolButton('brush'); if (b) b.click();
     knobSet('tb_wash', 1); knobSet('tb_hardness', 0.2);
     knobSet('tb_brush', 40);
-    knobSet('tb_edge', 4); knobSet('tb_feather', 12);
+    knobSet('tb_edge', 4); knobSet('tb_feather', 12);      // fixture driver ONLY
     return wait(80).then(function () {
       fire('pointerdown', 780, 80, 40, { isPrimary: true });
       for (var i = 1; i <= 6; i++) fire('pointermove', 780, 80, 40 + i * 5, {});
@@ -1005,41 +1016,134 @@
       !!me && me.edge === 4 && me.wire === 'auto', JSON.stringify(me));
     return true;
   });
-  step('KNB selecting locks the panel pair to a mirror', function () {
-    // Scramble the panel first: the mirror (selectObj) MUST overwrite these with the
-    // OBJECT's numbers (12/4). Without that overwrite step the values would merely be
-    // what the fixture itself typed, and a lost mirror would sail through.
-    knobSet('tb_edge', 30); knobSet('tb_feather', 3);
-    var sb = toolButton('select'); if (sb) sb.click();
-    fire('pointerdown', 781, 80, 55, { isPrimary: true });
-    fire('pointerup', 781, 80, 55, {});
-    return wait(150);
-  });
-  step('KNB lock asserts', function () {
-    var fe = document.getElementById('tb_feather'), ee = document.getElementById('tb_edge');
-    var insp = document.querySelector('.tb-inspect');
-    var live = insp && insp.offsetParent !== null
-      ? [].slice.call(insp.querySelectorAll('input[type=range]')) : [];
-    T('while an object is picked: panel inert, ONE live editor (the inspector), values mirrored',
-      !!fe && !!ee && fe.disabled && ee.disabled &&
-      live.length === 2 && live.every(function (r) { return !r.disabled; }) &&
-      fe.value === '12' && ee.value === '4',
-      'panel=' + (fe && fe.value) + '/' + (ee && ee.value) +
-      ' live=' + live.length + ' insp=' + (insp ? 'yes' : 'no'));
-    return true;
-  });
-  step('KNB deselect unlocks', function () {
-    var d = byText('Deselect'); if (d) d.click();
-    return wait(100);
-  });
-  step('KNB unlock asserts', function () {
-    var fe = document.getElementById('tb_feather'), ee = document.getElementById('tb_edge');
-    T('deselecting hands the pair back as the NEXT object defaults',
-      !!fe && !!ee && !fe.disabled && !ee.disabled && fe.value === '12',
-      'feather=' + (fe && fe.value) + ' disabled=' + (fe && fe.disabled));
-    // leave the knobs clean for the groups that follow (they paint at rest)
+  step('KNB a fresh object is HARD out of the box', function () {
+    // Post-generation ONLY: with nothing ever armed, a brand-new object commits with no
+    // grow and no feather — softening exists strictly in the Selection box, not as a
+    // secret default the user never set.
+    clearForDraw();
     knobSet('tb_edge', 0); knobSet('tb_feather', 0);
-    return true;
+    var b = toolButton('rect'); if (b) b.click();
+    fire('pointerdown', 782, 30, 235, { isPrimary: true });
+    fire('pointermove', 782, 50, 250, {});
+    fire('pointerup', 782, 60, 265, {});
+    return wait(150).then(function () {
+      var st = region(), me = st && st.all && st.all[0];
+      out.note.push('KF_HARD ' + JSON.stringify(me));
+      T('nothing selected, nothing armed: the new object carries edge 0 / feather 0',
+        !!me && me.edge === 0 && me.feather === 0 && me.wire === 'shape',
+        JSON.stringify(me));
+      return true;
+    });
+  });
+  step('KNB tuning the selected object does NOT arm the next one', function () {
+    var sb = toolButton('select'); if (sb) sb.click();
+    fire('pointerdown', 783, 45, 250, { isPrimary: true });      // grab the rect
+    fire('pointerup', 783, 45, 250, {});
+    return wait(150).then(function () {
+      inspSet(1, 20);                                            // feather it, post-generation
+      return wait(150);
+    }).then(function () {
+      var d = byText('Deselect'); if (d) d.click();
+      var b = toolButton('rect'); if (b) b.click();
+      fire('pointerdown', 784, 110, 235, { isPrimary: true });
+      fire('pointermove', 784, 130, 250, {});
+      fire('pointerup', 784, 140, 265, {});
+      return wait(200);
+    }).then(function () {
+      var st = region(), mine = null, other = null;
+      (st && st.all || []).forEach(function (q) {
+        if (q.bbox.x0 >= 60) mine = q; else other = q;
+      });
+      out.note.push('KF_LEAK ' + JSON.stringify(st && st.all));
+      T('the tuned object keeps feather 20 and the FRESH object is still hard (no hidden arming)',
+        !!other && other.feather === 20 && !!mine && mine.feather === 0 && mine.edge === 0,
+        JSON.stringify(st && st.all));
+      return true;
+    });
+  });
+  step('SB the selection shows the boundary, not a dashed box', function () {
+    var sb = toolButton('select'); if (sb) sb.click();
+    fire('pointerdown', 785, 45, 250, { isPrimary: true });      // reselect the FIRST rect
+    fire('pointerup', 785, 45, 250, {});
+    return wait(200).then(function () {
+      var st = region(), me = null;
+      (st && st.all || []).forEach(function (q) { if (q.bbox.x0 < 60) me = q; });
+      if (!me) { T('no dashed rectangle ever paints around a selected object', false,
+                   'fixture lost the first rect'); return true; }
+      // Sample the row the dashed bbox would have stroked at bbox.y0 (that is exactly
+      // where the old #3ba7ff dashes lived) and count pixels PUSHED TOWARD that blue
+      // versus the untouched photo. The cyan boundary ring (60,220,255) and the wash
+      // (232,62,62) are both outside the blue-family window.
+      var d = px(view), ref = refData, W0 = view.width, H0 = view.height;
+      var xl = Math.max(0, me.bbox.x0 | 0), xh = Math.min(W0 - 1, me.bbox.x1 | 0);
+      var yl = Math.max(0, me.bbox.y0 | 0), yh = Math.min(H0 - 1, me.bbox.y1 | 0);
+      // Sample ALL FOUR sides — a bbox edge that happens to lie in empty ink is precisely
+      // where a resurrected rectangle shows itself, and an early version sampling only the
+      // top row let a faithful dashbox mutant sail through on an L-shaped brush blob.
+      // ABSOLUTE match on the dash colour, not a delta-vs-photo: the stub's magenta
+      // overlay sits under the selection border and poisons any photo-relative test.
+      // Nothing else the editor paints is (59,167,255)-family: the wash is (232,62,62),
+      // the boundary ring (60,220,255) — the 120..210 green band excludes it — the
+      // overlay tint (255,0,255) and the polygon dots are far away in RGB.
+      // The azure corridor of the dash itself: r~59 g~167 b~255, tolerant to AA against
+      // the base photo, and the photo must have MOVED (>=40 summed channel travel) —
+      // a static blue photo pixel cannot vote. The cyan boundary ring (g 210..255 even
+      // at its 0.95 alpha over any base) and the magenta overlay (r 255) cannot reach
+      // g<=200 while keeping r<=110. (Two lessons were learned the hard way here: a
+      // photo-delta-only window let the anti-aliased dashes escape; a g<=216 window let
+      // the 0.95-alpha ring in — hits=70 on shipped code. The corridor must exclude both.)
+      function side(xx, yy) {
+        var o = (yy * W0 + xx) * 4;
+        var travel = Math.abs(d[o] - ref[o]) + Math.abs(d[o + 1] - ref[o + 1]) +
+                     Math.abs(d[o + 2] - ref[o + 2]);
+        return d[o] <= 110 && d[o + 1] >= 130 && d[o + 1] <= 200 &&
+               d[o + 2] >= 225 && travel >= 40;
+      }
+      var hits = 0, n = 0, x, y;
+      for (x = xl; x <= xh; x++) { n++; if (side(x, yl)) hits++; if (side(x, yh)) hits++; }
+      for (y = yl; y <= yh; y++) { n++; if (side(xl, y)) hits++; if (side(xh, y)) hits++; }
+      out.note.push('SB row ' + y + ' hits=' + hits + '/' + n);
+      T('no dashed rectangle ever paints around a selected object',
+        n > 8 && hits / n < 0.12, 'hits=' + hits + '/' + n);
+      return true;
+    });
+  });
+  step('ZM the zoom label is the true pixel ratio', function () {
+    function honest() {                                  // label vs measured css pixels
+      var lab = document.querySelector('.tb-zoom .tb-num');
+      var bx = document.querySelector('.tb-canvasbox');
+      if (!lab || !bx || !view.width) return -1;
+      var pct = parseInt(lab.textContent, 10);
+      var cssW = bx.getBoundingClientRect().width;
+      var truePct = Math.round(cssW * (window.devicePixelRatio || 1) / view.width * 100);
+      return Math.abs(pct - truePct);
+    }
+    var f = byText('Fit'); if (f) f.click();
+    return wait(120).then(function () {
+      T('at Fit the label matches the ACTUAL pixels, not a fake 100%',
+        honest() >= 0 && honest() <= 3,
+        'delta=' + honest() + '% label=' +
+        (document.querySelector('.tb-zoom .tb-num') || {}).textContent);
+      var one = byText('1:1'); if (one) one.click();
+      return wait(120);
+    }).then(function () {
+      var lab = document.querySelector('.tb-zoom .tb-num');
+      var bx = document.querySelector('.tb-canvasbox');
+      var cssW = bx ? bx.getBoundingClientRect().width : -1;
+      var want = view.width / (window.devicePixelRatio || 1);
+      T('1:1 really shows one image pixel per screen pixel - the label meaning',
+        !!lab && /^\s*100%\s*$/.test(lab.textContent) && Math.abs(cssW - want) <= 2,
+        'label=' + (lab && lab.textContent) + ' cssW=' + cssW + ' want=' + want);
+      var z = byText('Zoom +'); if (z) { z.click(); z.click(); z.click(); }
+      return wait(120);
+    }).then(function () {
+      T('deep zoom stays honest (label == measured ratio, and both above 100%)',
+        honest() <= 3,
+        'delta=' + honest() + '% label=' +
+        (document.querySelector('.tb-zoom .tb-num') || {}).textContent);
+      var f2 = byText('Fit'); if (f2) f2.click();       // hand the suite back a fitted view
+      return wait(120);
+    });
   });
 
   step('BR clear + soft-brush knobs', function () {
@@ -1365,6 +1469,9 @@
     var r = region();
     out.note.push('ERF_STATE ' + JSON.stringify(r && r.all));
     var two = r && r.regions === 2 ? r.all : null;
+    out.note.push('ERF_CSS cssW=' + (view.getBoundingClientRect().width || 0).toFixed(0) +
+                  ' backing=' + view.width + ' zoomLbl=' +
+                  ((document.querySelector('.tb-zoom .tb-num') || {}).textContent || '?'));
     T('the wide cut split the object in two, both still feathered and unfurled-in-kind',
       !!two && two.every(function (q) { return q.feather === 8 && q.edge === 0; }),
       JSON.stringify(two));
@@ -1377,9 +1484,17 @@
     // washed — that soft ring can ONLY come from a feather recomputed around the NEW
     // boundary. And the middle of a 40px channel (20px from either edge, past ~12 of
     // reach) must be bare: nothing of the old outer halo survives the cut.
-    var nearTop = bandAvg(65, 95, 143, 145);
-    var midChan = bandAvg(65, 95, 158, 162);
-    var nearBot = bandAvg(65, 95, 177, 179);
+    // bbox-DRIVEN rows, never hardcoded: the channel's width is brushR() = size*scale()/2,
+    // and scale() follows the live layout (450 CSS px here), so rows like the old
+    // '143..145' silently drift into the wrong place when the panel changes height. The
+    // halves' measured bboxes ARE the cut edges — 2 px inside each must carry the live
+    // skirt; the middle of the measured gap must be bare whatever its width.
+    var hi = two[0], loHalf = two[1];
+    if (hi.bbox.y0 > loHalf.bbox.y0) { var sw = hi; hi = loHalf; loHalf = sw; }
+    var nearTop = bandAvg(65, 95, hi.bbox.y1 - 2, hi.bbox.y1);
+    var midChan = bandAvg(65, 95, Math.round((hi.bbox.y1 + loHalf.bbox.y0) / 2) - 1,
+                               Math.round((hi.bbox.y1 + loHalf.bbox.y0) / 2) + 1);
+    var nearBot = bandAvg(65, 95, loHalf.bbox.y0, loHalf.bbox.y0 + 2);
     // The live tail past the outer edge: present at ~6px (inside f), gone by ~16px
     // (> ~1.5f). If the feather were ever folded into the raster this reads solid at 215.
     var tail = bandAvg(65, 95, 201, 205), far = bandAvg(65, 95, 219, 223);   // tail: inside f; far: past ~1.5f
@@ -1400,12 +1515,34 @@
     return true;
   });
 
+  var _errPlan = null;   // measured drag geometry, recomputed every run
   step('ERr re-merge: drag the top half down over the channel', function () {
     var sb = toolButton('select'); if (sb) sb.click();
     return wait(120).then(function () {
-      fire('pointerdown', 756, 80, 130, { isPrimary: true });   // inside the TOP half's pixels
-      for (var i = 1; i <= 5; i++) fire('pointermove', 756, 80, 130 + i * 10, {});
-      fire('pointerup', 756, 80, 180, {});
+      var r = region(), up = null, loHalf = null;
+      (r && r.all || []).forEach(function (q) {
+        if (!up || q.bbox.y0 < up.bbox.y0) up = q;
+        if (!loHalf || q.bbox.y1 > loHalf.bbox.y1) loHalf = q;
+      });
+      if (!up || !loHalf || up === loHalf) {
+        out.note.push('ERR_NOPLAN ' + JSON.stringify(r && r.all));
+        fire('pointerdown', 756, 80, 130, { isPrimary: true });
+        fire('pointerup', 756, 80, 130, {});
+        return wait(160);
+      }
+      // Drag the TOP half down until it overlaps the bottom one by 10 px — the overlap is
+      // measured, so a channel that grew (scale drift) can never leave the halves short
+      // of each other again. The band probed for a latent gap is 1..7 rows ABOVE the
+      // lower half's head: pixels only the moved half can cover, and exactly the rows the
+      // old sweep deleted.
+      var cx = Math.round((Math.max(up.bbox.x0, loHalf.bbox.x0)
+                           + Math.min(up.bbox.x1, loHalf.bbox.x1)) / 2);
+      var sy = Math.round((up.bbox.y0 + up.bbox.y1) / 2);
+      var dy = loHalf.bbox.y0 - up.bbox.y1 + 10;
+      _errPlan = { cx: cx, band0: loHalf.bbox.y0 - 7, band1: loHalf.bbox.y0 - 1 };
+      fire('pointerdown', 756, cx, sy, { isPrimary: true });
+      for (var i = 1; i <= 5; i++) fire('pointermove', 756, cx, sy + Math.round(i * dy / 5), {});
+      fire('pointerup', 756, cx, sy + dy, {});
       window.__ERMARK = (window.__LREAL || []).length;
       return wait(160);
     });
@@ -1418,7 +1555,9 @@
     // The old sweep sat at rows ~140..180; the moved half now covers ~160..179 there. A
     // permanent punch would carve exactly this band and the user would see a hole through
     // the middle of the object they just joined (the reported 'latent gap').
-    var joined = bandAvg(65, 95, 171, 178);
+    var joined = _errPlan
+      ? bandAvg(65, 95, _errPlan.band0, _errPlan.band1) : -1;
+    out.note.push('ERR_PLAN ' + JSON.stringify(_errPlan));
     out.note.push('ERR_JOINED=' + joined.toFixed(1));
     T('the re-merged object has NO latent gap where the eraser used to be',
       joined > 120, 'joinedBand=' + joined);

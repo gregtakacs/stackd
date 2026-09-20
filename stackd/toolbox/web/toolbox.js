@@ -85,10 +85,17 @@
   // Zoom/pan: the canvas backing store always stays at natural W×H; zoom only changes the
   // CSS display size inside a scrollable stage. toNatural maps off the RENDERED rect, so it
   // needs no zoom term — the browser's own scaling of the backing store to the element's
-  // box does that. fitW is the width the canvas gets at zoom 1 (the stage's inner width),
-  // so the default (zoom 1) view is exactly what a no-zoom build showed.
-  var zoom = 1, fitW = 0;
-  var ZOOM_MIN = 1, ZOOM_MAX = 6;
+  // box does that.
+  //
+  // zoom is the TRUE pixel ratio: image pixels per DEVICE pixels. 1.0 means one image px
+  // fills exactly one screen px — what '100%' means everywhere else, and what it means
+  // here. (The label used to print the fit-WIDTH multiplier, so a photo two-thirds the
+  // stage width read '100%' at 150 real percent and 'Fit' was the lie the user refused.
+  // CSS px come from zoom/dpr; the device ratio is what a photographer or a painter
+  // checks pixel-peeping against.) Fit is a MODE, not a number: the width the canvas
+  // gets at the stage's inner width (fitW), recomputed live so rotation/reflow follows.
+  var zoom = 1, fitW = 0, zoomFit = true, zoomFits = true;
+  var ZOOM_MIN = 0.1, ZOOM_MAX = 16;   // 10% .. 1600% true pixel zoom, both ways past 1:1
 
   // Two-pointer pinch bookkeeping (mobile). Map pointerId -> {x,y} client px while active.
   var ptrs = {}, pinchStart = null;
@@ -362,20 +369,10 @@
 
   function selectObj(i) {
     sel = (i >= 0 && i < regions.length) ? i : -1;
-    // Mirror the object's edge/feather into the toolbar sliders so the obvious slider
-    // reads (and then edits) THIS object — for EVERY object, brush included. The old
-    // exclusion ("a live slider that silently did nothing is the lie we refuse") removed
-    // the knob; the user's answer was that the knob is WANTED, so the honest fix is that
-    // it works: the first drag onto a brush blob retires the handwork edge (setObjParam).
     var o = selObj();
-    if (o) {
-      // effEdge: after a split/merge the grow is inside the pixels, so the honest knob
-      // reading is 0 (and dragging from there adds to the folded silhouette).
-      if (el.edge) { el.edge.value = String(effEdge(o));
-                     if (el.edge_out) el.edge_out.textContent = String(el.edge.value); }
-      if (el.feather) { el.feather.value = (typeof o.feather === 'number') ? o.feather : 0;
-                        if (el.feather_out) el.feather_out.textContent = String(el.feather.value); }
-    }
+    // NO mirror into the hidden default store, deliberately: tuning THIS object must
+    // not secretly arm the NEXT one. edge/feather are strictly properties of the
+    // selected object (post-generation only); a brand-new object is always HARD.
     syncInspector();
     compose();
     if (sel < 0) status('Nothing selected.');
@@ -551,26 +548,22 @@
     return lab;
   }
 
-  // ONE edge/feather editor visible at a time (the user's "feather is duplicated" report).
-  // With an object picked, the panel pair goes INERT — it keeps mirroring the object's
-  // numbers (selectObj/_sync below, so you can read what the NEXT object will inherit)
-  // but the only live control is the Selection band's inspector rows. With nothing
-  // picked, the pair is the defaults the next committed object gets. The greyed state is
-  // deliberate and titled: a visible slider that edits a different thing than it reads
-  // is the exact confusion this replaces.
+  // ONE owner per visible slider, enforced structurally (the follow-up report:
+  // "greyed-out but still showing the same stupid value I can adjust in the select
+  // window" — a mirror is still a second display of the number, so the pair is not
+  // merely disabled, it is NEVER SHOWN). edge/feather exist only in the Selection
+  // inspector, only while an object is picked; the Tool band shows only what the
+  // current tool actually uses and collapses entirely for tools that use none.
   function syncKnobLock() {
-    var o = selObj(), lock = !!o;
     var pair = [el.edge, el.feather];
-    for (var pi = 0; pi < 2; pi++) {
+    for (var pi = 0; pi < pair.length; pi++) {
       var n = pair[pi]; if (!n) continue;
-      n.disabled = lock;
-      if (n.parentNode) n.parentNode.title = lock
-        ? 'an object is selected: its own edge/feather rows are in the Selection box below — this pair shows what the NEXT object starts with'
-        : '';
+      n.disabled = true;                       // hidden AND dead: resurrecting either
+      if (n.parentNode) n.parentNode.style.display = 'none';   // half is a visible bug
     }
-    if (el.selhint) el.selhint.textContent = lock
-      ? 'drag left shrinks the selected object, right grows it (same px unit the graph uses; feather softens OUTWARD only) — edit it in the Selection rows below'
-      : 'edge and feather are the numbers the object you now DRAW will get — drag left to shrink, right to grow; feather softens OUTWARD only. overlay only dims the on-screen wash; it never changes the mask. Tap Select, then an object, to retune one already placed.';
+    var tv = (tool === 'brush' || tool === 'eraser');
+    if (el.g1) el.g1.style.display = tv ? '' : 'none';
+    if (el.bandTool) el.bandTool.style.display = tv ? '' : 'none';
   }
 
   function syncInspector() {
@@ -581,6 +574,8 @@
               el_inspect._sync = null; return; }
     el_inspect.style.display = '';
     el_inspect.innerHTML = '';
+    el_inspect.appendChild(mk('div', 'tb-band',
+      'Selection — the picked object only (edge grows/shrinks, feather softens OUTWARD)'));
     var kind = o.kind;
     // The inspector edits the OBJECT (the connected blob), not the strokes that made it:
     // after commit there is no size/hardness vertex left to re-tune — the pixels are the
@@ -614,13 +609,9 @@
       if (o._ipF && String(o._ipF.value) !== String(o.feather)) {
         o._ipF.value = o.feather; if (o._outF) o._outF.textContent = String(o.feather);
       }
-      // toolbar mirror follows inspector edits (selectObj did the other direction)
-      if (el.edge && String(el.edge.value) !== String(effEdge(o))) {
-        el.edge.value = effEdge(o); if (el.edge_out) el.edge_out.textContent = String(effEdge(o));
-      }
-      if (el.feather && String(el.feather.value) !== String(o.feather)) {
-        el.feather.value = o.feather; if (el.feather_out) el.feather_out.textContent = String(o.feather);
-      }
+      // (The old toolbar mirror that followed inspector edits is gone BY DESIGN: the
+      // hidden default store must not absorb the tuned object's numbers, or editing
+      // one object would silently pre-feather the next one.)
     };
     var rowb = mk('div', 'tb-row');
     rowb.appendChild(btn('Delete object', deleteSel, 'Remove this object from the mask'));
@@ -1388,7 +1379,10 @@
     var v = viewC.getContext('2d');
     v.clearRect(0, 0, W, H);
     v.drawImage(baseC, 0, 0);
-    if (selObj()) drawSelection(v);          // before the early return, or the box vanishes
+    // (No dashed bbox. The selection indicator is the object's OWN boundary — the cyan
+    // morph ring drawn by drawActiveAutoOutline below — which tracks grow/feather and
+    // says "this is the selected object" without framing it in a rectangle the object
+    // does not fill. The box was the user's last complaint about the selection model.)
     if (preview && preview.img && preview.sig === previewSig()) {
       v.drawImage(preview.img, 0, 0, W, H);
       drawActiveOutline(v);
@@ -1470,22 +1464,10 @@
   // The in-progress shape, drawn in natural coords so it scales with the view for free.
   // Covers the freehand lasso trace ('draw'), the click-built polygon ('poly'), rect and
   // ellipse — every tool now previews while it builds, which the lasso previously did not.
-  function drawSelection(v) {
-    var o = selObj(); if (!o) return;
-    var b = objBBox(o); if (!b) return;
-    // Pixel objects: the dashed box is an indicator, not a manipulator. The corner SCALE
-    // handle retired with the vector model — a blob that may BE a merge of several
-    // strokes has no "vector to resize", and an affordance that scales half of what the
-    // user sees is exactly the dead-control lie this project's greyed-knobs rule exists
-    // to prevent. Drag anywhere inside the object to move its pixels.
-    v.save();
-    v.strokeStyle = '#3ba7ff'; v.lineWidth = Math.max(1.5, 2 * scale());
-    v.setLineDash([6 * scale(), 4 * scale()]);
-    v.strokeRect(b.x0 + (o.mvx || 0), b.y0 + (o.mvy || 0),
-                 b.x1 - b.x0 + 1, b.y1 - b.y0 + 1);
-    v.setLineDash([]);
-    v.restore();
-  }
+  // (drawSelection retired with the dashed rectangle — see compose(). The cyan
+  // boundary ring IS the selection indicator, and the in-progress shape keeps its own
+  // yellow drawActiveOutline, which is a different thing: the trace being built, not a
+  // frame around a committed object.)
 
   function drawActiveOutline(v) {
     if (!active || !active.pts.length || active.mode === 'load') return;
@@ -1708,13 +1690,10 @@
     for (var k in (attrs || {})) { if (Object.prototype.hasOwnProperty.call(attrs, k)) i.setAttribute(k, attrs[k]); }
     i.value = value;
     var out = mk('span', 'tb-num', String(value));
-    // edge/feather are the numbers for the object you DRAW NEXT (stamp() and the
-    // region-commit branch read them at commit). While an object is picked the panel pair
-    // goes inert — it mirrors the object's values but cannot edit them — because the ONE
-    // live editor for a placed object is the Selection band's inspector rows (syncKnobLock).
-    // The duplicate that died here used to write the selected object from the top of the
-    // panel; two live UIs for one number, labeled differently and capped differently, is
-    // what read as "the feather slider is a secret second copy of the inspector's feather".
+    // edge/feather reach the COMMIT paths (stamp(), the region-commit branch) as the
+    // hidden next-object default store. They are never shown and never user-editable:
+    // their only UI is the Selection inspector (syncKnobLock). The handler remains for
+    // the suite's fixture driver, which arms defaults the same way a commit reads them.
     i.addEventListener('input', function () {
       out.textContent = i.value;
       refresh();
@@ -1830,9 +1809,11 @@
     root.appendChild(el.tools);
     buildInspector(root);          // appears directly under the toolbar when something is picked
 
-    root.appendChild(mk('div', 'tb-band',
-      'Tool — what your current tool draws with (sliders appear only where the tool uses them)'));
+    el.bandTool = mk('div', 'tb-band',
+      'Tool — what your current tool draws with (sliders appear only where the tool uses them)');
+    root.appendChild(el.bandTool);
     var g1 = row('tb-grid');
+    el.g1 = g1;
     g1.appendChild(ctl('brush', 'range', 60, 'size', { min: 4, max: 400, step: 2 }));
     g1.appendChild(ctl('hardness', 'range', 0.55, 'hardness', { min: 0, max: 1, step: 0.05 }));
     root.appendChild(g1);
@@ -1851,16 +1832,26 @@
     // when the object is scaled in the Select tool, and on a ring painted as blob-minus-
     // eraser it fills the hole the user carved (10% of a 566 px bbox is 43 px, against ~50 px
     // of material). Percentage is offered as a READOUT, so the number stays honest.
-    root.appendChild(mk('div', 'tb-band',
-      'Selection — the mask shape and how strongly you see it'));
+    // EDGE/FEATHER ARE NOT PANEL CONTROLS. They exist exactly once — the Selection
+    // inspector — and only while an object is picked (the user: "strictly a
+    // post-generation slider when the object is selected", and "I don't need to see
+    // these values twice", which killed the greyed mirror too). These inputs survive
+    // HIDDEN as the next-object default store stamp() and the region-commit branch
+    // read at commit; nothing the user can reach arms them, so every fresh object
+    // starts HARD (0/0) and softening/growing is a deliberate post-selection act.
+    // The elements stay in the DOM so the commit path and the suite's fixture driver
+    // keep one honest mechanism instead of a parallel private one.
     g2.appendChild(ctl('edge', 'range', 0, 'edge grow/shrink', { min: -60, max: 60, step: 2 }));
-    // max 64 = the inspector's feather cap (ipair below). One number, one range — two
-    // caps (40 here, 64 there) for the SAME object parameter was a real inconsistency.
-    g2.appendChild(ctl('feather', 'range', 8, 'feather', { min: 0, max: 64, step: 1 }));
-    g2.appendChild(ctl('wash', 'range', 0.45, 'overlay', { min: 0, max: 1, step: 0.05 }));
+    // max 64 = the inspector's feather cap (ipair): one number, one range.
+    g2.appendChild(ctl('feather', 'range', 0, 'feather', { min: 0, max: 64, step: 1 }));
+    g2.style.display = 'none';
     root.appendChild(g2);
-    el.selhint = mk('div', 'tb-hint', '');
-    root.appendChild(el.selhint);
+
+    root.appendChild(mk('div', 'tb-band',
+      'Display — how the mask looks on screen (overlay never changes the mask)'));
+    var gD = row('tb-grid');
+    gD.appendChild(ctl('wash', 'range', 0.45, 'overlay', { min: 0, max: 1, step: 0.05 }));
+    root.appendChild(gD);
     root.appendChild(labelled('', toggle('inv', 'invert — edit everything OUTSIDE the paint', false)));
 
     root.appendChild(mk('div', 'tb-band',
@@ -2299,30 +2290,45 @@
   /* ---------------- zoom / pan ---------------- */
   // The canvas backing store never changes; only the CSS box grows, and toNatural reads the
   // live rect, so painting stays correct at any zoom. The stage scrolls when zoomed.
-  function setZoom(z) {
-    zoom = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, z || 1));
+  function dpr() { return Math.max(1, window.devicePixelRatio || 1); }
+  // The EFFECTIVE ratio, measured from what is ACTUALLY RENDERED — never from a stale
+  // sample. In fit mode the box is fluid ('100%'), so the stage's own reflow (the render
+  // column appearing widens it) is the truth; the label and the +/- seeds follow that.
+  function curZoom() {
+    if (!zoomFit) return zoom;
+    var rw = viewC ? viewC.getBoundingClientRect().width : 0;
+    return rw && W ? rw * dpr() / W : 1;
+  }
+  function setZoom(z, fit) {
+    zoomFit = !!fit;
+    if (!zoomFit) zoom = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, z || 1));
     applyZoom();
   }
   function measureFit() {
     // clientWidth already excludes the permanently reserved vertical gutter, i.e. the
     // width content can occupy WITHOUT provoking a horizontal bar. Sample it only while
-    // unzoomed: measured while zoomed it would shrink a little on every +/- press.
+    // the view FITS: measured while zoomed it would shrink a little on every +/- press.
     var cw = el.stage ? el.stage.clientWidth : 0;
     if (cw > 0) fitW = cw;
   }
   function applyZoom() {
     if (!viewC || !W) return;
-    if (zoom <= 1) measureFit();
+    if (zoomFits) measureFit();
     if (el.box) {
       el.box.style.aspectRatio = W + ' / ' + H;
-      // unzoomed: fluid, so no measured-pixel drift can overflow the stage and no
-      // scrollbar can ever appear at 'Fit'. zoomed: px, and the stage legitimately
-      // scrolls to reach the rest of the photo.
-      el.box.style.width = (zoom > 1 && fitW)
-        ? (Math.max(1, Math.round(fitW * zoom)) + 'px') : '100%';
+      // Fit stays FLUID, as it always has: freezing fit at a sampled pixel width goes
+      // stale the moment the page reflows (the render column appearing genuinely
+      // widens the stage). The ANTI-LIE lives in the label — curZoom() measures the
+      // rendered rect instead of printing a confident number — and in free mode, where
+      // the box is sized in true CSS px so 1:1 means one image px per screen px.
+      // (A mutant that lets free mode drift fluid again dies on the 1:1 gate.)
+      el.box.style.width = zoomFit ? '100%'
+        : Math.max(1, Math.round(W * zoom / dpr())) + 'px';
     }
-    if (el.stage) el.stage.style.justifyContent = zoom > 1 ? 'flex-start' : 'center';
-    if (el.zoomVal) el.zoomVal.textContent = Math.round(zoom * 100) + '%';
+    var cssW = viewC.getBoundingClientRect().width;
+    zoomFits = !fitW || cssW <= fitW + 1;
+    if (el.stage) el.stage.style.justifyContent = zoomFits ? 'center' : 'flex-start';
+    if (el.zoomVal) el.zoomVal.textContent = Math.round(curZoom() * 100) + '%';
     drawRing();
   }
 
@@ -2375,7 +2381,7 @@
       var d = dist(ab[0], ab[1]);
       if (d < 8) return;                       // untrustworthy: fingers collapsed together
       setZoom(pinchStart.zoom * d / pinchStart.dist);
-      if (zoom > 1 && el.stage) {
+      if (!zoomFits && el.stage) {
         var mx = (ab[0].clientX + ab[1].clientX) / 2, my = (ab[0].clientY + ab[1].clientY) / 2;
         el.stage.scrollLeft = pinchStart.sx + (pinchStart.mx - mx);
         el.stage.scrollTop = pinchStart.sy + (pinchStart.my - my);
@@ -2397,7 +2403,7 @@
         active = null; dragEnabled = false; pinching = true;
         var ab = twoPts();
         pinchStart = {
-          dist: dist(ab[0], ab[1]), zoom: zoom,
+          dist: dist(ab[0], ab[1]), zoom: curZoom(),
           mx: (ab[0].clientX + ab[1].clientX) / 2, my: (ab[0].clientY + ab[1].clientY) / 2,
           sx: el.stage ? el.stage.scrollLeft : 0, sy: el.stage ? el.stage.scrollTop : 0
         };
@@ -2589,11 +2595,14 @@
     actions.appendChild(btn('Start over', function () { clearMask(); el.out.innerHTML = ''; status('Ready.'); }));
 
     var zr = row('tb-zoom');
-    zr.appendChild(btn('Zoom -', function () { setZoom(zoom / 1.4); }, 'Zoom out'));
-    el.zoomVal = mk('span', 'tb-num', '100%');
+    // Steps multiply the EFFECTIVE ratio (which in Fit mode is the live fit ratio), so
+    // the first press from Fit continues from where the photo actually is.
+    zr.appendChild(btn('Zoom -', function () { setZoom(curZoom() / 1.4); }, 'Zoom out (true pixel scale)'));
+    el.zoomVal = mk('span', 'tb-num', '—');
     zr.appendChild(el.zoomVal);
-    zr.appendChild(btn('Zoom +', function () { setZoom(zoom * 1.4); }, 'Zoom in'));
-    zr.appendChild(btn('Fit', function () { setZoom(1); }, 'Fit to width'));
+    zr.appendChild(btn('Zoom +', function () { setZoom(curZoom() * 1.4); }, 'Zoom in (true pixel scale)'));
+    zr.appendChild(btn('1:1', function () { setZoom(1); }, 'Show one image pixel per screen pixel (true 100%)'));
+    zr.appendChild(btn('Fit', function () { setZoom(0, true); }, 'Fit the photo to the stage width'));
     el.cover = mk('span', 'tb-hint', '');
     zr.appendChild(el.cover);
     host.appendChild(el.stage);
@@ -2679,7 +2688,7 @@
     });
   }
   window.addEventListener('resize', function () {
-    if (zoom <= 1) { fitW = 0; applyZoom(); }
+    if (zoomFit && zoomFits) { fitW = 0; applyZoom(); }
   });
   window.addEventListener('load', reportHeightSoon);
   if (window.ResizeObserver) {
