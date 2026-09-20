@@ -35,6 +35,16 @@
   step('ring on hover', function () { fire('pointermove', 1, 40, 40, { isPrimary: true, buttons: 0 }); });
   step('ring drawn', function () { T('brush cursor ring appears on hover', nonEmpty(ring)); });
 
+  step('knobs to hard defaults', function () {
+    // feather 8 is the shipped slider default, and a numbered brush now COMMITS under
+    // the auto wire rules (that is the honest new contract). This first block is about
+    // HARD ink and the edge-axis only - so take the feather out of the equation at
+    // rest, before anything is painted.
+    var f = document.getElementById('tb_feather');
+    if (f) { f.value = '0'; f.dispatchEvent(new Event('input', { bubbles: true })); }
+    var e = document.getElementById('tb_edge');
+    if (e) { e.value = '0'; e.dispatchEvent(new Event('input', { bubbles: true })); }
+  });
   step('paint', function () {
     out.note.push('DBG ref=' + (refData ? 'yes' : 'NO') +
                   ' viewSize=' + view.width + 'x' + view.height +
@@ -369,6 +379,10 @@
       // can't assert the post-undo preview is empty. Instead paint a brush stroke now — if
       // Undo had left a ghost auto layer, it would reappear in the layers alongside the brush.
       var b = toolButton('brush'); if (b) b.click();
+      var fz = document.getElementById('tb_feather');
+      if (fz) { fz.value = '0'; fz.dispatchEvent(new Event('input', { bubbles: true })); }
+      // hard ink here: the gate is about the GHOST, and a feathered brush would
+      // legitimately ship as an auto layer and drown it in false positives.
       fire('pointerdown', 400, 30, 30, { isPrimary: true });
       for (var i = 0; i < 6; i++) fire('pointermove', 400, 30 + i * 6, 30 + i * 4, {});
       fire('pointerup', 400, 70, 60, {});
@@ -516,11 +530,13 @@
   });
 
   // Issue-2 regression (the reported "grow/shrink/feather re-render but nothing changes"):
-  // with a smart-select (auto) object SELECTED, the TOOLBAR edge/feather sliders must edit
-  // THAT object. They used to feed only the global mask_expand/feather, which the layered
-  // server path (normalize_layers) ignores entirely, so dragging them re-fired the preview and
-  // returned an identical overlay. The fix routes the sliders onto the selected auto layer;
-  // this asserts the auto layer reaches the wire carrying the moved edge + feather. A
+  // with a smart-select (auto) object SELECTED, the edge/feather numbers MUST reach THAT
+  // object. They used to feed only the global mask_expand/feather, which the layered server
+  // path (normalize_layers) ignores entirely, so dragging them re-fired the preview and
+  // returned an identical overlay. The knob-ownership model puts exactly ONE live editor
+  // on those numbers while an object is picked: the inspector rows (the panel pair is the
+  // greyed mirror of them - editing through a mirror is the duplication this replaces).
+  // This asserts the auto layer reaches the wire carrying the moved edge + feather. A
   // `--mutate autoslider` mutant (routing removed) turns this RED, so it genuinely tests the fix.
   step('the toolbar edge/feather sliders edit a SELECTED auto object (reaches the wire)', function () {
     clearForDraw();
@@ -538,8 +554,10 @@
       T('edge + feather sliders exist', !!ed && !!fe);
       // Drag to values the commit-time stamp would NOT have used (stub committed edge from the
       // current slider, which is whatever the prior left; force distinct, unmistakable values).
-      ed.value = '30'; ed.dispatchEvent(new Event('input', { bubbles: true }));
-      fe.value = '20'; fe.dispatchEvent(new Event('input', { bubbles: true }));
+      inspSet(0, 30); inspSet(1, 20);      // the inspector is the one live editor
+      // Belt on the lock itself: the panel pair must be INERT while this object is picked.
+      T('the panel pair is a mirror, not a second editor (disabled while selected)',
+        !!ed && !!fe && ed.disabled === true && fe.disabled === true);
       return wait(800);
     }).then(function () {
       var pv = previews();

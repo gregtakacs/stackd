@@ -119,6 +119,13 @@ html {
 .tb-out { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .tb-out img { max-width: 100%; border-radius: 8px; border: 1px solid #34343b; }
 .tb-hint { color: #7a7a82; font-size: 12px; margin-top: 6px; }
+/* Band headers: which group of sliders answers to WHICH owner (Tool / Selection /
+   Generation). One glance tells a user whether a slider can even matter right now -
+   a slider visible outside its owner's band was the "meaningless sliders" report. */
+.tb-band { margin: 14px 0 2px; padding-top: 8px; border-top: 1px solid #2a2a30;
+           color: #9a9aa4; font-size: 11px; font-weight: 600; letter-spacing: .06em;
+           text-transform: uppercase; }
+.tb-ctl input:disabled { opacity: .45; }   /* the inert mirrored pair while an object is picked */
 
 
 

@@ -564,6 +564,70 @@ def LEGACY_STALEOVERLAY(s):
 
 
 MUTANTS["nofold"] = LEGACY_NOFOLD
+# THE FEATHER-VANISHING-COMMIT, restored: the region rebuild hard-zeroed brush
+# edge/feather while stamp() had already given the stroke the slider numbers - the soft
+# edge under the finger disappeared the moment the stroke lifted (user report).
+def LEGACY_COMMITZERO(s):
+    an = NL.join(["        edge = val('tb_edge', 0);",
+                  "        feather = val('tb_feather', 8);"])
+    assert s.count(an) == 1, 'commit-branch anchor moved'
+    return s.replace(an, NL.join([
+        "        edge = kind === 'brush' ? 0 : val('tb_edge', 0);",
+        "        feather = kind === 'brush' ? 0 : val('tb_feather', 8);"]), 1)
+
+
+# THE DEAD SLIDERS BACK: visibility collapses to the old eraser-only rule, so polygon/
+# smart/rect/select all show size AND hardness again.
+def LEGACY_TOOLVIS(s):
+    an = NL.join([
+        "    if (el.brush) el.brush.parentNode.style.display =",
+        "      (t === 'brush' || t === 'eraser') ? '' : 'none';",
+        "    if (el.hardness) el.hardness.parentNode.style.display = (t === 'brush') ? '' : 'none';"])
+    assert an in s, 'setTool visibility anchor moved'
+    return s.replace(an, "    if (el.hardness) el.hardness.parentNode.style.display = (t === 'eraser') ? 'none' : '';", 1)
+
+
+# THE SECOND LIVE FEATHER COPY, restored: the panel pair edits the selected object too,
+# so two UIs claim the same number with different labels and histories again.
+def LEGACY_PANEDITS(s):
+    NL = chr(10)
+    an = "      n.disabled = lock;"
+    assert an in s, 'syncKnobLock disable anchor moved'
+    s = s.replace(an, "      n.disabled = false;   // MUTANT: the pair edits whatever is selected", 1)
+    an2 = NL.join(["    i.addEventListener('input', function () {",
+                   "      out.textContent = i.value;",
+                   "      refresh();",
+                   "    });"])
+    assert an2 in s, 'ctl input handler anchor moved'
+    return s.replace(an2, NL.join([
+        "    i.addEventListener('input', function () {",
+        "      out.textContent = i.value;",
+        "      var o = selObj();",
+        "      if ((id === 'edge' || id === 'feather') && o && o.kind) {",
+        "        setObjParam(id === 'edge' ? 'edge' : 'feather', parseFloat(i.value) || 0);",
+        "        return;",
+        "      }",
+        "      refresh();",
+        "    });"]), 1)
+
+
+# THE MIRROR LOST: the greyed pair stops following the selected object, so what the
+# user reads as 'what the next object inherits' is whatever was last typed at rest.
+def LEGACY_NOMIRROR(s):
+    NL = chr(10)
+    an = NL.join([
+        "      if (el.feather) { el.feather.value = (typeof o.feather === 'number') ? o.feather : 0;",
+        "                        if (el.feather_out) el.feather_out.textContent = String(el.feather.value); }"])
+    assert an in s, 'selectObj mirror anchor moved'
+    return s.replace(an, "      // MUTANT: no mirror - the greyed pair lies about the next object", 1)
+
+
+MUTANTS["commitzero"] = LEGACY_COMMITZERO
+MUTANTS["toolvis"] = LEGACY_TOOLVIS
+MUTANTS["panedits"] = LEGACY_PANEDITS
+MUTANTS["nomirror"] = LEGACY_NOMIRROR
+
+
 MUTANTS["latentpunch"] = LEGACY_LATENTPUNCH
 MUTANTS["bakepad"] = LEGACY_BAKEPAD
 MUTANTS["bakefeather"] = LEGACY_BAKEFEATHER
@@ -623,8 +687,8 @@ def main():
         print('COMPOSE TRACE:')
         for i, d in enumerate(res['dbg'][:10]):
             print('  ', i, d)
-    EXPECT = 142   # 133 (eraser-model group) + 9: BR hard-ink x2, live perimeter + binary wire x2,
-                   # cut-feather x2, DR fixture x1, DR mask-follows x2
+    EXPECT = 152   # 142 + 10 knob-ownership: visibility x4, bands x1, one-feather x1,
+                   # KF keeps-preview-promise x2, KNB lock/mirror x2, A3 panel-inert belt x1
                  # wire-no-punch (2), feather-live group (4), re-merge no-remnant (3)
     if len(res["tests"]) != EXPECT:
         print("TRUNCATED RUN: got %d assertions, expected %d -- an early error stopped the "

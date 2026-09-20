@@ -551,7 +551,30 @@
     return lab;
   }
 
+  // ONE edge/feather editor visible at a time (the user's "feather is duplicated" report).
+  // With an object picked, the panel pair goes INERT — it keeps mirroring the object's
+  // numbers (selectObj/_sync below, so you can read what the NEXT object will inherit)
+  // but the only live control is the Selection band's inspector rows. With nothing
+  // picked, the pair is the defaults the next committed object gets. The greyed state is
+  // deliberate and titled: a visible slider that edits a different thing than it reads
+  // is the exact confusion this replaces.
+  function syncKnobLock() {
+    var o = selObj(), lock = !!o;
+    var pair = [el.edge, el.feather];
+    for (var pi = 0; pi < 2; pi++) {
+      var n = pair[pi]; if (!n) continue;
+      n.disabled = lock;
+      if (n.parentNode) n.parentNode.title = lock
+        ? 'an object is selected: its own edge/feather rows are in the Selection box below — this pair shows what the NEXT object starts with'
+        : '';
+    }
+    if (el.selhint) el.selhint.textContent = lock
+      ? 'drag left shrinks the selected object, right grows it (same px unit the graph uses; feather softens OUTWARD only) — edit it in the Selection rows below'
+      : 'edge and feather are the numbers the object you now DRAW will get — drag left to shrink, right to grow; feather softens OUTWARD only. overlay only dims the on-screen wash; it never changes the mask. Tap Select, then an object, to retune one already placed.';
+  }
+
   function syncInspector() {
+    syncKnobLock();
     if (!el_inspect) return;
     var o = selObj();
     if (!o) { el_inspect.innerHTML = ''; el_inspect.style.display = 'none';
@@ -1032,8 +1055,15 @@
         }
       } else {
         kind = commitHintKind || 'shape';
-        edge = kind === 'brush' ? 0 : val('tb_edge', 0);
-        feather = kind === 'brush' ? 0 : val('tb_feather', 8);
+        // Same contract as stamp(): the sliders are this object's numbers for EVERY
+        // kind. The brush exception that lived here (hard-zero edge/feather at commit)
+        // contradicted stamp(), which had ALREADY given the stroke the slider feather —
+        // so the soft edge under the finger vanished the moment the stroke lifted: the
+        // reported "feather shows while drawing, but the object's feather is zero".
+        // A brush that should be hard says so at the slider; wireKind then keeps a
+        // zero-number brush on the wire as untouchable hard ink anyway.
+        edge = val('tb_edge', 0);
+        feather = val('tb_feather', 8);
       }
       var reg = { id: regionSeq++, kind: kind, edge: edge, feather: feather,
                   area: st2.area, mvx: 0, mvy: 0, foldIdx: fold,
@@ -1517,6 +1547,7 @@
     strokes = []; redoStack = []; active = null; preview = null; sel = -1; selDrag = null;
     regions = []; compLabel = null; maskA = null; _dragReg = null; pendingMove = null;
     smartObjs = []; smartCur = -1; smartDrag = null;   // a cleared canvas has no object to refine
+    syncKnobLock();   // no selection left to keep the panel pair inert
     rasterize(); status('Mask cleared');
   }
   // Invert is a mask *semantic*, so it travels as a parameter instead of being baked
@@ -1677,20 +1708,15 @@
     for (var k in (attrs || {})) { if (Object.prototype.hasOwnProperty.call(attrs, k)) i.setAttribute(k, attrs[k]); }
     i.value = value;
     var out = mk('span', 'tb-num', String(value));
-    // When a REGION is selected, the edge/feather sliders edit THAT object: per-object
-    // geometry is what the layered server path normalises (see masks.normalize_layers +
-    // api h_mask_preview), and the global mask_expand/feather these sliders otherwise
-    // feed are IGNORED once layers exist. Brush blobs are NOT excluded — the first drag
-    // retires their handwork edge (setObjParam); the old exclusion is what the user
-    // reported as "can't set the feather afterwards". An unselected canvas keeps the old
-    // meaning of these controls: defaults for the NEXT object.
+    // edge/feather are the numbers for the object you DRAW NEXT (stamp() and the
+    // region-commit branch read them at commit). While an object is picked the panel pair
+    // goes inert — it mirrors the object's values but cannot edit them — because the ONE
+    // live editor for a placed object is the Selection band's inspector rows (syncKnobLock).
+    // The duplicate that died here used to write the selected object from the top of the
+    // panel; two live UIs for one number, labeled differently and capped differently, is
+    // what read as "the feather slider is a secret second copy of the inspector's feather".
     i.addEventListener('input', function () {
       out.textContent = i.value;
-      var o = selObj();
-      if ((id === 'edge' || id === 'feather') && o && o.kind) {
-        setObjParam(id === 'edge' ? 'edge' : 'feather', parseFloat(i.value) || 0);
-        return;                        // parameters only: pixels untouched, view + cache refresh
-      }
       refresh();
     });
     wrap.appendChild(i); wrap.appendChild(out);
@@ -1751,10 +1777,18 @@
     // crosshair and the size ring fight each other and the size is still ambiguous.
     if (viewC) viewC.style.cursor = (t === 'brush' || t === 'eraser') ? 'none'
       : (t === 'select' ? 'default' : 'crosshair');
-    // The eraser takes SIZE alone: its sweep is hard-pinned (paintStroke can only ramp
-    // what it lifts via the scratch composite), so a knob the tool ignores would be a
-    // second lie next to the first. Brush keeps hardness — there the ramp IS content.
-    if (el.hardness) el.hardness.parentNode.style.display = (t === 'eraser') ? 'none' : '';
+    // TOOL band: a slider the tool cannot use is a lie, so it is not shown at all.
+    // SIZE belongs to the two SWEPT tools only (brush, eraser); rect/ellipse/polygon/
+    // lasso/smart/select build their geometry from the drag itself, and their
+    // grow/feather lives in the Selection band. The eraser takes size ALONE — its sweep
+    // is hard-pinned (paintStroke can only ramp what it lifts via the scratch
+    // composite). HARDNESS belongs to brush alone — there the ramp IS the stroke.
+    // (The old rule hid hardness for the eraser only, so polygon/smart/rect/select all
+    // kept showing two dead sliders — the user's "sliders with no meaning" report.)
+    if (el.brush) el.brush.parentNode.style.display =
+      (t === 'brush' || t === 'eraser') ? '' : 'none';
+    if (el.hardness) el.hardness.parentNode.style.display = (t === 'brush') ? '' : 'none';
+    syncKnobLock();   // a tool switch can clear the selection - the pair must unlock too
     status(msg || ('Tool: ' + t));
   }
 
@@ -1796,10 +1830,11 @@
     root.appendChild(el.tools);
     buildInspector(root);          // appears directly under the toolbar when something is picked
 
+    root.appendChild(mk('div', 'tb-band',
+      'Tool — what your current tool draws with (sliders appear only where the tool uses them)'));
     var g1 = row('tb-grid');
     g1.appendChild(ctl('brush', 'range', 60, 'size', { min: 4, max: 400, step: 2 }));
     g1.appendChild(ctl('hardness', 'range', 0.55, 'hardness', { min: 0, max: 1, step: 0.05 }));
-    g1.appendChild(ctl('wash', 'range', 0.45, 'overlay', { min: 0, max: 1, step: 0.05 }));
     root.appendChild(g1);
 
     var g2 = row('tb-grid');
@@ -1816,15 +1851,20 @@
     // when the object is scaled in the Select tool, and on a ring painted as blob-minus-
     // eraser it fills the hole the user carved (10% of a 566 px bbox is 43 px, against ~50 px
     // of material). Percentage is offered as a READOUT, so the number stays honest.
+    root.appendChild(mk('div', 'tb-band',
+      'Selection — the mask shape and how strongly you see it'));
     g2.appendChild(ctl('edge', 'range', 0, 'edge grow/shrink', { min: -60, max: 60, step: 2 }));
-    g2.appendChild(ctl('feather', 'range', 8, 'feather', { min: 0, max: 40, step: 1 }));
+    // max 64 = the inspector's feather cap (ipair below). One number, one range — two
+    // caps (40 here, 64 there) for the SAME object parameter was a real inconsistency.
+    g2.appendChild(ctl('feather', 'range', 8, 'feather', { min: 0, max: 64, step: 1 }));
+    g2.appendChild(ctl('wash', 'range', 0.45, 'overlay', { min: 0, max: 1, step: 0.05 }));
     root.appendChild(g2);
-    root.appendChild(mk('div', 'tb-hint',
-      'edge: drag left to shrink the selection, right to grow it. Applies to shapes and ' +
-      'auto-selections — a brush stroke keeps the edge its hardness gave it. These set the ' +
-      'values for the NEXT object; tap Select to re-tune one already placed.'));
+    el.selhint = mk('div', 'tb-hint', '');
+    root.appendChild(el.selhint);
     root.appendChild(labelled('', toggle('inv', 'invert — edit everything OUTSIDE the paint', false)));
 
+    root.appendChild(mk('div', 'tb-band',
+      'Generation — how the masked area is re-dreamed (never changes the mask)'));
     var g3 = row('tb-grid');
     g3.appendChild(ctl('strength', 'range', 0.25, 'edit strength', { min: 0.05, max: 1, step: 0.05 }));
     g3.appendChild(ctl('opacity', 'range', 1, 'blend opacity', { min: 0, max: 1, step: 0.05 }));

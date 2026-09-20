@@ -296,8 +296,8 @@
       var r = region();
       T('tapping A selects it', !!r && r.sel >= 0, 'sel=' + (r && r.sel));
       inkRaw = inkCount(view);
-      var e = document.getElementById('tb_edge');
-      e.value = '40'; e.dispatchEvent(new Event('input', { bubbles: true }));
+      inspSet(0, 40);   // the inspector row edits THIS object; the panel pair is the
+                        // greyed mirror while a selection exists (one live editor)
       return wait(110);
     }).then(function () {
       inkGrown = inkCount(view);
@@ -344,16 +344,13 @@
       fire('pointerdown', 306, 45, 260, { isPrimary: true }); fire('pointerup', 306, 45, 260, {});
       return wait(150);
     }).then(function () {
-      var e = document.getElementById('tb_edge'), f = document.getElementById('tb_feather');
-      e.value = '30'; e.dispatchEvent(new Event('input', { bubbles: true }));
-      f.value = '20'; f.dispatchEvent(new Event('input', { bubbles: true }));
+      inspSet(0, 30); inspSet(1, 20);      // A's own numbers, via the inspector
       return wait(150);
     }).then(function () {
       fire('pointerdown', 307, 125, 260, { isPrimary: true }); fire('pointerup', 307, 125, 260, {});
       return wait(150);
     }).then(function () {
-      var f2 = document.getElementById('tb_feather');
-      f2.value = '0'; f2.dispatchEvent(new Event('input', { bubbles: true }));
+      inspSet(1, 0);                       // B's feather back to hard, via its inspector row
       return wait(150);
     }).then(function () {
       // DESELECT first (tap empty canvas): while a shape is selected the edge/feather
@@ -405,8 +402,7 @@
       fire('pointerdown', 310, 82, 140, { isPrimary: true }); fire('pointerup', 310, 82, 140, {});
       return wait(150);
     }).then(function () {
-      var f = document.getElementById('tb_feather');
-      f.value = '15'; f.dispatchEvent(new Event('input', { bubbles: true }));
+      inspSet(1, 15);                      // the inspector row: parent feather 15
       return wait(200);
     });
   });
@@ -717,6 +713,16 @@
     var e = document.getElementById(id); if (!e) return;
     e.value = String(v); e.dispatchEvent(new Event('input', { bubbles: true }));
   }
+  // The Selection band's inspector is the ONLY live edge/feather editor while an object
+  // is picked (the panel pair goes inert - syncKnobLock). Tests that retune a selected
+  // object drive THESE rows; tests that set defaults for the next object drive knobSet.
+  function inspSet(idx, v) {           // 0 = edge row, 1 = feather row
+    var insp = document.querySelector('.tb-inspect');
+    var rs = insp ? [].slice.call(insp.querySelectorAll('input[type=range]')) : [];
+    var e = rs[idx]; if (!e) return false;
+    e.value = String(v); e.dispatchEvent(new Event('input', { bubbles: true }));
+    return true;
+  }
   step('ID clear + knobs', function () {
     clearForDraw();
     knobSet('tb_edge', 0); knobSet('tb_feather', 30);
@@ -930,6 +936,112 @@
     return { solid: solid, fringe: fringe };
   }
 
+  /* =====================================================================================
+   * KNOB OWNERSHIP — the "which slider belongs to whom" report, made structural:
+   * three bands (Tool / Selection / Generation), and every visible slider has exactly
+   * ONE owner and ONE meaning. size+hardness appear only for the tools that use them;
+   * edge/feather exist in two UIs but only ever one of them is live — the inspector
+   * while an object is picked, the panel pair as the NEXT object's defaults (inert
+   * mirror otherwise). And a committed object keeps the numbers its preview promised:
+   * the brush's feather used to be hard-zeroed the moment the stroke lifted (the region
+   * rebuild disagreed with stamp()), which is the reported 'feather disappears on
+   * completion'. All three contracts die together in one group so a regression names
+   * itself.
+   * ===================================================================================== */
+  function knobShown(id) {
+    var e = document.getElementById('tb_' + id);
+    if (!e || !e.parentNode) return null;
+    return e.parentNode.style.display !== 'none';
+  }
+  step('KNB clear + brush shows its two knobs', function () {
+    clearForDraw();
+    var b = toolButton('brush'); if (b) b.click();
+    return wait(80);
+  });
+  step('KNB visibility matrix', function () {
+    T('brush, the swept tool, shows BOTH size and hardness',
+      knobShown('brush') === true && knobShown('hardness') === true,
+      'size=' + knobShown('brush') + ' hard=' + knobShown('hardness'));
+    var dead = '';
+    ['polygon', 'smart', 'rect', 'select'].forEach(function (t) {
+      var b = toolButton(t); if (b) b.click();
+      if (knobShown('brush') || knobShown('hardness')) dead += t + ' ';
+    });
+    T('polygon/smart/rect/select show NEITHER dead slider', dead === '', 'leaked: ' + dead);
+    var eb = toolButton('eraser'); if (eb) eb.click();
+    T('the eraser takes size ALONE (its sweep is hard-pinned)',
+      knobShown('brush') === true && knobShown('hardness') === false,
+      'size=' + knobShown('brush') + ' hard=' + knobShown('hardness'));
+    var bands = [].slice.call(document.querySelectorAll('.tb-band'))
+      .map(function (n) { return n.textContent; }).join(' / ');
+    T('the three ownership bands are declared: Tool, Selection, Generation',
+      /TOOL|Tool/.test(bands) && /Selection/.test(bands) && /Generation/.test(bands), bands);
+    var pf = document.getElementById('tb_feather'), inspF = null;
+    // (ranges compared below after a select — just attribute caps here)
+    T('ONE feather: panel cap equals the inspector cap (was 40 vs 64)',
+      !!pf && pf.max === '64' && pf.min === '0',
+      'panel=' + (pf && pf.min) + '..' + (pf && pf.max));
+    return wait(60);
+  });
+  step('KF paint a brush stroke while the sliders read edge 4 / feather 12', function () {
+    var b = toolButton('brush'); if (b) b.click();
+    knobSet('tb_wash', 1); knobSet('tb_hardness', 0.2);
+    knobSet('tb_brush', 40);
+    knobSet('tb_edge', 4); knobSet('tb_feather', 12);
+    return wait(80).then(function () {
+      fire('pointerdown', 780, 80, 40, { isPrimary: true });
+      for (var i = 1; i <= 6; i++) fire('pointermove', 780, 80, 40 + i * 5, {});
+      fire('pointerup', 780, 80, 70, {});
+      return wait(150);
+    });
+  });
+  step('KF the committed object keeps what the preview promised', function () {
+    var st = region(), me = st && st.all && st.all[0];
+    out.note.push('KF_STATE ' + JSON.stringify(me));
+    T('lifting the stroke does NOT zero the feather the finger saw (the reported bug)',
+      !!me && me.kind === 'brush' && me.feather === 12,
+      JSON.stringify(me));
+    T('and the edge number survives too, under the auto contract the server honours',
+      !!me && me.edge === 4 && me.wire === 'auto', JSON.stringify(me));
+    return true;
+  });
+  step('KNB selecting locks the panel pair to a mirror', function () {
+    // Scramble the panel first: the mirror (selectObj) MUST overwrite these with the
+    // OBJECT's numbers (12/4). Without that overwrite step the values would merely be
+    // what the fixture itself typed, and a lost mirror would sail through.
+    knobSet('tb_edge', 30); knobSet('tb_feather', 3);
+    var sb = toolButton('select'); if (sb) sb.click();
+    fire('pointerdown', 781, 80, 55, { isPrimary: true });
+    fire('pointerup', 781, 80, 55, {});
+    return wait(150);
+  });
+  step('KNB lock asserts', function () {
+    var fe = document.getElementById('tb_feather'), ee = document.getElementById('tb_edge');
+    var insp = document.querySelector('.tb-inspect');
+    var live = insp && insp.offsetParent !== null
+      ? [].slice.call(insp.querySelectorAll('input[type=range]')) : [];
+    T('while an object is picked: panel inert, ONE live editor (the inspector), values mirrored',
+      !!fe && !!ee && fe.disabled && ee.disabled &&
+      live.length === 2 && live.every(function (r) { return !r.disabled; }) &&
+      fe.value === '12' && ee.value === '4',
+      'panel=' + (fe && fe.value) + '/' + (ee && ee.value) +
+      ' live=' + live.length + ' insp=' + (insp ? 'yes' : 'no'));
+    return true;
+  });
+  step('KNB deselect unlocks', function () {
+    var d = byText('Deselect'); if (d) d.click();
+    return wait(100);
+  });
+  step('KNB unlock asserts', function () {
+    var fe = document.getElementById('tb_feather'), ee = document.getElementById('tb_edge');
+    T('deselecting hands the pair back as the NEXT object defaults',
+      !!fe && !!ee && !fe.disabled && !ee.disabled && fe.value === '12',
+      'feather=' + (fe && fe.value) + ' disabled=' + (fe && fe.disabled));
+    // leave the knobs clean for the groups that follow (they paint at rest)
+    knobSet('tb_edge', 0); knobSet('tb_feather', 0);
+    return true;
+  });
+
   step('BR clear + soft-brush knobs', function () {
     clearForDraw();
     knobSet('tb_edge', 0); knobSet('tb_feather', 0);
@@ -964,7 +1076,9 @@
     fire('pointerdown', 761, 80, 230, { isPrimary: true });
     fire('pointerup', 761, 80, 230, {});
     return wait(120).then(function () {
-      knobSet('tb_feather', 8);
+      // The panel pair is inert while this object is selected (one editor per number -
+      // the feather-duplication report), so the fixture drives the inspector's row.
+      inspSet(1, 8);
       window.__BRMARK = (window.__LREAL || []).length;   // wire gate trusts only later POSTs
       return wait(140);
     });
@@ -1060,7 +1174,7 @@
       fire('pointerup', 770, 40, 67, {});
       return wait(150);
     }).then(function () {
-      knobSet('tb_feather', 6);          // same value; the point is the re-schedule
+      inspSet(1, 6);                     // same value; the point is the re-schedule
       return wait(700);                  // the stub's answer lands while tool=select
     });
   });
