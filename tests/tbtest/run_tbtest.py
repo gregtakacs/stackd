@@ -378,7 +378,7 @@ def LEGACY_MOVELOST(s):
 # the harness view is 160x320, so the mutant stands the cap in at 48 — the SAME relative
 # shrinkage the user sees at 1024 px (feather 30 drawn as ~4, visibly hard-edged).
 def LEGACY_SHRINKRAD(s):
-    an = "    if (e) on = (r.kind === 'auto' ? _discOn : _boxOn)(on, w, h, Math.min(96, Math.max(1, Math.abs(e))), e > 0);"
+    an = "    if (e) on = (r.kind !== 'shape' ? _discOn : _boxOn)(on, w, h, Math.min(96, Math.max(1, Math.abs(e))), e > 0);"
     assert an in s, 'true-edge anchor moved'
     s = s.replace(an,
         "    var sd = Math.min(1, 48 / Math.max(1, Math.max(w, h)));\n" + an.replace(
@@ -517,11 +517,60 @@ def LEGACY_ERASEPAINTS(s):
     return s[:i] + "    m.globalCompositeOperation = 'source-over';   // MUTANT" + NL + s[i + len(an):]
 
 
+# THE DOUBLE SOFT EDGE, restored: the hardness ramp lives in the raster again AND the
+# display early-returns raw ink for brush, so an object feather lands outside the ramp -
+# the exact "feather on the brush, then feather on the pixel cloud" the user rejected.
+def LEGACY_BRUSHSOFT(s):
+    NL = chr(10)
+    an = "          d[o + 3] = 255;"
+    assert an in s, 'binary alpha write moved'
+    s = s.replace(an, "          d[o + 3] = maskA[g];   // MUTANT: ramp lives in the raster", 1)
+    an2 = "    var cx = c.getContext('2d');" + NL + "    // No kind is exempt, brush included."
+    assert an2 in s, 'disp brush comment anchor moved'
+    early = NL.join([
+        "    var cx = c.getContext('2d');   // MUTANT: raw ramp for brush again",
+        "    if (r.kind === 'brush') {",
+        "      cx.drawImage(regionRawCanvas(r), r.bbox.x0 - dg.px0, r.bbox.y0 - dg.py0);",
+        "      r._on = null; r._cDisp = c; r._cDispKey = key; return c;",
+        "    }",
+        "    // No kind is exempt, brush included."])
+    return s.replace(an2, early, 1)
+
+
+# THE SERVER IGNORES THE BRUSH NUMBERS: wireKind stopped routing a numbered brush to the
+# 'auto' rules, so the feather the user sees on screen is KIND_RULES-forbidden in the
+# render - preview softens, render does not.
+def LEGACY_WIREBRUSH(s):
+    an = "  function wireKind(r) {" + chr(10) + "    if (r.kind !== 'brush') return r.kind;"
+    assert an in s, 'wireKind anchor moved'
+    return s.replace(an, "  function wireKind(r) {" + chr(10)
+        + "    return r.kind;   // MUTANT: label = contract" + chr(10)
+        + "    if (r.kind !== 'brush') return r.kind;", 1)
+
+
+# THE DRAG DRAWN UNDER A STALE ANSWER: preview survives translateSel, so the server's
+# frozen overlay covers the canvas while only the bbox/ring follow the finger (report 4).
+def LEGACY_STALEOVERLAY(s):
+    NL = chr(10)
+    an = NL.join(["    preview = null;", "    compose();", "  }", "", "  function bakeMove()"])
+    assert an in s, 'translateSel preview-drop anchor moved'
+    s = s.replace(an, NL.join(["    compose();", "  }", "", "  function bakeMove()"]), 1)
+    # Removing ONLY the explicit drop cannot reproduce the bug because objSig carries the
+    # live mvx/mvy (the second guard). A mutant has to actually restore the defect:
+    # neither guard present, exactly as shipped when the user hit it.
+    an2 = 'r.feather, r.area >> 4, r.mvx || 0, r.mvy || 0,'
+    assert an2 in s, 'objSig offset term moved'
+    return s.replace(an2, 'r.feather, r.area >> 4,', 1)
+
+
 MUTANTS["nofold"] = LEGACY_NOFOLD
 MUTANTS["latentpunch"] = LEGACY_LATENTPUNCH
 MUTANTS["bakepad"] = LEGACY_BAKEPAD
 MUTANTS["bakefeather"] = LEGACY_BAKEFEATHER
 MUTANTS["erasepaints"] = LEGACY_ERASEPAINTS
+MUTANTS["brushsoft"] = LEGACY_BRUSHSOFT
+MUTANTS["wirebrush"] = LEGACY_WIREBRUSH
+MUTANTS["staleoverlay"] = LEGACY_STALEOVERLAY
 
 
 def main():
@@ -574,7 +623,8 @@ def main():
         print('COMPOSE TRACE:')
         for i, d in enumerate(res['dbg'][:10]):
             print('  ', i, d)
-    EXPECT = 133   # +15: eraser model group - parent probe (2), split+fold+channel+boundary (4),
+    EXPECT = 142   # 133 (eraser-model group) + 9: BR hard-ink x2, live perimeter + binary wire x2,
+                   # cut-feather x2, DR fixture x1, DR mask-follows x2
                  # wire-no-punch (2), feather-live group (4), re-merge no-remnant (3)
     if len(res["tests"]) != EXPECT:
         print("TRUNCATED RUN: got %d assertions, expected %d -- an early error stopped the "

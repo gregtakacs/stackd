@@ -157,14 +157,15 @@
       insp ? 'display=' + insp.style.display : 'no .tb-inspect at all');
     var ranges = [].slice.call((insp || document.createElement('i'))
       .querySelectorAll('input[type=range]'));
-    // The old contract pinned these rows DISABLED for brush ("an enabled row would be
-    // the dead-knob lie"). The user's report settled the argument: the knob is WANTED,
-    // so the honest fix is that it WORKS — the first drag retires the handwork edge and
-    // the object ships under the auto rules (outward feather, no erosion). Rows live,
-    // with the handwork history stated, not simulated inertness.
-    T('a brush object offers LIVE edge/feather rows, with the handwork note',
+    // Two contracts have died on this element. It was first pinned DISABLED for brush
+    // ("an enabled row would be the dead-knob lie"); the user wanted the knob, so it
+    // became live and the first drag flipped the object to the auto rules. Now hardness is
+    // preview only and the numbers are ordinary per-object adjustments, so the hint says
+    // what the knob does instead of narrating a handwork history that no longer applies -
+    // and the rows stay live, which is what the brushdead mutant takes away.
+    T('a brush object offers LIVE edge/feather rows, with an honest hint',
       ranges.length === 2 && ranges.every(function (r) { return !r.disabled; }) &&
-      /hardness set this edge/.test((insp.textContent) || ''),
+      /brush hardness only previews/.test((insp.textContent) || ''),
       'ranges=' + ranges.length + ' disabled=' +
       ranges.filter(function (r) { return r.disabled; }).length +
       ' text=' + (insp ? insp.textContent.slice(0, 60) : 'none'));
@@ -613,13 +614,13 @@
                       ' me=' + JSON.stringify(me));
         // Why this is the honest gate: the LIVE growth rendering of an auto-kind object
         // is already pixel-proven upstream (the edge slider visibly grows the wash
-        // assertion runs the exact regionDispCanvas branch this flip routes into). What
-        // was NEW about the brush complaint — the number reaching the object and the
-        // wire at all — is gated by the drag-identity and layer assertions; here we
-        // confirm the table itself flipped, which is what selects that proven branch.
-        T('the numbered brush is now an AUTO object with the numbers stored (knob bites)',
-          !!me && me.kind === 'auto' && me.edge === 6 && me.feather === 4 &&
-          (washBefore >= 0),
+        // The label no longer flips (hand-painted stays 'brush' in the panel); the
+        // CONTRACT flips, and that is what state().all.wire exposes — the rule masks.py
+        // will actually apply. A brush carrying numbers must read wire='auto' or the
+        // feather it shows would never reach the render (KIND_RULES ignores 'brush').
+        T('the numbered brush keeps its label but ships under the auto rules (knob bites)',
+          !!me && me.kind === 'brush' && me.wire === 'auto' && me.edge === 6 &&
+          me.feather === 4 && (washBefore >= 0),
           'me=' + JSON.stringify(me));
         return true;
       });
@@ -654,6 +655,22 @@
    * so the merge takes the NEIGHBOUR's parameters wholesale — feather 30 -> 0).
    * The move/delete stroke now stamps its own identity into the next rebuild.
    * ===================================================================================== */
+  function decodeStats(l) {   // whole-layer alpha: max, solid count, partial-alpha (ramp) count
+    return new Promise(function (res) {
+      if (!l || !l.png) return res(null);
+      var im = new Image();
+      im.onload = function () {
+        var c = document.createElement('canvas'); c.width = im.width; c.height = im.height;
+        var g = c.getContext('2d'); g.drawImage(im, 0, 0);
+        var d = g.getImageData(0, 0, im.width, im.height).data, mx = 0, hi = 0, lo = 0;
+        for (var i = 3; i < d.length; i += 4) { if (d[i] > mx) mx = d[i];
+          if (d[i] >= 200) hi++; else if (d[i] > 8) lo++; }
+        res({ maxAlpha: mx, solidPx: hi, rampPx: lo });
+      };
+      im.onerror = function () { res(null); };
+      im.src = 'data:image/png;base64,' + l.png;
+    });
+  }
   function decodeRows(l, x, y0, y1) {   // alpha column dump of a shipped layer PNG
     return new Promise(function (res) {
       if (!l || !l.png) return res(null);
@@ -891,6 +908,185 @@
         noClipCorner > 15, 'cornerBeyondOldClip=' + noClipCorner);
       return true;
     });
+  });
+
+  /* =====================================================================================
+   * ONE SOFT EDGE PER OBJECT, AND IT BELONGS TO THE OBJECT.
+   * The user's model, third pass: the brush must not feather the ink AND then feather the
+   * pixel cloud it left behind. Hardness previews the stroke while the finger is down;
+   * committed ink is the binarised silhouette (>REGION_ALPHA_MIN, the server's own
+   * number), and the object's feather is the ONLY softness - applied at whatever boundary
+   * exists now, which is why a cut through a feathered blob feathers its two new edges.
+   * ===================================================================================== */
+  function colStats(y0, y1, x0, x1) {   // solid vs part-washed columns vs the bare photo
+    if (!refData || !view.width) return null;
+    var d = px(view), W0 = view.width, solid = 0, fringe = 0, y, x;
+    for (y = y0; y <= y1; y++) for (x = x0; x <= x1; x++) {
+      var i = (y * W0 + x) * 4;
+      var dl = Math.max(Math.abs(d[i] - refData[i]), Math.abs(d[i + 1] - refData[i + 1]),
+                        Math.abs(d[i + 2] - refData[i + 2]));
+      if (dl > 140) solid++; else if (dl > 25) fringe++;
+    }
+    return { solid: solid, fringe: fringe };
+  }
+
+  step('BR clear + soft-brush knobs', function () {
+    clearForDraw();
+    knobSet('tb_edge', 0); knobSet('tb_feather', 0);
+    knobSet('tb_wash', 1); knobSet('tb_hardness', 0.15);   // the SOFTEST possible ramp
+    var b = toolButton('brush'); if (b) b.click();
+    knobSet('tb_brush', 60);
+    return wait(650);
+  });
+  step('BR paint a very soft brush stroke', function () {
+    // VERTICAL, ~70 tall: the cut later sweeps horizontally at row 240, and the halves
+    // only exist if there is ink above AND below the ~30px channel. (An earlier fixture
+    // swept along a 14px-tall horizontal blob and the eraser simply deleted it.)
+    fire('pointerdown', 760, 80, 205, { isPrimary: true });
+    for (var i = 1; i <= 10; i++) fire('pointermove', 760, 80, 205 + i * 7, {});
+    fire('pointerup', 760, 80, 275, {});
+    return wait(140);
+  });
+  step('BR feather 0: the ink is hard-edged', function () {
+    var r = region();
+    out.note.push('BR_STATE0 ' + JSON.stringify(r && r.all));
+    var st = colStats(200, 280, 70, 90);
+    out.note.push('BR_STATS0 ' + JSON.stringify(st));
+    T('a soft brush leaves NO feathered fringe in the ink once the stroke is lifted',
+      !!st && st.solid > 500 && st.fringe <= 8,
+      JSON.stringify(st));
+    T('the blob is one object and is still labelled hand-painted ink',
+      !!r && r.regions === 1 && r.all[0].kind === 'brush', JSON.stringify(r && r.all));
+    return true;
+  });
+  step('BR feather 8 on the object', function () {
+    var sb = toolButton('select'); if (sb) sb.click();
+    fire('pointerdown', 761, 80, 230, { isPrimary: true });
+    fire('pointerup', 761, 80, 230, {});
+    return wait(120).then(function () {
+      knobSet('tb_feather', 8);
+      window.__BRMARK = (window.__LREAL || []).length;   // wire gate trusts only later POSTs
+      return wait(140);
+    });
+  });
+  step('BR feather 8: one live perimeter', function () {
+    var st = colStats(192, 290, 58, 102);
+    var core = colStats(210, 270, 74, 86);
+    out.note.push('BR_STATS8 ' + JSON.stringify(st) + ' core=' + JSON.stringify(core));
+    T('the object feather is the only soft edge, and it wraps the whole object',
+      !!st && core.solid > 300 && st.fringe > 150,
+      'ring=' + JSON.stringify(st) + ' core=' + JSON.stringify(core));
+    // FRESHNESS-PINNED (see the ER group): the first draft of this gate scanned the last
+    // POST unmarked and greened off a numbered-brush layer left over from BRUSHNUM two
+    // groups earlier. Only entries appended after the feather drag count.
+    function poll(tries) {
+      var q = window.__LREAL || [], mk = window.__BRMARK || 0, mine = null, seen = 0;
+      for (var i = q.length - 1; i >= mk; i--) {
+        if (!/mask\/preview$/.test(q[i].url)) continue;
+        seen++; var ls = q[i].layers || [];
+        for (var j = 0; j < ls.length; j++) if (ls[j] && ls[j].feather >= 4) mine = ls[j];
+        if (mine) break;
+      }
+      if (mine || seen) return Promise.resolve(mine);
+      if (tries <= 0) return Promise.resolve(null);
+      return wait(120).then(function () { return poll(tries - 1); });
+    }
+    return poll(18).then(function (mine) {
+      if (!mine) { T('the feathered ink ships as raw BINARY pixels under the auto rules',
+                     false, 'no feathered layer on the wire after the feather drag'); return true; }
+      return decodeStats(mine).then(function (d) {
+        out.note.push('BR_WIRE ' + JSON.stringify({ kind: mine.kind, feather: mine.feather })
+                      + ' ' + JSON.stringify(d));
+        T('the feathered ink ships as raw BINARY pixels under the auto rules',
+          mine.kind === 'auto' && !!d && d.maxAlpha === 255 && d.rampPx === 0,
+          'kind=' + mine.kind + ' feather=' + mine.feather + ' ' + JSON.stringify(d));
+        return true;
+      });
+    });
+  });
+  step('BR cut the feathered brush blob', function () {
+    var eb = toolButton('eraser'); if (eb) eb.click();
+    knobSet('tb_brush', 150);                      // ~40 natural px channel. 30 was NOT
+    fire('pointerdown', 762, 60, 240, { isPrimary: true });   // enough: each side's blur
+    for (var i = 1; i <= 4; i++) fire('pointermove', 762, 60 + i * 10, 240, {});  // tail
+    fire('pointerup', 762, 100, 240, {});          // reaches the middle of a 30px channel
+                                                   // (alpha ~48 - below solid, above the
+                                                   // fringe floor). Over-traces the blob.
+    window.__BRMARK = (window.__LREAL || []).length;
+    return wait(140);
+  });
+  step('BR the cut edges feather like the object', function () {
+    var r = region();
+    out.note.push('BR_STATE1 ' + JSON.stringify(r && r.all));
+    var two = r && r.regions === 2 ? r.all : null;
+    T('the cut splits the feathered ink in two, feather intact on both',
+      !!two && two.every(function (q) { return q.feather === 8; }), JSON.stringify(two));
+    // Beside each cut edge (rows just inside the ink) must be soft-washed - only a feather
+    // recomputed around the NEW boundary paints that; the raw-rank model left the cut hard.
+    // Channel occupies rows ~220..260 now. Just INSIDE its top edge (220..225) the wash
+    // can only come from the TOP half's feather reaching across the cut; the dead centre
+    // (238..242) sits 17+ px from either silhouette, ~10 past each grown edge, where the
+    // blurred union tail is alpha <15 - under every threshold that matters.
+    var beside = colStats(220, 225, 70, 90), midC = colStats(238, 242, 70, 90);
+    out.note.push('BR_CUT beside=' + JSON.stringify(beside) + ' mid=' + JSON.stringify(midC));
+    T('the eraser line gets the object feather: soft beside the cut, bare down the middle',
+      !!beside && !!midC && beside.fringe + beside.solid > 60 && midC.solid === 0 && midC.fringe <= 6,
+      'beside=' + JSON.stringify(beside) + ' mid=' + JSON.stringify(midC));
+    return true;
+  });
+
+  step('DR clear + paint an object', function () {
+    clearForDraw();
+    knobSet('tb_edge', 0); knobSet('tb_feather', 6);
+    knobSet('tb_wash', 1);
+    var b = toolButton('rect'); if (b) b.click();
+    fire('pointerdown', 770, 30, 60, { isPrimary: true });
+    fire('pointermove', 770, 50, 75, {});
+    fire('pointerup', 770, 70, 90, {});
+    return wait(700);
+  });
+  step('DR make the preview fresh UNDER the select tool', function () {
+    // The fixture must reach the state the bug ACTUALLY needs. previewSig() contains the
+    // tool name, so a preview requested while tool=rect is auto-invalidated by the switch
+    // to select - an early version of this fixture greened the staleoverlay mutant for
+    // that accidental reason. A real user lands here via a baked move or an edit made
+    // with an object selected: schedulePreview fires with tool=select, the answer comes
+    // back current, and compose() prefers it over the local wash. That is the state we
+    // re-create: select, tap the object, nudge its feather (touchObject ->
+    // schedulePreview), settle.
+    var sb = toolButton('select'); if (sb) sb.click();
+    return wait(120).then(function () {
+      fire('pointerdown', 770, 40, 67, { isPrimary: true });    // grab inside the blob
+      fire('pointerup', 770, 40, 67, {});
+      return wait(150);
+    }).then(function () {
+      knobSet('tb_feather', 6);          // same value; the point is the re-schedule
+      return wait(700);                  // the stub's answer lands while tool=select
+    });
+  });
+  step('DR drag it while the stale overlay is current', function () {
+    T('the fixture reached the state the bug needs: a matching server preview on screen',
+      magentaCount(view) > 0, 'magenta=' + magentaCount(view));
+    fire('pointerdown', 771, 40, 67, { isPrimary: true });      // grab inside the blob
+    for (var i = 1; i <= 6; i++) fire('pointermove', 771, 40 + i * 8, 67 + i * 10, {});
+    return wait(60);                                            // STILL MID-DRAAG
+  });
+  step('DR the mask follows the finger', function () {
+    var st = region();
+    var me = st && st.all && st.all[0];
+    out.note.push('DR_STATE ' + JSON.stringify(me) + ' magenta=' + magentaCount(view));
+    // The stale-answer path paints the stub's magenta over everything (that is what makes
+    // this observable), and the mask position is what the user is watching.
+    T('mid-drag the canvas is NOT the frozen server overlay',
+      magentaCount(view) === 0, 'magenta=' + magentaCount(view));
+    var moved = colStats(105, 135, 75, 105);       // where the object is being dragged TO
+    var left  = colStats(55, 80, 35, 65);          // where it used to be
+    out.note.push('DR_BANDS moved=' + JSON.stringify(moved) + ' left=' + JSON.stringify(left));
+    T('the preview mask moves WITH the object, not to a fixed spot',
+      !!moved && moved.solid > 150 && !!left && left.solid < 20,
+      'moved=' + JSON.stringify(moved) + ' left=' + JSON.stringify(left));
+    fire('pointerup', 771, 88, 127, {});   // release: bake the move
+    return wait(200);
   });
 
   /* =====================================================================================

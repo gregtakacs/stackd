@@ -152,7 +152,10 @@
     var parts = [];
     for (var i = 0; i < regions.length; i++) {
       var r = regions[i], b = r.bbox || { x0: 0, y0: 0, x1: 0, y1: 0 };
-      parts.push([r.kind, effEdge(r), r.feather, r.area >> 4,
+      // mvx/mvy in the signature, deliberately: this is what makes a dragged object
+      // read as CHANGED, so an answer computed for its pre-move pixels can never be
+      // mistaken for the current one (see translateSel).
+      parts.push([r.kind, effEdge(r), r.feather, r.area >> 4, r.mvx || 0, r.mvy || 0,
                   Math.round(b.x0 / 4), Math.round(b.y0 / 4),
                   Math.round(b.x1 / 4), Math.round(b.y1 / 4)].join(':'));
     }
@@ -206,8 +209,16 @@
   // the sliders are the defaults for the NEXT object, not a live global filter.
   function stamp(s) {
     s.kind = kindOf(s);
-    if (s.kind === 'brush') {
-      s.edge = 0; s.grow = 0; s.shrink = 0; s.feather = 0;   // hardness already defined the edge
+    // A freehand stroke is no longer exempt. Its hardness ramp previews softness while
+    // the finger is down; the moment the stroke commits the object IS the binarised
+    // silhouette (membership at REGION_ALPHA_MIN, the server's own number) and the only
+    // softness on screen is this object's feather, applied once at its perimeter. The old
+    // rule (brush means edge/feather 0, hardness IS the edge) meant a hand-painted blob
+    // kept its ramp AND then, once a number was put on it, got feathered outside that
+    // ramp's own 20%-alpha fringe: two soft edges, and a cut through it that never
+    // softened, because the feather was measured off the ink, not off the object.
+    if (s.kind === 'brush' && !val('tb_edge', 0) && !val('tb_feather', 8)) {
+      s.edge = 0; s.grow = 0; s.shrink = 0; s.feather = 0;   // hard ink, nothing to apply
     } else {
       s.edge = val('tb_edge', 0);
       // grow/shrink stay on the wire as the derived pair, so a server that only understands
@@ -369,7 +380,7 @@
     compose();
     if (sel < 0) status('Nothing selected.');
     else status(o.kind === 'brush'
-      ? 'Selected a brush selection — drag to move it; edge/feather make its edge numeric.'
+      ? 'Selected hand-painted ink — drag to move it; edge/feather adjust its perimeter.'
       : 'Selected a ' + o.kind + ' selection — use edge / feather to grow, shrink or soften it.');
   }
 
@@ -386,7 +397,10 @@
   // copy and layer export all follow from r.kind alone.
   function setObjParam(key, v) {
     var o = selObj(); if (!o) return;
-    if (o.kind === 'brush') o.kind = 'auto';
+    // No kind flip: 'brush' stays the label for hand-painted ink (the inspector says so),
+    // and wireKind() is what hands it to the server under the 'auto' rules the moment it
+    // carries a number. Flipping the label here used to be how a brush object silently
+    // lost its identity in the panel while looking identical on canvas.
     o[key] = v;
     // The knob is a LIVE adjustment, so taking a number on it unfolds THIS object: from
     // now on this number (not the parent's) is what grow/shrink means, measured from the
@@ -403,6 +417,16 @@
     var o = selObj(); if (!o) return;
     o.mvx = (o.mvx || 0) + dx;
     o.mvy = (o.mvy || 0) + dy;
+    // Drop the server overlay for the duration of the drag - this is the whole of report
+    // 4. compose() paints preview.img INSTEAD OF the local wash whenever the cached answer
+    // still matches previewSig(), and a drag changes no part of that signature: bbox, area
+    // and stroke count all describe the COMMITTED pixels, while the offset lives in
+    // mvx/mvy. So whenever a preview had landed, the finger was dragging the blue bbox and
+    // the cyan morphed ring while the red mask underneath stayed painted where the object
+    // used to be and then snapped to a fixed spot - exactly "the perimeter drags but the
+    // overlay does not, or it jumps". The local wash draws disp at dg.px0 + mvx and so does
+    // follow the finger; the server answer is re-requested when the move bakes.
+    preview = null;
     compose();
   }
 
@@ -412,7 +436,7 @@
     var dx = Math.round(r.mvx || 0), dy = Math.round(r.mvy || 0);
     r.mvx = 0; r.mvy = 0;
     if (!dx && !dy) return;
-    var cv = regionRawCanvas(r, true);
+    var cv = regionRawCanvas(r);
     // ONE compound stroke (lift the blob's pixels here, lay them down at the offset).
     // Two strokes would let Undo pop half a move and leave the object drawn twice —
     // the compound keeps vector-undo honest for something vectors could never express.
@@ -469,7 +493,7 @@
     });
     wrap.appendChild(inp); wrap.appendChild(out);
     lab.appendChild(wrap);
-    var hintF = mk('span', 'tb-hint', 'hardness set this edge — this knob replaces it');
+    var hintF = mk('span', 'tb-hint', 'brush hardness only previews the stroke; this sets the object edge');
     if (obj.kind !== 'brush') hintF.style.display = 'none';
     lab.appendChild(hintF);
     // refs the in-place sync reads (touchObject updates them; rebuilds re-stamp them)
@@ -520,7 +544,7 @@
     paint(parseInt(inp.value, 10) || 0);
     wrap.appendChild(inp); wrap.appendChild(out);
     lab.appendChild(wrap); lab.appendChild(rel);
-    var hintE = mk('span', 'tb-hint', 'hardness set this edge — this knob replaces it');
+    var hintE = mk('span', 'tb-hint', 'brush hardness only previews the stroke; this sets the object edge');
     if (o.kind !== 'brush') hintE.style.display = 'none';
     lab.appendChild(hintE);
     o._ipE = inp; o._outE = out; o._relE = rel; o._hintE = hintE;
@@ -583,7 +607,7 @@
 
   function deleteSel() {
     var r = selObj(); if (!r) return;
-    var cv = regionRawCanvas(r, true);
+    var cv = regionRawCanvas(r);
     // Deleting an OBJECT (a blob that may be made of many strokes) lifts exactly its
     // pixels as one synthetic erase stroke — splicing a stroke could not express it once
     // contiguity, not authorship, decides what an object is. Undo pops the carve; pixels back.
@@ -1073,6 +1097,20 @@
     return res;
   }
 
+  // What to CALL this object on the wire. A freehand blob keeps the 'brush' label in the
+  // UI (it is hand-painted ink, which is worth telling the user), but masks.KIND_RULES
+  // forbids the server to threshold, morph or feather a 'brush' layer - correctly, for the
+  // old contract where the hardness ramp WAS the edge. Now that the raster is binarised
+  // and the numbers are real, shipping 'brush' with a feather on it would have the server
+  // quietly ignore that feather: the preview would soften and the render would not. So a
+  // brush object carrying any correction ships under the 'auto' rules (binarise, disc
+  // grow, OUTWARD feather), which is what the display mirrors. One with nothing to apply
+  // stays 'brush' and ships as hard binary ink, which the server may not touch.
+  function wireKind(r) {
+    if (r.kind !== 'brush') return r.kind;
+    return (effEdge(r) || r.feather) ? 'auto' : 'brush';
+  }
+
   // WHICH edge number this object currently answers to. A topology change (an erase that
   // split a blob, a move that merged two) folds the grow/shrink the user had set INTO the
   // rasterized pixels, because grow/shrink is a correction to a silhouette and a split or
@@ -1124,7 +1162,7 @@
     var buf = new Uint8ClampedArray(w * h * 4);
     for (i = 0; i < regions.length; i++) {
       r = regions[i]; if (!r.area) continue;
-      var e = effEdge(r), keep = (r.kind === 'brush' && !e);
+      var e = effEdge(r);
       var on = new Uint8Array(w * h), k, x, y;
       for (y = 0; y < h; y++) {
         for (x = 0; x < w; x++) {
@@ -1137,7 +1175,7 @@
       for (k = 0; k < w * h; k++) {
         if (!on[k]) continue;
         var ox = (k % w), oy = (k - ox) / w;
-        var a = keep ? maskA[(oy + y0) * W + (ox + x0)] : 255;
+        var a = 255;   // binary: the hardness ramp is preview, never geometry
         var o = k * 4;
         if (a <= 0) continue;
         if (buf[o + 3] < a) { buf[o] = 255; buf[o + 1] = 255; buf[o + 2] = 255; buf[o + 3] = a; }
@@ -1173,14 +1211,15 @@
     return { px0: px0, py0: py0, w: px1 - px0 + 1, h: py1 - py0 + 1 };
   }
 
-  // The blob's OWN pixels. binary=true lifts the whole object (destination-out cuts
-  // must be total); binary=false keeps the composited alpha so a pure-brush object
-  // ships its hardness gradient (masks.KIND_RULES['brush'] forbids the server from
-  // touching it, so nothing here may pre-morph the pixels either — the double-grow
-  // bug this whole file has been bitten by once).
-  function regionRawCanvas(r, binary) {
-    var ck = binary ? '_cBin' : '_cShip';
-    var key = regionRev + '|' + binary + '|' + r.bbox.x0 + ',' + r.bbox.y0 + ',' + r.bbox.x1 + ',' + r.bbox.y1;
+  // The blob's OWN pixels, as a hard mask: the >REGION_ALPHA_MIN set and nothing else.
+  // There used to be a second mode that kept the composited alpha, "so a pure-brush object
+  // ships its hardness gradient" - that is the model the user rejected: a ramp in the ink
+  // plus a feather on the object is two soft edges, and a cut through such a blob leaves
+  // the ramp exposed on a boundary the feather was never measured from. One mode now,
+  // binary, because the silhouette the user approved IS the membership set, for every kind.
+  function regionRawCanvas(r) {
+    var ck = '_cBin';
+    var key = regionRev + '|1|' + r.bbox.x0 + ',' + r.bbox.y0 + ',' + r.bbox.x1 + ',' + r.bbox.y1;
     if (r[ck + 'Key'] === key) return r[ck];
     var id = regions.indexOf(r) + 1;
     var w = r.bbox.x1 - r.bbox.x0 + 1, h = r.bbox.y1 - r.bbox.y0 + 1;
@@ -1193,7 +1232,7 @@
         if (compLabel && compLabel[g] === id) {
           var o = (y * w + x) * 4;
           d[o] = 255; d[o + 1] = 255; d[o + 2] = 255;
-          d[o + 3] = binary ? 255 : maskA[g];
+          d[o + 3] = 255;
         }
       }
     }
@@ -1219,12 +1258,14 @@
     var w = dg.w, h = dg.h, id = regions.indexOf(r) + 1, x, y, k;
     var c = document.createElement('canvas'); c.width = w; c.height = h;
     var cx = c.getContext('2d');
-    if (r.kind === 'brush') {                       // hardness IS the edge: raw pixels
-      cx.drawImage(regionRawCanvas(r, false), r.bbox.x0 - dg.px0, r.bbox.y0 - dg.py0);
-      r._on = null;
-      r._cDisp = c; r._cDispKey = key;
-      return c;
-    }
+    // No kind is exempt, brush included. The on[] loop below binarises the blob at
+    // REGION_ALPHA_MIN (which is what discards the hardness ramp) and then applies this
+    // object's edge and ONE outward feather at its CURRENT perimeter - including the
+    // perimeter a cut leaves behind. That is what "the feather recalculates around the new
+    // boundary" means, and it is also why the ramp may not survive into the render: it
+    // would be a second soft edge. Brush takes the DISC kernel because that is the rule
+    // wireKind() ships it under; only a shape stays square (masks._morph).
+    
     var on = new Uint8Array(w * h);
     for (y = 0; y < h; y++) {
       for (x = 0; x < w; x++) {
@@ -1239,7 +1280,7 @@
     // canvas). The slider caps (edge 60, feather 64) bound the cost; the kernels are
     // separable O(n) and the whole canvas is cached per (params, generation) anyway.
     var e = Math.round(effEdge(r));
-    if (e) on = (r.kind === 'auto' ? _discOn : _boxOn)(on, w, h, Math.min(96, Math.max(1, Math.abs(e))), e > 0);
+    if (e) on = (r.kind !== 'shape' ? _discOn : _boxOn)(on, w, h, Math.min(96, Math.max(1, Math.abs(e))), e > 0);
     var im = cx.createImageData(w, h), d = im.data;
     for (k = 0; k < w * h; k++) {
       if (on[k]) { var o = k * 4; d[o] = 255; d[o + 1] = 255; d[o + 2] = 255; d[o + 3] = 255; }
@@ -1365,7 +1406,7 @@
       if (!on) {
         // brush blobs keep their raw silhouette (no _on grid): binarise the ship copy
         // for the ring. A brush edge is handwork, so the ring traces what it ships.
-        var rc0 = regionRawCanvas(o, true);
+        var rc0 = regionRawCanvas(o);
         var pw = rc0.width, ph = rc0.height;
         if (!pw || !ph) return;
         var pc = rc0.getContext('2d', { willReadFrequently: true });
@@ -1534,7 +1575,7 @@
       // pixels being shipped, so the number sent must be 0 or the server grows it a
       // SECOND time from the new cut/merged boundary — the reported defect exactly.
       var ee = effEdge(r);
-      var curParams = { kind: r.kind, edge: ee,
+      var curParams = { kind: wireKind(r), edge: ee,
                         grow: ee > 0 ? ee : 0,
                         shrink: ee < 0 ? -ee : 0,
                         feather: r.feather || 0, erase: false };
@@ -1549,8 +1590,12 @@
       // inflates into a full-frame mask, in the preview overlay AND the render. The
       // bbox-cropped ship copy is an export STAGE only; it must be pasted back at its
       // offset onto a full-size canvas before the encode.
+      // Binary, always, and that word carries this fix: the raw alpha of a freehand blob
+      // is a hardness RAMP, and shipping it under a kind the server feathers softens the
+      // object twice (ramp outside, feather outside that). The silhouette the user
+      // approved is the >REGION_ALPHA_MIN set, so that is what crosses the wire.
       var fc = document.createElement('canvas'); fc.width = W; fc.height = H;
-      fc.getContext('2d').drawImage(regionRawCanvas(r, false), r.bbox.x0, r.bbox.y0);
+      fc.getContext('2d').drawImage(regionRawCanvas(r), r.bbox.x0, r.bbox.y0);
       var png = fc.toDataURL('image/png').split(',')[1];
       if (!png) continue;
       r._ck = curKey;
@@ -2621,7 +2666,12 @@
              // number the knob holds: reading them apart is what makes a fold that never
              // happened, or a grow applied twice, visible instead of deniable.
              all: regions.map(function (q) {
-               return { kind: q.kind, edge: effEdge(q), edgeSet: q.edge || 0,
+               // 'kind' is the UI label (hand-painted stays hand-painted); 'wire' is the
+               // contract masks.py actually applies (wireKind). Reading them APART is what
+               // lets the suite tell a brush carrying real numbers from a brush that is
+               // still raw ink - the two render under different rules.
+               return { kind: q.kind, wire: wireKind(q),
+                        edge: effEdge(q), edgeSet: q.edge || 0,
                         feather: q.feather, area: q.area, folded: folded(q),
                         nAnc: q.nAnc || 0,
                         bbox: { x0: q.bbox.x0, y0: q.bbox.y0, x1: q.bbox.x1, y1: q.bbox.y1 } };
