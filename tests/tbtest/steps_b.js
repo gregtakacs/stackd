@@ -1153,6 +1153,21 @@
       out.note.push('SB newazure hits=' + hits + '/' + n);
       T('no dashed rectangle ever paints around a selected object',
         n > 8 && hits === 0, 'new azure pixels when selected: ' + hits + '/' + n);
+      // THE PAIR MUST LOOK LIKE A PAIR: the edge and feather sliders are one control
+      // family (grow/shrink, soften) and the user flagged their unequal track lengths
+      // as obviously wrong. Same start x, same width, within a pixel. (The hint rows
+      // are allowed to differ; the TRACKS are not.)
+      var rs2 = [].slice.call((insp || document.createElement('i'))
+        .querySelectorAll('input[type=range]'));
+      var wev = rs2[0] && rs2[0].getBoundingClientRect(),
+          wfe = rs2[1] && rs2[1].getBoundingClientRect();
+      out.note.push('SB tracks edge=' + (wev && Math.round(wev.width)) + '@' + (wev && Math.round(wev.left)) +
+                    ' feather=' + (wfe && Math.round(wfe.width)) + '@' + (wfe && Math.round(wfe.left)));
+      T('edge and feather sliders are the same length, starting at the same x',
+        !!wev && !!wfe && Math.abs(wev.width - wfe.width) <= 1 &&
+        Math.abs(wev.left - wfe.left) <= 1,
+        'edge ' + (wev && Math.round(wev.width)) + '@' + (wev && Math.round(wev.left)) +
+        ' vs feather ' + (wfe && Math.round(wfe.width)) + '@' + (wfe && Math.round(wfe.left)));
       return true;
     });
   });

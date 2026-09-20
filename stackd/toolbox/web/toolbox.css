@@ -140,10 +140,17 @@ html {
   border-radius: 7px; background: #1e2430;
 }
 .tb-inspect-h { color: #9ec9ff; font-size: 12px; font-weight: 600; margin-bottom: 6px; }
-.tb-inspect .tb-lab { display: flex; align-items: center; gap: 8px; margin: 4px 0; font-size: 12px; }
+.tb-inspect .tb-lab { display: flex; align-items: center; gap: 8px; margin: 4px 0; font-size: 12px; flex-wrap: wrap; }
+/* ONE name column, ONE value column, so the edge and feather sliders are literally
+   the same width: 'edge'/'feather' differ in word length and the edge value carries a
+   sign ('+60'), which before this shifted each row's track by a few pixels — two
+   stacked sliders of visibly different length read as two different controls.
+   flex-wrap + the hint's 100% basis puts the hint text on its own line instead of
+   letting it (width:100% as a flex item) eat half the edge slider — the actual bug. */
+.tb-inspect .tb-k { flex: 0 0 4.5em; }
 .tb-inspect .tb-num { display: flex; align-items: center; gap: 6px; flex: 1 1 auto; min-width: 0; }
 .tb-inspect input[type=range] { flex: 1 1 auto; width: auto; min-width: 0; }
-.tb-inspect .tb-v { min-width: 2em; text-align: right; color: #d8d8de; font-variant-numeric: tabular-nums; }
+.tb-inspect .tb-v { min-width: 3em; text-align: right; color: #d8d8de; font-variant-numeric: tabular-nums; }
 /* A brush's feather is deliberately unavailable; showing it greyed with the reason is
    more honest than hiding it, which would read as a missing feature. */
 .tb-inspect input[type=range]:disabled { opacity: .35; cursor: not-allowed; }

@@ -476,7 +476,11 @@
   }
 
   function ipair(label, key, obj, min, max, step, val_, disabled) {
-    var lab = mk('label', 'tb-lab', label);
+    // Label text goes in a fixed-width span (see edgePair): two stacked rows whose
+    // names differ in word length otherwise start their sliders at different x,
+    // and the user rightly calls that "weird — they're not the same size".
+    var lab = mk('label', 'tb-lab');
+    lab.appendChild(mk('span', 'tb-k', label));
     var wrap = mk('span', 'tb-num');
     var inp = mk('input');
     inp.type = 'range'; inp.min = min; inp.max = max; inp.step = step; inp.value = val_;
@@ -513,7 +517,12 @@
   // is computed from it. obj_min_side is the object's own extent in canvas px, which is the
   // same space the server rasterizes this layer into.
   function edgePair(o) {
-    var lab = mk('label', 'tb-lab', 'edge');
+    // 'edge' is a shorter word than 'feather'; without the fixed-name span below the
+    // two rows' sliders visibly differ in length, which reads as two different
+    // controls, not as one pair. Same treatment as ipair — name column, slider,
+    // value column, all fixed; the hint drops to its own line (see the .tb-lab CSS).
+    var lab = mk('label', 'tb-lab');
+    lab.appendChild(mk('span', 'tb-k', 'edge'));
     var wrap = mk('span', 'tb-num');
     var inp = mk('input');
     inp.type = 'range'; inp.min = -60; inp.max = 60; inp.step = 2;

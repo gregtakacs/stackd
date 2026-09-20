@@ -708,7 +708,19 @@ def LEGACY_FLUIDBOX(s):
     return s.replace(an, "      el.box.style.width = '100%';   // MUTANT: free mode silently re-fluids", 1)
 
 
+# THE UNEQUAL PAIR, restored: before the fixed name/value columns, the always-present
+# edge hint (a width:100% flex item IN the slider row) plus the shorter 'edge' word
+# made the edge track a few dozen px narrower than feather — the user's "not the same
+# size which is weird". Faithful reproduction: put the hint back inline.
+def LEGACY_SIZERIFT(s):
+    an = "    lab.appendChild(wrap); lab.appendChild(rel);"
+    assert s.count(an) == 1, 'edgePair row assembly anchor moved'
+    return s.replace(an, an + NL +
+        "    rel.style.flex = '0 0 auto'; rel.style.width = 'auto';   // MUTANT: hint back inline, eats the track", 1)
+
+
 MUTANTS["commitzero"] = LEGACY_COMMITZERO
+MUTANTS["sizerift"] = LEGACY_SIZERIFT
 MUTANTS["toolvis"] = LEGACY_TOOLVIS
 MUTANTS["panedits"] = LEGACY_PANEDITS
 MUTANTS["armleak"] = LEGACY_ARMLEAK
@@ -790,7 +802,7 @@ def main():
         print('COMPOSE TRACE:')
         for i, d in enumerate(res['dbg'][:10]):
             print('  ', i, d)
-    EXPECT = 161   # 160 + 1 caption-handover gate (submit line names the sent caption): visibility x6 (pair NEVER shown), KF promise x2,
+    EXPECT = 162   # 161 + 1 edge/feather equal-track gate: visibility x6 (pair NEVER shown), KF promise x2,
                    # fresh-hard x1, no-arm-leak x1, no-dashed-box x1, ZM honesty x3, A3 belt x1
                  # wire-no-punch (2), feather-live group (4), re-merge no-remnant (3)
     if len(res["tests"]) != EXPECT:
