@@ -183,6 +183,16 @@ class Toolbox:
             return hdr[7:].strip()
         return (query.get("token") or "").strip()
 
+    def _jti_hint(self, http, query) -> str:
+        """The refused token's jti, sanitised to loggable characters, or n/a. Log-only:
+        never returned to a client, and it is not a credential (no signature)."""
+        tok = (self._token_from(http, query) or "").split(".")
+        if len(tok) != 3:
+            return "n/a"
+        claims = _tokens._try_claims(tok[1]) or {}
+        jti = str(claims.get("jti") or "")[:32] if isinstance(claims, dict) else ""
+        return jti if jti.replace("-", "").replace("_", "").isalnum() else "n/a"
+
     def _identity(self, http, query, *, scope="launch", single_use=False,
                   job_id: str | None = None) -> str:
         """Verify the token and return its email. Raises TokenError -> 403 in dispatch.
@@ -413,6 +423,12 @@ class Toolbox:
         try:
             self._route(http, path, query)
         except _tokens.TokenError as e:
+            # Log WHICH token was refused, by its jti alone (never the signature, never
+            # the raw text): that is the one field tying a browser's 403 back to a mint
+            # line in the same log, which is how "the link is broken" gets answered
+            # without handing a log full of credentials to anyone who tails it.
+            self._note(f"toolbox: {path} refused a token ({e}) "
+                       f"jti={self._jti_hint(http, query)}")
             http._send_json(403, {"error": f"not authorised: {e}"}, self._cors())
         except ValueError as e:
             http._send_json(400, {"error": str(e)}, self._cors())
@@ -441,6 +457,11 @@ class Toolbox:
                 self.h_launch(http, query)
             elif path == "/toolbox/embed":
                 self.h_embed(http, query)
+            elif path.startswith("/toolbox/e/"):
+                # The transcription-safe face of the mount: /toolbox/e/<code> serves the
+                # same document with the credential resolved server-side (see h_editor_link
+                # and tokens.mint_link for why a link that survives a chat must be short).
+                self.h_editor_link(http, path[len("/toolbox/e/"):])
             elif path == "/toolbox/source.png":
                 self.h_source(http, query)
             # A known route reached with the wrong verb is 405, not 404: "the endpoint
@@ -467,7 +488,7 @@ class Toolbox:
                 self.h_job_poll(http)
             elif path == "/toolbox/jobs/cancel":
                 self.h_job_cancel(http)
-            elif path in self.GET_ONLY:
+            elif path in self.GET_ONLY or path.startswith("/toolbox/e/"):
                 http._send_json(405, {"error": f"{path} is GET-only"}, self._cors())
             else:
                 http._send_json(404, {"error": f"no toolbox route {path}"}, self._cors())
@@ -595,6 +616,21 @@ class Toolbox:
         return _tokens.mint(self.secret, scope="launch", email=email,
                             image_id=(ref or None))
 
+    def mint_editor_link(self, email: str, ref: str | None = None):
+        """(token, code, url) — the transcription-safe face of mint_launch, for any link
+        that a MODEL or a human may have to reproduce: the URL carries a ~10-char code,
+        never the ~250-char credential (see tokens.mint_link for the live incident that
+        made this necessary). The token is returned too, because the caller inlines it
+        into the editor document; it must NOT be put in a URL handed to a chat.
+
+        Requires public_base: a relative link is how a wrong-but-200 editor ships."""
+        if not self.public_base:
+            raise ValueError("no browser-reachable base (STACKD_TOOLBOX_PUBLIC_URL) is "
+                             "configured, so no editor link can be built")
+        token = self.mint_launch(email, ref)
+        code = _tokens.mint_link(token)
+        return token, code, self.public_base + "/toolbox/e/" + code
+
     def _embed_cfg(self, email: str, query: dict, *, api_base: str, token: str) -> dict:
         """Build the editor's config: resolve the photo through the ONE ingest path
         (see _ingest_source — the bytes the iframe shows are the bytes the mask is
@@ -712,17 +748,54 @@ class Toolbox:
                                    "reason": "no_public_base"}, self._cors())
             return
         self._fire_prewarm()
-        token = self.mint_launch(email, ref)
-        url = (self.public_base + "/toolbox/embed?token="
-               + urllib.parse.quote(token, safe="")
-               + "&source_ref=" + urllib.parse.quote(ref, safe=""))
+        # The URL handed back carries a short opaque code, NOT the token: this response
+        # is consumed by a server-side caller that may forward the link through a chat,
+        # and a 250-char base64 credential does not survive an LLM re-typing it (the
+        # payload's `exp` lost a character in a live 403 and the signature could not
+        # follow). The token itself is inlined into the document below, which is the
+        # only place a launch credential may appear on a browser-facing surface.
+        token, code, url = self.mint_editor_link(email, ref)
         cfg = self._embed_cfg(email, {"source_ref": ref},
                               api_base=self.public_base, token=token)
         html = _web.embed_document(cfg, title="Comfy Toolbox", probe=False)
         http._send_json(200, {"ok": True, "email": email, "source_ref": ref,
-                              "token": token, "url": url,
+                              "token": token, "code": code, "url": url,
                               "expires_in": _tokens.DEFAULT_TTL_S.get("launch", 900),
                               "html": html}, self._cors())
+
+    def h_editor_link(self, http, code):
+        """GET /toolbox/e/<code> — the editor document behind a transcription-safe code.
+
+        Resolves the code to its token IN THIS PROCESS, verifies the token exactly as
+        every other route does, and serves the same document h_mint built — so the
+        credential never appears in a URL a user can bookmark, a Referer header can
+        leak, or a model has to reproduce. The editor's later calls present the inlined
+        token as a bearer header, unchanged from the token-in-URL mount.
+
+        Not single-use, deliberately (see tokens.mint_link): the code may serve the
+        document repeatedly until the token expires, which is the token's own read
+        posture and keeps a pre-Render refresh working. The gate that matters — one
+        GPU spend per launch — is still the submit (REDEEM_ON_CREATE).
+        """
+        token = _tokens.resolve_link(code)
+        if not token:
+            # One message for unknown/expired/never-minted-here: a probe must not learn
+            # which it hit, and all three mean the same thing to the person holding it.
+            http._send_json(404, {"error": "that editor link is no longer recognised — "
+                                           "ask for a fresh one (links do not survive a "
+                                           "daemon restart and last ~15 minutes)",
+                                  "reason": "unknown_editor_link"}, self._cors())
+            return
+        payload = _tokens.verify(self.secret, token, scope="launch", single_use=False)
+        email = payload["email"]
+        ref = payload.get("image_id") or ""
+        self._fire_prewarm()
+        cfg = self._embed_cfg(email, {"source_ref": ref},
+                              api_base=self.public_base or self._base_url(http),
+                              token=token)
+        http._send_bytes(200, _web.embed_document(cfg, title="Comfy Toolbox",
+                                                 probe=False).encode("utf-8"),
+                         "text/html", cache_s=0)
 
     def h_source(self, http, query):
         """The photo by URL, for the harness's same-origin panel A. The real in-chat mount

@@ -50,7 +50,6 @@ import os
 import random
 import re
 import time
-import urllib.parse
 
 import anyio
 import httpx
@@ -1491,8 +1490,9 @@ async def retouch_image(ctx: Context) -> str:
     mask themselves, which is the whole difference from edit_image (where the model
     describes the region and SAM guesses at it). No image is rendered by this call:
     it resolves the source exactly like edit_image does (own key, own branch,
-    auto-detect, no model-suppliable override) and returns a link whose ONE-TIME
-    launch token rides inside, minted by the toolbox's own mint_launch."""
+    auto-detect, no model-suppliable override) and returns a link carrying a SHORT
+    one-time-use code, minted by the toolbox's own mint_editor_link — never the raw
+    launch token, because this string is something a model has to publish verbatim."""
     tb = _TOOLBOX_REF.get("tb")
     if tb is None:
         return ("The Comfy Toolbox mask editor is not mounted on this server. If the "
@@ -1513,20 +1513,25 @@ async def retouch_image(ctx: Context) -> str:
         image_ref = await _resolve_image_url(ctx, api_key)
     except ValueError as e:
         return str(e)
-    try:
-        token = tb.mint_launch(email, image_ref)
-    except ValueError as e:
-        return f"Cannot open the mask editor: {e}"
     base = (getattr(tb, "public_base", "") or "").rstrip("/")
     if not base:
         return ("Cannot open the mask editor: this stackd has no "
                 "STACKD_TOOLBOX_PUBLIC_URL configured, so there is no browser-reachable "
                 "address to send the user to. edit_image still works for described edits.")
-    url = (base + "/toolbox/embed?token="
-           + urllib.parse.quote(token, safe="")
-           + "&source_ref=" + urllib.parse.quote(image_ref, safe=""))
+    try:
+        # Short-link mint (never mint_launch's raw token): the returned URL is text this
+        # response hands to a model to publish, and a 250-char base64 credential does not
+        # survive that trip intact — see tokens.mint_link for the live 403 it caused.
+        _token, _code, url = tb.mint_editor_link(email, image_ref)
+    except ValueError as e:
+        return f"Cannot open the mask editor: {e}"
     return (f"Mask editor ready for the most recent image in this chat.\n\n"
             f"[Open the Comfy Toolbox]({url})\n\n"
+            "Publish that link EXACTLY as written above — copy it whole, character for "
+            "character. Do not retype, re-wrap, shorten, URL-decode or 'correct' it, and "
+            "never paraphrase it in prose: one wrong character makes the editor reject a "
+            "link that was minted seconds ago, which looks to the user like a broken "
+            "feature. Quote it in a markdown link and leave it alone. "
             "Tell the user: the link opens the editor ONCE (its access is single-use and "
             "expires in ~15 minutes; ask for a fresh link if it goes stale). They paint "
             "the area to change, tune each object's edge/feather in the Selection box, "

@@ -297,7 +297,7 @@ the first draft were wrong and are fixed here):
 **M2** the in-chat embed mount — a thin native OWU Function returning `HTMLResponse` +
 `Content-Disposition: inline`, required because MCP tool returns do *not* get embed
 treatment — plus the `retouch_image` MCP tool for assistant-driven flows.
-  - **M2 DEPLOYED** (offline suite 565/565; live health `mint:true` at the public
+  - **M2 DEPLOYED** (offline suite 580/580; live health `mint:true` at the public
     front; the trust root is Open WebUI's
     server-vouched identity, and the browser never touches a secret. `/toolbox/mint`
     is the INTERNAL mint seam — caller-auth'd with the daemon's own admin bearer (empty
@@ -344,6 +344,27 @@ treatment — plus the `retouch_image` MCP tool for assistant-driven flows.
     verified live from inside the OWU container: resolver returns a 64-char key equal to
     the daemon's own bearer, source label `secret file /run/secrets/ollama_token`, and
     the mint answers 200 with a 165 KB editor document for a registered user.
+  - **Editor links are SHORT (`/toolbox/e/<code>`), and the reason is a live incident.**
+    `retouch_image` used to hand the model a markdown link with the ~250-char launch
+    token inside it. Models cannot retype long base64: a user clicked a link minted 14
+    seconds earlier and got `not authorised: bad signature` because the payload's `exp`
+    key had become `ex` while the signature was carried over untouched — provable, since
+    re-signing the repaired payload reproduced the presented signature byte for byte
+    (`verify(secret, token)` had no way to know that story, which is why the 403 now
+    says "the link text was damaged in transit … ask for a fresh editor link" when the
+    body still looks like a claim set we would sign, and keeps plain `bad signature`
+    for bodies that don't). So: anything a model or a human must reproduce verbatim gets
+    a 10-char code from an ambiguity-free alphabet, and the credential stays in the
+    process — `tokens.mint_link`/`resolve_link`, `Toolbox.mint_editor_link`,
+    `h_editor_link`. Deliberate properties, all pinned: the code is **not** single-use
+    (a pre-Render refresh must not brick it; the single-use gate remains the first
+    submit), unknown/expired/mistyped codes answer identically (a probe learns nothing),
+    POST to the route is 405 not 404, and the legacy `/toolbox/embed?token=` mount stays
+    served because the lab harness and the browser suite drive it. Trade-off stated
+    honestly: codes live in-process, so a daemon restart un-mints outstanding links
+    (a token-in-URL used to survive one) — the visible cost is "ask again", which is
+    what the 404 says. The OWU Tool path is unaffected either way: it returns the
+    document itself, so the model never saw that URL at all.
 **M3** non-destructive layer stack, gallery, saved recipes, batch.
 **M4** video/music: multi-slot media tiers (`state.py`'s single `ImageSlot` -> per-kind
 slots), artifact-typed jobs, cleaner support for `SaveVideo`/`SaveAudio*` outputs, and

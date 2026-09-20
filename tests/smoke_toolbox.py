@@ -1296,14 +1296,115 @@ def test_mint_seam():
     # the happy path through an explicit source_ref
     r = mint({"email": EMAIL, "source_ref": "/api/v1/files/photo/content"})
     p = r.payload or {}
-    check("mint: source_ref path returns link, token and a full editor document",
+    check("mint: source_ref path returns a SHORT link, the token and a full editor document",
           r.status == 200 and p.get("ok")
-          and p.get("url", "").startswith("https://lab.example/toolbox/embed?token=")
-          and urllib.parse.quote("/api/v1/files/photo/content", safe="") in p.get("url", "")
+          and p.get("url", "").startswith("https://lab.example/toolbox/e/")
+          and len(p.get("code") or "") == 10
+          # The credential must not be in the URL at all: this link is text a model
+          # publishes, and a re-typed 250-char base64 body is what caused the live 403
+          # (payload `exp` -> `ex`, signature carried over untouched, verified by
+          # re-signing the repaired payload and matching the pasted signature).
+          and "token=" not in p.get("url", "") and "." not in p.get("url", "").split("/e/")[1]
           and p.get("token") and "createElement('canvas')" in (p.get("html") or "")
+          and "/api/v1/files/photo/content" in (p.get("html") or "")
           and p.get("expires_in") == 900,
           {k: str(v)[:80] for k, v in p.items()})
     tok = p.get("token") or ""
+    code = p.get("code") or ""
+
+    # the short link IS the mount: same document, credential resolved server-side
+    doc = get(tb, "/toolbox/e/" + code)
+    body = (doc.raw or b"").decode("utf-8", "replace")
+    check("editor link: the short code serves the editor document with the token inlined",
+          doc.status == 200 and "createElement('canvas')" in body and tok in body
+          and (doc.ctype or "").startswith("text/html"),
+          {"status": doc.status, "ctype": doc.ctype, "len": len(body)})
+    again = get(tb, "/toolbox/e/" + code)
+    check("editor link: re-fetching is allowed (a pre-Render refresh must not brick it)",
+          again.status == 200, again.status)
+    check("editor link: the code avoids the visually ambiguous characters",
+          not set(code) & set("0o1il"), code)
+    bogus = get(tb, "/toolbox/e/" + ("z" * 10))
+    check("editor link: an unknown code is a 404 that tells the holder to ask again",
+          bogus.status == 404
+          and bogus.payload.get("reason") == "unknown_editor_link"
+          and "fresh" in (bogus.payload.get("error") or "").lower(), bogus.payload)
+    mangled = get(tb, "/toolbox/e/" + (code[:-1] + ("a" if code[-1] != "a" else "b")))
+    check("editor link: a mistyped code is indistinguishable from an unknown one",
+          mangled.status == 404 and mangled.payload.get("reason") == "unknown_editor_link",
+          mangled.payload)
+    post_like = post(tb, "/toolbox/e/" + code, {})
+    check("editor link: the code route is GET-only (405, not a silent 404)",
+          post_like.status == 405, post_like.status)
+    # the token-in-URL mount stays live: the lab harness and the browser suite drive it
+    legacy = get(tb, "/toolbox/embed?token=" + urllib.parse.quote(tok, safe=""))
+    check("editor link: the legacy /toolbox/embed?token= mount still serves (compat)",
+          legacy.status == 200 and "createElement('canvas')" in (legacy.raw or b"").decode(),
+          legacy.status)
+
+    # THE failure the operator actually hit, pinned as a message. Rebuild the token the
+    # way a bad transcription produces one: same claims, one key mangled (exp -> ex),
+    # signature carried over untouched from the real mint.
+    _v, _b, _s = tok.split(".")
+    _claims = json.loads(T._unb64(_b))
+    _claims["ex"] = _claims.pop("exp")
+    _tampered_body = T._b64(json.dumps(_claims, separators=(",", ":"), sort_keys=True).encode())
+    _tampered = _v + "." + _tampered_body + "." + _s
+    r_alt = get(tb, "/toolbox/embed?token=" + urllib.parse.quote(_tampered, safe=""))
+    check("a damaged token says the link was altered, not merely 'bad signature'",
+          r_alt.status == 403
+          and "signature does not match" in (r_alt.payload.get("error") or "")
+          and "fresh" in (r_alt.payload.get("error") or ""), r_alt.payload)
+    # ...and the generic message survives for a body that never looked like a claim set
+    # we would sign, so the two rejections stay distinguishable.
+    _strange = _v + "." + T._b64(json.dumps({"hello": "world"}).encode()) + "." + _s
+    r_bad = get(tb, "/toolbox/embed?token=" + urllib.parse.quote(_strange, safe=""))
+    check("a body that never looked minted still reads plainly as 'bad signature'",
+          r_bad.status == 403 and "bad signature" in (r_bad.payload.get("error") or ""),
+          r_bad.payload)
+    r_junk = get(tb, "/toolbox/embed?token=" + urllib.parse.quote("v1.just-one-part", safe=""))
+    check("a nonsense token still reads as malformed",
+          r_junk.status == 403 and "malformed" in (r_junk.payload.get("error") or ""),
+          r_junk.payload)
+    _jti = json.loads(T._unb64(_b)).get("jti")
+    check("the log hint surfaces a jti for correlation, and never a signature",
+          tb._jti_hint(Fake("GET", "/toolbox/embed", {}, b""), {"token": tok}) == _jti
+          and tb._jti_hint(Fake("GET", "/toolbox/embed", {}, b""), {"token": "junk"}) == "n/a")
+
+    def _raises(exc, fn, *a):
+        try:
+            fn(*a)
+            return False
+        except exc:
+            return True
+    check("mint_link refuses to stand in for garbage or an expired token",
+          _raises(T.BadToken, T.mint_link, "not-a-token")
+          and _raises(T.Expired, T.mint_link,
+                      T.mint(SECRET, scope="launch", email=EMAIL, ttl_s=-5))
+          and T.resolve_link("never-minted") is None)
+    # Two gates that exist ONLY to kill specific mutants in h_editor_link, which is new
+    # attack surface: a handler that resolved the code and served the document without
+    # re-verifying the token would still pass every check above (the token we registered
+    # is a good one). So pin the two ways a resolved-but-unverified token is dangerous.
+    _job_tok = T.mint(SECRET, scope="job", email=EMAIL, job_id="j1")
+    _job_code = T.mint_link(_job_tok)
+    r_job = get(tb, "/toolbox/e/" + _job_code)
+    check("editor link: a resolved code never outranks the token's own scope",
+          r_job.status == 403 and not r_job.raw
+          and "not 'launch'" in (r_job.payload.get("error") or ""),
+          r_job.payload)
+    _live_tok = T.mint(SECRET, scope="launch", email=EMAIL, ttl_s=60)
+    _live_code = T.mint_link(_live_tok)
+    import time as _time_mod, types as _types
+    _real_time, T.time = T.time, _types.SimpleNamespace(
+        time=lambda: _time_mod.time() + 3600)
+    try:
+        r_gone = get(tb, "/toolbox/e/" + _live_code)
+    finally:
+        T.time = _real_time
+    check("editor link: the code expires with its token, it does not outlive it",
+          r_gone.status == 404
+          and r_gone.payload.get("reason") == "unknown_editor_link", r_gone.payload)
     # A photo that FAILS to fetch mid-mint (deleted file, OWU hiccup — _ingest_source
     # raises ValueError, unlike the fake resolver's None) must still produce a loadable
     # editor document. Live-found: the fallback branch left `before` unbound and the
@@ -1352,7 +1453,14 @@ def test_mint_seam():
     check("mint: chat_id path resolves the branch image through the ONE lookup seam",
           r.status == 200 and seen.get("chat_id") == "CH1"
           and seen.get("message_id") == "M2"
-          and "from-chat" in (r.payload or {}).get("url", ""), (seen, r.payload))
+          # The ref is BOUND (token claim + inlined cfg), not printed in the URL: the
+          # whole point of the short link is that nothing model-visible carries it.
+          and (r.payload or {}).get("source_ref") == "/api/v1/files/from-chat/content"
+          and "from-chat" in (r.payload or {}).get("html", "")
+          and "from-chat" in (lambda _p: T._unb64(_p[1]).decode()
+                              if len(_p) == 3 else "")(
+                              (r.payload or {}).get("token", "").split(".")),
+          (seen, {k: str(v)[:60] for k, v in (r.payload or {}).items() if k != "html"}))
     tb_none = make_tb(mint_key="minty", public_base="https://lab.example")
     r = post(tb_none, "/toolbox/mint", {"email": EMAIL, "chat_id": "CH1"},
              headers={"authorization": "Bearer minty"})
@@ -1380,10 +1488,13 @@ def test_mint_seam():
     root = _p.Path(__file__).resolve().parents[1] / "stackd"
     it_src = (root / "imagegen" / "tools.py").read_text()
     sv_src = (root / "serve.py").read_text()
-    check("the MCP retouch tool mints through the ONE mint_launch path, in-process",
-          "def retouch_image(" in it_src and "tb.mint_launch(email, image_ref)" in it_src
+    check("the MCP retouch tool mints through the ONE mint seam, in-process",
+          "def retouch_image(" in it_src and "tb.mint_editor_link(email, image_ref)" in it_src
           and "def set_toolbox_ref(" in it_src
           and "set_toolbox_ref(toolbox)" in sv_src)
+    check("retouch hands out the SHORT link, never a token in a URL (model-retypeable)",
+          "toolbox/embed?token=" not in it_src
+          and "urllib.parse.quote(token" not in it_src.split("def retouch_image(")[-1][:4000])
     check("retouch never grows its own token code (only toolbox.api may mint)",
           "_tokens.mint(" not in it_src.split("def retouch_image(")[-1][:4000])
     owu = (root / "toolbox" / "owu_tool.py").read_text()

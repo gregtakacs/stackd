@@ -2,10 +2,17 @@ Open the Comfy Toolbox mask editor for the image the user is looking at. This to
 NOTHING and takes no parameters of any kind -- it resolves the chat's most recent image the
 same way edit_image does (server-side auto-detect via the real conversation tree, the
 CALLING user's own registered API key, no model-suppliable image reference) and returns a
-markdown link that opens the mask editor ONCE: the link carries a single-use access token
-that dies on the first render submission and expires ~15 minutes after this call. If the
-user's link has gone stale, call this tool again for a fresh one -- that is the intended
+markdown link that opens the mask editor ONCE: the link carries a short one-time access
+CODE that dies on the first render submission and expires ~15 minutes after this call. If
+the user's link has gone stale, call this tool again for a fresh one -- that is the intended
 recovery, not an error state.
+
+COPY THE LINK OUT EXACTLY AS GIVEN. It is short on purpose (a ~10-character code) because
+you are the only thing standing between the tool output and the user's browser, and a
+single altered or dropped character makes the editor reject a link that was minted seconds
+ago -- which looks to the user like a broken feature, not like a typo. Do not retype,
+re-wrap, shorten, URL-decode, split across lines or "correct" it; emit the markdown link the
+tool gave you, whole, and do not restate the URL in prose.
 
 Use this, and NOT edit_image, whenever the user wants to control the masked area THEMSELVES:
 any phrasing like "let me pick the area", "I want to paint the mask", "let me choose
