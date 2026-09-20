@@ -3394,6 +3394,136 @@ def test_render_seam():
           "(the artifact still comes back)",
           art_f is not None and job_f.get("_chat_post") == "failed"
           and len(st_f.get("posts") or []) == 1, repr(job_f.get("_chat_post")))
+
+    # ---- post_chat_message's SHAPE, against OWU's OWN tree semantics ---------------
+    # Live defect round 2 of the hand-back: the POST returned 200, the row landed in
+    # webui.db, and the chat showed NOTHING — this build renders the thread as
+    # get_message_list(messages_map, history.currentId), a walk of camelCase
+    # `parentId` links. Round 1 appended a snake_case `parent_id: None` detached
+    # root: saved, reconciled, UNREACHABLE from the tip — invisible even on reload.
+    # So the fake below mimics the deployed 0.11.x contract exactly (camelCase
+    # fixture read from the live DB) and the walk re-implements misc.py:182
+    # server-side. A hand-back that cannot be walked from the tip is NOT posted.
+    _FIX = {"chat": {"history": {"currentId": "U2", "messages": {
+        "U1": {"id": "U1", "role": "user", "content": "make me a photo",
+               "parentId": None, "childrenIds": ["A1"]},
+        "A1": {"id": "A1", "role": "assistant", "content": "here you go",
+               "parentId": "U1", "childrenIds": ["U2"], "model": "TakacsAI-med",
+               "done": True},
+        "U2": {"id": "U2", "role": "user", "content": "let me retouch",
+               "parentId": "A1", "childrenIds": []},
+    }}, "messages": [{"id": "U1", "role": "user", "content": "make me a photo"}]}}
+
+    class _Resp:
+        def __init__(self, status=200, body=None): self.status_code, self._b = status, body or {}
+        def json(self): return self._b
+
+    class _FakeClient:
+        posts, posts_status = [], 200
+        def __init__(self, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def get(self, url, headers=None):
+            if not url.endswith("/CH-OK"):
+                return _Resp(404)
+            import copy
+            return _Resp(200, copy.deepcopy(_FIX))
+        async def post(self, url, json=None, headers=None):
+            type(self).posts.append(json)
+            return _Resp(type(self).posts_status)
+
+    # Load the REAL httpx-backed client FROM SOURCE under a temp name — drive() left
+    # its no-httpx stub cached under the canonical name, so an ordinary import (even
+    # after a pop) would hand back the stub. Module level imports are network-free,
+    # so this is safe; the base url is pointed at an unroutable port as a
+    # belt-and-braces guarantee this block can never POST to the live OWU even if
+    # the client stub ever stops covering a path.
+    import importlib.util as _ilu
+    import types as _types
+    import stackd.imagegen.config as _igc
+    _spec = _ilu.spec_from_file_location(
+        "owu_client_shape_probe",
+        str(pathlib.Path(__file__).resolve().parent.parent
+            / "stackd" / "imagegen" / "openwebui_client.py"))
+    _owu_real = _ilu.module_from_spec(_spec)
+    # The host suite runs WITHOUT httpx (by design — the fake-registry contract).
+    # The from-source load needs the name to exist, and it binds `import httpx` at
+    # module level; the stub carries exactly what this module's functions touch.
+    _httpx_stub = _types.ModuleType("httpx")
+    _httpx_stub.AsyncClient = _FakeClient
+    _httpx_err = type("HTTPStatusError", (Exception,), {})
+    _httpx_stub.HTTPStatusError = _httpx_err
+    _saved_httpx = sys.modules.get("httpx")
+    sys.modules["httpx"] = _httpx_stub
+    try:
+        _spec.loader.exec_module(_owu_real)
+    finally:
+        if _saved_httpx is not None:
+            sys.modules["httpx"] = _saved_httpx
+        else:
+            sys.modules.pop("httpx", None)   # the host runs without httpx — restore that
+    _real_ac = _owu_real.httpx.AsyncClient
+    _real_base = _igc.OPENWEBUI_BASE_URL
+    _igc.OPENWEBUI_BASE_URL = "http://127.0.0.1:1"
+    _owu_real.httpx.AsyncClient = _FakeClient
+    try:
+        import asyncio as _aio
+
+        def _walk(hms, tip):        # open_webui/utils/misc.py get_message_list, verbatim
+            out, seen, cur = [], set(), tip
+            m = hms.get(cur)
+            while m and cur not in seen:
+                seen.add(cur); out.append(m)
+                cur = m.get("parentId"); m = hms.get(cur) if cur else None
+            out.reverse(); return out
+
+        _FakeClient.posts.clear()
+        ok = _aio.run(_owu_real.post_chat_message("CH-OK", "Toolbox render — ![x](/f/c)", "k"))
+        posted = _FakeClient.posts[0]["chat"] if _FakeClient.posts else {}
+        hm = (posted.get("history") or {}).get("messages") or {}
+        new = [m for m in hm.values() if m.get("model") == "Comfy Toolbox"]
+        tip = (posted.get("history") or {}).get("currentId")
+        walk = _walk(hm, tip) if new else []
+        check("post_chat_message: True on a 200 POST (the honest happy path)", ok is True)
+        check("post_chat_message: the append is REACHABLE by OWU's own tip-walk "
+              "(the invisible-hand-back guard)",
+              len(new) == 1 and new[0]["id"] == tip
+              and [w.get("role") for w in walk] == ["user", "assistant", "user", "assistant"],
+              repr([w.get("role") for w in walk]))
+        check("post_chat_message: parent/children link BOTH ways — the tip's children "
+              "list must name the append, or the SPA's branch UI never shows it",
+              len(new) == 1 and new[0].get("parentId") == "U2"
+              and new[0]["id"] in hm["U2"].get("childrenIds", []),
+              repr(new[0].get("parentId") if new else None))
+        check("post_chat_message: the legacy top-level list is mirrored (doc keeps both shapes)",
+              isinstance(posted.get("messages"), list)
+              and posted["messages"][-1].get("model") == "Comfy Toolbox")
+        _FakeClient.posts.clear()
+        ok404 = _aio.run(_owu_real.post_chat_message("CH-MISSING", "x", "k"))
+        check("post_chat_message: an unknown chat is False, not a raise", ok404 is False)
+        _FakeClient.posts.clear(); _FakeClient.posts_status = 500
+        ok500 = _aio.run(_owu_real.post_chat_message("CH-OK", "x", "k"))
+        _FakeClient.posts_status = 200
+        check("post_chat_message: a 5xx POST is False — _chat_post turns that into the "
+              "editor's honest 'did NOT go through' line", ok500 is False)
+        # broken tip (not in the map): degrade to a fresh ROOT the way the SPA's first
+        # message does — and STILL be the tip, so it is visible.
+        _FakeClient.posts.clear()
+        _saved = _FIX["chat"]["history"]["currentId"]
+        _FIX["chat"]["history"]["currentId"] = "GHOST"
+        _aio.run(_owu_real.post_chat_message("CH-OK", "x", "k"))
+        _FIX["chat"]["history"]["currentId"] = _saved
+        posted_b = _FakeClient.posts[0]["chat"]
+        hmb = posted_b["history"]["messages"]
+        newb = [m for m in hmb.values() if m.get("model") == "Comfy Toolbox"][0]
+        check("post_chat_message: an unresolvable tip degrades to a root that is STILL "
+              "the currentId (visible), never a detached orphan (invisible)",
+              newb["parentId"] is None
+              and posted_b["history"]["currentId"] == newb["id"]
+              and _walk(hmb, newb["id"])[-1]["id"] == newb["id"])
+    finally:
+        _owu_real.httpx.AsyncClient = _real_ac
+        _igc.OPENWEBUI_BASE_URL = _real_base
     # ---- the give-up path, END TO END through comfy_render ------------------------
     # test_render_timeout exercises the helper functions; these prove the RENDER SEAM wires
     # them, which is where two mutants slipped through GREEN. The order is the feature: if

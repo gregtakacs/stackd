@@ -461,17 +461,27 @@ treatment — plus the `retouch_image` MCP tool for assistant-driven flows.
     graph mask, the node-28 preview, `overlay_layers`' approved wash and the paste
     gate all see ONE lifted mask. The 128 is not taste: it is the graph's own rounding.
     Suite +6 (601/601; mutant: no-op lift -> exactly 3 red), browser 162/162.
-  - **"It just sits in the new window" — it actually lands; OWU just never pushes.**
-    The dog render's hand-back WORKED (log: `chat hand-back posted`, OWU access log:
-    `POST /api/v1/chats/2ffd6e91… 200`, and the message is in webui.db as
-    `model="Comfy Toolbox"`). An externally appended message does not live-render in
-    an already-open chat — OWU refreshes history on tab switch/reload. So the editor
-    now says it: the persisted crop provenance carries `chat_post` and the render-done
-    status line reads "also posted back into your chat (refresh the chat tab to see
-    it)" — or admits "the chat hand-back did NOT go through — the image is still in
-    your files" when it truly fails. (The new-window OPEN itself remains the MCP-link
-    route: the model only embeds inline when it calls the native Tool, and it published
-    the link again — see the toolIds note; both routes now hand back identically.)
+  - **"It just sits in the new window" — round 1's hand-back was a LIE of omission.**
+    The POST returned 200 and the row reached webui.db AND chat_message — but this
+    build renders a chat as `get_message_list(messages_map, history.currentId)`: a
+    walk of `parentId` links from the tip. Round 1 appended a DETACHED ROOT
+    (parent None, tip unchanged), so the message existed in every table and was
+    unreachable by the only reader that matters — invisible even after a reload (the
+    "refresh the tab" advice was wrong too). OWU's source proved it: `toolIds` in the
+    model meta is read by ONE file (`utils/automations.py`); chat runs whatever
+    `form_data["tool_ids"]` the SPA sends — which is why the model, tool-less,
+    published the MCP markdown link instead of the Tool's inline HTMLResponse, and a
+    fork chat even hallucinated raw `<tool_call>` text. Fixes: (a)
+    `post_chat_message` now appends EXACTLY like the SPA — parent = the live tip,
+    tip's children list grows, `history.currentId` ADVANCES, legacy `messages`
+    mirrored; (b) the two already-orphaned renders in the live DB were stitched into
+    their trees in place (both layers, verified through OWU's own
+    `get_messages_map_by_chat_id` + walk — both chats now END in the Toolbox
+    message); (c) OWU container restarted (tools/model caches are in-process, and
+    the previous session's toolIds attach could not be seen by a cached SPA).
+    Suite +7 (608/608) — the checks fake the OWU client and re-implement the server's
+    tip-walk, so "posted" now means REACHABLE; mutants — detached root → 3 red, tip
+    not advanced → 2 red.
   - **Blend modes are live AND explained** (user: "I don't know why it's even there"):
     the dropdown was wired all along (paste_back's ImageChops ops) but unlabelled; the
     panel now carries a one-line explanation per mode under the selector.

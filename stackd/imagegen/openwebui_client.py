@@ -243,12 +243,20 @@ async def post_chat_message(chat_id: str, content: str, api_key: str) -> bool:
     editor window. Uses the OWNER's key — chats are per-user here (admin chat access is
     off), so a wrong chat id simply 404s rather than posting into someone else's thread.
 
-    Read-modify-write on chat.history.messages: GET /api/v1/chats/{id}, insert the new
-    message into the history dict, POST it back to the same route (update_chat_by_id
-    replaces the chat doc, and its reconcile pass explicitly does NOT infer deletes from
-    missing ids, so an append is safe). Returns False — never raises — on any HTTP or
-    shape problem: this is a convenience on top of a render that already succeeded, and
-    the caller surfaces the failure as a note rather than losing the artifact.
+    THE SHAPE IS THE FEATURE (live defect, round 1 of this function): the append must
+    be indistinguishable from one the SPA itself committed, and this build's thread is
+    a TREE — the visible list is get_message_list walking parentId links back from
+    history.currentId. A first version appended a DETACHED ROOT (parent None, tip
+    unchanged) and the POST answered 200 — the row landed in webui.db and in the
+    chat_message table, and the chat showed nothing, not even after a reload.
+    "It was posted" is only worth saying when "it is reachable". So: parent = the
+    current tip, the tip's children list grows the link, history.currentId ADVANCES to
+    the new message, and the legacy top-level messages list (this chat doc keeps one)
+    is mirrored so readers of either shape see it. Both key spellings are written: the
+    row builder and merge_history accept either, the walk needs the link to RESOLVE,
+    and matching the sibling messages' camelCase keeps the doc uniform. A failed post
+    stays False — never a raise, never a lost artifact: the render already succeeded
+    and the file is saved.
     """
     if not chat_id:
         return False
@@ -271,13 +279,41 @@ async def post_chat_message(chat_id: str, content: str, api_key: str) -> bool:
                 return False
             mid = uuid.uuid4().hex
             now = int(time.time())
-            messages[mid] = {
+            # parent = the current tip when it resolves; an empty or broken history
+            # (tip id absent from the map) degrades to a fresh root, exactly what the
+            # SPA does for the first message of a chat.
+            tip = (hist.get("currentId") or hist.get("current_message_id")
+                   or chat.get("currentId"))
+            parent = tip if (tip and tip in messages) else None
+            msg = {
                 "id": mid, "role": "assistant", "content": content,
                 "chat_id": chat_id, "created_at": now, "updated_at": now,
                 "timestamp": now, "model": "Comfy Toolbox", "done": True,
-                "parent_id": None, "children_ids": [], "feature_selections": [],
-                "citations": [], "references": None, "error": None,
+                "parentId": parent, "childrenIds": [],
+                # snake_case twins for the chat_message row builder, which accepts
+                # either; the HISTORY tree (what get_message_list walks) is camelCase.
+                "parent_id": parent, "children_ids": [],
+                "feature_selections": [], "citations": [], "references": None,
+                "error": None,
             }
+            messages[mid] = msg
+            if parent:
+                pkids = messages[parent].get("childrenIds")
+                if not isinstance(pkids, list):
+                    pkids = []
+                    messages[parent]["childrenIds"] = pkids
+                pkids.append(mid)
+                # keep a snake_case twin coherent too if the doc carries one
+                pk2 = messages[parent].get("children_ids")
+                if isinstance(pk2, list):
+                    pk2.append(mid)
+            # ADVANCE THE TIP: without this the new message is a branch nobody walks
+            # to — a 200 POST that renders nothing. The user's next message parents
+            # to it, which is right: the render is now the live end of the thread.
+            hist["currentId"] = mid
+            legacy = chat.get("messages")
+            if isinstance(legacy, list):
+                legacy.append(dict(msg))
             r2 = await client.post(url, json={"chat": chat}, headers=headers)
             return r2.status_code == 200
     except Exception:  # noqa: BLE001 — a lost hand-back must never cost a render
