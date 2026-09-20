@@ -419,6 +419,40 @@ treatment — plus the `retouch_image` MCP tool for assistant-driven flows.
     safe). A failed post is a log line + `_chat_post` on the job, never a lost artifact.
     Suite now 590/590 offline (+9), 162/162 browser; the gate's mutant (ignore
     selection_png) is caught by the new border check.
+  - **The dog round-2 (same session, live): the BALLOON was in the GRAPH, not the paste.**
+    A fresh chat, a 0.9-1.8% paint, Replace mode ("bare asphalt") → half the dog got
+    asphalt and highlights blew out. `paste_back` was innocent this time (crop path,
+    gated correctly): the scaffold's CLIPSeg-era mask-branch constants — `GrowMask
+    expand=12`, `ImageBlur radius=28 sigma=9`, clamp `GrowMask expand=28`,
+    `VAEEncodeForInpaint grow_mask_by=6` — dilate a PAINTED mask the user already sized.
+    Those constants exist for TEXT SEGMENTATION (workflows.py Bugs 3/5: the segmenter
+    under-captures, so the graph grows + soft-blurs to catch missed detail), and
+    imagegen's own `_submit_edit` had already had to abandon fixed pixel values for
+    exactly this defect ("a fixed 28 px here is what made small objects balloon to
+    fill an oversized mask") — the toolbox inherited the scaffold WITHOUT that lesson.
+    `engine._apply_mask_geometry` now runs after `_patch_graph`: a painted mask passes
+    through HARD (node 16 expand 0, composite + preview rewired straight to it, the
+    31→32→33→34→35 chain deleted imagegen-style — which also makes the node-28 mask
+    preview finally show the REAL gate), `mask_expand` restores growth on both dilators
+    when the user asks for it, `mask_edge` rebuilds the soft chain scaled (with the
+    Bug-3 dilated clamp). And ColorMatchV2 (node 7) stops being a hidden 0.95 constant:
+    it follows `spec.color_match`, so the knob now drives BOTH colour matches and 0
+    really means off. Pinned with 5 new checks (595/595); mutants — geometry no-op →
+    3 fails, hidden 0.95 → 1 fail.
+  - **"It just sits in the new window" — it actually lands; OWU just never pushes.**
+    The dog render's hand-back WORKED (log: `chat hand-back posted`, OWU access log:
+    `POST /api/v1/chats/2ffd6e91… 200`, and the message is in webui.db as
+    `model="Comfy Toolbox"`). An externally appended message does not live-render in
+    an already-open chat — OWU refreshes history on tab switch/reload. So the editor
+    now says it: the persisted crop provenance carries `chat_post` and the render-done
+    status line reads "also posted back into your chat (refresh the chat tab to see
+    it)" — or admits "the chat hand-back did NOT go through — the image is still in
+    your files" when it truly fails. (The new-window OPEN itself remains the MCP-link
+    route: the model only embeds inline when it calls the native Tool, and it published
+    the link again — see the toolIds note; both routes now hand back identically.)
+  - **Blend modes are live AND explained** (user: "I don't know why it's even there"):
+    the dropdown was wired all along (paste_back's ImageChops ops) but unlabelled; the
+    panel now carries a one-line explanation per mode under the selector.
 **M3** non-destructive layer stack, gallery, saved recipes, batch.
 **M4** video/music: multi-slot media tiers (`state.py`'s single `ImageSlot` -> per-kind
 slots), artifact-typed jobs, cleaner support for `SaveVideo`/`SaveAudio*` outputs, and

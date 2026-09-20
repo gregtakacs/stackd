@@ -1868,6 +1868,48 @@ def test_graphs():
           WF.MASK_POSITIVE_NODE in rep_g and WF.MASK_REGION_REFLATENT_NODE in rep_g
           and isinstance(_json.dumps(rep_g), str))
 
+    # Painted-mask GEOMETRY (the live dog: a 1.8% paint came back with half the dog
+    # repainted). The scaffold's CLIPSeg-era mask-branch constants (expand 12, blur 28,
+    # clamp-grow 28, grow_mask_by 6) dilate a PAINTED mask the user already sized —
+    # the exact balloon imagegen's _submit_edit abandoned ("a fixed 28 px here is what
+    # made small objects balloon"). engine._apply_mask_geometry must zero the growth,
+    # rewire the composite to the painted silhouette, and never leave a dangling edge
+    # into a deleted node. These are the red gates for that regression.
+    from stackd.toolbox import engine as _eng_g, graphs as _G_g
+    _gp = G.painted_mask_graph("flux2-klein", mask_filename="m.png")
+    _eng_g._patch_graph(_gp, {"prompt": "p", "mask_expand": 0, "mask_edge": 0,
+                              "color_match": 0.9},
+                      source_filename="s.png", mask_filename="m.png", w=64, h=64, seed=1)
+    check("painted mask defaults to HARD geometry: no grow, no blur, no latent dilate",
+          _gp[WF.MASK_GROW_NODE]["inputs"]["expand"] == 0
+          and [n for n in _gp.values() if n.get("class_type") == "VAEEncodeForInpaint"][0]
+                ["inputs"]["grow_mask_by"] == 0
+          and WF.MASK_BLUR_NODE not in _gp and "34" not in _gp
+          and WF.MASK_CLAMP_MARGIN_NODE not in _gp
+          and _gp[WF.MASK_COMPOSITE_NODE]["inputs"]["mask"] == [WF.MASK_GROW_NODE, 0]
+          and _gp["28"]["inputs"]["mask"] == [WF.MASK_GROW_NODE, 0],
+          repr(_gp.get(WF.MASK_COMPOSITE_NODE))[:110])
+    check("patched graph keeps zero dangling references into the deleted soft-edge chain",
+          all(v[0] in _gp for nd in _gp.values() for v in (nd.get("inputs") or {}).values()
+              if isinstance(v, list) and len(v) == 2)
+          and _G_g.validate_painted_mask_graph(_gp) == [])
+    _gp2 = G.painted_mask_graph("flux2-klein", mask_filename="m.png")
+    _eng_g._patch_graph(_gp2, {"mask_expand": 10, "mask_edge": 30, "color_match": 0.0},
+                      source_filename="s", mask_filename="m", w=64, h=64, seed=1)
+    check("mask_expand/mask_edge restore the growth honestly (scale with the knobs)",
+          _gp2[WF.MASK_GROW_NODE]["inputs"]["expand"] == 10
+          and [n for n in _gp2.values() if n.get("class_type") == "VAEEncodeForInpaint"][0]
+                ["inputs"]["grow_mask_by"] == 10
+          and WF.MASK_BLUR_NODE in _gp2
+          and _gp2[WF.MASK_BLUR_NODE]["inputs"]["blur_radius"] == 9
+          and _gp2[WF.MASK_CLAMP_MARGIN_NODE]["inputs"]["expand"] == 9
+          and _gp2[WF.MASK_COMPOSITE_NODE]["inputs"]["mask"] == ["34", 0])
+    check("the graph's global ColorMatchV2 is off the painted path (server paste owns "
+          "colour match; color_match 0 means OFF end to end)",
+          WF.MASK_COLOR_STRENGTH_NODE not in _gp and "26" not in _gp
+          and _gp[WF.MASK_COMPOSITE_NODE]["inputs"]["source"] == [_G_g.DECODE_NODE, 0]
+          and _gp2[WF.MASK_COMPOSITE_NODE]["inputs"]["source"] == [_G_g.DECODE_NODE, 0])
+
     # Mask polarity: the graph edits where the mask is 0 (the CLIPSeg convention the
     # canonical path relies on), but the server mask is 255 = edit-here (what the preview
     # and coverage the user sees are built from). engine._graph_mask flips the alpha at the
@@ -3190,6 +3232,33 @@ def test_render_seam():
             check("render seam: everything outside the box stays the user's photo",
                   px[4, 4] == (10, 200, 10) and px[PHOTO[0] - 5, PHOTO[1] - 5] == (10, 200, 10),
                   "corner=%s %s" % (px[4, 4], px[PHOTO[0] - 5, PHOTO[1] - 5]))
+            # THE DOG GUARD (live: a 1% paint on a dog came back with the fur beside it
+            # repainted). The ring INSIDE the box — past the paint, past the 12px seam
+            # fade — is model-output-adjacent only through the server's knob pass, which
+            # fits its color_match affine to the WHOLE box. With knobs at the shipped
+            # defaults and NO gate, these pixels re-grade (measured +34 mean-abs live);
+            # gated, the photo must survive them BYTE-EXACT. Deep-in-the-ring sampling is
+            # what keeps this honest: at the box border the seam fade already zeroes the
+            # paste, so a border probe would pass even un-gated.
+            _stR, _aR, _jR = drive(small, spec={"color_match": 0.9,
+                                                "preserve_detail": 0.35})
+            if _aR is not None and M.image_size(_aR) == PHOTO:
+                pxR = Image.open(io.BytesIO(_aR)).convert("RGB").load()
+                sb = M._scale_box(plan["box"], plan["frame"], PHOTO)
+                probe_y = int((by0 + by1) / 2 * fy)
+                ringL = pxR[sb[0] + 30, probe_y]      # 30 photo-px inside the box edge
+                ringR = pxR[sb[2] - 30, probe_y]
+                # (the paint spans canvas x 120..210 of a box starting ~96: +30 lands
+                # between box edge and paint edge at 4x scale — ring, not paint, not fade)
+                check("render seam: the RING inside the box, outside the paint, stays the "
+                      "user's photo even with colour-match/detail knobs ON (the dog)",
+                      ringL == (10, 200, 10) and ringR == (10, 200, 10),
+                      "ringL=%s ringR=%s box=%s" % (ringL, ringR, sb))
+            else:
+                check("render seam: the RING inside the box, outside the paint, stays the "
+                      "user's photo even with colour-match/detail knobs ON (the dog)",
+                      False, "ring artefact not probeable (size %s)"
+                      % (M.image_size(_aR) if _aR else None,))
         else:
             check("render seam: the model output lands inside the planned box", False,
                   "skipped: artifact is %dx%d, not %s -- cannot probe pixels"
@@ -3257,6 +3326,10 @@ def test_render_seam():
           repr([(c, x[:40]) for c, x, _k in posts])[:160])
     check("render seam: the hand-back outcome is recorded on the job for the log",
           job_p.get("_chat_post") == "posted", repr(job_p.get("_chat_post")))
+    check("render seam: the hand-back state rides the persisted provenance (the editor's "
+          "status line reads crop.chat_post — the 'it just sits in the window' fix)",
+          json.loads(job_p["_crop_json"]).get("chat_post") == "posted",
+          repr(job_p.get("_crop_json"))[:160])
     st_n, art_n, job_n = drive(full)
     check("render seam: a job with no chat binding posts NOTHING to any chat",
           art_n is not None and not st_n.get("posts")

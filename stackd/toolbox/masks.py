@@ -436,22 +436,33 @@ def _color_match(src: "Image.Image", ref: "Image.Image") -> "Image.Image":
     return Image.merge("RGB", bands)
 
 
-def _gate_from_selection(selection_png: bytes, want) -> "Image.Image":
-    """An 'L' gate from the canonical (255 = edit-here) selection, resized to the paste
-    region. HARD-edged on purpose: the artifact `new` already carries the graph's own
-    soft-edged composite at the silhouette (nodes 31–35), so its pixels converge on the
-    base photo right at the gate boundary — a blur here would push the model's output
-    PAST the paint (measured: a 1.5px Gaussian bled red 30+ levels into the 2px unpainted
-    margin of the suite's border test). A decode failure RAISES rather than returning a
-    solid gate: silently un-gated is exactly the whole-photo regrade this exists to stop.
+def _gate_from_selection(selection_png: bytes, want, src_box) -> "Image.Image":
+    """The paste gate: the painted coverage 'L' (255 = edit-here) CROPPED to the paste
+    box in the selection's own frame, then resized to the region — cropping first is not
+    cosmetic: the region is the box, not the canvas, and resizing the whole canvas into
+    the box's size lands the gate on the wrong coordinates (an offset balloon/shrink).
+    The soft alpha is kept, NOT binarised: the artifact reaching paste_back was already
+    blended against the photo by the graph's ImageCompositeMasked through this same
+    feathered mask, so multiplying the paste alpha by the feather again is exactly
+    right — the model's core stays, the photo just outside the paint survives untouched.
+    A decode failure RAISES rather than returning a solid gate: silently un-gated is
+    exactly the whole-photo regrade this exists to stop.
     """
     try:
         sel = extract_coverage(_open(selection_png))
     except Exception as e:  # noqa: BLE001 — name the stage, never fall back to opaque
         raise MaskError(f"the selection gate could not be decoded ({e.__class__.__name__}: {e})")
+    x0, y0, x1, y1 = (max(0, int(v)) for v in src_box)
+    x1, y1 = min(x1, sel.width), min(y1, sel.height)
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        # A box the selection does not even overlap cannot be "gated open" — closing it
+        # entirely is the honest answer (nothing pastes); opening it would re-stage the
+        # un-gated defect past every guard above.
+        return Image.new("L", tuple(want), 0)
+    sel = sel.crop((x0, y0, x1, y1))
     if sel.size != tuple(want):
         sel = sel.resize(tuple(want), Image.LANCZOS)
-    return sel.point(lambda p: 255 if p > 128 else 0)
+    return sel
 
 
 def paste_back(source_bytes: bytes, artifact_png: bytes, plan: dict, *,
@@ -461,16 +472,14 @@ def paste_back(source_bytes: bytes, artifact_png: bytes, plan: dict, *,
     """Paste a regenerated crop back over the FULL-RESOLUTION photo. (bytes, note).
 
     `selection_png` (canonical RGBA, 255 = edit-here) gates the paste to the painted
-    selection. It is REQUIRED by the full-frame path (feather 0): there is no crop box
-    to hide behind there, and the four knob operations below run on `new` as a WHOLE —
-    color_match in particular fits ONE per-channel affine to the stats of the entire
-    frame and applies it to EVERY pixel. With a large selection (the live sailboat:
-    tall sail -> plan_crop declined -> full frame) that affine is dominated by the
-    regenerated region and visibly re-grades the untouched sky: measured background
-    mean-abs-diff 24.6 (RGB shift -38/-31/-1) with knobs as shipped vs 0.1 zeroed.
-    Gated, the photo survives byte-for-byte outside the paint. The crop path passes
-    None: its ring context is deliberately part of the paste and the graph's own
-    ImageCompositeMasked already honoured the silhouette inside the crop.
+    selection on BOTH paths. Without it the four knob operations below run on `new` as a
+    WHOLE — color_match in particular fits ONE per-channel affine to the stats of the
+    entire box and applies it to EVERY pixel — and that affine is dominated by the
+    regenerated region, so it visibly re-grades pixels the user never painted. Measured
+    live twice: the sailboat's blown-out sky (full frame, background mean-abs 24.6 vs
+    0.1 zeroed, RGB shift −38/−31/−1) and a 1% dog paint whose crop RING came back at
+    +34 (pure resampling alone measures 0.0 — the balloon is the knobs, not geometry).
+    Gated, the photo survives outside the paint's own feather, on both paths.
 
     Server-side rather than graph nodes, because the graph never sees the uncropped
     photo — no ComfyUI node could composite against it — and keeping it here means the
@@ -561,7 +570,8 @@ def paste_back(source_bytes: bytes, artifact_png: bytes, plan: dict, *,
         # raises (MaskError) rather than falling back to solid — a silent un-gated
         # paste is the exact defect this exists to prevent; the caller's except turns
         # it into the honest "could not be composited" note instead.
-        alpha = ImageChops.multiply(alpha, _gate_from_selection(selection_png, want))
+        alpha = ImageChops.multiply(alpha, _gate_from_selection(selection_png, want,
+                                                                 plan["box"]))
     out = base.copy()
     out.paste(new, (x0, y0), alpha)
     buf = io.BytesIO(); out.save(buf, DEFAULT_FORMAT)

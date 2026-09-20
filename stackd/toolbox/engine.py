@@ -198,7 +198,95 @@ def _patch_graph(graph: dict, spec: dict, *, source_filename: str, mask_filename
     wf.set_node(graph, wf.MASK_HEIGHT_NODE, "height", int(h))
     wf.set_node(graph, wf.MASK_SEED_NODE, "seed", int(seed))
     _apply_mode(graph, spec)
+    _apply_mask_geometry(graph, spec)
     return graph
+
+
+def _apply_mask_geometry(graph: dict, spec: dict) -> None:
+    """OVERRIDE the scaffold's CLIPSeg-era mask-branch defaults — the "mask was way bigger
+    than what I painted" fix (live: a 1.8% paint in Replace mode came back with half the
+    dog repainted, because the scaffold still carried expand=12 / blur 28 / clamp-grow 28
+    / grow_mask_by=6, the same constants imagegen's _submit_edit had to ABANDON for
+    exactly this defect: "a fixed 28 px here is what made small objects balloon to fill an
+    oversized mask").
+
+    A PAINTED mask needs none of it: masks.normalize_layers already applied each object's
+    grow/shrink/feather exactly once, and re-growing in the graph dilates the user's
+    intent (and, in Replace mode, paints the prompt across the dilated ring). So the
+    composite honours the silhouette AS PAINTED — the soft-edge chain (31→32→33→34→35) is
+    deleted and both consumers (preview node 28, composite node 30) take the mask straight
+    from node 16, which now passes it through (expand 0). Two spec knobs remain honest:
+
+      mask_expand   >0 re-grows node 16 (and grow_mask_by with it) — the documented
+                    "expand the paint region" affordance the UI advertises.
+      mask_edge     >0 rebuilds the soft-edge chain scaled from it, with the dilated
+                    clamp imagegen's Bug 3 proved necessary (clamping against the RAW
+                    mask would zero alpha in one pixel at the boundary).
+
+    ColorMatchV2 (node 26, fed by the strength PrimitiveFloat node 7) is REMOVED from
+    the painted path outright: it fitted the generated crop to the GLOBAL stats of the
+    whole photo (measured +34 mean-abs pushed outside a hard-edited square), while the
+    server-side paste_back already colour-matches the pasted region against the LOCAL
+    ring pixels it must blend with — and spec.color_match drives THAT one, so 0 means
+    off end to end.
+    """
+    from stackd.imagegen import workflows as wf
+    try:
+        expand = max(0, min(64, int((spec or {}).get("mask_expand") or 0)))
+    except (TypeError, ValueError):
+        expand = 0
+    try:
+        edge = max(0, min(64, int((spec or {}).get("mask_edge") or 0)))
+    except (TypeError, ValueError):
+        edge = 0
+
+    graph[wf.MASK_GROW_NODE]["inputs"]["expand"] = expand
+    # tapered_corners left EXACTLY as the scaffold ships it: at expand 0 it is inert
+    # (nothing grows), and mutating an input the user never asked about is how a
+    # "geometry" patch drifts into changing corner-rounding on someone's next request.
+
+    # VAEEncodeForInpaint (node 20): its grow_mask_by silently dilates WHICH latents get
+    # noise — the same balloon, second time. Follow the user's expand instead of the
+    # scaffold's baked 6. (No named constant upstream; the node-id layout is the contract.)
+    for nid, node in graph.items():
+        if node.get("class_type") == "VAEEncodeForInpaint":
+            node["inputs"]["grow_mask_by"] = expand
+
+    comp = graph[wf.MASK_COMPOSITE_NODE]["inputs"]
+    mt28 = graph.get("28")                              # MaskToImage feeding the preview
+    if edge <= 0:
+        # Hard composite straight from the painted silhouette (imagegen's edge_softness<=0
+        # branch, same wiring). Deleting 34 also makes the node-28 preview show the REAL
+        # gate the composite used — with the scaffold chain it previewed the blurred mask,
+        # not the painted one.
+        for nid in ("31", wf.MASK_BLUR_NODE, "33", "34", wf.MASK_CLAMP_MARGIN_NODE):
+            graph.pop(nid, None)
+        comp["mask"] = [wf.MASK_GROW_NODE, 0]
+        if mt28 is not None:
+            mt28["inputs"]["mask"] = [wf.MASK_GROW_NODE, 0]
+    else:
+        blur_radius = max(1, min(10, round(edge * 0.3)))
+        bl = graph.get(wf.MASK_BLUR_NODE)
+        if bl is not None:
+            bl["inputs"]["blur_radius"] = blur_radius
+            bl["inputs"]["sigma"] = max(0.1, min(10.0, blur_radius / 3))
+        graph[wf.MASK_CLAMP_MARGIN_NODE]["inputs"]["expand"] = blur_radius
+        # chain intact: 16→31→32→33→34(multiply, clamped against dilated 35)→30/28
+
+    # The graph's ColorMatchV2 (node 26, strength node 7) fits the generated crop to the
+    # GLOBAL stats of the whole scaled photo (node 13): measured a +34 mean-abs band
+    # pushed into the ring just outside a hard-edited square, and it is a pass that can
+    # never HELP the composite — the server's paste_back already colour-matches the
+    # region it pastes, against the LOCAL ring pixels it will be seen next to. A global
+    # affine mean/std transfer toward the untouched photo's palette IS the "blown-out
+    # highlights" family of defect. So node 30 takes the VAEDecodeTiled output (25)
+    # directly and the dead colour-match pair is dropped — ComfyUI never executes it.
+    # The spec knob still rides along for honesty: color_match 0 also zeroes the server
+    # pass (paste_back), and if the pair is ever rewired the node-7 value says what the
+    # user chose.
+    graph[wf.MASK_COMPOSITE_NODE]["inputs"]["source"] = [_graphs.DECODE_NODE, 0]
+    graph.pop(_graphs.COLOR_MATCH_NODE, None)
+    graph.pop(wf.MASK_COLOR_STRENGTH_NODE, None)
 
 
 def _apply_mode(graph: dict, spec: dict) -> None:
@@ -473,13 +561,17 @@ def comfy_render(job: dict, source: bytes, mask: bytes, *, on_prompt_id=None,
                 # original's outermost ring and read as a halo around a wholly regenerated
                 # image. There is no seam to hide at full frame.
                 feather=(_m.SEAM_FEATHER_PX if crop_plan else 0),
-                # Full-frame ALSO gates the paste by the painted selection: the graph's
-                # ImageCompositeMasked honoured the silhouette on the CROP path, but the
-                # server-side knob pass below runs on the artifact as a whole and, at
-                # full frame with an unmasked opaque paste, its color_match affine touched
-                # every pixel of the photo (the live "sky blew out after painting only the
-                # sail"). None on the crop path: the ring is part of that paste by design.
-                selection_png=(None if crop_plan else mask))
+                # BOTH paths gate the paste by the painted selection. The graph's own
+                # ImageCompositeMasked honoured the silhouette at render time, but the
+                # knob pass above runs on the artifact as a WHOLE: color_match fits one
+                # affine across the entire box (dominated by the regenerated region) and
+                # preserve_detail high-passes it everywhere, so an un-gated paste
+                # re-graded pixels the user never painted — measured live as the sail's
+                # blown-out sky (full frame) and half the dog repainted beside a 1% paint
+                # (crop ring: +34 mean-abs on the ring inside the box, resample alone
+                # measures 0.0). The ring stays in the LATENTS (model context) — it just
+                # no longer ships as pixels.
+                selection_png=mask)
         except Exception as e:  # noqa: BLE001 — hand back SOMETHING, never a blank
             paste_note = (f"the render could not be composited ({e.__class__.__name__}); "
                           "returning the model output alone")
@@ -522,6 +614,17 @@ def comfy_render(job: dict, source: bytes, mask: bytes, *, on_prompt_id=None,
                 (job or {}).get("id") or "?",
                 job.get("_chat_post") or "not attempted (no saved url)",
                 chat_id[:8] or "-")
+            # Ride the persisted provenance so the EDITOR can say it out loud — the
+            # user's complaint was "it just sits in the new window": the message IS
+            # appended, but OWU never live-pushes an external append, so the chat tab
+            # needs one refresh. The status line says which of the three states happened.
+            if job.get("_chat_post") and job.get("_crop_json"):
+                try:
+                    _cj = json.loads(job["_crop_json"])
+                    _cj["chat_post"] = job["_chat_post"]
+                    job["_crop_json"] = json.dumps(_cj)
+                except (ValueError, TypeError):
+                    pass
         return base64.b64encode(png).decode(), url
 
     art_b64, url = asyncio.run(_run())

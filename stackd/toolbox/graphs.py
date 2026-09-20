@@ -24,6 +24,8 @@ from stackd.imagegen import workflows as _wf
 # imagegen does rather than a duplicated literal.
 SEGMENT_NODE = _wf.MASK_SEGMENT_NODE            # "14"
 GROW_NODE = _wf.MASK_GROW_NODE                   # "16", consumes ["14", 0]
+DECODE_NODE = "25"                # VAEDecodeTiled — the raw model output
+COLOR_MATCH_NODE = "26"           # ColorMatchV2 — see engine._apply_mask_geometry
 SAVE_NODE = _wf.MASK_SAVE_NODE                   # "27"
 LOAD_IMAGE_NODE = _wf.MASK_LOAD_IMAGE_NODE       # "5", the photo
 

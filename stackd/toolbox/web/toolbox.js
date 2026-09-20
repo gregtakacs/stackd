@@ -1896,10 +1896,10 @@
     root.appendChild(labelled('prompt', el.prompt));
 
     var g4 = row('tb-grid');
-    // NOT yet wired into the render graph (see DEAD_KNOBS below): this mode is recorded
-    // with the job and echoed by the API, but _patch_graph never reads it. Values match
-    // ComfyUI's ImageBlend enum spellings (soft_light/hard_light) so the eventual
-    // rewire is a passthrough.
+    // WIRED since M2.1: paste_back composites the model output over the photo and applies
+    // this mode INSIDE the edited region (values match ComfyUI's ImageBlend spellings).
+    // It changes HOW the generation is married to the photo, never what is generated —
+    // which is why it sits below the prompt, next to the other compositing knobs.
     g4.appendChild(labelled('blend', select('blend', [
       ['normal', 'Normal'], ['multiply', 'Multiply'], ['screen', 'Screen'],
       ['overlay', 'Overlay'], ['soft_light', 'Soft light'], ['hard_light', 'Hard light'],
@@ -1907,6 +1907,14 @@
     g4.appendChild(ctl('variants', 'number', 1, 'variants', { min: 1, max: 4 }));
     g4.appendChild(ctl('seed', 'number', -1, 'seed (-1 random)', { min: -1, max: 4294967295, step: 1 }));
     root.appendChild(g4);
+    root.appendChild(mk('div', 'tb-hint',
+      'Blend says how the generation is laid over the photo inside the edit: Normal simply ' +
+      'replaces it (the right choice almost always). Multiply darkens toward the photo ' +
+      '(shadows, stains); Screen lightens (glow, haze, smoke); Overlay / Soft light / Hard ' +
+      'light keep the photo\'s light-dark pattern under the new colour (texture keepers); ' +
+      'Luminosity keeps only the generation\'s COLOUR and takes the photo\'s brightness; ' +
+      'Color keeps the photo\'s brightness and takes only the generation\'s hues — the last ' +
+      'two are recolour tools. If you never touched it, leave it on Normal.'));
 
     // Knobs whose values reach the server, are persisted with the job, and are then
     // ignored: engine._patch_graph wires only prompt/width/height/seed (plus the mask
@@ -2148,6 +2156,18 @@
     return bits;
   }
 
+  function chatPostNote(crop) {
+    // The user's "it just sits in the new window" answer: say what happened to the
+    // copy that goes back to the conversation. The append is server-side (OWU never
+    // live-pushes an external message), so 'posted' comes with the one refresh it
+    // needs — and 'failed' is admitted here rather than discovered in the chat.
+    var p = crop && crop.chat_post;
+    if (p === 'posted') return ' · also posted back into your chat (refresh the chat tab to see it)';
+    if (p === 'failed' || (p && p.indexOf('failed') === 0))
+      return ' · the chat hand-back did NOT go through — the image is still in your Open WebUI files';
+    return '';
+  }
+
   function pollJob(id, tries, tok) {
     // Poll rather than hold a connection open: an editor session should not depend on a
     // 10-minute in-flight request surviving a daemon restart or a proxy idle timeout.
@@ -2170,7 +2190,7 @@
 
         status('Rendered ' + list.length + ' image(s)' + (r.seed !== undefined ? ' · seed ' + r.seed : '')
                + (r.elapsed_s ? ' · ' + r.elapsed_s.toFixed(0) + 's' : '')
-               + cropNote(r.crop), 'ok');
+               + cropNote(r.crop) + chatPostNote(r.crop), 'ok');
         return;
       }
       status(progressLine(r, tries));
