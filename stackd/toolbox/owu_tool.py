@@ -23,11 +23,26 @@ requires: requests
 # the model only a neutral ui_component status (result_context below) — the editor's
 # own iframe:height postMessage (M0-verified protocol) sizes it.
 #
-# Configuration (Admin -> Functions -> import this file, then):
+# Configuration (Admin -> Tools -> import this file, then):
 #   VALVE stackd_base_url  — where the daemon answers FROM THIS CONTAINER
 #                            (default http://stackd:11444 on the shared compose network).
-#   VALVE mint_key         — the stackd admin bearer; leave empty to inherit the
-#                            container's OPENAI_API_KEY env (already set by compose).
+#   The caller-auth (the stackd admin bearer mint demands) resolves in this order,
+#   first non-blank wins — see _mint_caller_auth for why the ORDER is the design:
+#     1. VALVE mint_key          — explicit override, encrypted at rest when
+#                                  ENABLE_VALVE_ENCRYPTION is on.
+#     2. env STACKD_MINT_KEY     — a deployment-level override for hosts without a
+#                                  mounted secret.
+#     3. VALVE mint_key_file     — the mounted compose secret, by default
+#                                  /run/secrets/ollama_token: the same file the daemon
+#                                  itself reads (STACKD_API_KEY_FILE), so a stack that
+#                                  already mounts the secret needs NO secret pasted
+#                                  anywhere and no secret ever enters the DB.
+#     4. env OPENAI_API_KEY      — legacy inheritance; kept last because in a real
+#                                  Open WebUI container it is set to the EMPTY string
+#                                  (chat credentials live in the DB, not the
+#                                  environment), so treating it as a hit guarantees a
+#                                  403 mint_requires_caller_auth. Empty/blank is never
+#                                  a hit at any step.
 # stackd's OWN side must have STACKD_TOOLBOX_PUBLIC_URL set (browser-reachable base);
 # mint answers a clear reason string if it is not — surface that text to the operator.
 
@@ -42,10 +57,51 @@ class Tools:
     class Valves(BaseModel):
         stackd_base_url: str = "http://stackd:11444"
         mint_key: str = ""
+        mint_key_file: str = "/run/secrets/ollama_token"
         timeout_s: int = 20
 
     def __init__(self):
         self.valves = self.Valves()
+
+    def _mint_caller_auth(self):
+        """The stackd admin bearer this Function must present to /toolbox/mint, resolved
+        from SERVER-side sources only (valve -> STACKD_MINT_KEY -> mounted secret file ->
+        OPENAI_API_KEY). Returns (key, source_label); the label rides into the failure
+        text, because the whole class of bug this fixes was a silent empty bearer whose
+        403 named neither the file nor the valve that was actually in force.
+
+        Blank-at-every-step is enforced deliberately, not tidily: compose-set
+        OPENAI_API_KEY= is a PRESENT, EMPTY variable in the deployed container, and an
+        `or`-chain that treated presence as a hit shipped a bearer of nothing."""
+        cands = (
+            ("valve mint_key", self.valves.mint_key),
+            ("env STACKD_MINT_KEY", os.environ.get("STACKD_MINT_KEY", "")),
+        )
+        for label, val in cands:
+            val = (val or "").strip()
+            if val:
+                return val, label
+        path = (self.valves.mint_key_file or "").strip()
+        note = ""
+        if path:
+            try:
+                with open(os.path.expanduser(path), "r", encoding="utf-8") as f:
+                    val = f.read().strip()          # secret files carry trailing newlines
+                if val:
+                    return val, "secret file " + path
+                note = "secret file %s is empty" % path
+            except OSError as e:
+                # Absent/unreadable is NOT terminal: a host that does not use compose
+                # secrets (the standalone deploy/, a dev box) has no such file, and
+                # aborting here would kill the OPENAI_API_KEY fallback for everyone who
+                # never had the mount. Keep looking, but remember the complaint so a
+                # dead-end chain reports the FILE as the suspect rather than blaming the
+                # env it eventually fell through to.
+                note = "unreadable secret file %s (%s)" % (path, e.__class__.__name__)
+        val = (os.environ.get("OPENAI_API_KEY", "") or "").strip()
+        if val:
+            return val, "env OPENAI_API_KEY"
+        return "", note or "no caller-auth source configured"
 
     async def open_mask_editor(self, __user__=None, __request__=None,
                                __chat_id__=None, __message_id__=None) -> HTMLResponse:
@@ -66,7 +122,12 @@ class Tools:
             "chat_id": headers.get("x-openwebui-chat-id") or __chat_id__ or "",
             "message_id": headers.get("x-openwebui-message-id") or __message_id__ or "",
         }
-        key = self.valves.mint_key or os.environ.get("OPENAI_API_KEY", "")
+        key, key_src = self._mint_caller_auth()
+        if not key:
+            return ("Comfy Toolbox: no stackd caller-auth is available to this Function "
+                    f"({key_src}). Set valve mint_key, export STACKD_MINT_KEY, or point "
+                    "valve mint_key_file at the mounted secret the daemon itself uses "
+                    "(default /run/secrets/ollama_token). Do not paste the key into chat.")
         try:
             r = requests.post(
                 self.valves.stackd_base_url.rstrip("/") + "/toolbox/mint",
@@ -82,7 +143,12 @@ class Tools:
             return f"Comfy Toolbox: daemon answered {r.status_code} with a non-JSON body."
         if r.status_code != 200 or not data.get("ok"):
             reason = data.get("reason") or data.get("error") or f"HTTP {r.status_code}"
-            return (f"Comfy Toolbox could not open: {reason}. If the answer is an "
+            caller = ""
+            if reason in ("mint_requires_caller_auth", "mint_not_configured"):
+                # The one failure whose cause is THIS file rather than the user's chat:
+                # name the source that supplied the bearer (never the bearer itself).
+                caller = f" (this Function sent a bearer from {key_src})"
+            return (f"Comfy Toolbox could not open: {reason}{caller}. If the answer is an "
                     "unregistered user or a missing image, relay it; if the edit is "
                     "describable without painted control, edit_image can serve instead.")
         html = data.get("html") or ""

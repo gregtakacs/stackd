@@ -77,11 +77,16 @@ services:
       # file, deliberately NOT the cost ledger, so a toolbox bug can never skew savings.
       - STACKD_TOOLBOX_SECRET=${STACKD_TOOLBOX_SECRET:-${STACKD_API_KEY}}
       - STACKD_TOOLBOX_DB=/data/toolbox_jobs.db
-      # Mint caller-auth reuses STACKD_API_KEY (OWU already holds it as OPENAI_API_KEY,
-      # so the in-chat Tool needs no new secret); this is the browser-reachable base the
-      # embed iframe and retouch links are built from — NO container-internal fallback
-      # (the iframe fetches from the user's machine), and /toolbox/health reports
-      # mint:false until it is set.
+      # Mint caller-auth is STACKD_API_KEY by default; the in-chat Tool reads it from
+      # STACKD_MINT_KEY here rather than from OPENAI_API_KEY, because in Open WebUI that
+      # variable means "the OpenAI provider key" and is routinely set to something else
+      # (in the AI-STACK deployment it is set to the EMPTY string — chat credentials live
+      # in OWU's own DB, not the environment). The Tool also falls back to the mounted
+      # compose secret (valve mint_key_file, default /run/secrets/ollama_token), which is
+      # how AI-STACK supplies it with no env var at all. This is the browser-reachable
+      # base the embed iframe and retouch links are built from — NO container-internal
+      # fallback (the iframe fetches from the user's machine), and /toolbox/health
+      # reports mint:false until it is set.
       - STACKD_TOOLBOX_PUBLIC_URL=${STACKD_TOOLBOX_PUBLIC_URL:-}
       - LLM_BASE_URL=http://localhost:11444/v1     # self-loop for image-prompt rewriting
       - LLM_MODEL=${LLM_REWRITE_MODEL:-assistant}   # a pass-through name; prompt_llm.py forces no-think
@@ -156,6 +161,8 @@ services:
       # pre-wire stackd as the model backend
       - OPENAI_API_BASE_URL=http://stackd:11444/v1
       - OPENAI_API_KEY=${STACKD_API_KEY}
+      # the in-chat Comfy Toolbox Tool's mint caller-auth (see the stackd service note)
+      - STACKD_MINT_KEY=${STACKD_MINT_KEY:-${STACKD_API_KEY}}
       - ENABLE_OLLAMA_API=false
       # REQUIRED for the image MCP tools (per-user key + chat image lookup)
       - ENABLE_FORWARD_USER_INFO_HEADERS=true

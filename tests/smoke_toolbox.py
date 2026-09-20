@@ -1394,8 +1394,82 @@ def test_mint_seam():
           and 'headers.get("x-openwebui-user-email")' in owu)
     check("the OWU Tool hands the MODEL a neutral context, not the editor HTML",
           "result_context" in owu or "mask editor is open" in owu)
-    check("the OWU Tool carries the mint key from valve-or-env, never from the browser",
-          "os.environ.get(\"OPENAI_API_KEY\"" in owu and "self.valves.mint_key" in owu)
+    check("the OWU Tool carries the mint key from server-side sources only",
+          "os.environ.get(\"OPENAI_API_KEY\"" in owu and "self.valves.mint_key" in owu
+          and "self.valves.mint_key_file" in owu)
+    check("no caller-auth ever comes from a browser-supplied value",
+          "_mint_caller_auth(self)" in owu
+          and "request" not in owu.split("def _mint_caller_auth")[1].split("def ")[0])
+
+    # BEHAVIOURAL, not grep: the resolver alone is exec'd (the module drags
+    # fastapi/pydantic, but _mint_caller_auth needs only os + a valves object), so the
+    # precedence, the blank-is-not-a-hit rule and the fall-through-past-a-missing-file
+    # are actually RUN. The live container's OPENAI_API_KEY= (present, EMPTY) is case 5.
+    import ast as _ast
+    import os as _os
+    import tempfile as _tf
+    _cls = next(n for n in _ast.parse(owu).body
+                if isinstance(n, _ast.ClassDef) and n.name == "Tools")
+    _fn = next(n for n in _cls.body
+               if isinstance(n, _ast.FunctionDef) and n.name == "_mint_caller_auth")
+    _ns = {"os": _os}
+    exec(compile(_ast.Module(body=[_fn], type_ignores=[]), "<resolver>", "exec"), _ns)
+    resolve = _ns["_mint_caller_auth"]
+
+    class _V:
+        mint_key = ""
+        mint_key_file = ""
+
+    class _Self:
+        def __init__(self, valves):
+            self.valves = valves
+
+    def resolve_with(mint_key="", mint_key_file="", **env):
+        v = _V()
+        v.mint_key, v.mint_key_file = mint_key, mint_key_file
+        saved = dict(_os.environ)
+        for k in ("STACKD_MINT_KEY", "OPENAI_API_KEY"):
+            _os.environ.pop(k, None)
+        _os.environ.update({k: v2 for k, v2 in env.items()})
+        try:
+            return resolve(_Self(v))
+        finally:
+            _os.environ.clear()
+            _os.environ.update(saved)
+
+    with _tf.TemporaryDirectory() as d:
+        secret = d + "/ollama_token"
+        with open(secret, "w") as f:
+            f.write("  FILEKEY  \n")          # compose secret files end in \n
+        empty = d + "/empty"
+        open(empty, "w").close()
+        gone = d + "/no-such-mount"
+        check("caller-auth: an explicit valve beats every other source",
+              resolve_with(mint_key="VALVE", STACKD_MINT_KEY="E", OPENAI_API_KEY="O")
+              == ("VALVE", "valve mint_key"),
+              resolve_with(mint_key="VALVE", STACKD_MINT_KEY="E", OPENAI_API_KEY="O"))
+        check("caller-auth: STACKD_MINT_KEY env wins over the mounted secret",
+              resolve_with(mint_key_file=secret, STACKD_MINT_KEY="E") == ("E", "env STACKD_MINT_KEY"))
+        check("caller-auth: the mounted secret is used, whitespace-stripped, and named",
+              resolve_with(mint_key_file=secret, OPENAI_API_KEY="O")
+              == ("FILEKEY", "secret file " + secret))
+        check("caller-auth: a MISSING secret file falls through to OPENAI_API_KEY "
+              "(the no-compose-secrets host must keep working)",
+              resolve_with(mint_key_file=gone, OPENAI_API_KEY="O") == ("O", "env OPENAI_API_KEY"))
+        check("caller-auth: an EMPTY secret file also falls through",
+              resolve_with(mint_key_file=empty, OPENAI_API_KEY="O") == ("O", "env OPENAI_API_KEY"))
+        check("caller-auth: no source at all yields NO key — never a blank bearer",
+              resolve_with(mint_key_file=gone)
+              == ("", "unreadable secret file %s (FileNotFoundError)" % gone),
+              resolve_with(mint_key_file=gone))
+        check("caller-auth: the deployed container's OPENAI_API_KEY= (present, EMPTY) "
+              "is not treated as a hit",
+              resolve_with(OPENAI_API_KEY="")[0] == "")
+        check("caller-auth: a whitespace-only valve is not a hit either",
+              resolve_with(mint_key="   ", STACKD_MINT_KEY="E") == ("E", "env STACKD_MINT_KEY"))
+        check("caller-auth: the failure label names the FILE, not the env it fell through to",
+              "secret file" in resolve_with(mint_key_file=empty)[1]
+              and resolve_with(mint_key_file=empty)[0] == "")
 
 
 def test_prompt_captioning():

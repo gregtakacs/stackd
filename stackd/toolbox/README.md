@@ -297,11 +297,11 @@ the first draft were wrong and are fixed here):
 **M2** the in-chat embed mount — a thin native OWU Function returning `HTMLResponse` +
 `Content-Disposition: inline`, required because MCP tool returns do *not* get embed
 treatment — plus the `retouch_image` MCP tool for assistant-driven flows.
-  - **M2 DEPLOYED** (offline suite 555/555; live health `mint:true` at the public
+  - **M2 DEPLOYED** (offline suite 565/565; live health `mint:true` at the public
     front; the trust root is Open WebUI's
     server-vouched identity, and the browser never touches a secret. `/toolbox/mint`
-    is the INTERNAL mint seam — caller-auth'd with the daemon's own admin bearer (the
-    value OWU already holds as OPENAI_API_KEY; empty `mint_key` = route dead), user
+    is the INTERNAL mint seam — caller-auth'd with the daemon's own admin bearer (empty
+    `mint_key` = route dead), user
     asserted by the caller, gated on the OWU-key registry (`user_not_registered`
     403 before any GPU thought), refuses to mint when `STACKD_TOOLBOX_PUBLIC_URL` is
     unset (503 `no_public_base` — a wrong-but-200 link would open an editor that
@@ -325,6 +325,25 @@ treatment — plus the `retouch_image` MCP tool for assistant-driven flows.
     **NOT human-verified end-to-end yet**: the operator must import the Tool in Open
     WebUI (Admin → Tools, file `stackd/toolbox/owu_tool.py`) — the first in-chat open
     plus one real Render click is that verification (it doubles as M1's GPU smoke).
+  - **Where the Tool's caller-auth comes from.** `owu_tool.py._mint_caller_auth()`
+    resolves it server-side only, first non-blank wins: valve `mint_key` → env
+    `STACKD_MINT_KEY` → valve `mint_key_file` (default `/run/secrets/ollama_token`, the
+    SAME compose secret the daemon presents as `STACKD_API_KEY_FILE`) → env
+    `OPENAI_API_KEY`. Two hard-won details, both pinned behaviourally in
+    `smoke_toolbox` (the resolver is exec'd standalone — the module itself needs
+    fastapi/pydantic, which only exist in the OWU container): (a) **blank is never a
+    hit** — the deployed OWU container has `OPENAI_API_KEY=` *present and empty* (OWU
+    keeps chat credentials in its DB, not the environment), so the original
+    `valve or env` chain produced a bearer of nothing and a guaranteed 403
+    `mint_requires_caller_auth`; (b) **an absent secret file is not terminal** — it
+    falls through, or the no-compose-secrets host (`deploy/`, a dev box) would lose the
+    env fallback entirely. A dead-end chain names the file it could not read, and a
+    `mint_requires_caller_auth` reply names which source supplied the bearer (never the
+    bearer). Consequence for AI-STACK: `open-webui` already declares
+    `secrets: [ollama_token]`, so **no valve paste and no compose change is needed** —
+    verified live from inside the OWU container: resolver returns a 64-char key equal to
+    the daemon's own bearer, source label `secret file /run/secrets/ollama_token`, and
+    the mint answers 200 with a 165 KB editor document for a registered user.
 **M3** non-destructive layer stack, gallery, saved recipes, batch.
 **M4** video/music: multi-slot media tiers (`state.py`'s single `ImageSlot` -> per-kind
 slots), artifact-typed jobs, cleaner support for `SaveVideo`/`SaveAudio*` outputs, and
