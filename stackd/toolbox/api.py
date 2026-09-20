@@ -608,7 +608,14 @@ class Toolbox:
             # A mount without a resolvable photo is still a valid document to load:
             # the editor itself reports "no source image was handed to the editor",
             # which is the honest state rather than a 400 the harness would misread.
+            # The source FETCH can raise this too (deleted file, OWU hiccup) — and the
+            # document builder reads `before` unconditionally, so binding it here is
+            # not decoration: leaving it unbound turned this fallback into a live 500
+            # (UnboundLocalError) the moment a mint asked for a ref the server could
+            # not open. The offline suite never hit it because its fake source resolver
+            # returns None instead of raising — the check in smoke_toolbox pins both.
             source = b""
+            before = (0, 0)
         w, h = self._dims(spec, source) if source else (1024, 1024)
         return {
             "api": api_base,

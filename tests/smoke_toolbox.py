@@ -1304,6 +1304,19 @@ def test_mint_seam():
           and p.get("expires_in") == 900,
           {k: str(v)[:80] for k, v in p.items()})
     tok = p.get("token") or ""
+    # A photo that FAILS to fetch mid-mint (deleted file, OWU hiccup — _ingest_source
+    # raises ValueError, unlike the fake resolver's None) must still produce a loadable
+    # editor document. Live-found: the fallback branch left `before` unbound and the
+    # whole mount 500'd with UnboundLocalError.
+    def fetch_refuses(email, ref):
+        raise ValueError("OWU fetch failed")
+    tbf = make_tb(mint_key="minty", public_base="https://lab.example", source=fetch_refuses)
+    r = post(tbf, "/toolbox/mint", {"email": EMAIL, "source_ref": "/api/v1/files/gone/content"},
+             headers={"authorization": "Bearer minty"})
+    pf = r.payload or {}
+    check("mint: a photo whose fetch raises still yields a loadable editor document",
+          r.status == 200 and pf.get("ok")
+          and "createElement('canvas')" in (pf.get("html") or ""), r.payload)
     # The single-use launch contract bites ONLY when a queue is mounted — the stub
     # echo path deliberately does not redeem (there is no GPU spend to protect; see
     # h_job_create). Mount the established no-GPU fake so this really tests the
