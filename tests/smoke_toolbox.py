@@ -169,6 +169,13 @@ def spot_mask():
 
 
 PHOTO = png_bytes("RGB", (640, 480), lambda x, y, s: ((x * 3) % 256, (y * 3) % 256, 128))
+# The photo's OWN base64, for asserting a document really carries the pixels. Never
+# assert on the bare "data:image/png;base64," prefix: toolbox.js contains that literal
+# five times as a concatenation template (im.src = 'data:image/png;base64,' + b64), so
+# the prefix is in EVERY document whether or not a photo was fetched. A check written on
+# it passes vacuously — which is precisely how "No source image was handed to the editor"
+# reached a live browser with 581 offline checks green.
+PHOTO_B64 = base64.b64encode(PHOTO).decode()
 MASK = rect_mask((640, 480), (200, 150, 300, 250))
 MASK_B64 = base64.b64encode(MASK).decode()
 TOK = T.mint(SECRET, scope="launch", email=EMAIL)
@@ -918,7 +925,7 @@ def test_routes():
     check("embed inlines css+js, references nothing relatively",
           "<style>" in doc and "window.__TB__" in doc and 'src="' not in doc and 'href="' not in doc)
     check("embed carries the photo as a data URI (the frame never fetches it)",
-          "data:image/png;base64," in doc)
+          PHOTO_B64 in doc)
     check("embed leaves no unsubstituted tokens", "__TB_SCRIPT__" not in doc)
 
     # the transport probe: bytes survive the trip, identity comes from the token
@@ -1258,7 +1265,13 @@ def test_mint_seam():
     — the part that makes the seam worth having — that the minted token is the SAME
     single-use artifact /toolbox/launch mints: reads ride it, first submit redeems it,
     the replay is refused."""
-    tb = make_tb(mint_key="minty", public_base="https://lab.example")
+    # Ref-SENSITIVE on purpose: the suite's default fake hands back PHOTO for ANY ref,
+    # including "", which is how 580 checks stayed green while the mint path resolved an
+    # empty ref and mounted an editor with no photo at all. A fake that mirrors the real
+    # resolver (engine.make_source returns None for a blank ref) is what makes "the
+    # pixels actually arrived" assertable rather than inferred from a echoed label.
+    tb = make_tb(mint_key="minty", public_base="https://lab.example",
+                 source=lambda email, ref: PHOTO if (email and ref) else None)
 
     def mint(body, key="minty"):
         return post(tb, "/toolbox/mint", body,
@@ -1306,6 +1319,11 @@ def test_mint_seam():
           # re-signing the repaired payload and matching the pasted signature).
           and "token=" not in p.get("url", "") and "." not in p.get("url", "").split("/e/")[1]
           and p.get("token") and "createElement('canvas')" in (p.get("html") or "")
+          # THE check that matters, and the one the old suite lacked: the photo's OWN
+          # bytes in the document, not merely the ref echoing back through the cfg label
+          # (and not the data-URI prefix, which shipped JS always contains — see
+          # PHOTO_B64).
+          and PHOTO_B64 in (p.get("html") or "")
           and "/api/v1/files/photo/content" in (p.get("html") or "")
           and p.get("expires_in") == 900,
           {k: str(v)[:80] for k, v in p.items()})
@@ -1317,8 +1335,14 @@ def test_mint_seam():
     body = (doc.raw or b"").decode("utf-8", "replace")
     check("editor link: the short code serves the editor document with the token inlined",
           doc.status == 200 and "createElement('canvas')" in body and tok in body
+          # The photo's own bytes must be IN the document the code route serves. This is
+          # the check that pins the live "No source image was handed to the editor" bug:
+          # the code route handed _embed_cfg a {"source_ref": ...} dict and the resolver
+          # only read image_id from a query, so it mounted empty.
+          and PHOTO_B64 in body
           and (doc.ctype or "").startswith("text/html"),
-          {"status": doc.status, "ctype": doc.ctype, "len": len(body)})
+          {"status": doc.status, "ctype": doc.ctype, "len": len(body),
+           "has_photo": PHOTO_B64 in body})
     again = get(tb, "/toolbox/e/" + code)
     check("editor link: re-fetching is allowed (a pre-Render refresh must not brick it)",
           again.status == 200, again.status)
@@ -1446,7 +1470,8 @@ def test_mint_seam():
         seen.update(email=email, chat_id=chat_id, message_id=message_id)
         return "/api/v1/files/from-chat/content"
     tb_chat = make_tb(mint_key="minty", public_base="https://lab.example",
-                      chat_source=resolver)
+                      chat_source=resolver,
+                      source=lambda email, ref: PHOTO if (email and ref) else None)
     r = post(tb_chat, "/toolbox/mint",
              {"email": EMAIL, "chat_id": "CH1", "message_id": "M2"},
              headers={"authorization": "Bearer minty"})
@@ -1457,10 +1482,20 @@ def test_mint_seam():
           # whole point of the short link is that nothing model-visible carries it.
           and (r.payload or {}).get("source_ref") == "/api/v1/files/from-chat/content"
           and "from-chat" in (r.payload or {}).get("html", "")
+          # pixels, not the label — see the source_ref/query asymmetry in _source_ref
+          and PHOTO_B64 in (r.payload or {}).get("html", "")
           and "from-chat" in (lambda _p: T._unb64(_p[1]).decode()
                               if len(_p) == 3 else "")(
                               (r.payload or {}).get("token", "").split(".")),
           (seen, {k: str(v)[:60] for k, v in (r.payload or {}).items() if k != "html"}))
+    # /toolbox/source.png is the harness panel A, and it reads the SAME resolver with a
+    # query dict — broken by the same one-key omission, so it is pinned here too.
+    sp = get(tb, "/toolbox/source.png?source_ref="
+             + urllib.parse.quote("/api/v1/files/panel/content", safe=""), token=tok)
+    check("source.png: a query source_ref really fetches the photo (not a 0-byte body)",
+          sp.status == 200 and (sp.raw or b"") == PHOTO
+          and (sp.ctype or "").startswith("image/"),
+          {"status": sp.status, "bytes": len(sp.raw or b""), "ctype": sp.ctype})
     tb_none = make_tb(mint_key="minty", public_base="https://lab.example")
     r = post(tb_none, "/toolbox/mint", {"email": EMAIL, "chat_id": "CH1"},
              headers={"authorization": "Bearer minty"})

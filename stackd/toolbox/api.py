@@ -314,6 +314,22 @@ class Toolbox:
             raise ValueError("no usable mask layers were submitted")
         return out
 
+    @staticmethod
+    def _source_ref(body, query) -> str:
+        """The ONE precedence for "which photo is this mount about", shared by the
+        resolver and the cfg label so they can never disagree again.
+
+        `source_ref` must be read from the QUERY as well as the body: /toolbox/mint and
+        /toolbox/e/<code> both hand the photo over in a query-shaped dict, and this line
+        reading only image_id there is what made a mounted editor load with NO photo
+        ("No source image was handed to the editor") while its own label cheerfully
+        echoed the ref back — the fetch saw "", the resolver refused it, and
+        _embed_cfg's fallback hid the reason. A caller-supplied ref is still bounded by
+        the resolver (fetched with the caller's OWN key, engine.make_source), so widening
+        which dict the key may appear in widens no access."""
+        return str(body.get("image_id") or body.get("source_ref")
+                   or query.get("image_id") or query.get("source_ref") or "")
+
     def _source_bytes(self, email, body, query) -> bytes:
         """Resolve the photo being edited. `image_id`/`source_ref` are opaque strings we
         handed the editor at launch — there is deliberately no URL field, for the reason
@@ -321,7 +337,7 @@ class Toolbox:
         footgun that has already fired once in this codebase)."""
         if self._source is None:
             raise ValueError("no source-image resolver is configured")
-        ref = body.get("image_id") or body.get("source_ref") or query.get("image_id") or ""
+        ref = self._source_ref(body, query)
         data = self._source(email, str(ref))
         if not data:
             raise ValueError("the source image could not be found for this user")
@@ -360,7 +376,7 @@ class Toolbox:
                 return data, size, _masks.image_size(data)
             return out, size, _masks.image_size(data)
         except Exception as e:  # noqa: BLE001 — a resize failure must not sink the request
-            self._note(f"toolbox: source not resized on ingest ({e.__class__.__name__}: {e})")
+            self._note(f"source not resized on ingest ({e.__class__.__name__}: {e})")
             return data, (0, 0), (0, 0)
 
     def _size_note(self, spec, w, h):
@@ -427,7 +443,7 @@ class Toolbox:
             # the raw text): that is the one field tying a browser's 403 back to a mint
             # line in the same log, which is how "the link is broken" gets answered
             # without handing a log full of credentials to anyone who tails it.
-            self._note(f"toolbox: {path} refused a token ({e}) "
+            self._note(f"{path} refused a token ({e}) "
                        f"jti={self._jti_hint(http, query)}")
             http._send_json(403, {"error": f"not authorised: {e}"}, self._cors())
         except ValueError as e:
@@ -638,6 +654,7 @@ class Toolbox:
         honestly. Shared by h_embed (browser-carried token) and h_mint (the Open WebUI
         mounts) so the two can never render two different editors."""
         spec = {"width": 0, "height": 0}
+        ref = self._source_ref({}, query)
         try:
             source, _after, before = self._ingest_source(email, {}, query)
         except ValueError:
@@ -652,12 +669,24 @@ class Toolbox:
             # returns None instead of raising — the check in smoke_toolbox pins both.
             source = b""
             before = (0, 0)
+            # Say out loud WHICH of the two this is. From the browser they are the same
+            # sentence, but one is the caller's fault (no ref handed over) and one is
+            # ours (a ref we minted that will not open) — and with nothing in the log the
+            # second looks like a broken secret, which is exactly how long this one took
+            # to find. Log-safe: ref is attacker-influenced text, so it is truncated and
+            # stripped of newlines rather than pasted in.
+            self._note("editor for {} mounted WITHOUT a photo — {} ({})".format(
+                email,
+                "no reference was supplied" if not ref else "ref would not open",
+                (ref[:60].replace("\n", " ")).replace("\r", "") if ref else "-"))
         w, h = self._dims(spec, source) if source else (1024, 1024)
         return {
             "api": api_base,
             "token": token,
             "image": ("data:image/png;base64," + base64.b64encode(source).decode()) if source else None,
-            "image_id": query.get("image_id") or query.get("source_ref") or "",
+            # Same expression the fetch used, so a document can never advertise a photo
+            # it did not actually load (the asymmetry behind the live no-photo mount).
+            "image_id": ref,
             # The canvas ceiling the EDITOR must obey, which is the same number the
             # server renders at. masks.RENDER_MAX_SIDE is the single source of truth.
             "max_side": _masks.RENDER_MAX_SIDE,
