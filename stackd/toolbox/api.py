@@ -824,7 +824,8 @@ class Toolbox:
             # Empty, not merely small: a blemish brush is legitimately ~0.2%, and the
             # paint number ignores feather so a wide blend can't mask an empty stroke.
             raise ValueError("the mask selects nothing at all, so nothing would be "
-                             "painted — paint the area to change, then Preview")
+                             "painted — paint the area to change; the live mask preview "
+                             "shows what the server sees")
         job_id = hashlib.sha256(f"{email}|{time.time_ns()}|{w}|{h}".encode()).hexdigest()[:16]
         seed = _as_int(spec.get("seed"), -1)
         kind = str(spec.get("kind") or "edit")

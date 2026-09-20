@@ -68,8 +68,13 @@
       var g = c.getContext('2d'); g.fillStyle = 'rgb(255,0,255)'; g.fillRect(0, 0, 12, 12);
       var b64 = c.toDataURL('image/png').split(',')[1];
       return Promise.resolve({ ok: true, status: 200, json: function () {
+        // FIXTURE HOOK: the empty/tiny verdicts are the SERVER's judgement; the suite
+        // raises the flag on the window to make the stub answer as if the paint were
+        // zero (the editor must report it without being asked).
+        if (window.__PVEMPTY) return Promise.resolve({ ok: true, overlay_png: b64,
+                                 coverage: 0, info: { size: [160, 320] }, empty: true, tiny: false });
         return Promise.resolve({ ok: true, overlay_png: b64, coverage: 0.0314,
-                                 info: { size: [160, 320] }, empty: false, tiny: false });
+                                 info: { size: [160, 320] }, empty: false, tiny: !!window.__PVTINY });
       }});
     }
     if (String(url).indexOf('mask/click') !== -1) {

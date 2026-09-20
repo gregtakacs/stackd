@@ -566,6 +566,23 @@ def LEGACY_STALEOVERLAY(s):
     return s.replace(an2, 'r.feather, r.area >> 4,', 1)
 
 
+# THE VESTIGIAL BUTTON, restored: a manual 'Preview mask' press for the server answer
+# that already arrives on its own with every paint - theatre the user retired.
+def LEGACY_PREVIEWBTN(s):
+    an = "    var actions = row('tb-actions');"
+    assert s.count(an) == 1, 'actions row anchor moved'
+    return s.replace(an, an + NL +
+        "    actions.appendChild(btn('Preview mask', function () { status('Previewing mask (server-side, no GPU)…'); }, 'tb-key'));", 1)
+
+
+# THE SILENT ZERO: the automatic round-trip swallows the server's empty/tiny verdict,
+# so a mask that selects NOTHING costs a full render before the user finds out.
+def LEGACY_NOWARN(s):
+    an = "      if (r.empty || r.tiny) {"
+    assert s.count(an) == 1, 'runPreview verdict anchor moved'
+    return s.replace(an, "      if (false && (r.empty || r.tiny)) {", 1)
+
+
 MUTANTS["nofold"] = LEGACY_NOFOLD
 # THE FEATHER-VANISHING-COMMIT, restored: the region rebuild hard-zeroed brush
 # edge/feather while stamp() had already given the stroke the slider numbers - the soft
@@ -683,6 +700,8 @@ MUTANTS["toolvis"] = LEGACY_TOOLVIS
 MUTANTS["panedits"] = LEGACY_PANEDITS
 MUTANTS["armleak"] = LEGACY_ARMLEAK
 MUTANTS["dashbox"] = LEGACY_DASHBOX
+MUTANTS["previewbtn"] = LEGACY_PREVIEWBTN
+MUTANTS["nowarn"] = LEGACY_NOWARN
 MUTANTS["zoomlie"] = LEGACY_ZOOMLIE
 MUTANTS["fluidbox"] = LEGACY_FLUIDBOX
 
@@ -746,7 +765,7 @@ def main():
         print('COMPOSE TRACE:')
         for i, d in enumerate(res['dbg'][:10]):
             print('  ', i, d)
-    EXPECT = 158   # 142 + 16 ownership round-2: visibility x6 (pair NEVER shown), KF promise x2,
+    EXPECT = 160   # 158 + 2 preview-button removal: button gone x1, unprompted-empty-verdict x1: visibility x6 (pair NEVER shown), KF promise x2,
                    # fresh-hard x1, no-arm-leak x1, no-dashed-box x1, ZM honesty x3, A3 belt x1
                  # wire-no-punch (2), feather-live group (4), re-merge no-remnant (3)
     if len(res["tests"]) != EXPECT:

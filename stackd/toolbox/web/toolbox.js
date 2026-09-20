@@ -1942,25 +1942,8 @@
   }
 
 
-  function doPreview() {
-    var m = exportMask();
-    if (!m) { status('Nothing painted yet.', 'bad'); return; }
-    status('Previewing mask (server-side, no GPU)…');
-    req('/toolbox/mask/preview', {
-      image: CFG.image || null, image_id: CFG.image_id || null,
-      mask_png: m, layers: exportLayers(), params: params()
-    }).then(function (r) {
-      if (r.overlay_png) showImage(r.overlay_png);
-      var c = 100 * (typeof r.coverage === 'number' ? r.coverage : 0);
-      var msg = 'Server sees ' + c.toFixed(2) + '% of the frame selected';
-      if (r.info && r.info.size) msg += ' · resampled to ' + r.info.size[0] + 'x' + r.info.size[1];
-      // empty vs tiny is the difference between a broken mask and a blemish-sized edit;
-      // collapsing them would make every spot-heal look like a failure.
-      if (r.empty) msg += ' — NOTHING SELECTED: the render would paint nothing.';
-      else if (r.tiny) msg += ' — small (fine for a spot, too small for an object).';
-      status(r.error || r.note || msg, r.empty ? 'bad' : (r.tiny ? 'warn' : 'ok'));
-    }).catch(function (e) { status('Preview failed: ' + e.message, 'bad'); });
-  }
+  // (doPreview retired with the Preview mask button — see actions above and runPreview.)
+
 
   function doAuto() {
     var text = (el.prompt.value || '').trim();
@@ -2276,6 +2259,16 @@
       mask_png: exportMask(), layers: exportLayers(), params: params()
     }, TOKEN).then(function (r) {
       if (seq !== _pvSeq) return;   // a newer request already won
+      // The verdicts the retired button used to deliver by hand, now automatic: zero is
+      // FAILURE (a render that paints nothing is a bug, not a result) and small-but-
+      // present is a WARN (legit for a blemish spot, wrong for an object). A healthy
+      // mask never shouts — the coverage readout already carries its number.
+      if (r.empty || r.tiny) {
+        var vm = 'Server sees ' + (100 * (r.coverage || 0)).toFixed(2) + '% of the frame selected'
+               + (r.info && r.info.size ? ' (resampled to ' + r.info.size[0] + 'x' + r.info.size[1] + ')' : '');
+        if (r.empty) status(vm + ' — NOTHING SELECTED: the render would change nothing.', 'bad');
+        else status(vm + ' — small (fine for a spot, too small for an object).', 'warn');
+      }
       var im = new Image();
       im.onload = function () {
         if (seq !== _pvSeq) return;
@@ -2588,7 +2581,10 @@
     el.out = row('tb-out');
 
     var actions = row('tb-actions');
-    actions.appendChild(btn('Preview mask', doPreview, 'tb-key'));
+    // ('Preview mask' retired at the user's call: the server overlay ALREADY arrives on
+    // its own — schedulePreview fires on every paint — so a button re-asking for the same
+    // answer was theatre. The one thing only the button delivered, the empty/tiny verdict,
+    // moved into runPreview below, where it lands automatically.)
     actions.appendChild(btn('Auto-mask from prompt', doAuto));
     actions.appendChild(btn('Render', doRender, 'tb-go'));
     actions.appendChild(btn('Cancel', doCancel, 'stop the running render (interrupts ComfyUI)'));

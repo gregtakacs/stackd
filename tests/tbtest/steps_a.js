@@ -123,7 +123,7 @@
   });
   step('live preview asserts', function () {
     var pv = previews();
-    T('preview fired WITHOUT pressing Preview mask', pv.length >= 1,
+    T('preview fired on its own — no button (the Preview mask affordance is retired)', pv.length >= 1,
       JSON.stringify(out.fetches.map(function (f) { return f.url.replace(/^.*\/toolbox/, ''); })));
     T('preview body carries the real API contract',
       pv.length && /^image,image_id,layers,mask_png,params$/.test(pv[0].keys), pv[0] && pv[0].keys);
@@ -196,6 +196,24 @@
   // Environment canary: if this Chrome uses overlay scrollbars, a vertical bar steals no
   // width and the Fit assertions below can only ever pass -- a vacuous green. Refuse to
   // pretend: prove the environment can exhibit the bug before crediting the fix.
+  step('preview button retired asserts', function () {
+    T('the Preview mask button is GONE from the actions row', !byText('Preview mask'),
+      [].slice.call(document.querySelectorAll('button')).map(function (b) { return b.textContent; }).join(','));
+    // The empty verdict the retired button used to deliver by hand must now arrive on
+    // the AUTOMATIC round-trip: force the stub to answer 'empty' (a paint so small the
+    // server calls it zero) and watch the status line, unprompted, say NOTHING SELECTED.
+    window.__PVEMPTY = true;
+    knobSet('tb_wash', 0.4);
+    return wait(700);
+  });
+  step('empty verdict surfaces unprompted', function () {
+    var st = (document.querySelector('.tb-status') || {}).textContent || '';
+    out.note.push('PVEMPTY status=' + st.slice(0, 90));
+    T('the live round-trip itself reports a zero mask as a FAILURE',
+      /NOTHING SELECTED/.test(st), st.slice(0, 120));
+    window.__PVEMPTY = false; knobSet('tb_wash', 0.45);  // shipped default
+    return wait(150);
+  });
   step('env canary', function () {
     var d = document.createElement('div');
     d.style.cssText = 'width:120px;height:80px;overflow:scroll;position:absolute;top:0;left:0;visibility:hidden';

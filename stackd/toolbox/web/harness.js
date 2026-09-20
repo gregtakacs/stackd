@@ -72,13 +72,13 @@
    * stage died — distinguishing "the sandbox blocked it" from "the harness never ran" from
    * "you have not done this step yet", which is the whole reason this page exists.
    * Missing cells are NAMED: an anonymous count once told a user the probe was silent when
-   * the truth was that they simply had not pressed Preview mask yet. */
+   * the truth was that they simply had not painted in that panel yet. */
   function missingOf(k, kind) {
     return CELLS[k].filter(function (c) { return c.kind === kind && !filled[c.id]; });
   }
   ['A', 'B'].forEach(function (k) {
     CELLS[k].forEach(function (c) {
-      if (c.kind === 'action') hint(c.id, 'not yet — press Preview mask in panel ' + k);
+      if (c.kind === 'action') hint(c.id, 'not yet — paint a stroke in panel ' + k);
     });
   });
   setInterval(function () {
@@ -101,7 +101,7 @@
     if (!silentProbe.length) {
       verdict('wait', 'RIG IS HEALTHY — waiting on you, not on the browser. Not yet done: ' +
               pending.map(function (c) { return c.what; }).join(', ') +
-              '. Drag on the photo in BOTH panels, then press Preview mask in BOTH.');
+              '. Drag on the photo in BOTH panels — the server round-trip fires on its own once you paint.');
       return;
     }
     var why;
@@ -223,22 +223,16 @@
     } catch (e) { log(k + ': script failed — ' + e.message); }
   }
 
-  function clickPreview(k) {
-    try {
-      var doc = frames[k].contentDocument;
-      if (!doc) { log(k + ': cannot click Preview in an opaque-origin frame — press it by hand'); return; }
-      [].slice.call(doc.querySelectorAll('button')).forEach(function (b) {
-        if (/Preview mask/.test(b.textContent)) b.click();
-      });
-    } catch (e) { log(k + ': preview click failed — ' + e.message); }
-  }
+  // (clickPreview retired with the Preview mask button: the server round-trip cell
+  //  fills from the AUTOMATIC preview now, so there is nothing left to click.)
+
 
   var ta = document.getElementById('t-a'), tb = document.getElementById('t-b'),
       tall = document.getElementById('t-all'),
       rel = document.getElementById('reload');
   if (ta) ta.addEventListener('click', function () { paintIn('A'); });
   if (tb) tb.addEventListener('click', function () { paintIn('B'); log('B is unscribable by design — drag on it yourself.'); });
-  if (tall) tall.addEventListener('click', function () { paintIn('A'); paintIn('B'); clickPreview('A'); });
+  if (tall) tall.addEventListener('click', function () { paintIn('A'); paintIn('B'); });
   // Bound here rather than in an inline script element in harness.html: the template is
   // meant to carry markup only, so every line of controller logic lives in one file that
   // the suite actually reads. (An inline handler was the last one, and it is gone. Do not
