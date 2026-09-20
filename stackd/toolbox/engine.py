@@ -472,7 +472,14 @@ def comfy_render(job: dict, source: bytes, mask: bytes, *, on_prompt_id=None,
                 # No border fade when the box IS the frame: a feathered edge would keep the
                 # original's outermost ring and read as a halo around a wholly regenerated
                 # image. There is no seam to hide at full frame.
-                feather=(_m.SEAM_FEATHER_PX if crop_plan else 0))
+                feather=(_m.SEAM_FEATHER_PX if crop_plan else 0),
+                # Full-frame ALSO gates the paste by the painted selection: the graph's
+                # ImageCompositeMasked honoured the silhouette on the CROP path, but the
+                # server-side knob pass below runs on the artifact as a whole and, at
+                # full frame with an unmasked opaque paste, its color_match affine touched
+                # every pixel of the photo (the live "sky blew out after painting only the
+                # sail"). None on the crop path: the ring is part of that paste by design.
+                selection_png=(None if crop_plan else mask))
         except Exception as e:  # noqa: BLE001 — hand back SOMETHING, never a blank
             paste_note = (f"the render could not be composited ({e.__class__.__name__}); "
                           "returning the model output alone")
@@ -488,6 +495,33 @@ def comfy_render(job: dict, source: bytes, mask: bytes, *, on_prompt_id=None,
             "note": paste_note,
         })
         url = await openwebui_client.save_image(png, "toolbox-edit.png", key)
+        # HAND BACK INTO THE CHAT: an editor that opens inline is only half a feature if
+        # its result stays trapped in the editor window. When the mint bound this session
+        # to a chat (the OWU Tool / MCP retouch pass chat_id through, signed into the
+        # launch token — the browser never supplies it), post the saved file as an
+        # assistant message the moment the render lands. Best-effort: a failed post is a
+        # note on the row, never a lost artifact (the file is saved and the editor shows
+        # it either way).
+        chat_id = str((job or {}).get("spec", {}).get("chat_id") or "")
+        posted = False
+        if chat_id and url:
+            try:
+                posted = await openwebui_client.post_chat_message(
+                    chat_id, f"Toolbox render — ![toolbox edit]({url})", key)
+            except Exception as e:  # noqa: BLE001 — post_chat_message guards too
+                job["_chat_post"] = f"failed ({e.__class__.__name__})"
+            else:
+                job["_chat_post"] = "posted" if posted else "failed"
+        if job.get("_chat_post") or chat_id:
+            # Name it in the log too (same logger name serve.py gives the queue, so
+            # `docker logs stackd | grep toolbox` answers "it never showed up in chat"
+            # from the server side without reproducing the flow).
+            import logging
+            logging.getLogger("stackd.toolbox").info(
+                "job %s: chat hand-back %s (chat %s…)",
+                (job or {}).get("id") or "?",
+                job.get("_chat_post") or "not attempted (no saved url)",
+                chat_id[:8] or "-")
         return base64.b64encode(png).decode(), url
 
     art_b64, url = asyncio.run(_run())

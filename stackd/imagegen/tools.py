@@ -1522,7 +1522,11 @@ async def retouch_image(ctx: Context) -> str:
         # Short-link mint (never mint_launch's raw token): the returned URL is text this
         # response hands to a model to publish, and a 250-char base64 credential does not
         # survive that trip intact — see tokens.mint_link for the live 403 it caused.
-        _token, _code, url = tb.mint_editor_link(email, image_ref)
+        # chat_id (forwarded by OWU, not model-suppliable) is stamped into the token so
+        # the finished render is posted back into THIS conversation, not just saved to
+        # the file library.
+        chat_id = (headers.get("X-OpenWebUI-Chat-Id") or "").strip()
+        _token, _code, url = tb.mint_editor_link(email, image_ref, chat_id=chat_id or None)
     except ValueError as e:
         return f"Cannot open the mask editor: {e}"
     return (f"Mask editor ready for the most recent image in this chat.\n\n"

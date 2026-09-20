@@ -161,6 +161,8 @@ class Tools:
                          headers={"Content-Disposition": "inline"}),
             "Comfy Toolbox mask editor is open for the user: they paint the area, tune "
             "edge/feather per object, pick Edit or Replace, and press Render; the result "
-            "saves to their own Open WebUI files. The link is single-use (~15 min). Do "
-            "not call edit_image for this same request now the user has the controls.",
+            "saves to their own Open WebUI files AND is posted back into this chat as a "
+            "new assistant message automatically when the render finishes (the mint "
+            "carried this chat's id — do not call edit_image for this same request now "
+            "the user has the controls).",
         )

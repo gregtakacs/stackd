@@ -385,6 +385,40 @@ treatment — plus the `retouch_image` MCP tool for assistant-driven flows.
     (a token-in-URL used to survive one) — the visible cost is "ask again", which is
     what the 404 says. The OWU Tool path is unaffected either way: it returns the
     document itself, so the model never saw that URL at all.
+  - **The first human paint (sailboat) found two real defects. Both fixed, both pinned.**
+    (a) **Whole-photo regrade on full-frame pastes.** A tall selection (a sail) makes
+    `plan_crop` decline (bbox > `CROP_AFFORDABLE` of the frame) and the render runs the
+    whole frame; `paste_back` then pasted the model output with a SOLID alpha, so the
+    compositing knobs — which were designed for a small crop — touched every pixel:
+    `color_match` fits ONE per-channel affine to the stats of the ENTIRE frame (dominated
+    by the regenerated region) and applies it everywhere. Measured on a synthetic sky +
+    painted square, shipped knobs (0.9/0.35): background mean-abs-diff **24.6**
+    (RGB mean shift −38/−31/−1 — the user's "sky became blown out"); knobs zeroed:
+    **0.1**. Fix: `paste_back(selection_png=...)` ANDs the paste alpha with the painted
+    selection (hard-edged — the graph's own soft-edge chain already converges `new` onto
+    the photo at the silhouette, and a blurred gate was measured bleeding 30+ levels past
+    the paint), and `comfy_render` passes it ONLY on the full-frame path; the crop path
+    keeps its ring paste (the ring is deliberately regenerated context) and the graph's
+    `ImageCompositeMasked` inside the crop still honours the silhouette. The pre-existing
+    pin that asserted red corners for a 2px-inset selection was **pinning the bug** — the
+    suite asserted "full-frame replaces everything" while calling that mask-honouring;
+    it now asserts unpainted pixels byte-preserve AND that an edge-to-edge paint still
+    reaches the border (halo mutant kept, split into two honest directions).
+    (b) **The artifact never reached the chat.** Two independent causes: the OWU Tool was
+    imported but NEVER ATTACHED to the chat model (Admin → Models → tool_ids), so the
+    model could only reach the MCP `retouch_image` → markdown link → new tab, not the
+    inline embed; and nothing carried `chat_id` to the render at all — mint resolved the
+    chat image then dropped the id. Now: `chat_id` is stamped into the launch token as a
+    SERVER-asserted claim at mint (Tool body / MCP forwarded header), `h_job_create`
+    copies it from the verified payload into the persisted spec (a body-smuggled value is
+    overwritten; a claimless token yields NO hand-back even if the browser types one —
+    XSS in the editor cannot post a render into someone else's thread; OWU chat access is
+    per-user anyway), and `comfy_render` posts `![toolbox edit](saved-url)` back through
+    `openwebui_client.post_chat_message` (GET chat → append to history.messages → POST
+    back; the route's reconcile never infers deletes from missing ids, so an append is
+    safe). A failed post is a log line + `_chat_post` on the job, never a lost artifact.
+    Suite now 590/590 offline (+9), 162/162 browser; the gate's mutant (ignore
+    selection_png) is caught by the new border check.
 **M3** non-destructive layer stack, gallery, saved recipes, batch.
 **M4** video/music: multi-slot media tiers (`state.py`'s single `ImageSlot` -> per-kind
 slots), artifact-typed jobs, cleaner support for `SaveVideo`/`SaveAudio*` outputs, and

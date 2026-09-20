@@ -35,6 +35,9 @@ not call edit_image alongside it for the same edit in the same turn -- the user 
 drives or you drive, not both. After calling, put the link in your reply with one line of
 guidance: paint the area to change; the Selection box (tap an object with the select tool)
 holds the edge/feather tuning; Render runs the edit and the artifact saves into their own
-Open WebUI files (it does NOT re-post into the chat). If the tool returns a plain-text
+Open WebUI files AND lands back in this conversation automatically as a new message when
+the render finishes (the link's session already carries this chat's id — do not ask the
+user to paste it back, and do not announce a result you did not produce: the toolbox
+posts its own result line). If the tool returns a plain-text
 failure (no image in chat, not registered, toolbox not mounted), relay it honestly and
 fall back to edit_image only if the user's request is describable without painted control.

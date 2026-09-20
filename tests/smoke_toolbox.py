@@ -1488,6 +1488,54 @@ def test_mint_seam():
                               if len(_p) == 3 else "")(
                               (r.payload or {}).get("token", "").split(".")),
           (seen, {k: str(v)[:60] for k, v in (r.payload or {}).items() if k != "html"}))
+
+    # ---- CHAT HAND-BACK: chat_id is a SERVER-ASSERTED claim -----------------------
+    # The user's live defect #1: the finished render never reached the conversation.
+    # The return channel is comfy_render's post_chat_message, driven by spec["chat_id"]
+    # — which may ONLY come from the verified launch token's claim, never the request
+    # body (the browser could type anything). These pins make a regression of that
+    # precedence a red gate.
+    rows = {}
+    tbw2 = make_tb(mint_key="minty", public_base="https://lab.example",
+                   chat_source=lambda e, c, m: "/api/v1/files/in-chat/content",
+                   source=lambda email, ref: PHOTO if (email and ref) else None,
+                   worker=J.JobQueue(J.JobStore(":memory:"),
+                                     render=lambda job, s, m, **kw: (None, None)))
+    rm = post(tbw2, "/toolbox/mint", {"email": EMAIL, "chat_id": "CH-HAND"},
+              headers={"authorization": "Bearer minty"})
+    tok_h = (rm.payload or {}).get("token") or ""
+    claim = (lambda _p: T._unb64(_p[1]).decode() if len(_p) == 3 else "")(tok_h.split("."))
+    check("mint: chat_id rides the launch token as a signed claim",
+          rm.status == 200 and '"chat_id":"CH-HAND"' in claim, claim[:120])
+    c = post(tbw2, "/toolbox/jobs",
+             {"mask_png": base64.b64encode(soft).decode(),
+              "source_ref": "/api/v1/files/in-chat/content",
+              "spec": {"prompt": "x", "chat_id": "FORGED-BY-BROWSER"}},
+             headers={"authorization": "Bearer " + tok_h})
+    rows["job_id"] = (c.payload or {}).get("job_id")
+    row = tbw2._worker.store.get(rows["job_id"]) if rows.get("job_id") else None
+    persisted = json.loads((row or {}).get("spec_json") or "{}")
+    check("job create: the persisted chat_id is the TOKEN's claim, not the body's "
+          "(forged body value overwritten)",
+          c.status == 200 and persisted.get("chat_id") == "CH-HAND", persisted)
+    check("job create: the create echo shows the same truth the worker will see",
+          (c.payload or {}).get("spec", {}).get("chat_id") == "CH-HAND")
+    # A token minted WITHOUT the claim (source_ref mount) must carry no hand-back,
+    # even if the browser smuggles one into the body — otherwise any XSS in the
+    # editor could post the user's renders into an arbitrary chat id.
+    rn = post(tbw2, "/toolbox/mint",
+              {"email": EMAIL, "source_ref": "/api/v1/files/in-chat/content"},
+              headers={"authorization": "Bearer minty"})
+    tok_n = (rn.payload or {}).get("token") or ""
+    c = post(tbw2, "/toolbox/jobs",
+             {"mask_png": base64.b64encode(soft).decode(),
+              "source_ref": "/api/v1/files/in-chat/content",
+              "spec": {"prompt": "x", "chat_id": "SMUGGLED"}},
+             headers={"authorization": "Bearer " + tok_n})
+    row = tbw2._worker.store.get((c.payload or {}).get("job_id"))
+    persisted = json.loads((row or {}).get("spec_json") or "{}")
+    check("job create: a smuggled spec.chat_id with no token claim is DROPPED, not honoured",
+          c.status == 200 and "chat_id" not in persisted, persisted)
     # /toolbox/source.png is the harness panel A, and it reads the SAME resolver with a
     # query dict — broken by the same one-key omission, so it is pinned here too.
     sp = get(tb, "/toolbox/source.png?source_ref="
@@ -1524,7 +1572,7 @@ def test_mint_seam():
     it_src = (root / "imagegen" / "tools.py").read_text()
     sv_src = (root / "serve.py").read_text()
     check("the MCP retouch tool mints through the ONE mint seam, in-process",
-          "def retouch_image(" in it_src and "tb.mint_editor_link(email, image_ref)" in it_src
+          "def retouch_image(" in it_src and "tb.mint_editor_link(email, image_ref, chat_id=" in it_src
           and "def set_toolbox_ref(" in it_src
           and "set_toolbox_ref(toolbox)" in sv_src)
     check("retouch hands out the SHORT link, never a token in a URL (model-retypeable)",
@@ -3001,6 +3049,16 @@ def test_render_seam():
             return "http://owu/x/" + filename
 
         ow.save_image = save_image
+
+        async def post_chat_message(chat_id, content, api_key):
+            # Records WHAT would land in the conversation. A state["chatpost_fail"]
+            # (or behaviour "chatpost_fail") makes it report failure the way a dead
+            # OWU would — the render must survive it.
+            state.setdefault("posts", []).append((chat_id, content, api_key))
+            return not (state.get("chatpost_fail") or
+                        state.get("behaviour") == "chatpost_fail")
+
+        ow.post_chat_message = post_chat_message
         return cc, ow
 
     class FakeRuntime:
@@ -3154,20 +3212,60 @@ def test_render_seam():
     out2 = M.image_size(art2)
     check("render seam: a full-frame artifact stays at the working size (no needless upscale)",
           out2 == CANVAS, "%s" % (out2,))
-    # The halo mutant: any border fade at full frame keeps a ring of the ORIGINAL (green)
-    # around a wholly regenerated image (red). Asserting EVERY pixel is the model's output
-    # is what makes that mutant die -- _seam_alpha's own unit test cannot see it, because
-    # the bug is which feather value the seam passes, not what the helper does with it.
+    # THE WHOLE-PHOTO REGRADE GUARD (the live sailboat: paint the sail, the sky blew out).
+    # This selection stops 2 px short of every border, so the outermost ring is UNPAINTED
+    # — pasting the model's (red) output over it, with the compositing knobs' whole-frame
+    # histogram ops riding along, is exactly the shipped defect. Gated by the selection,
+    # the ring must come back as the user's ORIGINAL (green) and the painted interior as
+    # the model's (red). This check fails loudly (4 checks, in fact) if the paste ever
+    # goes opaque at full frame again — the version of this pin that predates the fix
+    # asserted red corners here and thereby PINNED THE BUG.
     px2 = Image.open(io.BytesIO(art2)).convert("RGB")
-    flat = px2.resize((1, 1)).getpixel((0, 0))
     corners = [px2.getpixel(p) for p in [(0, 0), (out2[0] - 1, 0), (0, out2[1] - 1),
                                          (out2[0] - 1, out2[1] - 1)]]
-    check("render seam: a full-frame render has NO ring of the original surviving at its edge",
-          all(c == (250, 10, 10) for c in corners) and flat == (250, 10, 10),
-          "corners=%s mean=%s" % (corners, flat))
+    centre = px2.getpixel((out2[0] // 2, out2[1] // 2))
+    check("render seam: a full-frame render leaves UNPAINTED pixels at the border alone "
+          "(selection-gated paste — the sailboat regrade)",
+          all(c == (10, 200, 10) for c in corners) and centre == (250, 10, 10),
+          "corners=%s centre=%s" % (corners, centre))
+    # The halo mutant still dies: with the paint reaching the edges, EVERY pixel —
+    # including the corners — must be the model's output; a stray border fade at full
+    # frame would keep a green ring around a wholly painted image. (The blur inside the
+    # gate is ~2px; at the extreme corner a hard-edged 0..W selection keeps it model-red.)
+    edge = mask_png(CANVAS, (0, 0, CANVAS[0], CANVAS[1]))
+    _st3, art3, _job3 = drive(edge)
+    px3 = Image.open(io.BytesIO(art3)).convert("RGB")
+    flat = px3.resize((1, 1)).getpixel((0, 0))
+    corners3 = [px3.getpixel(p) for p in [(0, 0), (out2[0] - 1, 0), (0, out2[1] - 1),
+                                          (out2[0] - 1, out2[1] - 1)]]
+    check("render seam: an edge-to-edge selection still pastes to the very edge "
+          "(no full-frame border fade / halo mutant)",
+          all(c == (250, 10, 10) for c in corners3) and flat == (250, 10, 10),
+          "corners=%s mean=%s" % (corners3, flat))
     prov2 = json.loads(job2["_crop_json"])
     check("render seam: a full-frame render records cropped=false",
           prov2["cropped"] is False, repr(prov2)[:120])
+    # ---- chat hand-back through the REAL render seam (GPU-free) --------------------
+    # spec["chat_id"] set (the claim h_job_create stamped) => exactly one post to the
+    # OWU chat carrying the saved-file URL; absent => no post at all. A failed post
+    # must never cost the render (artifact still returned, note recorded).
+    st_p, art_p, job_p = drive(full, spec={"chat_id": "CH-HAND"})
+    posts = st_p.get("posts") or []
+    check("render seam: a chat-bound job posts the finished render back to the chat",
+          art_p is not None and len(posts) == 1 and posts[0][0] == "CH-HAND"
+          and "http://owu/x/toolbox-edit.png" in posts[0][1] and posts[0][2] == "key-for-a@b.c",
+          repr([(c, x[:40]) for c, x, _k in posts])[:160])
+    check("render seam: the hand-back outcome is recorded on the job for the log",
+          job_p.get("_chat_post") == "posted", repr(job_p.get("_chat_post")))
+    st_n, art_n, job_n = drive(full)
+    check("render seam: a job with no chat binding posts NOTHING to any chat",
+          art_n is not None and not st_n.get("posts")
+          and "_chat_post" not in job_n, repr(st_n.get("posts")))
+    st_f, art_f, job_f = drive(full, spec={"chat_id": "CH-HAND"}, behaviour="chatpost_fail")
+    check("render seam: a failed chat post is a NOTE, never a lost render "
+          "(the artifact still comes back)",
+          art_f is not None and job_f.get("_chat_post") == "failed"
+          and len(st_f.get("posts") or []) == 1, repr(job_f.get("_chat_post")))
     # ---- the give-up path, END TO END through comfy_render ------------------------
     # test_render_timeout exercises the helper functions; these prove the RENDER SEAM wires
     # them, which is where two mutants slipped through GREEN. The order is the feature: if

@@ -235,3 +235,51 @@ async def save_image(image_bytes: bytes, filename: str, api_key: str) -> str:
         resp.raise_for_status()
         file_id = resp.json()["id"]
         return f"/api/v1/files/{file_id}/content"
+
+
+async def post_chat_message(chat_id: str, content: str, api_key: str) -> bool:
+    """Append one assistant message (markdown allowed) to a chat via OWU's own REST API,
+    so a finished toolbox render LANDS IN THE CONVERSATION instead of living only in the
+    editor window. Uses the OWNER's key — chats are per-user here (admin chat access is
+    off), so a wrong chat id simply 404s rather than posting into someone else's thread.
+
+    Read-modify-write on chat.history.messages: GET /api/v1/chats/{id}, insert the new
+    message into the history dict, POST it back to the same route (update_chat_by_id
+    replaces the chat doc, and its reconcile pass explicitly does NOT infer deletes from
+    missing ids, so an append is safe). Returns False — never raises — on any HTTP or
+    shape problem: this is a convenience on top of a render that already succeeded, and
+    the caller surfaces the failure as a note rather than losing the artifact.
+    """
+    if not chat_id:
+        return False
+    import time
+    import uuid
+    url = f"{config.OPENWEBUI_BASE_URL.rstrip('/')}/api/v1/chats/{chat_id}"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.get(url, headers=headers)
+            if r.status_code != 200:
+                return False
+            body = r.json() or {}
+            chat = body.get("chat")
+            if not isinstance(chat, dict):
+                return False
+            hist = chat.get("history")
+            messages = (hist or {}).get("messages")
+            if not isinstance(messages, dict):
+                return False
+            mid = uuid.uuid4().hex
+            now = int(time.time())
+            messages[mid] = {
+                "id": mid, "role": "assistant", "content": content,
+                "chat_id": chat_id, "created_at": now, "updated_at": now,
+                "timestamp": now, "model": "Comfy Toolbox", "done": True,
+                "parent_id": None, "children_ids": [], "feature_selections": [],
+                "citations": [], "references": None, "error": None,
+            }
+            r2 = await client.post(url, json={"chat": chat}, headers=headers)
+            return r2.status_code == 200
+    except Exception:  # noqa: BLE001 — a lost hand-back must never cost a render
+        return False
+

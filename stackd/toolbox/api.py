@@ -194,18 +194,20 @@ class Toolbox:
         return jti if jti.replace("-", "").replace("_", "").isalnum() else "n/a"
 
     def _identity(self, http, query, *, scope="launch", single_use=False,
-                  job_id: str | None = None) -> str:
-        """Verify the token and return its email. Raises TokenError -> 403 in dispatch.
+                  job_id: str | None = None, with_claims: bool = False):
+        """Verify the token and return its email (or, with with_claims, (email, payload)).
 
         `scope` is not cosmetic: the editor polls with the job-scope token the create
         response handed it, so a poll that demanded a launch token would 403 every
         legitimate render. Job routes additionally pass the submitted job_id so a
-        job token cannot address a DIFFERENT job."""
+        job token cannot address a DIFFERENT job. The claims are only handed to the
+        CALLER-SIDE routes that must persist a server-asserted binding (chat_id into
+        the job row) — never echoed to a browser."""
         payload = _tokens.verify(self.secret, self._token_from(http, query),
                                  scope=scope, single_use=single_use)
         if job_id is not None and payload.get("job_id") not in (None, job_id):
             raise _tokens.BadToken("that token is bound to a different job")
-        return payload["email"]
+        return (payload["email"], payload) if with_claims else payload["email"]
 
     def _parse_json(self, raw: bytes) -> dict:
         if len(raw) > MAX_BODY_BYTES:
@@ -620,19 +622,29 @@ class Toolbox:
         threading.Thread(target=self._safe_prewarm, name="toolbox-prewarm",
                          daemon=True).start()
 
-    def mint_launch(self, email: str, ref: str | None = None) -> str:
+    def mint_launch(self, email: str, ref: str | None = None,
+                    chat_id: str | None = None) -> str:
         """THE ONE mint path every non-forward-auth mount funnels through (h_mint and
         the in-process MCP retouch tool). Empty email/secret raises ValueError -> an
-        honest 400/500, never a forgery-friendly token."""
+        honest 400/500, never a forgery-friendly token.
+
+        `chat_id` is a SERVER-asserted claim (the Tool/MCP caller knew the chat; the
+        browser can neither see nor widen it — h_job_create copies it from the verified
+        payload into the row, never from the request body). It exists so the finished
+        render can be posted back into that conversation instead of dying in the
+        editor window; a token minted without it simply keeps the old files-only
+        behaviour."""
         email = (email or "").strip().lower()
         if not email:
             raise ValueError("a launch token must be bound to a real email")
         if not self.secret:
             raise ValueError("toolbox tokens are not configured (no shared secret)")
         return _tokens.mint(self.secret, scope="launch", email=email,
-                            image_id=(ref or None))
+                            image_id=(ref or None),
+                            chat_id=(str(chat_id).strip() or None) if chat_id else None)
 
-    def mint_editor_link(self, email: str, ref: str | None = None):
+    def mint_editor_link(self, email: str, ref: str | None = None,
+                         chat_id: str | None = None):
         """(token, code, url) — the transcription-safe face of mint_launch, for any link
         that a MODEL or a human may have to reproduce: the URL carries a ~10-char code,
         never the ~250-char credential (see tokens.mint_link for the live incident that
@@ -643,7 +655,7 @@ class Toolbox:
         if not self.public_base:
             raise ValueError("no browser-reachable base (STACKD_TOOLBOX_PUBLIC_URL) is "
                              "configured, so no editor link can be built")
-        token = self.mint_launch(email, ref)
+        token = self.mint_launch(email, ref, chat_id=chat_id)
         code = _tokens.mint_link(token)
         return token, code, self.public_base + "/toolbox/e/" + code
 
@@ -747,8 +759,11 @@ class Toolbox:
                                   "reason": "user_not_registered"}, self._cors())
             return
         ref = str(body.get("source_ref") or body.get("image_id") or "").strip()
+        # The chat binding is captured whether the photo came from a ref or from chat
+        # auto-detection: the Tool knows which conversation it was called from, and the
+        # finished render is posted back there (server-asserted claim — mint_launch).
+        chat_id = str(body.get("chat_id") or "").strip()
         if not ref:
-            chat_id = str(body.get("chat_id") or "").strip()
             if not chat_id:
                 raise ValueError("pass source_ref (a /api/v1/files/... path) or chat_id "
                                  "(to auto-detect the chat's most recent image)")
@@ -783,7 +798,7 @@ class Toolbox:
         # payload's `exp` lost a character in a live 403 and the signature could not
         # follow). The token itself is inlined into the document below, which is the
         # only place a launch credential may appear on a browser-facing surface.
-        token, code, url = self.mint_editor_link(email, ref)
+        token, code, url = self.mint_editor_link(email, ref, chat_id=chat_id or None)
         cfg = self._embed_cfg(email, {"source_ref": ref},
                               api_base=self.public_base, token=token)
         html = _web.embed_document(cfg, title="Comfy Toolbox", probe=False)
@@ -1099,7 +1114,19 @@ class Toolbox:
             # spend GPU time (every cheap validation above passed). A replayed launch token
             # gets 403 here, not a second render. Persist the row first (survives a crash
             # mid-enqueue), then hand the blobs to the worker.
-            self._identity(http, {}, single_use=REDEEM_ON_CREATE)
+            # with_claims: chat_id rides the token as a SERVER-asserted claim (mint
+            # stamped it; the body could smuggle anything). Copy it into the persisted
+            # spec here — the one place a browser-supplied spec can never set it — so
+            # engine.comfy_render can post the finished render back to the conversation
+            # that opened the editor. A pre-existing body value is OVERWRITTEN, not
+            # trusted: the token is the truth, and a token without the claim means no
+            # hand-back even if the caller typed one in.
+            email, claims = self._identity(http, {}, single_use=REDEEM_ON_CREATE,
+                                           with_claims=True)
+            if claims.get("chat_id"):
+                spec["chat_id"] = str(claims["chat_id"])
+            else:
+                spec.pop("chat_id", None)
             self._worker.store.create(email=email, kind=kind, w=w, h=h, spec=spec,
                                       mask_info=info, job_id=job_id)
             self._worker.enqueue(job_id, source=source, mask=canon)
