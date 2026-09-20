@@ -998,6 +998,34 @@ KIND_RULES = {
 
 EDGE_LIMIT = MAX_MORPH_PX            # signed boundary-offset clamp, in working px
 
+# ---------------------------------------------------------------------------------
+# THE BRUSH CORE LIFT — why grey-in-the-middle must never reach the graph
+# ---------------------------------------------------------------------------------
+# brush is the one kind the server never thresholds ("hardness IS the edge"), and the
+# painter's disc is a solid core (r x hardness) ringed by single-pass source-over
+# gradient stamps — a filled region therefore settles at MID alpha across its interior
+# (live: a hand-painted dog came back UNCHANGED, because ComfyUI's VAEEncodeForInpaint
+# does `m = 1 - mask.round()` and rounds noise_mask: every pixel below 128/255 is
+# "not inpaint at all" — the original latents rode through and the model returned the
+# dog it was handed). ImageCompositeMasked then blended the little it did generate at
+# that same grey, and paste_back's gate multiplies it again.
+#
+# So a paint's INTERIOR is lifted to full white at or above its own half-point, and the
+# ramp under the half-point is scaled x2 to keep the fade continuous (127->254 meets 128->255
+# with no step): the mask that reaches the graph — and the paste gate, and the
+# authoritative overlay — is solid where it LOOKS painted and fades to black at the
+# perimeter, which is the semantic every inpaint node actually implements. The 128
+# threshold is not taste: it is the graph's own round() boundary, so nothing can sit
+# in the "looked painted, wasn't inpainted" limbo between wash and hole.
+BRUSH_CORE_LIFT_FROM = 128
+
+
+def _lift_brush_core(cov: "Image.Image") -> "Image.Image":
+    """Levels-lift a painted brush layer: >=half -> opaque, below-half scaled x2.
+    Monotone and continuous across the lift point; zero stays zero (an empty paint is
+    still empty — looks_empty / the coverage floor must keep seeing it that way)."""
+    return cov.point(lambda v: 255 if v >= BRUSH_CORE_LIFT_FROM else v * 2)
+
 
 def _bbox_min_side(cov):
     """Shorter side of the selection's bounding box, 0 when it selects nothing.
@@ -1207,6 +1235,11 @@ def normalize_layers(layers, width: int, height: int, *,
     invert applies to the UNION, not per layer: two overlapping inverted layers
     max-composited would resurrect the overlap, which is not what "edit everything outside
     what I marked" means.
+
+    The one non-per-object rule: brush PAINT layers get the core lift
+    (_lift_brush_core) before the union, because their interiors sit at partial alpha
+    by construction and the graph binarises the mask it inpaints. Eraser layers keep
+    their full soft ramp — subtraction is honest at whatever strength it was painted.
     """
     _require_pil()
     acc = Image.new("L", (width, height), 0)
@@ -1221,9 +1254,17 @@ def normalize_layers(layers, width: int, height: int, *,
         if lay.get("erase"):
             acc = Image.composite(Image.new("L", (width, height), 0), acc, cov)
         else:
-            # ImageChops.lighter, not "add": overlapping paint must reach 255 once and
-            # stay there. Adding would let two half-covered brush passes compound into a
-            # brighter pixel, which is the same class of error as the erode-the-brush bug.
+            # Paint can only ever ADD coverage (ImageChops.lighter, not "add":
+            # overlapping passes must reach 255 once, not compound past it — the same
+            # class of error as the erode-the-brush bug). Brush PAINT additionally gets
+            # the core lift (see BRUSH_CORE_LIFT_FROM): the graph's mask.round() hands
+            # anything under half alpha straight back to the source image, and a brush
+            # interior is exactly where soft-brush accumulation parks — the "dog stayed
+            # latent" defect. The eraser deliberately does NOT lift: its soft ramp is
+            # the user's own gentle un-paint, and lifting it would resurrect at full
+            # strength whatever a half-pass erase just removed.
+            if kind == "brush":
+                cov = _lift_brush_core(cov)
             acc = ImageChops.lighter(acc, cov)   # union: paint can only ever ADD coverage
         per.append({
             "i": i, "kind": kind,
@@ -1235,6 +1276,10 @@ def normalize_layers(layers, width: int, height: int, *,
             "feather": (round(float(lay.get("feather", 0) or 0), 2) if allow_feather else 0),
             "erase": bool(lay.get("erase")),
             "thresholded": bool(binary),
+            # the ONE exception to "nothing here may touch a brush edge": paints get the
+            # core lift (see BRUSH_CORE_LIFT_FROM), erases do not — report it per object
+            # or the info panel cannot explain why the render mask is harder than the wash.
+            "core_lifted": bool(kind == "brush" and not lay.get("erase")),
             # One-axis reporting. `edge` is what was asked, `edge_applied` what survived the
             # anti-annihilation guard; when they differ the preview MUST show the applied
             # number or the user approves a mask the render will not match.

@@ -435,10 +435,32 @@ treatment — plus the `retouch_image` MCP tool for assistant-driven flows.
     31→32→33→34→35 chain deleted imagegen-style — which also makes the node-28 mask
     preview finally show the REAL gate), `mask_expand` restores growth on both dilators
     when the user asks for it, `mask_edge` rebuilds the soft chain scaled (with the
-    Bug-3 dilated clamp). And ColorMatchV2 (node 7) stops being a hidden 0.95 constant:
-    it follows `spec.color_match`, so the knob now drives BOTH colour matches and 0
-    really means off. Pinned with 5 new checks (595/595); mutants — geometry no-op →
+    Bug-3 dilated clamp). And ColorMatchV2 (node 26 + strength node 7) leaves the
+    painted path ENTIRELY: it fit the crop to the GLOBAL photo stats (measured +34
+    mean-abs on the ring), while `paste_back` already colour-matches against the LOCAL
+    ring pixels — `spec.color_match` now drives only the server pass, and 0 means off
+    end to end. Pinned with 5 new checks (595/595); mutants — geometry no-op →
     3 fails, hidden 0.95 → 1 fail.
+  - **The dog round-3 (same session, live): "the dog remained latent" — the mask arrived
+    GREY.** The user's painted square reached the graph with mid-grey alpha: brush is
+    the one kind `normalize_layers` never thresholds (KIND_RULES: "hardness IS the
+    edge"), and the painter's disc is a solid core of only `r x hardness(0.55)` ringed
+    by single-pass source-over gradient stamps, so a filled region settles below full
+    alpha. ComfyUI's `VAEEncodeForInpaint` then does `m = 1 - mask.round()` and rounds
+    the noise_mask: **every pixel under 128/255 is "not inpaint at all"** — the source
+    latents rode through and the sampler returned the dog it was handed (the composite
+    blended at the same grey, and the new paste gate would have multiplied it a third
+    time). GPU A/B, flat-alpha square, same seed path: alpha 110 unlifted INSIDE=1.4
+    (unchanged photo), lifted INSIDE=11.4 with BG=0.0; alpha 150 (already over the
+    round() line) needed no lift to paint — the cliff is exactly the 128 boundary.
+    Fix: `_lift_brush_core` in `normalize_layers` — brush PAINT layers go
+    `>=128 -> 255, <128 -> x2` (continuous across the lift point, zero stays zero so
+    `looks_empty` still fires); ERASER layers keep their full soft ramp (a half-pass
+    erase must halve, not delete — and must not resurrect what it removed when the
+    lifted paint underneath is re-pasted). Because it lands at canonicalization, the
+    graph mask, the node-28 preview, `overlay_layers`' approved wash and the paste
+    gate all see ONE lifted mask. The 128 is not taste: it is the graph's own rounding.
+    Suite +6 (601/601; mutant: no-op lift -> exactly 3 red), browser 162/162.
   - **"It just sits in the new window" — it actually lands; OWU just never pushes.**
     The dog render's hand-back WORKED (log: `chat hand-back posted`, OWU access log:
     `POST /api/v1/chats/2ffd6e91… 200`, and the message is in webui.db as

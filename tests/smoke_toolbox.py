@@ -414,6 +414,61 @@ def test_layers():
     check("layers: duplicate paint is a union, not an additive sum",
           _selected(one) == _selected(two), f"{_selected(one)} vs {_selected(two)}")
 
+    # --- G2: BRUSH CORE LIFT -- the "dog stayed latent" guard (live GPU defect) -------
+    # ComfyUI's VAEEncodeForInpaint computes m = 1 - mask.round() and noise_mask =
+    # mask.round(): every mask pixel below 128/255 is "NOT INPAINT" -- the source image's
+    # latents ride straight through and the sampler hands back the original. A soft
+    # brush's accumulated interior parks exactly there (hardness 0.55 leaves 45% of the
+    # disc as single-pass gradient), so a hand paint that LOOKS solid can be mid-grey
+    # alpha, and the model never sees the region at all. The canonical mask must arrive
+    # WHITE in the middle, fading only at the perimeter.
+    def _flat_alpha(size, box, a):
+        im = Image.new("RGBA", size, (0, 0, 0, 0))
+        ImageDraw.Draw(im).rectangle(list(box), fill=(255, 255, 255, a))
+        buf = io.BytesIO(); im.save(buf, "PNG")
+        return buf.getvalue()
+
+    ramp = Image.new("L", (1, 10))
+    for _i, _v in enumerate([0, 25, 50, 63, 64, 100, 127, 128, 200, 255]):
+        ramp.putpixel((0, _i), _v)
+    _got = list(M._lift_brush_core(ramp).tobytes())
+    check("lift: >=half -> opaque, <half -> x2, continuous across 128, zero stays zero",
+          _got == [0, 50, 100, 126, 128, 200, 254, 255, 255, 255], _got)
+
+    cg, _ig = M.normalize_layers([{"png": _flat_alpha(SIZE, BOX, 150), "kind": "brush"}],
+                                 *SIZE)
+    ag = M.extract_coverage(M._open(cg))
+    check("lift: a mid-alpha painted interior reaches the graph WHITE (the dog)",
+          ag.getpixel(((BOX[0] + BOX[2]) // 2, (BOX[1] + BOX[3]) // 2)) == 255,
+          "centre alpha %s" % (ag.getpixel(((BOX[0] + BOX[2]) // 2,
+                                            (BOX[1] + BOX[3]) // 2)),))
+
+    soft2 = brush_ramp_mask(SIZE, BOX, 0.45)
+    raw2 = M.extract_coverage(M._open(soft2)).tobytes()
+    c2, _i2 = M.normalize_layers([{"png": soft2, "kind": "brush"}], *SIZE)
+    new2 = M.extract_coverage(M._open(c2)).tobytes()
+    _cross = sum(1 for r in raw2 if r >= 128)
+    _fade = sum(1 for r, g in zip(raw2, new2) if r < 128 and 0 < g < 255)
+    check("lift: whole-stroke property -- every pixel lifted per the levels curve",
+          all((g == 255) if r >= 128 else (g == r * 2) for r, g in zip(raw2, new2))
+          and _cross > 0 and _fade > 0,
+          "crossed %d, still-fading %d" % (_cross, _fade))
+
+    cE, _ = M.normalize_layers([{"png": _flat_alpha(SIZE, BOX, 200), "kind": "brush"},
+                                {"png": _flat_alpha(SIZE, (BOX[0] + 4, BOX[1] + 4,
+                                                           BOX[2] - 4, BOX[3] - 4), 100),
+                                 "kind": "brush", "erase": True}], *SIZE)
+    aE = M.extract_coverage(M._open(cE))
+    check("lift: the ERASER keeps its soft ramp -- a half-pass erase halves, not deletes",
+          abs(aE.getpixel(((BOX[0] + BOX[2]) // 2, (BOX[1] + BOX[3]) // 2)) - 155) <= 1,
+          "erased-at-100 alpha %s (want ~155: lifted 255 minus the 100/255 erase)"
+          % (aE.getpixel(((BOX[0] + BOX[2]) // 2, (BOX[1] + BOX[3]) // 2)),))
+
+    cZ, iZ = M.normalize_layers([{"png": _flat_alpha(SIZE, BOX, 0), "kind": "brush"}],
+                                *SIZE)
+    check("lift: an empty paint stays empty (the coverage floor still fires)",
+          iZ["coverage_paint"] == 0.0, iZ)
+
     # --- H: empty + response shape --------------------------------------------------
     _, iempty = M.normalize_layers([], *SIZE)
     check("layers: no layers selects nothing", iempty["coverage_paint"] == 0.0, iempty)
