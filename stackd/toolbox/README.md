@@ -297,7 +297,8 @@ the first draft were wrong and are fixed here):
 **M2** the in-chat embed mount — a thin native OWU Function returning `HTMLResponse` +
 `Content-Disposition: inline`, required because MCP tool returns do *not* get embed
 treatment — plus the `retouch_image` MCP tool for assistant-driven flows.
-  - **M2 CODE LANDED** (offline suite 554/554): the trust root is Open WebUI's
+  - **M2 DEPLOYED** (offline suite 555/555; live health `mint:true` at the public
+    front; the trust root is Open WebUI's
     server-vouched identity, and the browser never touches a secret. `/toolbox/mint`
     is the INTERNAL mint seam — caller-auth'd with the daemon's own admin bearer (the
     value OWU already holds as OPENAI_API_KEY; empty `mint_key` = route dead), user
@@ -312,9 +313,18 @@ treatment — plus the `retouch_image` MCP tool for assistant-driven flows.
     `(response, result_context)` tuple — was read out of the deployed bundle, not
     assumed), and the assistant-driven entry is the `retouch_image` MCP tool, which
     mints IN-PROCESS through `Toolbox.mint_launch` (one mint path, pinned by source
-    grep in smoke_toolbox). **NOT human-verified end-to-end yet**: needs the operator
-    to set `STACKD_TOOLBOX_PUBLIC_URL` and import the Tool in Open WebUI — first
-    in-chat open is that verification.
+    grep in smoke_toolbox). Live-verified on the deployed container: deny-first gates
+    (no bearer / unregistered email 403), the happy mint returning a public
+    `https://llama.…/toolbox/embed?token=…` whose GET returns the full editor document
+    through the Cloudflare+Traefik front (note: Cloudflare error 1010 blocks
+    non-browser UAs on that host — the iframe's real-browser GET is unaffected).
+    The live run also caught a fallback-only 500 the offline suite structurally could
+    not reach: `_embed_cfg`'s `except ValueError` branch (a source whose OWU fetch
+    RAISES, vs the fake resolver's None) left `before` unbound → UnboundLocalError;
+    bound now and pinned with a raising-resolver check.
+    **NOT human-verified end-to-end yet**: the operator must import the Tool in Open
+    WebUI (Admin → Tools, file `stackd/toolbox/owu_tool.py`) — the first in-chat open
+    plus one real Render click is that verification (it doubles as M1's GPU smoke).
 **M3** non-destructive layer stack, gallery, saved recipes, batch.
 **M4** video/music: multi-slot media tiers (`state.py`'s single `ImageSlot` -> per-kind
 slots), artifact-typed jobs, cleaner support for `SaveVideo`/`SaveAudio*` outputs, and
