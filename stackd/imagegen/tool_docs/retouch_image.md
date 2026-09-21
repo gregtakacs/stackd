@@ -7,6 +7,14 @@ CODE that dies on the first render submission and expires ~15 minutes after this
 the user's link has gone stale, call this tool again for a fresh one -- that is the intended
 recovery, not an error state.
 
+PREFERRED ENTRY POINT, CHECK FIRST: if your tool list also contains a tool named
+"Comfy Toolbox (Mask Editor)" (comfy_toolbox_mask_editor), call THAT instead of this one --
+it embeds the editor INLINE in the chat, while this MCP tool can only hand back a link the
+user must click, which pops the editor open in a new browser window. This tool is the
+fallback for MCP clients that have no such native Tool. A user who complains that "the
+toolbox opens in a new window" has been served this tool where the native one was
+available -- prefer the native one whenever it exists.
+
 COPY THE LINK OUT EXACTLY AS GIVEN. It is short on purpose (a ~10-character code) because
 you are the only thing standing between the tool output and the user's browser, and a
 single altered or dropped character makes the editor reject a link that was minted seconds

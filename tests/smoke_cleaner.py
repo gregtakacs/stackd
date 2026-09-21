@@ -20,7 +20,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 import _env  # noqa: F401,E402  — reference ${VAR} env for config interpolation
 
-from stackd.cleaner import Cleaner, prune_history, sweep_files  # noqa: E402
+from stackd.cleaner import Cleaner, prune_history, queue_busy, sweep_files  # noqa: E402
 
 CHECKS: list[tuple[str, bool]] = []
 
@@ -44,12 +44,14 @@ _DELETED: list = []
 class _Comfy(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     history_blob: dict = {}
+    queue_blob: dict = {}  # served at /queue -- see the busy-sweep checks below
 
     def log_message(self, *a):
         pass
 
     def do_GET(self):
-        raw = json.dumps(self.history_blob).encode()
+        blob = self.queue_blob if self.path.startswith("/queue") else self.history_blob
+        raw = json.dumps(blob).encode()
         self.send_response(200)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(raw)))
@@ -109,6 +111,35 @@ def main() -> int:
         swept, _ = c.run_once(endpoint=None)
         check("run_once sweeps with no endpoint", swept == 1 and c.swept_total == 1)
         check("status carries totals + last_run", c.status()["swept_total"] == 1 and c.status()["last_run"])
+        check("default TTL covers a full masked-Klein edit",
+              Cleaner(scratch).file_ttl_min == 10)
+
+        # --- busy-queue sweep gate (2026-09-20: the 2-min janitor TTL'd the
+        #     edit_image mask preview out of temp mid-render -> fetch 404 ->
+        #     "Could not reach ComfyUI proxy" on two completed ~6-min edits) ---
+        srv2 = ThreadingHTTPServer(("127.0.0.1", 0), _Comfy)
+        threading.Thread(target=srv2.serve_forever, daemon=True).start()
+        ep2 = f"http://127.0.0.1:{srv2.server_address[1]}"
+        _Comfy.history_blob = {}
+        _Comfy.queue_blob = {"queue_running": [[9, "in-flight", None, {}, []]],
+                             "queue_pending": []}
+        check("queue_busy sees a running prompt", queue_busy(ep2) is True)
+        _Comfy.queue_blob = {"queue_running": [], "queue_pending": []}
+        check("queue_busy false when idle", queue_busy(ep2) is False)
+        check("queue_busy false when ComfyUI is down",
+              queue_busy("http://127.0.0.1:1") is False)
+        _Comfy.queue_blob = {"queue_running": [[9, "in-flight", None, {}, []]],
+                             "queue_pending": []}
+        _touch(os.path.join(scratch, "temp", "owed_preview.png"), age_min=9)
+        c2 = Cleaner(scratch, file_ttl_min=2, interval_s=3600)  # long interval: only run_once sweeps
+        swept_busy, _ = c2.run_once(endpoint=ep2)
+        check("busy run_once skips sweep", swept_busy == 0
+              and os.path.exists(os.path.join(scratch, "temp", "owed_preview.png")))
+        _Comfy.queue_blob = {"queue_running": [], "queue_pending": []}
+        swept_idle, _ = c2.run_once(endpoint=ep2)
+        check("idle run_once sweeps again", swept_idle == 1
+              and not os.path.exists(os.path.join(scratch, "temp", "owed_preview.png")))
+        srv2.shutdown()
 
         # --- HTTP routes: GET /cleaner, POST /cleaner/{on,off} ---------------
         import urllib.error

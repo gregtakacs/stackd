@@ -1274,7 +1274,15 @@ async def edit_image(
             fetch_nodes = {save_node}
         _g0 = time.monotonic()
         prompt_id = await comfyui_client.submit_workflow(workflow, base=comfy_base)
-        images_by_node = await comfyui_client.wait_and_fetch(prompt_id, fetch_nodes, base=comfy_base)
+        # The mask preview is a DEBUG artifact: PreviewImage writes to temp seconds
+        # into the run and the scratch janitor's TTL can claim it before the ~6-min
+        # sampler finishes. Losing it must never sink a rendered edit -- it only
+        # degrades the nothing-found heuristic below, which already skips itself on
+        # an empty list (see comfyui_client.wait_and_fetch's optional_nodes doc).
+        images_by_node = await comfyui_client.wait_and_fetch(
+            prompt_id, fetch_nodes, base=comfy_base,
+            optional_nodes=({workflows.MASK_PREVIEW_NODE} if target_region else None),
+        )
     except httpx.HTTPError as e:
         logger.exception("edit_image: ComfyUI proxy request failed")
         return json.dumps({"error": f"Could not reach ComfyUI proxy: {e!r}"})

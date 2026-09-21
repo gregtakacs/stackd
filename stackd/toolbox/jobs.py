@@ -172,6 +172,41 @@ class JobStore:
                 (email, limit)).fetchall()
         return [dict(r) for r in rows]
 
+    def prune(self, keep_days: float = 14.0) -> dict:
+        """Retention sweep — without it this DB is a slow leak with my name on it.
+
+        Rows are cheap; artifact_b64 is a whole PNG of a finished render, and NOTHING
+        ever reads a week-old row again: the job-scope token lives only in the browser
+        tab that created the job, so a reopened page cannot poll it. (A reopened embed
+        shows results only for its own live session; the durable copies of every
+        finished image are the OWU file save and the chat post, not this table.)
+
+        Policy after keep_days: done rows KEEP the row (provenance is ~1 KB) but lose
+        their pixels; error/cancelled rows, which no UI ever shows again, go entirely.
+        In-flight rows are never touched. keep_days <= 0 disables the sweep.
+        """
+        if keep_days is None or keep_days <= 0:
+            return {"stripped": 0, "deleted": 0}
+        cutoff = time.time() - float(keep_days) * 86400.0
+        with self._lock:
+            cur = self.conn.execute(
+                "UPDATE jobs SET artifact_b64=NULL, artifact_type=NULL, "
+                "note=CASE WHEN note IS NULL OR note='' THEN '[artifact pruned]' "
+                "ELSE note||' [artifact pruned]' END "
+                "WHERE state='done' AND artifact_b64 IS NOT NULL "
+                "AND updated_at IS NOT NULL AND updated_at<?", (cutoff,))
+            stripped = cur.rowcount
+            cur2 = self.conn.execute(
+                "DELETE FROM jobs WHERE state IN ('error','cancelled') "
+                "AND updated_at IS NOT NULL AND updated_at<?", (cutoff,))
+            deleted = cur2.rowcount
+        if stripped or deleted:
+            try:                            # give the freed pages back to the file
+                self.conn.execute("VACUUM;")
+            except sqlite3.OperationalError:
+                pass                          # locked/inside-txn: next sweep retries
+        return {"stripped": stripped, "deleted": deleted}
+
     def reconcile_orphans(self) -> int:
         """On startup, a queued/running row is one the dead worker will never pick up
         again. Mark them error with a resubmit note so the UI shows truth, not a spinner
@@ -221,11 +256,14 @@ class JobQueue:
     queued and a running job — with fakes, no GPU, no httpx, no PIL.
     """
 
-    def __init__(self, store: JobStore, *, render, cancel=None, logger=None):
+    def __init__(self, store: JobStore, *, render, cancel=None, logger=None,
+                 keep_days: float = 14.0):
         self.store = store
         self._render = render
         self._cancel = cancel
         self.log = logger
+        self.keep_days = keep_days              # retention: see JobStore.prune
+        self._last_prune = 0.0
         self._q: "queue.Queue[str]" = queue.Queue()
         self._blobs: dict[str, tuple] = {}       # job_id -> (source_bytes, mask_bytes)
         self._blobs_lock = threading.Lock()
@@ -247,6 +285,8 @@ class JobQueue:
         swept = self.store.reconcile_orphans()
         if swept and self.log:
             self.log.info("toolbox: swept %d orphan job(s) from a prior run", swept)
+        self._last_prune = time.time()
+        self._prune()                        # retention at boot; then every ~6h idle
         self._thread = threading.Thread(target=self._run, name="toolbox-jobs", daemon=True)
         self._thread.start()
 
@@ -284,6 +324,7 @@ class JobQueue:
             try:
                 job_id = self._q.get(timeout=0.5)
             except queue.Empty:
+                self._maybe_prune()
                 continue
             if job_id is None:
                 break
@@ -299,6 +340,25 @@ class JobQueue:
                     pass
         # Anything still queued when we stop belongs to a worker going away; the next
         # start()'s reconcile_orphans() marks them error, not a forever-spinner.
+
+    def _prune(self) -> None:
+        try:
+            r = self.store.prune(self.keep_days)
+            if (r["stripped"] or r["deleted"]) and self.log:
+                self.log.info("toolbox: retention — %d artifact(s) stripped, %d dead row(s) deleted",
+                              r["stripped"], r["deleted"])
+        except Exception as e:  # noqa: BLE001 — the janitor is never a dependency
+            if self.log:
+                self.log.warning("toolbox: retention sweep failed: %r", e)
+
+    def _maybe_prune(self) -> None:
+        # Piggyback retention on the worker's idle wake-ups (~2/s) instead of adding a
+        # second thread: a six-hour cadence is more than enough for a days-scale policy.
+        now = time.time()
+        if now - self._last_prune < 21600:
+            return
+        self._last_prune = now
+        self._prune()
 
     def _process(self, job_id: str) -> None:
         job = self.store.get(job_id)

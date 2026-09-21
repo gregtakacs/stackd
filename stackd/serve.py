@@ -2494,6 +2494,11 @@ def serve(mgr: Manager, host: str, port: int, api_key: str | None,
             _tb_jobs.JobStore(tb_db),
             render=_tb_engine.comfy_render, cancel=_tb_engine.comfy_cancel,
             logger=logging.getLogger("stackd.toolbox"),
+            # Retention (JobStore.prune): done rows past this many days lose their
+            # stored PNG (the row and its provenance stay); error/cancelled rows go.
+            # 0 disables the sweep. The durable copies of a finished image are always
+            # the OWU file + the chat post, never this table.
+            keep_days=float(os.environ.get("TOOLBOX_JOB_KEEP_DAYS") or 14),
         )
         jobs_q.start()      # sweeps orphaned queued/running rows from a prior run first
         toolbox = _tb_api.Toolbox(

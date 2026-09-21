@@ -24,11 +24,20 @@
   // min/max/step snaps fractional defaults to whole numbers, which silently zeroed the
   // mask overlay and pinned hardness. Asserting the DOM value is the cheapest possible net.
   step('slider defaults', function () {
-    ['wash:0.45', 'hardness:0.55', 'strength:0.25', 'opacity:1', 'detail:0.35', 'colormatch:0.9'].forEach(function (spec) {
+    // M2.1 review retired strength/variants/blend from the panel (frozen constants in
+    // params()) and zeroed colour match / detail — a no-op default is the whole point
+    // (non-zero defaults silently repainted every artifact, the "worse than ComfyUI's
+    // own copy" bug). wash/hardness keep FRACTIONAL defaults: that half still catches
+    // the attribute-before-value snap bug this step exists for.
+    ['wash:0.45', 'hardness:0.55', 'opacity:1', 'detail:0', 'colormatch:0'].forEach(function (spec) {
       var id = spec.split(':')[0], want = spec.split(':')[1];
       var n = document.getElementById('tb_' + id);
-      T('slider tb_' + id + ' keeps its fractional default ' + want,
+      T('slider tb_' + id + ' keeps its default ' + want,
         !!n && Math.abs(parseFloat(n.value) - parseFloat(want)) < 1e-9, n ? n.value : 'MISSING');
+    });
+    ['tb_strength', 'tb_variants', 'tb_blend'].forEach(function (id) {
+      T(id + ' retired from the panel (frozen constant, no theatre control)',
+        !document.getElementById(id), 'still present');
     });
   });
 
@@ -264,43 +273,36 @@
   });
 
   // The blend dropdown shipped with BLANK options: select() read opts[i][1] for
-  // callers that passed bare values, so every textContent was undefined. Neither
-  // half is visible offline -- a blank <option> and an enabled no-op control both
-  // look perfectly fine to a regex test. This asserts the shipped DOM, which is the
-  // only place that failure mode existed. Same reasoning as the slider-defaults step.
+  // callers that passed bare values, so every textContent was undefined. The control
+  // was then RETIRED outright (M2.1 review): inside a hard-gated painted selection the
+  // paste is always Normal, so a blend legend over eight modes was theatre. This step
+  // now guards the retirement: the removed controls must NOT come back, the kept ones
+  // stay enabled, and no ghost dead-knob note may describe greyed controls that no
+  // longer exist (the note only earns its place when something is really disabled).
   step('inert knobs are honest', function () {
-    var bl = document.getElementById('tb_blend');
-    T('blend dropdown exists', !!bl);
-    if (bl) {
-      var blank = 0, labels = [];
-      for (var i = 0; i < bl.options.length; i++) {
-        var tx = (bl.options[i].textContent || '').trim();
-        if (!tx) blank++;
-        labels.push(tx);
-      }
-      T('no blank options in the blend dropdown', blank === 0, labels.join('|').slice(0, 60));
-      T('blend offers the eight documented modes', bl.options.length === 8, 'n=' + bl.options.length);
-      // blend/opacity/detail/colormatch used to be greyed because paste_back did not exist.
-      // They are wired now (engine.comfy_render feeds them to masks.paste_back), so the honest
-      // assertion INVERTS: they must be ENABLED. Left as-is these four lines failed 76/80 --
-      // a suite enforcing a retired truth is as misleading as one that never checked.
-      T('blend is enabled: it reaches the render graph now', bl.disabled === false,
-        'disabled=' + bl.disabled);
-    }
+    ['tb_blend', 'tb_variants', 'tb_strength'].forEach(function (id) {
+      T(id + ' stays retired (params() freezes it)', !document.getElementById(id),
+        'control is back');
+    });
     ['tb_opacity', 'tb_detail', 'tb_colormatch'].forEach(function (id) {
       var n = document.getElementById(id);
       T(id + ' is enabled: wired into paste_back', !!n && n.disabled === false,
         n ? 'disabled=' + n.disabled : 'missing');
     });
-    // ...while the still-dead ones must STAY greyed. Without this half the pair, deleting a
-    // control from DEAD_KNOBS wholesale would also turn green.
-    ['tb_variants'].forEach(function (id) {
-      var n = document.getElementById(id);
-      T(id + ' is still disabled: not wired into the render graph', !!n && n.disabled === true,
-        n ? 'disabled=' + n.disabled : 'missing');
-    });
-    T('the panel says in words which knobs are unwired',
-      /not wired into the render graph/.test(document.body.textContent));
+    // The deadnote must be CONDITIONAL: DEAD_KNOBS keeps strength/variants as the
+    // registry the smoke suite fails on if they ever reappear enabled-but-unwired, but
+    // no such control is on screen, so a panel that still says "greyed knobs are
+    // recorded..." would be describing a legend for nothing. Query the NODE, not
+    // body.textContent: the driver script is inlined in this same document, so its own
+    // quoted phrases poison any textContent search (measured: self-match false FAIL).
+    T('no ghost dead-knob note while every on-screen control is live',
+      !document.querySelector('.tb-deadknobs'),
+      document.querySelector('.tb-deadknobs') &&
+      document.querySelector('.tb-deadknobs').textContent.slice(0, 60));
+    T('select() labels a two-value option pair (fallback for future dropdowns) — ' +
+      'shipped select() must still handle [value, label]',
+      /opts\[i\]\.length\s*>\s*1/.test(document.documentElement.innerHTML) ||
+      !document.querySelector('select'));
     // (tb_edge is deliberately, permanently disabled now — it is the hidden default
     // store; the Selection inspector is the only edge/feather UI. Seed proves a genuinely
     // live control still ships enabled.)

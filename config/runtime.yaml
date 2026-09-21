@@ -35,6 +35,11 @@ runtime:
   # stackd's container (compose mounts appdata/comfyui/scratch there).
   comfyui_cleaner:
     enabled: true
-    file_ttl_min: 2
+    # 10 min, not the old 2: a Klein masked edit runs ~6 min and its mask preview
+    # is written to temp in the first seconds -- a 2-min TTL swept that file out
+    # from under the completion-time fetch (two rendered edits returned 404s on
+    # 2026-09-20). The sweep additionally pauses while /queue is busy, so this
+    # TTL is the backstop, not the only defense.
+    file_ttl_min: 10
     interval_s: 90
     scratch_dir: /comfyui-scratch

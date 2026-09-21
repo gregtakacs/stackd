@@ -201,7 +201,7 @@ class CleanerConfig:
     /cleaner/on|off flips it live."""
 
     enabled: bool = True
-    file_ttl_min: int = 2
+    file_ttl_min: int = 10
     interval_s: int = 90
     scratch_dir: str = "/comfyui-scratch"
 

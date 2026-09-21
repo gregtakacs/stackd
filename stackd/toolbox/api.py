@@ -19,10 +19,12 @@ called differs deliberately:
 
 CORS: `*`, no credentials, and the editor never sends cookies. The routes a sandboxed
 panel calls (/toolbox/mask/preview, /toolbox/jobs, /toolbox/mask/auto) are simple
-text/plain POSTs needing no preflight, and /toolbox/embed + /toolbox/source.png are
-plain GETs. That is exactly why the editor posts its JSON as text/plain: the
-plain-stdlib front has no OPTIONS handler yet, so a preflight would make the embed mount
-fail in a way that *looks* like a sandbox problem and isn't one.
+text/plain POSTs with the token as a ?token= query param — deliberately OUT OF SAFELIST
+HEADERS ENTIRELY: an authorization header would force a preflight, and the live Traefik
+front answers OPTIONS itself with a canned reply that omits POST/authorization, so a
+preflighted call never reaches this server's (correct) OPTIONS handler and dies in the
+browser as "Failed to fetch". /toolbox/embed + /toolbox/source.png are plain GETs.
+A preflighted embed mount looks exactly like a sandbox problem and isn't one.
 """
 
 from __future__ import annotations
@@ -178,10 +180,25 @@ class Toolbox:
         }
 
     def _token_from(self, http, query):
+        """The request's token, header-first (programmatic callers, spike harness), then
+        the caller-passed query dict, then the QUERY STRING OF THE RAW PATH ITSELF.
+
+        That last fallback is not belt-and-suspenders decoration: the POST handlers were
+        calling _identity(http, {}, ...) with a HARDCODED EMPTY query dict, so before
+        this the ?token= channel silently never worked on the POST surface — the shipped
+        editor (2026-09-21) had to move the token into the query to stay a CORS simple
+        request (a custom header forces a preflight the live Traefik front swallows) and
+        every Render/smart-select died as 403 'malformed token' — verify() receiving the
+        empty string, while dispatch's jti log decoded the very same token fine from the
+        real query. Reading http.path here is the one seam that makes every route accept
+        every carrier, whichever dict the caller forgot (or omitted) to pass."""
         hdr = (http.headers.get("authorization") or "").strip()
         if hdr[:7].lower() == "bearer ":
             return hdr[7:].strip()
-        return (query.get("token") or "").strip()
+        tok = (query.get("token") or "").strip()
+        if tok:
+            return tok
+        return (_parse_query(getattr(http, "path", "") or "").get("token") or "").strip()
 
     def _jti_hint(self, http, query) -> str:
         """The refused token's jti, sanitised to loggable characters, or n/a. Log-only:
@@ -506,6 +523,8 @@ class Toolbox:
                 self.h_job_poll(http)
             elif path == "/toolbox/jobs/cancel":
                 self.h_job_cancel(http)
+            elif path == "/toolbox/session":
+                self.h_session(http)
             elif path in self.GET_ONLY or path.startswith("/toolbox/e/"):
                 http._send_json(405, {"error": f"{path} is GET-only"}, self._cors())
             else:
@@ -1127,6 +1146,14 @@ class Toolbox:
                 spec["chat_id"] = str(claims["chat_id"])
             else:
                 spec.pop("chat_id", None)
+            # Server-asserted, same rule as chat_id: the launch token's jti stamped into
+            # the row is the ONLY way /toolbox/session can tie a refreshed embed document
+            # (which re-presents this very token) back to the job it spawned. A
+            # body-supplied launch_jti is OVERWRITTEN, never trusted.
+            if claims.get("jti"):
+                spec["launch_jti"] = str(claims["jti"])
+            else:
+                spec.pop("launch_jti", None)
             self._worker.store.create(email=email, kind=kind, w=w, h=h, spec=spec,
                                       mask_info=info, job_id=job_id)
             self._worker.enqueue(job_id, source=source, mask=canon)
@@ -1190,11 +1217,25 @@ class Toolbox:
             return
         out = {"ok": True, "job_id": job_id, "email": email, "state": row["state"]}
         try:
-            seed = _as_int(json.loads(row.get("spec_json") or "{}").get("seed"), -1)
+            spec = json.loads(row.get("spec_json") or "{}")
+        except (ValueError, TypeError):
+            spec = {}
+        try:
+            seed = _as_int(spec.get("seed"), -1)
         except (ValueError, TypeError):
             seed = -1
         if seed >= 0:
             out["seed"] = seed
+        if row["state"] == "done":
+            # The words the render ACTUALLY ran on (post-captioning). The editor no
+            # longer shows the image — it collapses to a summary line (2026-09-21, the
+            # user's call: the chat owns the photo) — and the one thing that summary
+            # must quote truthfully is the prompt. From spec.prompt, never prompt_raw:
+            # quoting the pre-rewrite instruction would claim credit for words the
+            # model never saw (same honest-handover rule as _create's status line).
+            _p = str(spec.get("prompt") or "").strip()
+            if _p:
+                out["prompt_sent"] = _p
         if row["state"] == "done" and row.get("artifact_b64"):
             out["artifacts"] = [{"png": row["artifact_b64"],
                                  "type": row.get("artifact_type") or "image/png"}]
@@ -1277,6 +1318,73 @@ class Toolbox:
         state = self._worker.cancel(job_id)
         http._send_json(200, {"ok": True, "job_id": job_id, "email": email,
                               "state": state}, self._cors())
+
+    def h_session(self, http):
+        """POST /toolbox/session — "has THIS editor session already rendered?"
+
+        Why it exists: the in-chat mount's document lives INSIDE the saved chat message,
+        so every chat refresh re-boots the full editor with the same launch token — one
+        the first submit already redeemed. Without this read the refreshed embed presents
+        an editable canvas + photo that can never submit; with it the client collapses
+        straight to the receipt (see web/toolbox.js, sessionReceipt).
+
+        Auth is the launch token, verified NON-single-use (the caller's copy is by
+        definition already spent, and this is a pure read — it redeems nothing, exactly
+        like poll's posture, and is why the answer must come from the replay table, not
+        from a verify call). The launch_jti stamp _create wrote into spec_json is the
+        join key back to the job; a session whose row cannot be found still answers
+        submitted=true generically — the token is the authority on its own spending."""
+        self._json_body(http)                      # read once; see _json_body's note
+        email, claims = self._identity(http, {}, scope="launch", single_use=False,
+                                       with_claims=True)
+        jti = str(claims.get("jti") or "")
+        out = {"ok": True, "email": email, "submitted": False}
+        # An un-mounted queue (the spike/stub) never redeems — always say "not submitted"
+        # truthfully, so the refresh keeps a working editor there too.
+        if self._worker is None or not jti or not _tokens.is_redeemed_jti(jti):
+            http._send_json(200, out, self._cors())
+            return
+        out["submitted"] = True
+        row = None
+        try:
+            for r in self._worker.store.for_email(email, limit=25):
+                try:
+                    sp = json.loads(r.get("spec_json") or "{}")
+                except (ValueError, TypeError):
+                    sp = {}
+                if sp.get("launch_jti") == jti:
+                    row = r
+                    break
+        except Exception:  # noqa: BLE001 — a missing row degrades the receipt, not the answer
+            row = None
+        if row is not None:
+            # The same fields (and the same prompt_sent truth rule) poll's done branch
+            # serves, so the live collapse and the refresh receipt cannot drift.
+            out["job_id"] = row["id"]
+            out["state"] = row["state"]
+            try:
+                sp = json.loads(row.get("spec_json") or "{}")
+            except (ValueError, TypeError):
+                sp = {}
+            _p = str(sp.get("prompt") or "").strip()
+            if _p:
+                out["prompt_sent"] = _p
+            seed = _as_int(sp.get("seed"), -1)
+            if seed >= 0:
+                out["seed"] = seed
+            if row.get("crop_json"):
+                try:
+                    out["crop"] = json.loads(row["crop_json"])
+                except (ValueError, TypeError):
+                    out["crop"] = None
+            if row["state"] == "error":
+                out["error_message"] = row.get("error") or "render failed"
+            try:
+                if row.get("created_at") and row.get("updated_at"):
+                    out["elapsed_s"] = round(float(row["updated_at"]) - float(row["created_at"]), 1)
+            except (TypeError, ValueError):
+                pass
+        http._send_json(200, out, self._cors())
 
 
 

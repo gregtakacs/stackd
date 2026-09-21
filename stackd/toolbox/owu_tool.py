@@ -2,9 +2,11 @@
 title: Comfy Toolbox (mask editor)
 author: stackd
 version: 0.1
-description: Opens the Comfy mask editor on this chat's most recent image. Call it when the
-    user wants to pick/paint the masked area themselves ("let me choose the area", "open the
-    editor/toolbox on this image", or a previous text-described edit was mis-segmented). It
+description: Opens the Comfy mask editor INLINE in this chat (embedded, no new window).
+    THIS IS THE ENTRY POINT for painted mask control whenever the user wants to pick/paint
+    the masked area themselves ("let me choose the area", "open the editor/toolbox on this
+    image", or a previous text-described edit was mis-segmented) -- call THIS tool, not the
+    MCP retouch_image, which merely returns a link that opens in a new browser window. It
     renders nothing — it hands back the editor; the user paints and presses Render. For an
     ordinary describable edit with no painted control wanted, use edit_image instead.
 requires: requests
@@ -46,6 +48,7 @@ requires: requests
 # stackd's OWN side must have STACKD_TOOLBOX_PUBLIC_URL set (browser-reachable base);
 # mint answers a clear reason string if it is not — surface that text to the operator.
 
+import asyncio
 import os
 
 import requests
@@ -105,7 +108,9 @@ class Tools:
 
     async def open_mask_editor(self, __user__=None, __request__=None,
                                __chat_id__=None, __message_id__=None) -> HTMLResponse:
-        """Open the Comfy mask editor for the most recent image in this chat."""
+        """Open the Comfy mask editor INLINE in this chat, on its most recent image.
+        Preferred over the MCP retouch_image link tool (which opens a new browser
+        window): call this whenever the user wants to paint/choose the edit area."""
         headers = {}
         try:
             headers = {k.lower(): v for k, v in dict(__request__.headers).items()}
@@ -128,8 +133,19 @@ class Tools:
                     f"({key_src}). Set valve mint_key, export STACKD_MINT_KEY, or point "
                     "valve mint_key_file at the mounted secret the daemon itself uses "
                     "(default /run/secrets/ollama_token). Do not paste the key into chat.")
+        # MUST NOT BLOCK THE EVENT LOOP. OWUI calls this coroutine directly on its own
+        # loop (utils/tools.py wraps tool functions without a threadpool), and the mint
+        # is NOT self-contained: stackd's h_mint resolves the chat's most recent image by
+        # calling BACK into this same OWUI server (/api/v1/chats, /api/v1/files/.../content).
+        # A blocking requests.post here froze the loop that those callbacks needed ->
+        # circular wait -> this call's own timeout fired first (live 2026-09-20: "cannot
+        # reach the stackd daemon ... Read timed out" at exactly timeout_s, while the
+        # stackd log showed its open-webui:8080 file fetch hanging). to_thread keeps the
+        # loop free to serve the mint's callbacks; the MCP retouch_image path never hit
+        # this because it mints inside the stackd process, where nothing of OWUI's is blocked.
         try:
-            r = requests.post(
+            r = await asyncio.to_thread(
+                requests.post,
                 self.valves.stackd_base_url.rstrip("/") + "/toolbox/mint",
                 json=body, timeout=self.valves.timeout_s,
                 headers={"Content-Type": "application/json",
@@ -162,7 +178,10 @@ class Tools:
             "Comfy Toolbox mask editor is open for the user: they paint the area, tune "
             "edge/feather per object, pick Edit or Replace, and press Render; the result "
             "saves to their own Open WebUI files AND is posted back into this chat as a "
-            "new assistant message automatically when the render finishes (the mint "
+            "new assistant message automatically when the render finishes — the editor "
+            "then collapses to a one-line summary and NEVER shows the finished image "
+            "itself, so do not paste, re-attach or re-describe the result; just tell the "
+            "user it is ready in the chat (the mint "
             "carried this chat's id — do not call edit_image for this same request now "
             "the user has the controls).",
         )

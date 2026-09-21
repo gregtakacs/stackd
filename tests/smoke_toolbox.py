@@ -972,6 +972,19 @@ def test_routes():
     r = post(tb, "/toolbox/mask/preview", {"mask_png": MASK_B64}, token=None)
     check("preview refuses no token", r.status == 403)
 
+    # THE QUERY-TOKEN CARRIER ON POSTS (live 2026-09-21): the shipped editor must stay a
+    # CORS *simple request*, so the token rides as ?token= and NO authorization header is
+    # ever sent. The POST handlers historically called _identity(http, {}, ...) with a
+    # hardcoded empty query dict — so query-carried credentials silently 403'd as
+    # 'malformed token' (verify() saw "") while the same token via header passed. Every
+    # POST route must authenticate from the raw path's query string alone.
+    f = Fake("POST", "/toolbox/mask/preview?token=" + TOK,
+             {"content-type": "text/plain"},
+             json.dumps({"mask_png": MASK_B64, "spec": {}}).encode())
+    tb.dispatch(f)
+    check("POST authenticates from the ?token= query alone (CORS-simple client)",
+          f.status == 200, f.payload)
+
     # the embed document must be self-contained: an opaque-origin srcdoc frame cannot
     # resolve relative asset URLs
     r = get(tb, "/toolbox/embed?image_id=x", token=fresh_token())
@@ -1200,6 +1213,23 @@ def test_contract():
     called = set(re.findall(r"req\('(/toolbox/[^']+)'", js))
     served = set(re.findall(r'"(/toolbox/[a-z/]+)"', api))
     check("every endpoint the editor calls exists on the server", bool(called) and not (called - served))
+    # PREFLIGHT-FREE CLIENT (live 2026-09-21): the srcdoc iframe is an opaque origin, so a
+    # single out-of-safelist header — an authorization header included — forces a CORS
+    # preflight, and the live Traefik front answers OPTIONS itself with a canned
+    # GET,OPTIONS,PUT and no allow-headers: the preflight never reaches stackd's correct
+    # handler and every Render/smart-select dies as "Failed to fetch". stackd still
+    # ACCEPTS the bearer header (programmatic callers, the spike harness), but the shipped
+    # client must never send one — the token rides as ?token=, the channel _token_from
+    # already reads. A "cleanup" that moves the token back into a header re-breaks the
+    # embed mount; this pin makes that a test failure, not a user-visible outage.
+    reqm = re.search(r"function req\(path, body, tok\)[\s\S]*?\n  \}", js)
+    check("the editor's fetches are CORS simple requests (token in query, no custom headers)",
+          reqm is not None
+          and "'authorization'" not in reqm.group(0)
+          and "authorization'" not in reqm.group(0).replace("'content-type'", "")
+          and "token=' + encodeURIComponent(tk)" in reqm.group(0),
+          "req() must send the token as ?token= only — an authorization header forces a "
+          "preflight the live Traefik front swallows (see the 2026-09-21 comment in req)")
     # --- knob honesty --------------------------------------------------------
     # A control that LOOKS configurable while the render ignores it is worse than
     # no control: the user moves it, sees no change, and concludes the editor is
@@ -1641,6 +1671,16 @@ def test_mint_seam():
           and 'headers={"Content-Disposition": "inline"}' in owu
           and "/toolbox/mint" in owu
           and 'headers.get("x-openwebui-user-email")' in owu)
+    # 2026-09-20 live deadlock: this Function runs on OWUI's event loop, and stackd's
+    # h_mint calls BACK into OWUI (chat lookup + file fetch) to inline the photo. The
+    # original blocking requests.post froze the loop those callbacks needed -> the mint
+    # never answered and the tool timed out at its own timeout_s. The mint POST must
+    # stay on a worker thread; a bare blocking call here is that bug reintroduced.
+    check("the OWU Tool's mint POST must not block OWUI's event loop",
+          "asyncio.to_thread" in owu
+          and "r = requests.post(" not in owu,
+          "wrap the mint requests.post in await asyncio.to_thread(...) — stackd calls "
+          "back into OWUI during mint and a frozen loop deadlocks it")
     check("the OWU Tool hands the MODEL a neutral context, not the editor HTML",
           "result_context" in owu or "mask editor is open" in owu)
     check("the OWU Tool carries the mint key from server-side sources only",
@@ -2321,7 +2361,25 @@ def test_spike_wiring():
           "overflow-x: clip" in css and "overflow-x: hidden" not in css)
 
     check("images re-report height on DECODE, not on append (an <img> has no height until it loads)",
-          "i.onload = reportHeightSoon" in js and js.count("im.onload = reportHeightSoon") >= 1)
+          "i.onload = reportHeightSoon" in js)
+    # The 2026-09-21 contract change: the finished render is NOT pasted into the embed
+    # (the chat owns it), so the old artifact-append loop is gone for good — pinned
+    # absent here, and the collapse that replaced it pinned present.
+    check("the finished artifact is never painted in the embed; the editor collapses to the summary with a height re-report instead",
+          "im.onload = reportHeightSoon" not in js
+          and "el.out.appendChild(im)" not in js
+          and "collapseEditor('terminal')" in js
+          and "el.host.classList.add('tb-collapsed')" in js)
+    # The two refresh-era pins (2026-09-21): the boot probe that stops a re-rendered
+    # chat message from presenting a dead session as an editor, and the box-based
+    # height measurement that lets the collapsed embed actually shrink (a document's
+    # scrollHeight inside an iframe can never report below the iframe's own height).
+    _ch = js[js.index("function contentHeight"):js.index("var _lastH")]
+    check("boot probes /toolbox/session before loading the photo and boots the receipt when submitted",
+          "'/toolbox/session'" in js and "sessionReceipt" in js
+          and "r.submitted" in js and "startPhoto" in js)
+    check("contentHeight measures the editor's own box (shrink-capable), with the document only as fallback",
+          "getBoundingClientRect" in _ch and "el.host" in _ch)
     # ...and the height ladder must not be the only thing that ever fires, since previews and
     # renders land long after 1600ms.
     check("preview/result append triggers a fresh report", js.count("reportHeightSoon()") >= 4)
@@ -2366,6 +2424,128 @@ def test_jobs():
         st.set(jid, state="exploded"); check("store.set refuses a bad state", False)
     except ValueError:
         check("store.set refuses a bad state", True)
+
+    # -- retention (2026-09-21, the user's "is it there forever?"): artifact pixels
+    # are disposable — the durable copies of a finished render are the OWU file save
+    # and the chat post, not this table; a week-old row is unreachable anyway (its
+    # job token lives only in the browser tab that made it). Provenance rows stay,
+    # stripped; error/cancelled rows leave; in-flight rows are never touched. --
+    stp = J.JobStore(":memory:")
+    jd = stp.create(email="a@b.c", kind="r", w=64, h=64, spec={}, mask_info={})
+    stp.set(jd, state="done", artifact_b64="QUJD", artifact_type="image/png")
+    je = stp.create(email="a@b.c", kind="r", w=64, h=64, spec={}, mask_info={})
+    stp.set(je, state="error", error="boom")
+    jf = stp.create(email="a@b.c", kind="r", w=64, h=64, spec={}, mask_info={})
+    jfresh = stp.create(email="a@b.c", kind="r", w=64, h=64, spec={}, mask_info={})
+    stp.set(jfresh, state="done", artifact_b64="QUJD", artifact_type="image/png")
+    import time as _rt_t
+    _old = _rt_t.time() - 40 * 86400
+    for _j in (jd, je, jf):                       # jfresh stays young on purpose
+        stp.conn.execute("UPDATE jobs SET created_at=?, updated_at=? WHERE id=?",
+                         (_old, _old, _j))
+    res = stp.prune(keep_days=14)
+    check("prune strips aged done rows' pixels but keeps the row (provenance survives)",
+          res["stripped"] == 1 and stp.get(jd) is not None
+          and stp.get(jd)["state"] == "done" and stp.get(jd)["artifact_b64"] is None
+          and "[artifact pruned]" in (stp.get(jd)["note"] or ""))
+    check("prune deletes aged error/cancelled rows entirely",
+          res["deleted"] == 1 and stp.get(je) is None)
+    check("prune never touches an in-flight row, whatever its age",
+          stp.get(jf) is not None and stp.get(jf)["state"] == "queued")
+    check("prune keeps young done rows intact (the reopen window)",
+          stp.get(jfresh)["artifact_b64"] == "QUJD")
+    check("keep_days<=0 disables the sweep entirely",
+          stp.prune(keep_days=0) == {"stripped": 0, "deleted": 0})
+
+    # -- the collapsed summary's payload (2026-09-21): the editor no longer shows the
+    # finished image (the chat owns it), so poll must at least carry the words the
+    # render ran on. Artifacts stay on the response — server-side provenance, and the
+    # editor simply declines to paint them. --
+    def rp(job, s, m, *, on_prompt_id=None):
+        on_prompt_id("pid-ps", "http://comfy:8188")
+        return (base64.b64encode(b"IMG").decode(), "image/png")
+    qp = J.JobQueue(J.JobStore(":memory:"), render=rp)
+    qp.start()
+    tbp = make_tb(mint_key="minty", public_base="https://lab.example",
+                  chat_source=lambda e, c, m: "/api/v1/files/in-chat/content",
+                  source=lambda email, ref: PHOTO if (email and ref) else None,
+                  worker=qp)
+    rmp = post(tbp, "/toolbox/mint", {"email": EMAIL, "chat_id": "CH-PS"},
+               headers={"authorization": "Bearer minty"})
+    tokp = (rmp.payload or {}).get("token") or ""
+    softp = brush_ramp_mask((640, 480), (20, 20, 70, 70), 0.5)
+    cp = post(tbp, "/toolbox/jobs",
+              {"mask_png": base64.b64encode(softp).decode(),
+               "source_ref": "/api/v1/files/in-chat/content",
+               "spec": {"prompt": "make it a red car", "seed": 3}},
+              headers={"authorization": "Bearer " + tokp})
+    check("poll_sent fixture: submit created the job", cp.status == 200, cp.payload)
+    jidp = (cp.payload or {}).get("job_id")
+    wait_for(qp.store, jidp)
+    _specp = json.loads(qp.store.get(jidp)["spec_json"] or "{}")
+    pp = post(tbp, "/toolbox/jobs/poll", {"job_id": jidp}, token=cp.payload.get("token"))
+    check("poll quotes the words the finished render ran on — the captioned form, not the raw instruction (the collapsed editor's summary)",
+          pp.status == 200 and pp.payload.get("state") == "done"
+          and pp.payload.get("prompt_sent") == _specp.get("prompt")
+          and _specp.get("prompt") != _specp.get("prompt_raw")
+          and "red car" in (pp.payload.get("prompt_sent") or ""), (pp.payload, _specp))
+    check("poll still carries the persisted artifact (provenance is server-side)",
+          bool((pp.payload.get("artifacts") or [{}])[0].get("png")))
+    # -- /toolbox/session: the refresh gate. OWU re-renders the saved tool-result HTML
+    # on every chat refresh, re-booting the editor document with the ALREADY-REDEEMED
+    # launch token; the boot probe must say submitted + replay the receipt fields
+    # (same prompt_sent truth as poll), and must never itself spend a token. --
+    ssn = post(tbp, "/toolbox/session", {},
+               headers={"authorization": "Bearer " + tokp})
+    check("session reports the redeemed launch token as submitted, joined back to ITS job via the server-stamped launch_jti",
+          ssn.status == 200 and ssn.payload.get("submitted") is True
+          and ssn.payload.get("job_id") == jidp
+          and ssn.payload.get("state") == "done"
+          and ssn.payload.get("prompt_sent") == _specp.get("prompt"), ssn.payload)
+    rm3 = post(tbp, "/toolbox/mint", {"email": EMAIL, "chat_id": "CH-PS3"},
+               headers={"authorization": "Bearer minty"})
+    tok3 = (rm3.payload or {}).get("token") or ""
+    ssn_a = post(tbp, "/toolbox/session", {},
+                 headers={"authorization": "Bearer " + tok3})
+    check("an unsubmitted session answers submitted:false (a pre-Render refresh keeps its editor)",
+          ssn_a.status == 200 and ssn_a.payload.get("submitted") is False, ssn_a.payload)
+    cp3 = post(tbp, "/toolbox/jobs",
+               {"mask_png": base64.b64encode(softp).decode(),
+                "source_ref": "/api/v1/files/in-chat/content",
+                "spec": {"prompt": "second edit please", "launch_jti": "FORGED-BY-BROWSER"}},
+               headers={"authorization": "Bearer " + tok3})
+    check("the token the session probe queried is still spendable — the pure read did not redeem it",
+          cp3.status == 200 and cp3.payload.get("state") == "queued", cp3.payload)
+    _row3 = qp.store.get((cp3.payload or {}).get("job_id"))
+    _sp3 = json.loads(_row3["spec_json"] or "{}")
+    _jti3 = json.loads(T._unb64(tok3.split(".")[1])).get("jti")
+    check("create stamps the launch jti server-side; a body-forged launch_jti is overwritten, never trusted",
+          _sp3.get("launch_jti") == _jti3 and _sp3.get("launch_jti") != "FORGED-BY-BROWSER",
+          str(_sp3)[:120])
+    wait_for(qp.store, (cp3.payload or {}).get("job_id"))
+    ssn_b = post(tbp, "/toolbox/session", {},
+                 headers={"authorization": "Bearer " + tok3})
+    check("session resolves a redeemed token to ITS OWN job (a second session's row cannot shadow the first)",
+          ssn_b.payload.get("submitted") is True
+          and ssn_b.payload.get("job_id") == (cp3.payload or {}).get("job_id"), ssn_b.payload)
+    rbad = post(tbp, "/toolbox/session", {}, token=None)
+    check("session still requires a token", rbad.status == 403)
+    qp.stop()
+
+    # -- is_redeemed_jti: the route's authority, pinned pure at the unit level --
+    tkx = T.mint(SECRET, scope="launch", email="u@v.w")
+    plx = T.verify(SECRET, tkx, scope="launch", single_use=False)
+    check("is_redeemed_jti answers false for a fresh token — and answering never spends it",
+          T.is_redeemed_jti(plx["jti"]) is False
+          and T.is_redeemed_jti(plx["jti"]) is False)
+    try:
+        T.verify(SECRET, tkx, scope="launch")          # the real redeem
+        _burned = True
+    except T.Replay:
+        _burned = False
+    check("is_redeemed_jti answers true once the single-use redeem has fired (and empty jti is not 'redeemed')",
+          _burned and T.is_redeemed_jti(plx["jti"]) is True
+          and T.is_redeemed_jti("") is False)
 
     # -- happy path: queued -> running (records prompt_id) -> done(artifact) --
     seen = {}

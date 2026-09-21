@@ -171,7 +171,9 @@ def canonical_inpaint_node_ids(model: str = "flux2-klein") -> set:
 #   3 CLIPTextEncode (optional, text only) -> CONDITIONING
 #   4 SAM3_Detect   model+image+coords[/cond]-> MASK, BBOXES
 #   5 MaskToImage   (binary MASK -> IMAGE)
-#   6 SaveImage     (so the result is fetchable via /history like any render)
+#   6 PreviewImage  (fetchable via /history type=temp like any render, WITHOUT cluttering
+#                   the user's ComfyUI output gallery -- one file per smart-select click
+#                   used to land there as toolbox_seg_*.png and read as a stray render)
 
 SAM3_CKPT = "sam3.1_multiplex_fp16.safetensors"   # Comfy-Org/sam3.1, fp16, ~1.7 GB
 SEG_LOAD = "1"
@@ -219,10 +221,9 @@ def sam3_segment_graph(*, source_filename: str, ckpt_name: str = SAM3_CKPT,
         SEG_MASKIMG: {"class_type": "MaskToImage",
                       "inputs": {"mask": [SEG_DETECT, 0]},
                       "_meta": {"title": "Mask to image"}},
-        SEG_SAVE: {"class_type": "SaveImage",
-                   "inputs": {"images": [SEG_MASKIMG, 0],
-                              "filename_prefix": "toolbox_seg"},
-                   "_meta": {"title": "Save mask"}},
+        SEG_SAVE: {"class_type": "PreviewImage",
+                   "inputs": {"images": [SEG_MASKIMG, 0]},
+                   "_meta": {"title": "Preview mask"}},
     }
     if text:
         graph[SEG_CLIP] = {"class_type": "CLIPTextEncode",
@@ -235,8 +236,8 @@ def sam3_segment_graph(*, source_filename: str, ckpt_name: str = SAM3_CKPT,
 def validate_sam3_segment_graph(graph: dict) -> list[str]:
     """Layout problems (empty == good). Guards the two contracts that actually break a
     click-select if they drift: the SAM3_Detect node must consume the checkpoint's MODEL
-    (output 0) and the LoadImage IMAGE (output 0), and SaveImage must sit at the end of the
-    MaskToImage chain. A wrong wiring here returns the wrong pixels (or none) on paid GPU
+    (output 0) and the LoadImage IMAGE (output 0), and the PreviewImage must sit at the end
+    of the MaskToImage chain. A wrong wiring here returns the wrong pixels (or none) on paid GPU
     time, so it is checked before submit, exactly like validate_painted_mask_graph."""
     problems: list[str] = []
     det = graph.get(SEG_DETECT)

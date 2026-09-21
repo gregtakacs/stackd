@@ -167,3 +167,15 @@ html {
    selection outright instead of merely reshaping it. The server clamps it either way
    (masks._erode_with_cap keeps >= 10% of the selection); this warns rather than surprises. */
 .tb-inspect .tb-hint.tb-warn { color: #e8a33e; }
+
+/* Session collapse (2026-09-21, the user's call): once a render is submitted the launch
+   token is single-use and spent, so the canvas, tools and knobs on screen belong to a
+   dead session — and the finished image belongs to the chat, never to this panel. The
+   embed shrinks to its status line. Everything except the status (and the live progress
+   bar and, during the render, the action row for Cancel's sake) goes. [data-hide] is
+   stamped by boot() on every action button except Cancel. */
+.tb-collapsed > * { display: none !important; }
+.tb-collapsed > .tb-status,
+.tb-collapsed > .tb-actions,
+.tb-collapsed > #tb-progbar { display: block !important; }
+.tb-collapsed .tb-actions [data-hide] { display: none !important; }

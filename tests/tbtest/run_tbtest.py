@@ -2,7 +2,7 @@
 
     python3 tests/tbtest/run_tbtest.py [--mutate NAME] [--width 420] [--height 620]
     (--mutate: sticky ctlorder softpunch brushfeather kindstr autoslider widetol
-     rawwash allmerge nosig selguard twoslider noderive blendblank seldbg
+     rawwash allmerge nosig selguard twoslider noderive seldbg
      barwash bar95 polltoken movelost shrinkrad padsniped erasesoft nofold latentpunch bakepad bakefeather erasepaints legacy)
 
 --mutate rebuilds the page with a deliberately broken copy of the shipped JS, so the suite
@@ -272,23 +272,8 @@ MUTANTS["seldbg"] = SELDBG
 # it is not testing the fix.
 
 
-# blank blend options: the defect the user actually reported. A faithful mutant needs
-# BOTH halves at once -- the old select() (which read opts[i][1] unconditionally) and
-# the old caller that passed bare values. Change either half alone and the options are
-# still labelled, so the mutant would reproduce nothing and pass for the wrong reason.
-def LEGACY_BLENDBLANK(s):
-    s2 = re.sub(r"labelled\('blend', select\('blend', \[.*?\]\]\)\)",
-                "labelled('blend', select('blend', [['normal'], ['multiply'], ['screen'], "
-                "['overlay'], ['soft-light'], ['hard-light'], ['luminosity'], ['color']]))",
-                s, count=1, flags=re.S)
-    assert s2 != s, 'blend caller not found -- mutant is not faithful'
-    s3 = s2.replace("(opts[i].length > 1 && opts[i][1] != null) ? opts[i][1] : opts[i][0]",
-                    "opts[i][1]")
-    assert s3 != s2, 'select() fallback not found -- mutant is not faithful'
-    return s3
-
-
-MUTANTS["blendblank"] = LEGACY_BLENDBLANK
+# blendblank RETIRED (M2.1): the blend dropdown no longer ships — params()
+# freezes blend_mode 'normal', so there is no select('blend', ...) call left to mutate.
 
 
 
@@ -787,7 +772,7 @@ def main():
            # Forcing classic scrollbars makes this environment able to exhibit the bug the
            # user actually reported (their desktop has non-overlay bars).
            "--disable-features=OverlayScrollbar",
-           "--window-size=%d,%d" % (w, h), "--virtual-time-budget=60000",
+           "--window-size=%d,%d" % (w, h), "--virtual-time-budget=90000",
            "--dump-dom", "file://" + str(out_html)]
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
     m = re.search(r'<pre id="__TBRESULT__">(.*?)</pre>', p.stdout, re.S)
@@ -802,9 +787,13 @@ def main():
         print('COMPOSE TRACE:')
         for i, d in enumerate(res['dbg'][:10]):
             print('  ', i, d)
-    EXPECT = 162   # 161 + 1 edge/feather equal-track gate: visibility x6 (pair NEVER shown), KF promise x2,
+    EXPECT = 166   # 163 + collapse round's three: height-shrink + boot-session-probe in
+                   # 'render done asserts', and the refresh-boot receipt assert (2026-09-21)
+                   # 161 + 1 edge/feather equal-track gate: visibility x6 (pair NEVER shown), KF promise x2,
                    # fresh-hard x1, no-arm-leak x1, no-dashed-box x1, ZM honesty x3, A3 belt x1
-                 # wire-no-punch (2), feather-live group (4), re-merge no-remnant (3)
+                 # wire-no-punch (2), feather-live group (4), re-merge no-remnant (3),
+                 # M2.1 knob-retirement restructure: net +1 (3 retired-control checks +
+                 # no-ghost-deadnote replace the blend-DOM/variants-greyed pair)
     if len(res["tests"]) != EXPECT:
         print("TRUNCATED RUN: got %d assertions, expected %d -- an early error stopped the "
               "steps (notes: %s). This is NOT a pass." %

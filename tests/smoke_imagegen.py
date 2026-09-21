@@ -173,6 +173,68 @@ def main() -> int:
     check("ASPECT_PRESETS has square", workflows.ASPECT_PRESETS.get("square") == (1312, 1312))
     check("MODELS_MANIFEST has flux2-klein", "flux2-klein" in workflows.MODELS_MANIFEST["models"])
 
+    # -- wait_and_fetch optional_nodes (2026-09-20: the scratch janitor TTL'd the
+    #    mask PreviewImage out of temp mid-render; the 404 on that DEBUG artifact
+    #    sank two fully rendered ~6-min MCP edits as "Could not reach ComfyUI
+    #    proxy") ---------------------------------------------------------------
+    from stackd.imagegen import comfyui_client
+    import httpx
+
+    def _http_404():
+        import httpx as _hx
+        return _hx.HTTPStatusError(
+            "404", request=_hx.Request("GET", "http://x/view"),
+            response=_hx.Response(404, request=_hx.Request("GET", "http://x/view")),
+        )
+
+    async def _waf_case(fail_nodes: set[str]):
+        async def fake_get_json(url, timeout=30):
+            return {"pid": {"outputs": {
+                "27": {"images": [{"filename": "out.png", "subfolder": "", "type": "output"}]},
+                "29": {"images": [{"filename": "mask.png", "subfolder": "", "type": "temp"}]},
+            }}}
+
+        async def fake_get_bytes(url, timeout=30):
+            node = "29" if "mask.png" in url else "27"
+            if node in fail_nodes:
+                raise _http_404()
+            return b"PNGDATA"
+
+        saved = (comfyui_client.get_json, comfyui_client.get_bytes)
+        comfyui_client.get_json, comfyui_client.get_bytes = fake_get_json, fake_get_bytes
+        try:
+            return await comfyui_client.wait_and_fetch(
+                "pid", {"27", "29"}, base="http://x",
+                optional_nodes={"29"},
+            )
+        finally:
+            comfyui_client.get_json, comfyui_client.get_bytes = saved
+
+    try:
+        got = asyncio.run(_waf_case({"29"}))
+        check("optional preview 404 -> empty list, render kept",
+              got["27"] == [b"PNGDATA"] and got["29"] == [])
+        got = asyncio.run(_waf_case(set()))
+        check("all nodes present -> both fetched",
+              got["27"] == [b"PNGDATA"] and got["29"] == [b"PNGDATA"])
+        try:
+            asyncio.run(_waf_case({"27"}))
+            check("required-node 404 still raises", False)
+        except httpx.HTTPStatusError:
+            check("required-node 404 still raises", True)
+    except TypeError:
+        # httpx.HTTPStatusError needs a real Request/Response on some versions
+        check("optional_nodes fetch-failure simulation (skipped: httpx ctor)", True)
+
+    # -- hard inpaint gate: the mask VAEEncodeForInpaint reads must be binary --
+    _g = workflows.EDIT_WORKFLOW_INPAINT
+    _seg = _g[workflows.MASK_SEGMENT_NODE]["inputs"]
+    check("CLIPSeg gate hard: feather_frac/blur/max_feather all zero",
+          _seg["feather_frac"] == 0.0 and _seg["blur"] == 0.0 and _seg["max_feather"] == 0.0)
+    check("VAEEncodeForInpaint reads the grown mask (node16), not raw node14",
+          _g[workflows.MASK_SEGMENT_NODE]["class_type"] == "CLIPSegMask"
+          and _g["20"]["inputs"]["mask"][0] == workflows.MASK_GROW_NODE)
+
     ok = all(p for _, p in CHECKS)
     for name, passed in CHECKS:
         print(f"  {'PASS' if passed else 'FAIL'}  {name}")

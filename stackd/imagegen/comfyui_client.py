@@ -12,11 +12,14 @@ ComfyUI containers sit on the internal Docker network with no auth, so no bearer
 
 import asyncio
 import io
+import logging
 import time
 import urllib.parse
 import uuid
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 from stackd.imagegen import config
 
@@ -200,11 +203,25 @@ async def wait_and_fetch(
     prompt_id: str, include_node_ids: set[str], base: str,
     timeout_s: float | None = None,
     on_poll=None,
+    optional_nodes: set[str] | None = None,
 ) -> dict[str, list[bytes]]:
     """Polls /history until the prompt completes, then downloads every image any of
     include_node_ids produced. Returns images keyed by node id so callers can tell a
     real output apart from e.g. a debug mask preview with certainty, instead of relying
     on dict/list ordering ComfyUI doesn't guarantee.
+
+    optional_nodes names nodes whose bytes are advisory rather than the point of the
+    call (e.g. the mask PreviewImage used by edit_image's nothing-found heuristic).
+    Nodes like PreviewImage write their PNG to temp EARLY in the run -- the mask branch
+    finishes in seconds while the sampler then grinds for minutes -- and stackd's own
+    scratch janitor (cleaner.py) sweeps temp on a TTL, so on a long Klein masked edit
+    the preview reliably ages out before this function ever fetches it. That used to
+    surface as an HTTPStatusError that sank a fully rendered edit over its own debug
+    image (2026-09-20: both smiley-face MCP edits paid for ~6 min of GPU and returned
+    "Could not reach ComfyUI proxy"). An optional node that fails to download logs a
+    warning and yields an empty list -- callers' optional-node heuristics already skip
+    themselves on empty input (see edit_image's `mask_images and all(...)` guard).
+    Non-optional nodes still raise exactly as before.
 
     timeout_s overrides config.TIMEOUT_S for this call only. It exists for the toolbox,
     whose renders are crop-bounded and therefore have a very different expected duration
@@ -240,6 +257,7 @@ async def wait_and_fetch(
     for node_id, node_out in outputs.items():
         if node_id not in include_node_ids:
             continue
+        optional = bool(optional_nodes) and node_id in optional_nodes
         for img in node_out.get("images", []):
             params = urllib.parse.urlencode(
                 {
@@ -248,7 +266,20 @@ async def wait_and_fetch(
                     "type": img.get("type", "output"),
                 }
             )
-            data = await get_bytes(f"{base}/view?{params}", timeout=30)
+            try:
+                data = await get_bytes(f"{base}/view?{params}", timeout=30)
+            except httpx.HTTPError:
+                if not optional:
+                    raise
+                # Advisory bytes (typically a temp preview the janitor already TTL'd
+                # out). The caller treats [] as "heuristic unavailable" -- verified
+                # for every current optional caller.
+                logger.warning(
+                    "wait_and_fetch: optional node %s (%s, type=%s) not fetchable; "
+                    "continuing without it", node_id, img["filename"],
+                    img.get("type", "output"),
+                )
+                continue
             images_by_node[node_id].append(data)
 
     # Result is in hand -- drop this history entry now, so the comfyui-cleaner

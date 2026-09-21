@@ -6,8 +6,10 @@
  * allow-same-origin; the only postMessage the renderer honours is iframe:height). So:
  *   - no cookies, no localStorage, no sessionStorage, no same-origin assumptions;
  *   - config arrives via window.__TB__ (injected by stackd/toolbox/web.py);
- *   - the only network calls are fetch()es to CFG.api with the launch token in a
- *     header — never a cookie, never credentials: 'include'.
+ *   - the only network calls are fetch()es to CFG.api with the launch token as a
+ *     ?token= query param — never a cookie, never an authorization header (a custom
+ *     header would force a CORS preflight, which the live Traefik front swallows; see
+ *     req()), never credentials: 'include'.
  *
  * Division of labour with the server (stackd/toolbox/masks.py owns mask semantics):
  * this canvas paints at the SOURCE image's natural size and exports white-RGB +
@@ -1558,13 +1560,20 @@
     var ctl = null;
     try { ctl = new AbortController(); } catch (e) { /* ancient engines */ }
     var timer = ctl && setTimeout(function () { ctl.abort(); }, 30000);
-    return fetch(API + path, {
+    return fetch(API + path + (tk ? (path.indexOf('?') < 0 ? '?' : '&') + 'token=' + encodeURIComponent(tk) : ''), {
       method: 'POST',
-      // text/plain, not application/json: a srcdoc iframe is an opaque origin, so this
-      // is a cross-origin POST and application/json would force a preflight OPTIONS the
-      // plain-stdlib front would have to answer. Same body either way.
-      headers: Object.assign({ 'content-type': 'text/plain' },
-                             tk ? { 'authorization': 'Bearer ' + tk } : {}),
+      // The ENTIRE request must stay a CORS *simple request*, on every mount. From a
+      // srcdoc iframe (opaque origin) any out-of-safelist header — an authorization
+      // header included — forces a preflight OPTIONS, and on the live stack Traefik's
+      // cors middleware answers OPTIONS itself with a canned GET,OPTIONS,PUT and no
+      // allow-headers, so the preflight never reaches stackd's own correct CORS reply
+      // and every call dies as "Failed to fetch" (live 2026-09-21: Render and smart
+      // select both dead in the OWUI embed while identical same-origin traffic worked
+      // from the standalone link page). Hence: text/plain (safelisted) and the token
+      // as a QUERY param — the channel _token_from has accepted since /toolbox/embed,
+      // and safe to leak only as far as it is already public: one-use, ~15-min, and
+      // useless without this very opaque-origin document that carries it.
+      headers: { 'content-type': 'text/plain' },
       body: JSON.stringify(body || {}),
       signal: ctl ? ctl.signal : undefined
     }).then(function (r) {
@@ -1650,7 +1659,9 @@
     return {
       kind: el.kind ? el.kind.value : 'edit',
       prompt: el.prompt ? el.prompt.value : '',
-      strength: val('tb_strength', 0.25),
+      strength: 0.25,            // frozen: the masked graph always renoises to 1.0 inside
+                                 // the hard gate (same as edit_image's masked path — the
+                                 // label "edit strength" promised a dial nothing reads)
       // Derived, never independent: one bipolar knob is the only way to express this, so the
       // flat-mask path (spike, older editors) cannot enter the both-set closing state either.
       mask_edge: val('tb_edge', 0),
@@ -1663,11 +1674,16 @@
       // the server's already-composited image without also fading the photo underneath.
       // Never reaches the render's mask maths.
       overlay_alpha: val('tb_wash', 0.45),
+      blend_mode: 'normal',      // frozen: the blend dropdown was removed — inside the
+                                 // painted selection Normal (replace) is what the user
+                                 // asked for every single time; the server still accepts
+                                 // other spellings for programmatic specs
       opacity: val('tb_opacity', 1.0),
-      blend_mode: el.blend ? el.blend.value : 'normal',
-      color_match: val('tb_colormatch', 0.9),
-      preserve_detail: val('tb_detail', 0.35),
-      variants: int0('tb_variants', 1),
+      color_match: val('tb_colormatch', 0),
+      preserve_detail: val('tb_detail', 0),
+      variants: 1,               // frozen: the queue stores exactly one artifact per job
+                                 // (jobs.py has one artifact_b64 column); a variants
+                                 // control that could not multiply renders was theatre
       seed: int0('tb_seed', -1),
       width: int0('tb_w', W), height: int0('tb_h', H)
     };
@@ -1866,10 +1882,12 @@
     root.appendChild(mk('div', 'tb-band',
       'Generation — how the masked area is re-dreamed (never changes the mask)'));
     var g3 = row('tb-grid');
-    g3.appendChild(ctl('strength', 'range', 0.25, 'edit strength', { min: 0.05, max: 1, step: 0.05 }));
+    // No "edit strength" slider: on the masked path the graph renoises the gate to 1.0
+    // unconditionally (that IS an inpaint — same as edit_image's masked path), so a
+    // strength dial had nothing to control. It stays a frozen value in the spec.
     g3.appendChild(ctl('opacity', 'range', 1, 'blend opacity', { min: 0, max: 1, step: 0.05 }));
-    g3.appendChild(ctl('colormatch', 'range', 0.9, 'colour match', { min: 0, max: 1, step: 0.05 }));
-    g3.appendChild(ctl('detail', 'range', 0.35, 'keep original detail', { min: 0, max: 1, step: 0.05 }));
+    g3.appendChild(ctl('colormatch', 'range', 0, 'colour match', { min: 0, max: 1, step: 0.05 }));
+    g3.appendChild(ctl('detail', 'range', 0, 'keep original detail', { min: 0, max: 1, step: 0.05 }));
     root.appendChild(g3);
 
     // The mode is NOT cosmetic: engine._apply_mode reads spec["kind"] and rewires the
@@ -1896,25 +1914,14 @@
     root.appendChild(labelled('prompt', el.prompt));
 
     var g4 = row('tb-grid');
-    // WIRED since M2.1: paste_back composites the model output over the photo and applies
-    // this mode INSIDE the edited region (values match ComfyUI's ImageBlend spellings).
-    // It changes HOW the generation is married to the photo, never what is generated —
-    // which is why it sits below the prompt, next to the other compositing knobs.
-    g4.appendChild(labelled('blend', select('blend', [
-      ['normal', 'Normal'], ['multiply', 'Multiply'], ['screen', 'Screen'],
-      ['overlay', 'Overlay'], ['soft_light', 'Soft light'], ['hard_light', 'Hard light'],
-      ['luminosity', 'Luminosity'], ['color', 'Color']])));
-    g4.appendChild(ctl('variants', 'number', 1, 'variants', { min: 1, max: 4 }));
+    // The blend-mode dropdown and the variants control were REMOVED (M2.1 review): inside
+    // a hard-gated painted selection the paste is always Normal (replace) — Multiply/
+    // Screen/Luminosity blend two whole images, which is not what a masked inpaint is —
+    // and jobs.py stores exactly one artifact per row, so a variants box was theatre.
+    // params() now sends 'normal'/1 as constants; engine/masks still honour other values
+    // from programmatic specs.
     g4.appendChild(ctl('seed', 'number', -1, 'seed (-1 random)', { min: -1, max: 4294967295, step: 1 }));
     root.appendChild(g4);
-    root.appendChild(mk('div', 'tb-hint',
-      'Blend says how the generation is laid over the photo inside the edit: Normal simply ' +
-      'replaces it (the right choice almost always). Multiply darkens toward the photo ' +
-      '(shadows, stains); Screen lightens (glow, haze, smoke); Overlay / Soft light / Hard ' +
-      'light keep the photo\'s light-dark pattern under the new colour (texture keepers); ' +
-      'Luminosity keeps only the generation\'s COLOUR and takes the photo\'s brightness; ' +
-      'Color keeps the photo\'s brightness and takes only the generation\'s hues — the last ' +
-      'two are recolour tools. If you never touched it, leave it on Normal.'));
 
     // Knobs whose values reach the server, are persisted with the job, and are then
     // ignored: engine._patch_graph wires only prompt/width/height/seed (plus the mask
@@ -1928,17 +1935,24 @@
     // unclaimed by the engine.
     var DEAD_KNOBS = ['strength', 'variants'];
     var DEAD_EL = {};   // control-id overrides for knobs still on death row (none today)
+    var anyDead = false;   // the note below must describe REAL greyed controls, not a
+                           // historical list: strength/variants now ship frozen in
+                           // params(), so an unconditional note would promise greyed
+                           // knobs that no longer exist (a legend for a missing feature).
     for (var di = 0; di < DEAD_KNOBS.length; di++) {
       var node = el[DEAD_EL[DEAD_KNOBS[di]] || DEAD_KNOBS[di]];
       if (node) {
         node.disabled = true;
+        anyDead = true;
         node.title = 'Recorded with the job, not wired into the render graph yet — changing this does nothing today';
       }
     }
-    root.appendChild(mk('div', 'tb-hint tb-deadnote',
-      'greyed knobs are recorded with the job but not wired into the render graph yet — ' +
-      'prompt, seed, the mask geometry and the compositing knobs (opacity, blend, colour ' +
-      'match, detail) affect the image today'));
+    if (anyDead) {
+      root.appendChild(mk('div', 'tb-hint tb-deadnote tb-deadknobs',
+        'greyed knobs are recorded with the job but not wired into the render graph yet — ' +
+        'prompt, seed, the mask geometry and the compositing knobs (opacity, colour match, ' +
+        'detail) affect the image today'));
+    }
     return root;
   }
 
@@ -2102,7 +2116,7 @@
   function doRender() {
     var m = exportMask();
     if (!m) { status('Paint a mask first.', 'bad'); return; }
-    if (jobTimer) { status('Still waiting on the previous render — see the result below.'); return; }
+    if (jobTimer) { status('Still waiting on the previous render — the summary will land here.'); return; }
     status('Submitting render…');
     req('/toolbox/jobs', {
       image: CFG.image || null, image_id: CFG.image_id || null,
@@ -2132,6 +2146,11 @@
       // scope="job" (a launch token there is a 403). This token is bound to this job_id.
       jobToken = r.token || null;
       jobId = r.job_id;
+      // The launch token died with this create (single-use redemption, api._create).
+      // From here on this embed can submit NOTHING — the canvas, tools and knobs still
+      // on screen would be furniture from a dead session. Collapse to the status
+      // updater (+ Cancel, while the job lives): see collapseEditor.
+      collapseEditor('running');
       pollJob(r.job_id, 0, jobToken);
     }).catch(function (e) { status('Render failed: ' + e.message, 'bad'); });
   }
@@ -2162,10 +2181,41 @@
     // live-pushes an external message), so 'posted' comes with the one refresh it
     // needs — and 'failed' is admitted here rather than discovered in the chat.
     var p = crop && crop.chat_post;
-    if (p === 'posted') return ' · also posted back into your chat (refresh the chat tab to see it)';
+    if (p === 'posted') return ' · the image was posted back into your chat (refresh the chat tab to see it)';
     if (p === 'failed' || (p && p.indexOf('failed') === 0))
       return ' · the chat hand-back did NOT go through — the image is still in your Open WebUI files';
-    return '';
+    return ' · the image was saved to your Open WebUI files';
+  }
+
+  function summaryLine(r) {
+    // The receipt's whole text, built ONCE and shared by the live done-poll and the
+    // refresh-boot receipt (sessionReceipt) — the two must never drift in what they
+    // claim about the render. The quoted words are poll/session's prompt_sent: the
+    // captioned form the model actually saw, never the raw instruction.
+    var pr = typeof r.prompt_sent === 'string' ? r.prompt_sent.trim() : '';
+    if (pr.length > 64) pr = pr.slice(0, 64) + '…';
+    return 'Done · '
+           + (r.elapsed_s ? Math.round(r.elapsed_s) + 's · ' : '')
+           + (pr ? '"' + pr + '" · ' : '')
+           + (r.seed !== undefined ? 'seed ' + r.seed + ' · ' : '')
+           + cropNote(r.crop)
+           + chatPostNote(r.crop);
+  }
+
+  function sessionReceipt(r) {
+    // The refresh defect (2026-09-21): OWU re-renders the SAVED tool-result HTML on
+    // every chat refresh — the whole editor document, re-booted with the launch token
+    // that the first submit already redeemed. Presenting an editable canvas + photo
+    // that can never submit is the lie the user reported; /toolbox/session is the
+    // question, this is the honest answer: boot straight into the collapsed summary,
+    // the photo never even decodes.
+    var line;
+    if (r.state === 'error') line = 'Render failed: ' + (r.error_message || 'engine error');
+    else if (r.state === 'cancelled') line = 'Render cancelled'
+         + (r.elapsed_s ? ' after ' + Math.round(r.elapsed_s) + 's' : '');
+    else line = summaryLine(r);
+    status(line, r.state === 'error' ? 'bad' : 'ok');
+    collapseEditor('terminal');
   }
 
   function pollJob(id, tries, tok) {
@@ -2177,20 +2227,18 @@
       if (r.state === 'done' || r.state === 'error') {
         jobTimer = null; jobId = null; jobToken = null;   // terminal: drop the spent job token
         clearBar();   // a bar parked at 95% next to a finished image is worse than no bar
-        if (r.state === 'error') { status('Render failed: ' + (r.error_message || 'engine error'), 'bad'); return; }
-        var list = r.artifacts || [];
-        el.out.innerHTML = '';
-        for (var i = 0; i < list.length; i++) {
-          var im = document.createElement('img');
-          im.src = list[i].url || ('data:image/png;base64,' + list[i].png);
-          im.onload = reportHeightSoon;   // same decode-time re-report as showImage: N
-          el.out.appendChild(im);         // artifacts arrive after the ladder has stopped
-        }
-        reportHeightSoon();
-
-        status('Rendered ' + list.length + ' image(s)' + (r.seed !== undefined ? ' · seed ' + r.seed : '')
-               + (r.elapsed_s ? ' · ' + r.elapsed_s.toFixed(0) + 's' : '')
-               + cropNote(r.crop) + chatPostNote(r.crop), 'ok');
+        if (r.state === 'error') { status('Render failed: ' + (r.error_message || 'engine error'), 'bad'); collapseEditor('terminal'); return; }
+        // The finished image does NOT live here anymore — the chat owns it (server-side
+        // hand-back + the OWU file save). An earlier build pasted the artifact into this
+        // panel and the user saw the same photo twice; the ask was explicit: "once we
+        // sent the render, the embed should just reduce down to a status updater and
+        // never show the final image". The artifacts still arrive on this response
+        // (they are the persisted row's copy, and the offline suite reads them there);
+        // the editor just refuses to display them. One honest line remains: what ran,
+        // how long it took, and where the picture went.
+        var pr = summaryLine(r);
+        status(pr, 'ok');
+        collapseEditor('terminal');
         return;
       }
       status(progressLine(r, tries));
@@ -2256,6 +2304,21 @@
     if (!host) return;
     var bar = host.querySelector('#tb-progbar');
     if (bar && bar.parentNode) bar.parentNode.removeChild(bar);
+  }
+
+  function collapseEditor(phase) {
+    // One-way door (see doRender): the launch token is redeemed by the first create, so
+    // after a submit every control left on screen belongs to a dead session — and the
+    // finished image belongs to the chat, not to this panel. The embed shrinks to its
+    // status line: during the render, plus Cancel; once terminal, just the summary.
+    // The hiding itself is CSS (.tb-collapsed > * in toolbox.css); this stamps the
+    // class, empties the artifact host, and re-reports the iframe height so the chat
+    // collapses along with it.
+    if (!el.host) return;
+    el.host.classList.add('tb-collapsed');
+    if (el.out) el.out.innerHTML = '';
+    if (el.btnCancel) el.btnCancel.style.display = (phase === 'running') ? '' : 'none';
+    reportHeightSoon();
   }
 
   function doCancel() {
@@ -2614,6 +2677,7 @@
     var host = $(CFG.root || 'tb');
     if (!host) return;
     host.className = 'tb';
+    el.host = host;                              // collapseEditor's marker target
     viewC = document.createElement('canvas'); viewC.id = 'tb_view';
     ringC = document.createElement('canvas'); ringC.id = 'tb_ring';
     var tbBox = mk('div', 'tb-canvasbox');
@@ -2628,10 +2692,18 @@
     // its own — schedulePreview fires on every paint — so a button re-asking for the same
     // answer was theatre. The one thing only the button delivered, the empty/tiny verdict,
     // moved into runPreview below, where it lands automatically.)
-    actions.appendChild(btn('Auto-mask from prompt', doAuto));
-    actions.appendChild(btn('Render', doRender, 'tb-go'));
-    actions.appendChild(btn('Cancel', doCancel, 'stop the running render (interrupts ComfyUI)'));
-    actions.appendChild(btn('Start over', function () { clearMask(); el.out.innerHTML = ''; status('Ready.'); }));
+    var bAuto = btn('Auto-mask from prompt', doAuto);
+    var bRender = btn('Render', doRender, 'tb-go');
+    el.btnCancel = btn('Cancel', doCancel, 'stop the running render (interrupts ComfyUI)');
+    var bReset = btn('Start over', function () { clearMask(); el.out.innerHTML = ''; status('Ready.'); });
+    actions.appendChild(bAuto);
+    actions.appendChild(bRender);
+    actions.appendChild(el.btnCancel);
+    actions.appendChild(bReset);
+    // collapseEditor's tags: on submit everything except Cancel leaves the stage for
+    // good (the launch token is spent — those buttons could never start a new job);
+    // the terminal states hide Cancel too (see collapseEditor).
+    [bAuto, bRender, bReset].forEach(function (b) { b.setAttribute('data-hide', '1'); });
 
     var zr = row('tb-zoom');
     // Steps multiply the EFFECTIVE ratio (which in Fit mode is the live fit ratio), so
@@ -2684,8 +2756,24 @@
       reportHeightSoon();      // the photo just changed our height; one report never caught it
     };
     im.onerror = function () { status('The source image failed to load.', 'bad'); };
-    if (CFG.image) im.src = CFG.image;
-    else status('No source image was handed to the editor.', 'bad');
+    // The refresh gate (2026-09-21): OWU re-renders the SAVED tool-result HTML on every
+    // chat refresh, re-booting this document with the launch token the first submit
+    // already redeemed — an editable canvas that can never submit. Ask the server,
+    // BEFORE the photo decodes, whether this token already submitted; if so boot
+    // straight into the collapsed receipt (sessionReceipt). An unsubmitted session —
+    // the pre-Render refresh the short link exists for — and any probe failure load
+    // the photo exactly as before: the probe may never be able to lose the user their
+    // editor, and a daemon predating the route (404) degrades to the old behaviour.
+    function startPhoto() {
+      if (CFG.image) im.src = CFG.image;
+      else status('No source image was handed to the editor.', 'bad');
+    }
+    if (CFG.image) {
+      req('/toolbox/session', {}).then(function (r) {
+        if (r && r.submitted) { sessionReceipt(r); return; }
+        startPhoto();
+      }).catch(function () { startPhoto(); });
+    } else startPhoto();
   }
 
   /* ---------------- embed plumbing ---------------- */
@@ -2699,6 +2787,18 @@
   // host leaves the frame with an internal scrollbar. Report now, again after layout
   // settles, and again whenever our own box changes size.
   function contentHeight() {
+    // Measure the EDITOR's own box, never documentElement/body: inside an iframe the
+    // document's scrollHeight can never fall below the iframe's CURRENT viewport (which
+    // IS the height we last reported), so a document-based measurement is a one-way
+    // ladder — this is exactly why a collapsed embed stayed as tall as the photo. The
+    // .tb host element shrinks when its children collapse, and Open WebUI's iframe:height
+    // handler (verified in the 0.11.3 bundle) assigns style.height unconditionally, so a
+    // smaller report genuinely shrinks the frame.
+    var host = el.host || document.getElementById(CFG.root || 'tb');
+    if (host) {
+      var r = host.getBoundingClientRect();
+      if (r.height > 0) return Math.ceil(r.height);
+    }
     var de = document.documentElement, b = document.body;
     return Math.max(de ? de.scrollHeight : 0, de ? de.offsetHeight : 0,
                     b ? b.scrollHeight : 0, b ? b.offsetHeight : 0);

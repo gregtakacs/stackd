@@ -145,16 +145,16 @@
         0
       ],
       "threshold": 0.3,
-      "blur": 2.0,
+      "blur": 0.0,
       "dilation": 3,
       "grow_frac": 0.07,
-      "feather_frac": 0.05,
+      "feather_frac": 0.0,
       "max_grow": 80,
-      "max_feather": 48.0
+      "max_feather": 0.0
     },
     "class_type": "CLIPSegMask",
     "_meta": {
-      "title": "CLIPSeg Auto Mask -- proportional grow/feather (grow_frac 0.07 / feather_frac 0.05 of sqrt(mask area)); dilation/blur are floors"
+      "title": "CLIPSeg Auto Mask -- HARD gate (feather zeroed): VAEEncodeForInpaint(20) reads this mask at denoise 1, and ComfyUI's m=1-mask.round() treats any sub-128 feather pixel as 'do not inpaint', leaving source latents for ReferenceLatent(22/23) to resurrect (source-subject hallucination). The perceptual soft edge lives downstream in the Blur(32)/Clamp(34) composite branch instead, which is where feather belongs. Proportional grow kept (grow_frac 0.07 of sqrt(mask area); dilation is a floor)."
     }
   },
   "16": {

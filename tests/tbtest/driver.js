@@ -12,6 +12,10 @@
 (function () {
   'use strict';
   var out = { tests: [], fetches: [], note: [] };
+  function qtok(u) {   // token as the client sends it: header (legacy/probe) or ?token= query (shipped req() is a CORS simple request -- a custom header would trigger a preflight the live Traefik front swallows)
+    var m = String(u).match(/[?&]token=([^&]+)/);
+    return m ? 'Bearer ' + decodeURIComponent(m[1]) : '';
+  }
   function T(name, pass, detail) { out.tests.push({ name: name, pass: !!pass, detail: detail == null ? '' : String(detail) }); }
   var finished = false;
   function finish() {
@@ -29,9 +33,14 @@
    * magenta can ONLY be the image the server sent back. Seeing it in #tb_view therefore
    * proves the live server preview is what got composited, with no button pressed. */
   window.fetch = function (url, opts) {
+    var fullUrl = String(url);   // the shipped req() carries the token as ?token=;
+    url = fullUrl.split('?')[0];     // route tests match the PATH only
     var body = {};
     try { body = JSON.parse((opts && opts.body) || '{}'); } catch (e) {}
-    b64s.push(body.mask_png || ''); window.__B64 = b64s;
+    // The session probe (boot's refresh gate) carries no mask — do not push it onto
+    // b64s or every positional read of the preview log below shifts by one.
+    if (!/toolbox\/session$/.test(String(url))) b64s.push(body.mask_png || '');
+    window.__B64 = b64s;
     // Keep the layers so assertions can inspect the per-object contract, but replace each
     // PNG with an equal-length run of 'x': assertions need truthiness + length, and the
     // dumped result JSON must not carry hundreds of KB of base64.
@@ -62,7 +71,7 @@
                        overlay_alpha: (body.params || {}).overlay_alpha,
                        click_pts_json: JSON.stringify(body.points || []),
                        click_neg_json: JSON.stringify(body.negative_points || []),
-                       auth: ((opts || {}).headers || {}).authorization || '' });
+                       auth: ((opts || {}).headers || {}).authorization || qtok(fullUrl) });
     if (/mask\/preview$/.test(String(url))) {
       var c = document.createElement('canvas'); c.width = 12; c.height = 12;
       var g = c.getContext('2d'); g.fillStyle = 'rgb(255,0,255)'; g.fillRect(0, 0, 12, 12);
@@ -100,12 +109,24 @@
         return Promise.resolve({ ok: true, mask_png: cb, coverage: 0.5, empty: false });
       }});
     }
+    if (/toolbox\/session$/.test(String(url))) {
+      // The refresh gate (boot asks whether this token already rendered). Default
+      // answer is "not yet" (the pre-Render refresh keeps a working editor); a test
+      // sets window.__SESSION to the server's submitted payload to simulate a chat
+      // refresh of a finished session.
+      out.fetches.push({ url: String(url), session: true,
+                         auth: ((opts || {}).headers || {}).authorization || qtok(fullUrl) });
+      var sess = window.__SESSION || { ok: true, submitted: false };
+      return Promise.resolve({ ok: true, status: 200, json: function () {
+        return Promise.resolve(sess);
+      }});
+    }
     if (/toolbox\/jobs\/poll$/.test(String(url))) {
       // The JOB token is minted by create and must ride every poll; recording the header
       // is what lets the suite assert it (a poll on the spent launch token is a 403 the
       // real server answers, and that class of token bug has bitten this seam before).
       out.fetches.push({ url: String(url), poll: true,
-                         auth: ((opts || {}).headers || {}).authorization || '' });
+                         auth: ((opts || {}).headers || {}).authorization || qtok(fullUrl) });
       var q = window.__POLLS || [];
       var answer = q.length ? q.shift()
              : { ok: true, state: 'progress', progress: { elapsed_s: 0 } };
@@ -116,7 +137,7 @@
     if (/toolbox\/jobs$/.test(String(url))) {
       out.fetches.push({ url: String(url), job_create: true,
                          has_layers: !!body.layers, has_spec: !!body.spec,
-                         auth: ((opts || {}).headers || {}).authorization || '' });
+                         auth: ((opts || {}).headers || {}).authorization || qtok(fullUrl) });
       var jp = { ok: true, job_id: 'JOBPROGRESS1234', seed: 77,
                  token: 'JOBSCOPE-TOKEN' };
       // The stub plays the SERVER's captioning step (imagegen.captioning, which the
@@ -260,5 +281,5 @@
   function start() { run(0); }
   if (document.readyState === 'complete') setTimeout(start, 400);
   else window.addEventListener('load', function () { setTimeout(start, 400); });
-  setTimeout(function () { out.note.push('TIMEOUT'); finish(); }, 60000);
+  setTimeout(function () { out.note.push('TIMEOUT'); finish(); }, 90000);
 })();

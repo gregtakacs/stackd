@@ -4,10 +4,18 @@ toggled live via POST /cleaner/on|off.
 
 Two jobs, every `interval_s`:
   * sweep: delete files under <scratch>/{output,input,temp} older than
-    `file_ttl_min` (a browser-gallery margin — generations are ~6-20s and the
-    image MCP fetches results within seconds).
+    `file_ttl_min`. Long skipped while ComfyUI's /queue has anything RUNNING:
+    the image MCP's fetch happens only after the WHOLE prompt completes, and
+    early-written temp artifacts (the edit_image mask PreviewImage) are minutes
+    to hours older than that by then -- a TTL sweep during a long Klein masked
+    edit deletes files the in-flight fetch is about to request (2026-09-20:
+    sank two fully rendered ~6-min MCP edits over their debug preview, 404).
+    A busy queue is never starved of cleanup for long: prompts finish, the
+    next idle sweep catches up.
   * prune: drop stale ComfyUI /history entries (it builds its gallery from
     execution history, not a dir scan, so deleting files leaves dangling rows).
+    Prune is safe while busy -- it only deletes entries whose files are ALL
+    gone, and an in-flight prompt has no history entry yet.
 
 Safety rules carried over verbatim from the shell script:
   * NEVER blanket-clear history ({"clear": true}) — it races the image MCP
@@ -57,6 +65,20 @@ def _history(endpoint: str, timeout: float = 10.0) -> dict:
         return json.loads(r.read() or b"{}")
 
 
+def queue_busy(endpoint: str, timeout: float = 5.0) -> bool:
+    """True if ComfyUI has at least one prompt in queue_running (GET /queue,
+    strictly read-only -- the never-touch-/queue rule is about not mutating it).
+    Unreadable queue -> False: a flaky peek must not permanently disable the
+    janitor, and the raised TTL keeps the race window vanishingly small anyway."""
+    try:
+        req = urllib.request.Request(f"{endpoint.rstrip('/')}/queue")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            q = json.loads(r.read() or b"{}")
+        return bool(q.get("queue_running"))
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+
 def _delete_history(endpoint: str, ids: list[str], timeout: float = 10.0) -> None:
     body = json.dumps({"delete": ids}).encode()
     req = urllib.request.Request(
@@ -99,7 +121,7 @@ def prune_history(endpoint: str, scratch_dir: str) -> int:
 class Cleaner:
     """Owns the enable flag + counters; `run_forever` is the thread body."""
 
-    def __init__(self, scratch_dir: str, *, file_ttl_min: int = 2,
+    def __init__(self, scratch_dir: str, *, file_ttl_min: int = 10,
                  interval_s: int = 90, enabled: bool = True) -> None:
         self.scratch_dir = scratch_dir
         self.file_ttl_min = file_ttl_min
@@ -130,7 +152,10 @@ class Cleaner:
         }
 
     def run_once(self, endpoint: str | None) -> tuple[int, int]:
-        swept = sweep_files(self.scratch_dir, self.file_ttl_min)
+        # Never sweep while a prompt is running: its early-written temp artifacts
+        # (mask previews) are still owed to the fetch that happens at completion.
+        busy = bool(endpoint) and queue_busy(endpoint)
+        swept = 0 if busy else sweep_files(self.scratch_dir, self.file_ttl_min)
         pruned = 0
         if endpoint:
             try:

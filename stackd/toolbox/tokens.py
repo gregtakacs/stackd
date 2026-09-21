@@ -194,6 +194,19 @@ def _prune_links(now: int) -> None:
             _LINKS.pop(code, None)
 
 
+def is_redeemed_jti(jti: str) -> bool:
+    """Pure query against the replay table: has this launch token's ONE submit already
+    happened? Needed by GET-style reads (/toolbox/session) so a refreshed chat embed can
+    learn its own session is spent WITHOUT any verify call.
+
+    It must stay pure. `verify(..., single_use=True)` looks like the same question but
+    is not: verifying consumes the token (marks the jti seen), so using it to test
+    would burn a still-unsubmitted token and kill the user's only Render. An
+    empty/absent jti answers False here; verify treats it as a Replay on the authority
+    path, where it belongs."""
+    return bool(jti) and jti in _SEEN
+
+
 def _prune(now: int) -> None:
     expired = [j for j, exp in _SEEN.items() if exp <= now]
     for j in expired:

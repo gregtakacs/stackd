@@ -468,8 +468,9 @@
       { ok: true, state: 'progress', progress: { elapsed_s: 11.0, stage: 'running', eta_s: 20, eta_samples: 3 } },
       { ok: true, state: 'progress', progress: { elapsed_s: 18.0, stage: 'running', eta_s: 20, eta_samples: 3 } },
       { ok: true, state: 'done', seed: 77, elapsed_s: 20.0,
+        prompt_sent: 'a sunlit red mustang',
         artifacts: [{ png: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==' }],
-        crop: { cropped: true, size: [512, 512], artifact: [2048, 1536], composited: true, knobs: { color_match: 0.4 } } }
+        crop: { cropped: true, size: [512, 512], artifact: [2048, 1536], composited: true, knobs: { color_match: 0.4 }, chat_post: 'posted' } }
     ];
     window.__BARLOG = [];
     var seen = {};
@@ -503,6 +504,9 @@
       });
       so.observe(stn, { childList: true, characterData: true, subtree: true });
     }
+    // Baseline for the collapse's height claim: the live editor's own box, measured
+    // BEFORE submit collapses it (see 'render done asserts').
+    window.__H_TALL = (window.ToolboxEditor && window.ToolboxEditor.contentHeight()) || 0;
     var rb = byText('Render'); if (rb) rb.click();
     return wait(5200);   // past the queued + running indeterminate polls
   });
@@ -544,11 +548,38 @@
     var b = barState();
     var st = document.querySelector('.tb-status');
     var outimgs = document.querySelectorAll('.tb-out img');
-    var done = st && /Rendered 1 image/.test(st.textContent) && /crop-rendered 512/.test(st.textContent);
-    T('the finished render clears the bar (a 95% bar next to a done image is a lie) and shows the artifact',
-      b === null && !!done && outimgs.length > 0,
+    var host = document.querySelector('.tb');
+    var vis = function (n) { return !!n && getComputedStyle(n).display !== 'none'; };
+    var stage = host && host.querySelector('.tb-stage');
+    var go = host && host.querySelector('.tb-go');
+    var done = st && /Done ·/.test(st.textContent) && /20s/.test(st.textContent)
+               && /"a sunlit red mustang"/.test(st.textContent)
+               && /crop-rendered 512/.test(st.textContent)
+               && /posted back into your chat/.test(st.textContent);
+    T('a finished render collapses the embed to the summary line — bar gone, artifact NOT displayed (the chat owns it), canvas and buttons hidden',
+      b === null && !!done && outimgs.length === 0 && !vis(stage) && !vis(go) && vis(st),
       'bar=' + JSON.stringify(b) + ' status=' + (st ? st.textContent.slice(0, 90) : 'none') +
-      ' imgs=' + outimgs.length);
+      ' imgs=' + outimgs.length + ' stageVis=' + vis(stage) + ' goVis=' + vis(go));
+    // The height bug this contract exposed (2026-09-21): inside an iframe the DOCUMENT
+    // can never measure below the frame's current height, so a document-based
+    // contentHeight was a one-way ladder and the collapsed embed stayed photo-tall.
+    // The editor-box measurement must report the shrink for real.
+    var hNow = (window.ToolboxEditor && window.ToolboxEditor.contentHeight()) || 0;
+    T('the collapsed editor MEASURES small — the height report can shrink, not just grow (document scrollHeight inside an iframe never falls below its own viewport)',
+      hNow > 10 && hNow < 200 && hNow < (window.__H_TALL || 0) * 0.6,
+      'collapsed=' + hNow + ' tall=' + window.__H_TALL);
+    T('boot asked the server whether this session had already rendered (the refresh gate fires before the photo)',
+      (out.fetches || []).some(function (f) { return f.session; }),
+      'fetches=' + JSON.stringify((out.fetches || []).slice(0, 2).map(function (f) { return f.url; })));
+    // The sections below re-use this page's canvas machinery (knobs, layers, history)
+    // — a situation the REAL product never creates: a finished embed cannot submit
+    // again (the launch token is single-use). Un-stamp the collapse so the rect-based
+    // pointer math downstream still measures a laid-out stage.
+    if (host) {
+      host.classList.remove('tb-collapsed');
+      var bs = host.querySelectorAll('.tb-actions button');
+      for (var bi = 0; bi < bs.length; bi++) bs[bi].style.display = '';
+    }
     var polls = out.fetches.filter(function (f) { return f.poll; });
     T('polls carry the JOB-scope token create minted (launch token stays redeemed)',
       polls.length > 2 && polls.every(function (f) { return f.auth === 'Bearer JOBSCOPE-TOKEN'; }),
@@ -1669,5 +1700,37 @@
   step('final metrics', function () {
     T('ends with no horizontal scrollbar', stage.scrollWidth - stage.clientWidth <= 1,
       'delta=' + (stage.scrollWidth - stage.clientWidth));
-    finish();
   });
+
+  /* ---- the refresh defect (2026-09-21): OWU re-renders the SAVED tool-result HTML
+     on every chat refresh, re-booting the editor document with the launch token the
+     first submit already redeemed. The boot probe (/toolbox/session) is what tells
+     that re-boot it is a receipt, not an editor. Simulate it by wiping the mount and
+     calling boot() again under a submitted __SESSION answer. ---- */
+  step('refresh-boot receipt', function () {
+    window.__SESSION = { ok: true, submitted: true, state: 'done', job_id: 'REBOOTJOB0000001',
+                         prompt_sent: 'a sunlit red mustang', elapsed_s: 12, seed: 5,
+                         crop: { cropped: false, chat_post: 'posted' } };
+    var host = document.querySelector('.tb');
+    if (host) host.innerHTML = '';
+    if (window.ToolboxEditor) window.ToolboxEditor.boot();
+    return wait(700);   // boot builds, probe answers, receipt collapses
+  });
+  step('refresh-boot asserts', function () {
+    var host = document.querySelector('.tb');
+    var st = host && host.querySelector('.tb-status');
+    var vis = function (n) { return !!n && getComputedStyle(n).display !== 'none'; };
+    var stage2 = host && host.querySelector('.tb-stage');
+    var probes = (out.fetches || []).filter(function (f) { return f.session; }).length;
+    T('a refreshed embed whose token already rendered boots as the collapsed receipt — no canvas, no photo, the summary line only',
+      !!host && host.classList.contains('tb-collapsed') && !vis(stage2)
+      && !!st && /Done · 12s/.test(st.textContent)
+      && /"a sunlit red mustang"/.test(st.textContent)
+      && /posted back into your chat/.test(st.textContent)
+      && host.querySelectorAll('.tb-out img').length === 0
+      && probes >= 2,
+      'cls=' + (host && host.className) + ' st=' + (st && st.textContent.slice(0, 90)) +
+      ' stage2=' + vis(stage2) + ' probes=' + probes);
+    window.__SESSION = null;
+  });
+  step('finish', function () { finish(); });
