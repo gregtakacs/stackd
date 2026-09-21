@@ -1,14 +1,14 @@
 # stackd/toolbox — the Comfy Toolbox (mask editor + edit engine)
 
-> **Status: M0 PASSED** (human-verified on PC + phone); **M1 code LANDED** (worker + real
-> ComfyUI render seam + daemon mount + `REDEEM_ON_CREATE`, all green in the offline suite at
-> 202/202). A sandboxed `srcdoc` opaque-origin frame paints, reports its height, and reaches
-> the toolbox API cross-origin — in the sandboxed panel exactly as in the unsandboxed
-> control. The in-chat rich-UI embed mount is viable; M1 builds against it. **M1 is NOT yet
-> human-verified end-to-end** (needs a resident image engine on a live GPU host) — the
-> `MILESTONE` string `/toolbox/health` reports stays `M0-passed` until that run happens, per
-> the rule that a milestone bumps on human verification, not on code merely merging. See
-> *Roadmap* for the result and the corrected M1 scope.
+> **Status: M2.1 — LIVE and human-verified.** M0's three pass criteria came back green
+> (PC + phone); M1's render path has run end-to-end on the deployed GPU host; M2's
+> in-chat mount is used from real Open WebUI chats — rounds 1–6 of field fixes are
+> recorded under *Roadmap*. Current gates: offline suite **640/640**
+> (`tests/smoke_toolbox.py`), headless-browser suite **166/166**
+> (`tests/tbtest/run_tbtest.py`). Caveat for operators: the `MILESTONE` string
+> `/toolbox/health` self-reports is still `M0-passed` — the human-verification runs
+> that milestone was gated on HAVE happened, but the constant has not been bumped (it
+> lives in `api.py` and ships inside the image); do not read health as a release note.
 
 Round-1 milestone **M0**: prove a mask can be *authored at all*. Mask authoring turned out
 
@@ -170,6 +170,10 @@ wrong scope / cross-job token), honest 503s, CORS, and the JS↔server field con
 | `web/toolbox.js` | the mount-agnostic editor. Objects are CONNECTED PAINT REGIONS (two-pass union-find over the composited mask), each with live per-object edge/feather; strokes are kept only as replay history for undo and eraser-ordering, never as the unit of selection |
 | `web/probe.js` | M0 instrumentation — injected into the spike only, never a real mount |
 | `web/harness.html`, `web/harness.js` | the two-panel feasibility page |
+| `jobs.py` | the job queue: `JobStore` (own SQLite file, never the cost ledger) + `JobQueue` worker (orphan sweep, cancel, ~6h retention prune); `submit`/`cancel` are INJECTED callables so the whole state machine tests with fakes, no GPU |
+| `engine.py` | the GPU seam: `comfy_render`/`comfy_cancel`/`comfy_segment_click` over the shared `imagegen.comfyui_client`, chat hand-back included; progress read from `/queue` (never invented) |
+| `graphs.py` | registers the toolbox graphs + the HARD noise-gate validator (the sampler's gate mask may never read the feathered ramp — the fix cannot silently drift) |
+| `owu_tool.py` | the CANONICAL source of the in-chat Open WebUI Tool (Admin → Tools paste; see the sync note under *Roadmap*, round-6 entry) |
 
 
 ## Deliberate decisions worth knowing before changing something
@@ -517,6 +521,72 @@ treatment — plus the `retouch_image` MCP tool for assistant-driven flows.
   - **Blend modes are live AND explained** (user: "I don't know why it's even there"):
     the dropdown was wired all along (paste_back's ImageChops ops) but unlabelled; the
     panel now carries a one-line explanation per mode under the selector.
+  - **Round 6 (2026-09-21, the render-button session): POSTs never read the query token
+    — a landmine from day one.** The CORS-simple-request rework (text/plain body, token
+    as `?token=`, zero preflight — the live Traefik front swallows OPTIONS otherwise)
+    still 403'd Render, and the reason was server-side: every POST handler calls
+    `_identity(http, {})` with a HARDCODED empty query dict, so `_token_from` checked
+    header → empty dict → nothing. The query channel had only ever worked on the GET
+    routes (which receive dispatch's parsed dict), and the offline suite authenticated
+    every POST via the header — the browser-shaped request had literally never been
+    exercised. Fix: `_token_from` now parses the raw `http.path` itself (header-first,
+    so programmatic callers are unchanged). Pinned permanently: a header-less POST whose
+    only credential is `?token=` must authenticate (`smoke_toolbox`), and the static JS
+    check demands the editor keeps sending it that way.
+  - **Round 6: the embed collapses to a receipt; the finished image belongs to the
+    chat.** (User: "once we sent the render, the embed should reduce to a status updater
+    and never show the final image.") The hard reason agrees with the ask: the launch
+    token is single-use and the first submit spends it, so every control still on screen
+    after Render belongs to a dead session. `collapseEditor()` fires on submit (status
+    line + progress bar + Cancel only) and again on terminal state (just the summary);
+    the artifact-append loop is deleted and pinned absent — `.tb-out` may never paint
+    render pixels again. Two subtleties: (a) the summary's height only shrinks for real
+    because `contentHeight()` measures the `.tb` BOX via `getBoundingClientRect` —
+    inside an iframe the *document* can never measure below the frame's current height,
+    so the old document-based ladder could grow but never shrink (the collapsed embed
+    stayed photo-tall until this); (b) the summary quotes `prompt_sent` from
+    `jobs/poll` — the CAPTIONED words the model saw, never `prompt_raw` (same
+    honest-handover rule as `_create`'s status line). OWU's own bundle (0.11.3 chunk,
+    grepped) proved the host honours smaller `iframe:height` unconditionally, so the
+    bug was ours alone.
+  - **Round 6: the refresh gate — `/toolbox/session`.** OWU re-renders the SAVED
+    tool-result HTML on every chat refresh: the full editor re-booted with the
+    already-redeemed token, an editable canvas that could never submit. `boot()` now
+    POSTs `/toolbox/session` before the photo decodes; a submitted session boots straight
+    into the collapsed receipt (photo never loads), an unsubmitted one (the pre-Render
+    refresh the short link exists for) and any probe failure load the editor as before —
+    the probe may never lose anyone their session. The join key is `launch_jti`, which
+    `_create` stamps into `spec_json` from the VERIFIED token (a body-forged one is
+    overwritten — the same server-asserted rule as `chat_id`). The route answers from
+    `tokens.is_redeemed_jti`, which must stay PURE: `verify(single_use=True)` looks like
+    the same question but CONSUMES the token, so using it to test would burn a
+    still-unsubmitted Render. Known limit: a refresh DURING a running render reboots the
+    full editor (nothing ties token to row until redemption); pressing Render then just
+    403s.
+  - **Round 6: job retention — the artifact column was growing forever.**
+    `/data/toolbox_jobs.db` held a full base64 PNG per done row (74 MB at 19 rows, no
+    ceiling). `JobStore.prune` (default 14 days, env `TOOLBOX_JOB_KEEP_DAYS`, `0` off):
+    aged done rows KEEP the provenance row and LOSE the pixels; aged error/cancelled
+    rows are deleted; in-flight rows are never touched; VACUUM returns the pages. Runs
+    at boot and piggybacks on the worker's idle loop ~every 6h — no second thread. Safe
+    because a week-old row is unreachable anyway: its job token died with the browser
+    tab, and the durable copies of a finished render are always the OWU file + the chat
+    post. (Mask/source PNGs were never stored — memory-only in-flight blobs.)
+  - **Round 6: the 2-min cleaner TTL sank two completed renders.** `stackd/cleaner.py`
+    (outside this package) swept `/comfyui-scratch` at TTL 2 min; a ~6-min Klein masked
+    edit writes its mask-preview temp in the FIRST seconds and fetches it only at
+    completion — the sweep deleted files the in-flight fetch was about to request (404
+    on two fully rendered edits). TTL 2→10 min AND the sweep now pauses while
+    `/queue` has anything RUNNING; the TTL is the backstop, not the only defense.
+  - **Round 6: the OWU Tool is a paste, and pastes drift.** `stackd/toolbox/owu_tool.py`
+    is canonical; the live copy lives in OWU's `tool` table (`comfy_toolbox_mask_editor`,
+    Admin → Tools) and does NOT update itself — round 6's `result_context` change (tell
+    the model the editor collapses and it must not re-paste/re-describe the result)
+    shipped in the wheel while the deployed paste was still round-5 text. After editing
+    `owu_tool.py`, re-paste it into Admin → Tools. Drift check WITHOUT touching OWU:
+    open `webui.db` read-only (`sqlite3.connect("file:...webui.db?mode=ro", uri=True)`),
+    SELECT the row's `content`, and diff it against the file (trailing-whitespace
+    tolerant). Never write to that DB from tooling — changes belong to the Admin UI.
 **M3** non-destructive layer stack, gallery, saved recipes, batch.
 **M4** video/music: multi-slot media tiers (`state.py`'s single `ImageSlot` -> per-kind
 slots), artifact-typed jobs, cleaner support for `SaveVideo`/`SaveAudio*` outputs, and

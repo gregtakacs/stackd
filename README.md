@@ -145,3 +145,15 @@ pytest                                             # test_validator.py, if avail
 
 Outstanding work and known gaps are tracked in [TODO.md](TODO.md).
 
+## Comfy Toolbox
+
+`stackd serve` also mounts `/toolbox/*` — the Comfy Toolbox: an in-chat mask editor
+(srcdoc iframe in Open WebUI) plus the edit job queue behind it: painted/SMART-selected
+masks, crop-and-paste renders on the resident ComfyUI engine, and an automatic hand-back
+of the finished image into the conversation, after which the embed collapses to a
+one-line receipt. Single-use HMAC launch tokens gate every state-touching route; the
+job queue owns its own SQLite file (`/data/toolbox_jobs.db`) and prunes stored render
+pixels after `TOOLBOX_JOB_KEEP_DAYS` (default 14). Design decisions, the milestone
+history, deploy env (`STACKD_TOOLBOX_SECRET`/`_DB`/`_PUBLIC_URL`, `STACKD_MINT_KEY`),
+test harnesses, and the Open-WebUI Tool paste contract: **[stackd/toolbox/README.md](stackd/toolbox/README.md)**.
+
