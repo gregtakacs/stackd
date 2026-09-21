@@ -583,10 +583,15 @@ treatment — plus the `retouch_image` MCP tool for assistant-driven flows.
     Admin → Tools) and does NOT update itself — round 6's `result_context` change (tell
     the model the editor collapses and it must not re-paste/re-describe the result)
     shipped in the wheel while the deployed paste was still round-5 text. After editing
-    `owu_tool.py`, re-paste it into Admin → Tools. Drift check WITHOUT touching OWU:
-    open `webui.db` read-only (`sqlite3.connect("file:...webui.db?mode=ro", uri=True)`),
-    SELECT the row's `content`, and diff it against the file (trailing-whitespace
-    tolerant). Never write to that DB from tooling — changes belong to the Admin UI.
+    `owu_tool.py`, re-paste it into Admin → Tools (an OWU container restart afterwards
+    refreshes the in-process module cache). Drift check WITHOUT touching OWU: open
+    `webui.db` read-only (`sqlite3.connect("file:...webui.db?mode=ro", uri=True)`),
+    SELECT the row's `content`, and compare ASTs + string literals against the file —
+    NOT raw bytes: the Admin → Tools editor re-wraps the code on save (reflowed line
+    counts and comment padding), so a byte-diff reports false drift on a perfectly
+    synced paste (`ast.dump(ast.parse(a)) == ast.dump(ast.parse(b))` plus a
+    string-literal set-equality is the honest comparison). Never write to that DB from
+    tooling — changes belong to the Admin UI.
 **M3** non-destructive layer stack, gallery, saved recipes, batch.
 **M4** video/music: multi-slot media tiers (`state.py`'s single `ImageSlot` -> per-kind
 slots), artifact-typed jobs, cleaner support for `SaveVideo`/`SaveAudio*` outputs, and
