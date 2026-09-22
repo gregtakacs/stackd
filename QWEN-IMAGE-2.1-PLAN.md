@@ -218,3 +218,61 @@ ideogram4. bf16 A/B deferred (decision: ship int8 only first).
   stackctl: docker exec stackd stackctl …   (build target name: image:vulkan)
   comfyui-rocm ip 192.168.90.23:8188 (no published port); stackd front :11444, MCP :8000
   models dir /home/greg/docker/appdata/comfyui/models (host)
+
+## CUDA enablement (2026-09-22, done)
+
+**Image:** `yanwk/comfyui-boot:cu130-megapak-pt211-20260921` — pulled, NOT
+rebuilt. Its bundled ComfyUI is EXACTLY the v0.37.0 commit (`git describe` →
+v0.37.0, 73c9bad4; the megapak tracks release commits, and this one shipped the
+day of the release). The old pin (…20260910) bundled a 09-09 commit — pre-v0.37,
+no qwen nodes, no kitchen. Revert = repoint COMFYUI_CUDA_IMAGE at …20260910
+(still local).
+  - GOTCHA: the megapak is a two-python image. Default `python3` = system 3.12;
+    the ML stack (torch 2.11+cu130, comfy-kitchen 0.2.35) lives on 3.13 at
+    /usr/bin/python3.13. An import test with the wrong interpreter looks like a
+    missing package (this happened during verification; `pip3 show` said
+    "installed in /usr/local/lib64/python3.13/…" while `python3` 3.12 got
+    ModuleNotFoundError).
+  - Pre-activation gate (all PASS, --cpu mode, zero GPU): node classes in
+    /object_info; all three qwen graphs validated (incl. dotted images.image_1);
+    shared models dir visible.
+
+**The SM120/xformers bug (why `--disable-xformers`):** the megapak bundles
+xformers, so ComfyUI v0.37.0 selects `attention_xformers` as the global
+attention (the ROCm image has no xformers → SDPA). Qwen's DiT + TE both use the
+global `optimized_attention`; their tensor-bias (masked) attention reaches
+xformers' FMHA dispatcher, which on Blackwell (capability 12.0) has NO matching
+operator — fa3F/cutlassF are built for <=9.0 ("too new"), fa2F 2.8.3 refuses
+Tensor attn_bias — and `attention_xformers` does not fall back:
+NotImplementedError, prompt dead in 0.04s. Fix is config-only: added
+`--disable-xformers` to the cuda container's CLI_ARGS (documented flag in
+comfy/cli_args.py:154) → global attention falls through to PyTorch SDPA, the
+exact path the ROCm build runs. Trade (accepted, noted in both yamls):
+dev-turbo/ideogram cuda attention also moves xformers→SDPA (fast on SM120 via
+cuDNN; regression-benched dev-turbo after the flip: 10.6s @1024², PASS).
+  - NOT a kitchen bug: the first (contaminated) bench misattributed this to
+    comfy-kitchen because the fa3F/fa2F/cutlassF naming looked like the
+    kitchen registry — the traceback shows xformers.ops.fmha.dispatch. Kitchen's
+    int8_convrot linear kernels run fine on SM120 (the measured runs used them).
+
+**Measured numbers (booked: footprint vulkan 13 / cuda 20, host_ram vulkan 18):**
+  - cuda bench (0921 image, SDPA): cold load+warmup 26.5s; 1024² 12.1s first /
+    4.6s warm; 2048² 24.7s; VRAM added 15.19G cold + 2.06G 2K activations
+    → 20 booked. (iGPU parity for comparison: 67s warm @1024², 13 booked.)
+  - The bench's own "suggested footprint 48-50 / host_ram 67" was REJECTED:
+    baseline VRAM was 30.5G because the auto-scheduler had dev-turbo loading in
+    the SAME container before the bench relabel (same-backend swap keeps the
+    container + checkpoint cache), so its footprint double-counted dev-turbo and
+    its host_ram is the cgroup-peak staging trap again (--reserve-vram 4 parks
+    idle models in reclaimable host RAM). Per-run "added" deltas are the honest
+    column; whole-machine host delta <= 1.7G → no cuda host_ram_gib booked
+    (same convention as klein/ideogram/dev-turbo).
+
+**Activation was live, no stackd rebuild:** AI-STACK is bind-mounted at
+/run/aistack inside stackd, and `stackctl reload` re-reads config + .env.
+Sequence: .env COMFYUI_CUDA_IMAGE → 0921; both image.yamls gained backends
+[vulkan, cuda] + cuda footprint + CLI_ARGS --disable-xformers; reload (twice);
+bench; final numbers; reload. A stackd image rebuild is still owed for the
+BAKED default config/ copy (committed in the stackd repo; the running container
+keeps the old baked config until the next rebuild — harmless, config.local
+shadows it).

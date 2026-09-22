@@ -22,7 +22,16 @@ containers:
       TZ: ${TZ}
       # NO --highvram (see the eGPU/ReBAR note): a generate touches TE (~17G),
       # UNET (~34G), VAE one at a time; --reserve-vram 4 keeps a cushion.
-      CLI_ARGS: "--reserve-vram 4"
+      # --disable-xformers (2026-09-22, qwen-image-2.1 on Blackwell SM120): the
+      # megapak bundles xformers and ComfyUI v0.37.0 selects it as the global
+      # attention; its FMHA dispatch has NO operator for tensor-bias attention on
+      # capability 12.0 (fa3/cutlass build for <=9.0, fa2 refuses tensor bias) and
+      # attention_xformers has no fallback — qwen's masked TE attention hard-failed
+      # in 0.04s. Disabling xformers falls through to PyTorch SDPA, the exact path
+      # the ROCm build (no xformers installed) runs, where all three qwen graphs
+      # work. Trade: other cuda models also take SDPA instead of xformers (fast on
+      # SM120 via cuDNN; it is what the vulkan tier already runs).
+      CLI_ARGS: "--reserve-vram 4 --disable-xformers"
     mounts:
       - { host_path: ${DOCKERDIR}/appdata/comfyui/models,        container_path: /root/ComfyUI/models, ro: false }
       - { host_path: ${DOCKERDIR}/appdata/comfyui/custom_nodes,  container_path: /root/ComfyUI/custom_nodes, ro: false }
@@ -87,9 +96,10 @@ prefer:
   # VAE, ~16.1G on disk), generate + stylize + whole-image edit. Explicit-selection only
   # (last in the ladder, the ideogram4 convention): `image_model: qwen` or
   # `stackctl image use qwen-image-2-1`. Needs ComfyUI >= v0.37.0 (TextEncodeQwenImage21)
-  # and the three qwen files in the shared models dir. Vulkan-only for now: cuda0 belongs
-  # to the resident LLM on the deployed box; enabling cuda later = backends + a cuda
-  # footprint here + a COMFYUI_CUDA_IMAGE at >= v0.37.0.
+  # and the three qwen files in the shared models dir. CUDA enabled 2026-09-22 via a
+  # COMFYUI_CUDA_IMAGE at exactly v0.37.0 (cu130-megapak-pt211-20260921); on the
+  # deployed box cuda0 belongs to the resident LLM, so cuda qwen loads only when the
+  # profile frees the card (e.g. bench-image).
   # NUMBERS = bench 2026-09-22 (two runs, -c37 image). The FIRST run's numbers
   # (footprint 10 / host_ram 36) came from `stackctl image bench` cgroup-PEAK
   # 32.23G measured --force --unsafe while flash-next was live-resident — and were
@@ -105,6 +115,15 @@ prefer:
   # re-reads real MemAvailable on every pick/swap meanwhile.
   - active_model: qwen-image-2-1
     capabilities: [generate, stylize, edit]
-    backends: [vulkan]
-    footprint_gib: { vulkan: 13 }
+    backends: [vulkan, cuda]
+    # cuda = 2026-09-22 MEASURED on the 0921 megapak (exact v0.37.0, --disable-xformers):
+    # cold set 15.19G VRAM + 2K activations 2.06G = ~17.3 peak -> 20 with cushion.
+    # (The bench's own 48-50 suggestion is contaminated: the auto-scheduler had
+    # dev-turbo loading in the same container first, so its "baseline VRAM" was 30G
+    # and its "footprint" double-counted that. The per-run "added" column is the
+    # honest delta, exactly the raw-peak-vs-baseline-delta trap the vulkan notes
+    # warn about.) NO cuda host_ram_gib, same as klein/ideogram/dev-turbo: on cuda
+    # the VRAM footprint is the constraint and the --reserve-vram staging is
+    # reclaimable page cache (measured whole-machine delta <= 1.7G).
+    footprint_gib: { vulkan: 13, cuda: 20 }
     host_ram_gib: { vulkan: 18 }
