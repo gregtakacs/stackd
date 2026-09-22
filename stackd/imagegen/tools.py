@@ -139,7 +139,12 @@ def _resolve_pipeline(q: str) -> tuple[str | None, list[str]]:
     names = [p["active_model"] for p in runtime.image_pipelines()]
     if not q:
         return None, names
-    norm = lambda s: s.strip().lower().replace("_", "-").replace(" ", "-")
+    # '.' folded too (2026-09, qwen-image-2-1): the published card's name is
+    # "Qwen-Image 2.1" — an LLM passes that verbatim and a residual '.' made
+    # "2.1" never match the registered "…-2-1" (fell through to the
+    # no-match error path). No registered model name has ever carried a dot,
+    # so this is additive for everything shipped before.
+    norm = lambda s: s.strip().lower().replace("_", "-").replace(" ", "-").replace(".", "-")
     nq = norm(q)
     for n in names:
         if norm(n) == nq:

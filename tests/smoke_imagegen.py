@@ -283,6 +283,18 @@ def main() -> int:
     _cw, _ch, _cnote = tools._resolve_dimensions_no_source("", 2100, 2100, _gq)
     check("qwen clamps 2100^2 to native-2K 2048x2048 (= its own ceiling, no error)",
           (_cw, _ch) == (2048, 2048) and any("2048x2048" in n for n in _cnote))
+
+    # -- loose-name resolution incl. the card's dotted form ----------------------
+    class _PreferMgr:
+        def image_status(self):
+            return {"prefer": [{"active_model": m} for m in
+                                 ("flux2-klein", "ideogram4", "qwen-image-2-1")]}
+    runtime.bind(_PreferMgr(), None, None)
+    for _q, _want in (("qwen", "qwen-image-2-1"), ("Qwen-Image 2.1", "qwen-image-2-1"),
+                      ("qwen image 2.1", "qwen-image-2-1"), ("Qwen_Image", "qwen-image-2-1"),
+                      ("klein", "flux2-klein"), ("ideogram", "ideogram4")):
+        check(f"_resolve_pipeline({_q!r}) -> {_want}", tools._resolve_pipeline(_q)[0] == _want)
+
     try:
         tools._resolve_dimensions_no_source(
             "", 1400, 1400, {**_gq, "model": QW, "max_pixels": 1_000_000})
