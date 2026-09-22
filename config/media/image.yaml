@@ -90,14 +90,21 @@ prefer:
   # and the three qwen files in the shared models dir. Vulkan-only for now: cuda0 belongs
   # to the resident LLM on the deployed box; enabling cuda later = backends + a cuda
   # footprint here + a COMFYUI_CUDA_IMAGE at >= v0.37.0.
-  # NUMBERS = `stackctl image bench qwen-image-2-1 --sizes 1024 --force --unsafe
-  # --backend vulkan` 2026-09-22 on the -c37 image (warm; 67.3s @1024²): pipeline added
-  # 6.8G VRAM/GTT, ComfyUI container cgroup peak 32.23G -> tool-suggested 10 / 36
-  # (measured + 3G cushion each). NOTE warm-only: the cold load stages ~16G of mmap'd
-  # weights the sampler baseline can't see (see the klein cold-load story above) --
-  # raise footprint if a fresh spawn ever OOMs during the first load.
+  # NUMBERS = bench 2026-09-22 (two runs, -c37 image). The FIRST run's numbers
+  # (footprint 10 / host_ram 36) came from `stackctl image bench` cgroup-PEAK
+  # 32.23G measured --force --unsafe while flash-next was live-resident — and were
+  # WRONG METRIC: the guard compares host_ram_gib against MemAvailable, which
+  # EXCLUDES reclaimable page cache, while cgroup peak INCLUDES the ~17G of
+  # mmap'd safetensors pages a load touches. The mismatch made qwen refuse under
+  # chat-code-img at 34.6G free (2026-09-22, user-visible). RECALIBRATED from a
+  # cold load + warmup + 1024² gen with 2s cgroup sampling splitting memory.stat:
+  # peak ANON 14.32G (the real commit), cgroup-total 31.2G, host MemAvailable dip
+  # to 49.4G. host_ram = anon peak + 3G cushion (+1 for sample aliasing) = 18.
+  # footprint 13 = bench's own GTT suggestion on the cold run (was 10, warm-only).
+  # If a fresh-spawn load ever OOMs, raise footprint toward ~20; the guard
+  # re-reads real MemAvailable on every pick/swap meanwhile.
   - active_model: qwen-image-2-1
     capabilities: [generate, stylize, edit]
     backends: [vulkan]
-    footprint_gib: { vulkan: 10 }
-    host_ram_gib: { vulkan: 36 }
+    footprint_gib: { vulkan: 13 }
+    host_ram_gib: { vulkan: 18 }
