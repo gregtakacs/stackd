@@ -1,4 +1,5 @@
-Generate a new image from a text prompt using a local ComfyUI Flux.2 pipeline.
+Generate a new image from a text prompt using a local ComfyUI image pipeline
+(Flux.2-family, Ideogram 4, or Qwen-Image 2.1 -- auto-selected unless named).
 Use this whenever the user wants an image created from a description. There is no
 negative-prompt input -- there is no negative_prompt parameter.
 There is no image parameter at all -- that's intentional, not a limitation to work around
@@ -153,14 +154,20 @@ conditions on the actual source image and stays recognizable by design.
       - flux2-klein     -- Flux.2 Klein 9B, distilled ~4 steps; faster, smaller
       - ideogram4       -- Ideogram 4; best when the image needs accurate rendered
                            TEXT / typography / signage / logos
+      - qwen-image-2-1  -- Qwen-Image 2.1 (int8), 25-step; large photoreal scenes,
+                           native 2K (2048^2), fine detail, transparent-background
+                           requests; also the model for whole-image edit/stylize
     Match loosely: "klein" / "the fast one" -> flux2-klein; "dev" / "turbo" /
     "the good one" / "higher quality" -> flux2-dev-turbo; "ideogram" or a request
-    centred on readable text in the image -> ideogram4. If your value doesn't
+    centred on readable text in the image -> ideogram4; "qwen" / "Qwen-Image 2.1"
+    / "2K" / "the big Qwen" -> qwen-image-2-1. If your value doesn't
     resolve you get the real list back in the error -- retry with a name from it.
-    Do NOT tell the user which pipeline was used -- not before a generation and not
-    after -- unless they specifically ask. The one exception: if you named a
-    pipeline and the result carries a note that it was swapped for a smaller one,
-    briefly mention that.
+    Do NOT tell the user which pipeline was used for a GENERATION -- not before
+    one and not after -- unless they specifically ask. The one exception: if you
+    named a pipeline and the result carries a note that it was swapped for a
+    smaller one, briefly mention that. When the user asks outright WHICH image
+    generators are available (not about a specific generation), answer from this
+    list directly -- no tool call needed.
 
 The result JSON has a `timing` object (`total_s`, `generate_s`, and `rewrite_s`
 when the prompt was rewritten). Do not report it unless the user asks how long it

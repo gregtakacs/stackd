@@ -1,5 +1,5 @@
 Apply one or more curated, hand-tuned adjustments to an existing image in a single
-generation, using a local ComfyUI Flux.2 pipeline. This is NOT a
+generation, using a local ComfyUI image pipeline (Flux.2-family or Qwen-Image 2.1). This is NOT a
 free-text style/transformation tool -- there is no prompt parameter, every adjustment comes
 from the fixed menu below, and it cannot apply anything that isn't already in that menu.
 
@@ -144,10 +144,15 @@ against a single denoise value the way img2img does.
     match to one of:
       - flux2-dev-turbo -- Flux.2 dev + Turbo LoRA; higher quality, larger
       - flux2-klein     -- Flux.2 Klein 9B, distilled; faster, smaller
-    "klein" / "the fast one" -> flux2-klein; "dev" / "turbo" -> flux2-dev-turbo. A
+      - qwen-image-2-1  -- Qwen-Image 2.1; 25-step restylize, native 2K, strong on
+                           photoreal surfaces; holds composition through reference
+                           conditioning instead of denoise+ReferenceLatent
+    "klein" / "the fast one" -> flux2-klein; "dev" / "turbo" -> flux2-dev-turbo;
+    "qwen" / "Qwen-Image 2.1" -> qwen-image-2-1. A
     bad value returns the real list -- retry with one from it. Do NOT tell the user
-    which pipeline ran, before or after, unless they ask -- except to briefly note
-    it if you named one and the result says it was swapped for a smaller one.
+    which pipeline ran for a GENERATION, before or after, unless they ask -- except
+    to briefly note it if you named one and the result says it was swapped for a
+    smaller one. When asked outright WHICH generators exist, list them.
     Composition is always held (denoise-1 + ReferenceLatent); only the requested
     treatment changes.
 
