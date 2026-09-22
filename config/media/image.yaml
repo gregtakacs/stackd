@@ -115,7 +115,11 @@ prefer:
   # re-reads real MemAvailable on every pick/swap meanwhile.
   - active_model: qwen-image-2-1
     capabilities: [generate, stylize, edit]
-    backends: [vulkan, cuda]
+    backends: [cuda, vulkan]   # cuda first (2026-09-22): tried first, refuses when
+                               # the resident LLM left < 20G cuda headroom (the
+                               # tier never evicts an LLM), falls back to vulkan
+                               # which always has the iGPU. First-fit-wins, the
+                               # klein convention.
     # cuda = 2026-09-22 MEASURED on the 0921 megapak (exact v0.37.0, --disable-xformers):
     # cold set 15.19G VRAM + 2K activations 2.06G = ~17.3 peak -> 20 with cushion.
     # (The bench's own 48-50 suggestion is contaminated: the auto-scheduler had

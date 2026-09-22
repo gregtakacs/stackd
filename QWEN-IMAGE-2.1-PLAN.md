@@ -259,6 +259,17 @@ cuDNN; regression-benched dev-turbo after the flip: 10.6s @1024², PASS).
   - cuda bench (0921 image, SDPA): cold load+warmup 26.5s; 1024² 12.1s first /
     4.6s warm; 2048² 24.7s; VRAM added 15.19G cold + 2.06G 2K activations
     → 20 booked. (iGPU parity for comparison: 67s warm @1024², 13 booked.)
+  - xformers-vs-SDPA A/B (dev-turbo, same container, both fresh): 6.1s = 6.1s
+    @1024², VRAM peaks 81.92 vs 81.76G (noise). On this SM120 card SDPA (cuDNN
+    path) matches the stale fa2-2.8.3 build exactly — the flag costs nothing for
+    the no-bias flux models; for qwen it is the only path that works at all.
+    Both are flash-style low-memory, so no VRAM difference either. The flag
+    only changes ComfyUI's global attention SELECT; the xformers package stays
+    installed for custom nodes that import it directly.
+  - backends order flipped to [cuda, vulkan] (2026-09-22): tier tries cuda
+    first (never evicts an LLM for VRAM), refuses when headroom < 20G
+    (chat-code-img: cuda0 reads 0G), falls back to vulkan. First-fit-wins,
+    the klein convention.
   - The bench's own "suggested footprint 48-50 / host_ram 67" was REJECTED:
     baseline VRAM was 30.5G because the auto-scheduler had dev-turbo loading in
     the SAME container before the bench relabel (same-backend swap keeps the
