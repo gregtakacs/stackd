@@ -1,0 +1,89 @@
+{
+  "1": {
+    "inputs": { "image": "example.png", "upload": "image" },
+    "class_type": "LoadImage",
+    "_meta": { "title": "Input Image" }
+  },
+  "2": {
+    "inputs": {
+      "unet_name": "qwen_image_2.1_int8_convrot.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": { "title": "Load Diffusion Model (Qwen-Image 2.1, int8 convrot)" }
+  },
+  "3": {
+    "inputs": {
+      "clip_name": "qwen3vl_8b_int8_convrot.safetensors",
+      "type": "qwen_image",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": { "title": "Load CLIP (Qwen3-VL 8B, qwen_image)" }
+  },
+  "4": {
+    "inputs": { "vae_name": "qwen_image_2.1_vae_bf16.safetensors" },
+    "class_type": "VAELoader",
+    "_meta": { "title": "Load VAE (Qwen-Image 2.1)" }
+  },
+  "5": {
+    "inputs": {
+      "model": ["2", 0],
+      "device": "auto",
+      "dtype": "default"
+    },
+    "class_type": "QwenImage21Cache",
+    "_meta": { "title": "Reference Prefix KV Cache (edit-path node from the published template)" }
+  },
+  "6": {
+    "inputs": {
+      "clip": ["3", 0],
+      "prompt": "",
+      "negative_prompt": "",
+      "vae": ["4", 0],
+      "resolution": 0,
+      "images.image_1": ["1", 0]
+    },
+    "class_type": "TextEncodeQwenImage21",
+    "_meta": {
+      "title": "Text Encode + Reference (source is seen by the VL encoder and spliced in as VAE latents; slot 2 is the image-sized latent the sampler draws -- resolution 0 keeps the source's own size rounded to /32, exactly the template's switch=false path)"
+    }
+  },
+  "7": {
+    "inputs": {
+      "seed": 624434243596488,
+      "control_after_generate": "randomize",
+      "steps": 25,
+      "cfg": 1,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1,
+      "model": ["5", 0],
+      "positive": ["6", 0],
+      "negative": ["6", 1],
+      "latent_image": ["6", 2]
+    },
+    "class_type": "KSampler",
+    "_meta": { "title": "KSampler (25-step, cfg 1, euler/simple; full denoise -- the source is carried by the reference conditioning, not by low denoise)" }
+  },
+  "8": {
+    "inputs": {
+      "samples": ["7", 0],
+      "vae": ["4", 0],
+      "tile_size": 512,
+      "overlap": 64,
+      "temporal_size": 64,
+      "temporal_overlap": 8
+    },
+    "class_type": "VAEDecodeTiled",
+    "_meta": { "title": "VAE Decode (Tiled)" }
+  },
+  "9": {
+    "inputs": {
+      "filename_prefix": "QI21_img2img",
+      "images": ["8", 0]
+    },
+    "class_type": "SaveImage",
+    "_meta": { "title": "Save Image" }
+  }
+}

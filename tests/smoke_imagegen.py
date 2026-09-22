@@ -173,6 +173,124 @@ def main() -> int:
     check("ASPECT_PRESETS has square", workflows.ASPECT_PRESETS.get("square") == (1312, 1312))
     check("MODELS_MANIFEST has flux2-klein", "flux2-klein" in workflows.MODELS_MANIFEST["models"])
 
+    # -- qwen-image-2-1: registry integrity + graph executability -------------
+    # (The Comfy-Org templates ship UI-format subgraphs full of frontend-only nodes --
+    # SaveImageAdvanced/ResolutionSelector/ComfySwitchNode each submit as a hard
+    # class-not-found on /prompt. The qwen graphs here are hand-converted to API
+    # format; these checks pin the conversion stayed server-executable AND that every
+    # role id in models.json still resolves inside its graph file.)
+    QW = "qwen-image-2-1"
+    _qwen_entry = workflows.MODELS_MANIFEST["models"].get(QW) or {}
+    check("MODELS_MANIFEST has qwen-image-2-1", bool(_qwen_entry))
+    _FRONTEND_ONLY = {"SaveImageAdvanced", "ResolutionSelector", "MarkdownNote",
+                      "Note", "ImageCompare", "PrimitiveCheckbox", "ComfySwitchNode"}
+    _loaded = {}
+    for _tool, _spec in (_qwen_entry.get("tools") or {}).items():
+        if _tool.startswith("_") or "graph" not in _spec:
+            continue
+        _g = workflows._load_graph(_spec["graph"])
+        _loaded[_tool] = (_g, _spec.get("nodes") or {})
+        for _role, _nid in (_spec.get("nodes") or {}).items():
+            check(f"qwen {_tool}: role {_role} -> node {_nid} exists", _nid in _g)
+        for _nid, _node in _g.items():
+            _ct = _node.get("class_type", "")
+            check(f"qwen {_tool} node {_nid} ({_ct}) is server-executable",
+                  _ct not in _FRONTEND_ONLY and "-" not in _ct)
+    check("qwen wires all three tools", set(_loaded) == {"generate", "edit", "stylize"})
+    check("qwen edit is whole-image only (no builtin inpaint declared -- masked must "
+          "clean-error, toolbox must fall back to klein)",
+          (_qwen_entry.get("tools") or {}).get("edit", {}).get("inpaint") != "builtin")
+
+
+    _gg, _gn = _loaded["generate"]
+    _g3, _n3 = _loaded["edit"]
+    _gs, _ns = _loaded["stylize"]
+    # set_node regression for the TextEncodeQwenImage21 role mapping: positive/prompt
+    # must land on the TE's `prompt` input, NOT fall through to the PrimitiveString
+    # default key `value` -- a graph patched into `value` encodes an empty prompt and
+    # still RUNS, the silent kind of bug this file exists to collect. (_load_graph
+    # returns a fresh dict per call, so these mutate scratch copies, not shipped state.)
+    workflows.set_node(_gg, _gn["positive"], "positive", "hello")
+    check("qwen positive role writes the TE prompt input",
+          _gg[_gn["positive"]]["inputs"].get("prompt") == "hello")
+    workflows.set_node(_gs, _ns["prompt"], "prompt", "hello")
+    workflows.set_node(_gs, _ns["seed"], "seed", 42)
+    workflows.set_node(_gs, _ns["scale_by"], "scale_by", 2.0)
+    check("qwen stylize prompt/seed/scale_by roles hit the right inputs",
+          _gs[_ns["prompt"]]["inputs"].get("prompt") == "hello"
+          and _gs[_ns["seed"]]["inputs"].get("seed") == 42
+          and _gs[_ns["scale_by"]]["inputs"].get("scale_by") == 2.0)
+    workflows.set_node(_g3, _n3["image"], "image", "src.png")
+    workflows.set_node(_g3, _n3.get("width"), "width", 1024)  # absent role: silent no-op
+    check("qwen edit image role writes LoadImage; missing width role no-ops",
+          _g3[_n3["image"]]["inputs"].get("image") == "src.png")
+
+    # Template fidelity (the numbers image_qwen_image_2_1_* ships with)
+    _ks = _gg[_gn["seed"]]
+    check("qwen generate sampler = template (25 / cfg 1 / euler / simple / denoise 1)",
+          (_ks["inputs"]["steps"], _ks["inputs"]["cfg"], _ks["inputs"]["sampler_name"],
+           _ks["inputs"]["scheduler"], _ks["inputs"]["denoise"]) == (25, 1, "euler", "simple", 1))
+    check("qwen negative conditioning is the TE's own slot 1 (no ConditioningZeroOut)",
+          _ks["inputs"]["negative"] == [_gn["positive"], 1])
+    check("qwen graphs use no CLIPTextEncode/ConditioningZeroOut/VAEEncode (TE-only front-end)",
+          not any(_nd["class_type"] in ("CLIPTextEncode", "ConditioningZeroOut", "VAEEncode")
+                  for _g in (_gg, _g3, _gs) for _nd in _g.values()))
+    check("qwen edit samples the TE's own image-sized latent (slot 2), not an EmptyLatent",
+          _g3[_n3["seed"]]["inputs"]["latent_image"] == [_n3["positive"], 2])
+    _ete = _g3[_n3["positive"]]
+    check("qwen edit TE links the VAE + resolution 0 (reference latents ON; canvas follows "
+          "image_1 -- the template's ComfySwitchNode switch=false path)",
+          isinstance(_ete["inputs"].get("vae"), list) and _ete["inputs"].get("resolution") == 0)
+    # LIVE-VERIFIED 2026-09-22 against 0.37.0 /prompt: the Autogrow reference input MUST
+    # use the per-slot dotted name (exactly as the UI subgraph names it). The nested
+    # {"images": {"image_1": <link>}} form is SILENTLY DROPPED (validation accepts it --
+    # the template is min=0 -- then execute() sees images={} and its
+    # `latent_w = latent_h = resolution or 1024` branch yields a SQUARE latent: an edit
+    # of a 960x1280 source came back 1024x1024, no error anywhere. This check pins the
+    # dotted form AND forbids the nested one; the dimension assertion lives in
+    # tests' live gate, not here.)
+    check("qwen edit/stylize wire references via the dotted Autogrow key",
+          _ete["inputs"].get("images.image_1") == ["1", 0]
+          and _gs[_ns["prompt"]]["inputs"].get("images.image_1") == ["2", 0]
+          and "images" not in _ete["inputs"] and "images" not in _gs[_ns["prompt"]]["inputs"])
+    check("qwen stylize feeds its (scaled) image_1 into the dotted Autogrow slot",
+          _gs[_ns["prompt"]]["inputs"]["images.image_1"] == [_ns["scale_by"], 0])
+    check("qwen loads UNET/CLIP/VAE as separate nodes (an int8/bf16 mix stays a filename swap)",
+          {"UNETLoader", "CLIPLoader", "VAELoader"}
+          <= {n["class_type"] for n in _gg.values()})
+
+    # -- per-model geometry: qwen on the 32 grid, klein byte-identical ---------
+    _gq = workflows.geometry_for(QW)
+    _gk = workflows.geometry_for("flux2-klein")
+    check("qwen geometry: multiple 32 / native-2K 4MP ceiling / 2048x832 practical",
+          _gq["multiple"] == 32 and _gq["max_pixels"] == 4 * 1024 * 1024
+          and _gq["practical_max_pixels"] == 2048 * 832)
+    check("klein geometry == the module constants (no behavior drift for shipped models)",
+          _gk["multiple"] == 16 and _gk["max_pixels"] == workflows.MAX_PIXELS
+          and _gk["practical_max_pixels"] == workflows.PRACTICAL_MAX_PIXELS
+          and _gk["aspect_presets"] == workflows.ASPECT_PRESETS)
+    check("qwen presets keep klein's names", set(_gq["aspect_presets"]) == set(workflows.ASPECT_PRESETS))
+    check("every qwen preset side is a multiple of 32",
+          all(v % 32 == 0 for pr in _gq["aspect_presets"].values() for v in pr))
+    check("qwen rounds 1008 -> 1024 (32 grid); klein keeps 1008 (16 grid)",
+          tools._resolve_dimensions_no_source("", 1008, 1008, _gq)[0:2] == (1024, 1024)
+          and tools._resolve_dimensions_no_source("", 1008, 1008, _gk)[0:2] == (1008, 1008))
+    # qwen 2100x2100 can NOT trip the MP guard: the MAX_SIDE(2048) clamp lands it on
+    # exactly 2048^2 == the 4MP ceiling (geometry deliberately aligns them = the card's
+    # native 2K). Assert THAT, and exercise the over-ceiling message with a synthetic
+    # tighter geometry (the only shape where an explicit request can pass the clamp
+    # and still exceed max_pixels).
+    _cw, _ch, _cnote = tools._resolve_dimensions_no_source("", 2100, 2100, _gq)
+    check("qwen clamps 2100^2 to native-2K 2048x2048 (= its own ceiling, no error)",
+          (_cw, _ch) == (2048, 2048) and any("2048x2048" in n for n in _cnote))
+    try:
+        tools._resolve_dimensions_no_source(
+            "", 1400, 1400, {**_gq, "model": QW, "max_pixels": 1_000_000})
+        check("over-ceiling explicit size raises", False)
+    except ValueError as e:
+        check("over-ceiling error names the pipeline (not 'Flux.2 Klein 9B')",
+              "qwen" in str(e) and "Klein" not in str(e))
+
     # -- wait_and_fetch optional_nodes (2026-09-20: the scratch janitor TTL'd the
     #    mask PreviewImage out of temp mid-render; the 404 on that DEBUG artifact
     #    sank two fully rendered ~6-min MCP edits as "Could not reach ComfyUI

@@ -1,0 +1,90 @@
+{
+  "1": {
+    "inputs": { "value": 1024 },
+    "class_type": "PrimitiveInt",
+    "_meta": { "title": "Width" }
+  },
+  "2": {
+    "inputs": { "value": 1024 },
+    "class_type": "PrimitiveInt",
+    "_meta": { "title": "Height" }
+  },
+  "3": {
+    "inputs": {
+      "unet_name": "qwen_image_2.1_int8_convrot.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": { "title": "Load Diffusion Model (Qwen-Image 2.1, int8 convrot)" }
+  },
+  "4": {
+    "inputs": {
+      "clip_name": "qwen3vl_8b_int8_convrot.safetensors",
+      "type": "qwen_image",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": { "title": "Load CLIP (Qwen3-VL 8B, qwen_image)" }
+  },
+  "5": {
+    "inputs": { "vae_name": "qwen_image_2.1_vae_bf16.safetensors" },
+    "class_type": "VAELoader",
+    "_meta": { "title": "Load VAE (Qwen-Image 2.1)" }
+  },
+  "6": {
+    "inputs": {
+      "clip": ["4", 0],
+      "prompt": "",
+      "negative_prompt": "",
+      "resolution": 1024
+    },
+    "class_type": "TextEncodeQwenImage21",
+    "_meta": { "title": "Text Encode (positive slot 0 / negative slot 1)" }
+  },
+  "7": {
+    "inputs": {
+      "width": ["1", 0],
+      "height": ["2", 0],
+      "batch_size": 1
+    },
+    "class_type": "EmptyLatentImage",
+    "_meta": { "title": "Empty Latent" }
+  },
+  "8": {
+    "inputs": {
+      "seed": 774944513813838,
+      "control_after_generate": "fixed",
+      "steps": 25,
+      "cfg": 1,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1,
+      "model": ["3", 0],
+      "positive": ["6", 0],
+      "negative": ["6", 1],
+      "latent_image": ["7", 0]
+    },
+    "class_type": "KSampler",
+    "_meta": { "title": "KSampler (published template: 25-step, cfg 1, euler/simple)" }
+  },
+  "9": {
+    "inputs": {
+      "samples": ["8", 0],
+      "vae": ["5", 0],
+      "tile_size": 512,
+      "overlap": 64,
+      "temporal_size": 64,
+      "temporal_overlap": 8
+    },
+    "class_type": "VAEDecodeTiled",
+    "_meta": { "title": "VAE Decode (Tiled)" }
+  },
+  "10": {
+    "inputs": {
+      "filename_prefix": "QI21_txt2img",
+      "images": ["9", 0]
+    },
+    "class_type": "SaveImage",
+    "_meta": { "title": "Save Image" }
+  }
+}

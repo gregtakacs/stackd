@@ -244,6 +244,39 @@ def rewrite_config(model: str | None, fallback: str | None = None) -> dict:
     return dict(entry.get("prompt_rewrite") or {})
 
 
+# -----------------------------------------------------------------------------
+# Per-model geometry (models.json `geometry` block)
+#
+# The module-level MAX_PIXELS / PRACTICAL_MAX_PIXELS / ASPECT_PRESETS above are the
+# Flux.2 Klein pipeline's numbers (16px grid, 4MP ceiling, its RAM-safe auto-sizing
+# budget) and STAY the defaults for every model that declares no `geometry`. Qwen
+# Image 2.1 declares multiples of 32 (its card: "native 2K ... Prefer multiples of
+# 32"; TextEncodeQwenImage21 itself rounds every reference image to /32 -- an input
+# off-grid silently resizes the canvas) plus its own 32-snapped preset table.
+# tools.py resolves geometry via geometry_for() right after loading the model's
+# graph and threads it through _resolve_dimensions_* / _autodetect_source_aspect /
+# stylize's upload budget -- a new grid is a manifest edit, not a code edit.
+# -----------------------------------------------------------------------------
+_GEOMETRY_DEFAULTS: dict = {
+    "multiple": 16,
+    "max_pixels": MAX_PIXELS,
+    "practical_max_pixels": PRACTICAL_MAX_PIXELS,
+    "aspect_presets": ASPECT_PRESETS,
+}
+
+
+def geometry_for(active_model: str | None) -> dict:
+    """The pipeline's `geometry` block merged over _GEOMETRY_DEFAULTS. An unknown or
+    absent model -- or one with no geometry block -- gets the defaults, i.e. exactly
+    today's Klein behavior. Carries `model` through for error-message attribution."""
+    entry = MODELS_MANIFEST["models"].get(active_model or "") or {}
+    geom = dict(_GEOMETRY_DEFAULTS)
+    geom.update(entry.get("geometry") or {})
+    geom["model"] = active_model or default_model_name()
+    return geom
+
+
+
 def load_model(tool: str, model: str | None, fallback: str | None = None) -> tuple[str, dict, dict, dict]:
     """(model_name, fresh graph dict, {role: node_id}, model entry).
 
@@ -286,9 +319,15 @@ def load_inpaint_graph(model: str | None, fallback: str | None = None) -> tuple[
 
 # Per-node-class input key for each logical role. A role not listed here (or a class
 # not listed for it) falls through to `_ROLE_DEFAULT_KEY`, then to the role name.
+#
+# TextEncodeQwenImage21 entries: qwen-image-2-1's graphs point the positive/prompt
+# roles straight at the conditioning node (it takes the text widgets directly, emits
+# positive+negative from ONE encode of each, and -- linked to the VAE with reference
+# images -- the image-sized latent the sampler draws). There is no CLIPTextEncode /
+# ConditioningZeroOut / VAEEncode in that front-end to patch.
 _ROLE_KEY_BY_CLASS: dict[str, dict[str, str]] = {
-    "positive": {"CLIPTextEncode": "text"},
-    "prompt": {"CLIPTextEncode": "text"},
+    "positive": {"CLIPTextEncode": "text", "TextEncodeQwenImage21": "prompt"},
+    "prompt": {"CLIPTextEncode": "text", "TextEncodeQwenImage21": "prompt"},
     "seed": {
         "KSampler": "seed",
         "KSamplerAdvanced": "seed",
@@ -296,6 +335,7 @@ _ROLE_KEY_BY_CLASS: dict[str, dict[str, str]] = {
         "RandomNoise": "noise_seed",
     },
 }
+
 _ROLE_DEFAULT_KEY: dict[str, str] = {
     "positive": "value",   # PrimitiveStringMultiline / PrimitiveString
     "prompt": "value",

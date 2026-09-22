@@ -83,3 +83,21 @@ prefer:
     capabilities: [generate]
     backends: [cuda]
     footprint_gib: { cuda: 34 }
+  # Qwen-Image 2.1 (Comfy-Org repack: int8-convrot DiT + int8 Qwen3-VL 8B encoder + bf16
+  # VAE, ~16.1G on disk), generate + stylize + whole-image edit. Explicit-selection only
+  # (last in the ladder, the ideogram4 convention): `image_model: qwen` or
+  # `stackctl image use qwen-image-2-1`. Needs ComfyUI >= v0.37.0 (TextEncodeQwenImage21)
+  # and the three qwen files in the shared models dir. Vulkan-only for now: cuda0 belongs
+  # to the resident LLM on the deployed box; enabling cuda later = backends + a cuda
+  # footprint here + a COMFYUI_CUDA_IMAGE at >= v0.37.0.
+  # NUMBERS = `stackctl image bench qwen-image-2-1 --sizes 1024 --force --unsafe
+  # --backend vulkan` 2026-09-22 on the -c37 image (warm; 67.3s @1024²): pipeline added
+  # 6.8G VRAM/GTT, ComfyUI container cgroup peak 32.23G -> tool-suggested 10 / 36
+  # (measured + 3G cushion each). NOTE warm-only: the cold load stages ~16G of mmap'd
+  # weights the sampler baseline can't see (see the klein cold-load story above) --
+  # raise footprint if a fresh spawn ever OOMs during the first load.
+  - active_model: qwen-image-2-1
+    capabilities: [generate, stylize, edit]
+    backends: [vulkan]
+    footprint_gib: { vulkan: 10 }
+    host_ram_gib: { vulkan: 36 }

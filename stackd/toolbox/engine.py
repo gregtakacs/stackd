@@ -167,7 +167,12 @@ def make_source():
 
 def _pick_model(spec: dict) -> str:
     """The pipeline to run: an explicit spec model, else whatever the tier has resident,
-    else the klein default that is guaranteed to carry a builtin inpaint graph."""
+    else the klein default that is guaranteed to carry a builtin inpaint graph.
+
+    A RESIDENT model without a builtin inpaint graph (qwen-image-2-1, ideogram4 --
+    the painted-mask flow needs the klein-layout MASK_* nodes) also falls back to the
+    klein default: the toolbox always renders an inpaint graph, so inheriting such a
+    resident model would raise ToolUnsupported from graphs.painted_mask_graph()."""
     m = (spec or {}).get("model")
     if m:
         return str(m)
@@ -175,7 +180,13 @@ def _pick_model(spec: dict) -> str:
         cap = _runtime().image_capability() or {}
     except Exception:  # noqa: BLE001
         cap = {}
-    return cap.get("active_model") or _DEFAULT_MODEL
+    model = cap.get("active_model")
+    if model:
+        from stackd.imagegen import workflows as wf
+        edit_spec = ((wf.MODELS_MANIFEST["models"].get(model) or {}).get("tools") or {}).get("edit") or {}
+        if edit_spec.get("inpaint") != "builtin":
+            return _DEFAULT_MODEL
+    return model or _DEFAULT_MODEL
 
 
 def _patch_graph(graph: dict, spec: dict, *, source_filename: str, mask_filename: str,

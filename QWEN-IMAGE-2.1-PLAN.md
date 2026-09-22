@@ -1,7 +1,35 @@
 # Qwen Image 2.1 (Comfy-Org repack) — implementation plan
 
-Status: APPROVED PLAN, awaiting act mode. Branches: stackd `feat/qwen-image-2.1` off
-`feat/comfy-toolbox`; AI-STACK `feat/qwen-image-2.1` off `main`.
+Status: SHIPPED + LIVE-VALIDATED 2026-09-22 on feat/qwen-image-2.1 (stackd off
+feat/comfy-toolbox; AI-STACK off main). Validated: true is SET. Live evidence on
+comfyui-rocm @ comfyui-rocm:rocm7141-c37 (ComfyUI 0.37.0, ROCm 7.14.1, gfx1151):
+  - bench: warm 67.3s @1024^2 t2i; added 6.8G GTT; container cgroup peak 32.23G
+    -> prefer numbers shipped as footprint 10 / host_ram 36 (bench tool's own
+    +3G-cushion suggestion; the pre-bench 28/45 ESTIMATE was rejected by the live
+    host-RAM guard -- 45 > 39.1 free -- and the model had to be forced via
+    --unsafe --backend vulkan to be MEASURED at all: that guard-refusal is the
+    documented purpose of the --unsafe escape hatch, NOT a bug).
+  - int8 confirmed REAL on hip: comfy-kitchen 0.2.35 'Native ops: convrot_w4a4,
+    int8_tensorwise, asym_w4a8_int8'; TE loads full 8917 MB, DiT full 6920 MB
+    (both == the int8 file sizes).
+  - edit PASS 960x1280 (canvas followed source); stylize PASS 960x1280; klein
+    generate+stylize regression PASS on 0.37 after the bump.
+  - THE AUTOGROW TRAP (cost the most debug time, pinned by a smoke check): the
+    API wire form for TextEncodeQwenImage21 reference images is the DOTTED
+    per-slot key "images.image_1": [node, slot] -- exactly as the UI subgraph
+    names it. The nested {"images": {"image_1": link}} form is SILENTLY DROPPED
+    (min=0 makes it validate clean; execute then sees images={} and
+    `latent_w = latent_h = resolution or 1024` yields a SQUARE latent -- an edit
+    of a 960x1280 source came back 1024x1024 with no error anywhere). Only a
+    DIMENSION ASSERTION catches this class; a returned-PNG check passes either
+    way. Server-side mechanism: execution.py -> _io.build_nested_inputs folds
+    dynamic_paths keys back into the dict before execute().
+  - process trap hit along the way: stackd's imagegen code AND workflow_graphs
+    are baked into the ai-stack-stackd image (no source bind-mount, see README
+    'Web assets are live; Python is not') -- a graph edit needs
+    `docker compose build stackd && up -d` before any live submit test can see
+    it, and `up -d` also wipes /tmp inside the container (copied probe scripts
+    included).
 
 Scope: generate (t2i) + edit/stylize for `qwen-image-2.1`, int8_convrot weights, iGPU
 (vulkan) only, coexisting in the prefer ladder with flux2-klein / flux2-dev-turbo /

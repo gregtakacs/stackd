@@ -104,6 +104,61 @@
           }
         }
       }
+    },
+    "qwen-image-2-1": {
+      "label": "Qwen-Image 2.1 -- int8-convrot DiT + Qwen3-VL 8B (int8) encoder; the published Comfy-Org repack. 25-step euler/simple at cfg 1 (the template's own numbers), native 2K, 32px grid. Whole-image edit/stylize carry the source through TextEncodeQwenImage21 reference conditioning (no ReferenceLatent, no denoise knob).",
+      "validated": true,
+      "prompt_rewrite": {
+        "system": "qwen_image_2_1.txt",
+        "default": true,
+        "json": false
+      },
+      "geometry": {
+        "multiple": 32,
+        "max_pixels": 4194304,
+        "practical_max_pixels": 1703936,
+        "aspect_presets": {
+          "square": [1312, 1312],
+          "landscape": [2048, 1568],
+          "portrait": [1568, 2048],
+          "widescreen": [2048, 1152],
+          "tall": [1152, 2048],
+          "ultrawide": [2048, 832],
+          "ultratall": [832, 2048]
+        }
+      },
+      "tools": {
+        "generate": {
+          "graph": "generate/qwen-image-2-1.json",
+          "nodes": {
+            "positive": "6",
+            "width": "1",
+            "height": "2",
+            "seed": "8",
+            "save": "10"
+          }
+        },
+        "edit": {
+          "_note": "WHOLE-IMAGE ONLY by design: no `inpaint` key exists for this model (no masked graph published by Comfy-Org; CLIPSeg masking was tuned against flux2 latent stats). edit_image gates target_region on this and returns a clean error BEFORE uploading anything. There is also no denoise role: the template carries the source via the TE's reference latents + VL tokens and samples that image-sized latent at denoise 1 (switch=false / resolution=0 path), so edit_strength is a no-op here and tools.py says so in the response note.",
+          "graph": "edit/qwen-image-2-1.json",
+          "nodes": {
+            "positive": "6",
+            "seed": "7",
+            "image": "1",
+            "save": "9"
+          }
+        },
+        "stylize": {
+          "graph": "stylize/qwen-image-2-1.json",
+          "nodes": {
+            "prompt": "7",
+            "seed": "8",
+            "image": "1",
+            "scale_by": "2",
+            "save": "10"
+          }
+        }
+      }
     }
   }
 }

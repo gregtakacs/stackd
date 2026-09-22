@@ -254,34 +254,43 @@ async def _maybe_rewrite(
 
 
 def _round16(value: float) -> int:
-    return max(16, round(value / 16) * 16)
+    return _round_to(value, 16)
 
 
-def _resolve_dimensions_no_source(aspect_ratio: str, width: int, height: int):
+def _round_to(value: float, multiple: int) -> int:
+    return max(multiple, round(value / multiple) * multiple)
+
+
+def _resolve_dimensions_no_source(aspect_ratio: str, width: int, height: int,
+                                  geometry: dict | None = None):
     """generate_image's dimension resolution -- no source image, so aspect_ratio must be
-    an explicit preset (or width/height given directly)."""
+    an explicit preset (or width/height given directly). `geometry` (workflows.geometry_for)
+    sets the grid multiple / MP ceiling / preset table; None = Klein's defaults."""
+    g = geometry or workflows._GEOMETRY_DEFAULTS
+    m = g["multiple"]
     notes = []
     if width and height:
-        rw, rh = _round16(width), _round16(height)
+        rw, rh = _round_to(width, m), _round_to(height, m)
         rw = max(config.MIN_SIDE, min(config.MAX_SIDE, rw))
         rh = max(config.MIN_SIDE, min(config.MAX_SIDE, rh))
         if (rw, rh) != (width, height):
             notes.append(
                 f"requested {width}x{height} adjusted to {rw}x{rh} "
-                f"(multiple of 16, {config.MIN_SIDE}-{config.MAX_SIDE}px per side)"
+                f"(multiple of {m}, {config.MIN_SIDE}-{config.MAX_SIDE}px per side)"
             )
-        if rw * rh > workflows.MAX_PIXELS:
+        if rw * rh > g["max_pixels"]:
             raise ValueError(
-                f"{rw}x{rh} is {rw * rh / 1_000_000:.1f}MP, over Flux.2 Klein 9B's 4MP limit. "
+                f"{rw}x{rh} is {rw * rh / 1_000_000:.1f}MP, over the {g['model']!r} "
+                f"pipeline's {g['max_pixels'] / 1_000_000:.0f}MP limit. "
                 "Pick smaller dimensions or use an aspect_ratio preset instead."
             )
         return rw, rh, notes
     if width or height:
         raise ValueError("Provide both width and height, or neither (to use aspect_ratio).")
-    preset = workflows.ASPECT_PRESETS.get(aspect_ratio.lower().strip())
+    preset = g["aspect_presets"].get(aspect_ratio.lower().strip())
     if not preset:
         raise ValueError(
-            f"Unknown aspect_ratio '{aspect_ratio}'. Choose one of: {', '.join(workflows.ASPECT_PRESETS)}."
+            f"Unknown aspect_ratio '{aspect_ratio}'. Choose one of: {', '.join(g['aspect_presets'])}."
         )
     return preset[0], preset[1], notes
 
@@ -308,44 +317,48 @@ def _dims_from_bytes(data: bytes):
 AUTO_BUDGET_PIXELS = workflows.PRACTICAL_MAX_PIXELS
 
 
-def _resolve_dimensions_from_source(source_bytes: bytes, aspect_ratio: str, width: int, height: int):
+def _resolve_dimensions_from_source(source_bytes: bytes, aspect_ratio: str, width: int, height: int,
+                                     geometry: dict | None = None):
     """edit_image's dimension resolution -- also supports aspect_ratio='auto', scaling to
-    fit AUTO_BUDGET_PIXELS while preserving the source's own aspect ratio."""
+    fit the geometry's practical_max_pixels while preserving the source's own aspect ratio."""
+    g = geometry or workflows._GEOMETRY_DEFAULTS
+    m = g["multiple"]
     notes = []
     if width and height:
-        rw, rh = _round16(width), _round16(height)
+        rw, rh = _round_to(width, m), _round_to(height, m)
         rw = max(config.MIN_SIDE, min(config.MAX_SIDE, rw))
         rh = max(config.MIN_SIDE, min(config.MAX_SIDE, rh))
         if (rw, rh) != (width, height):
             notes.append(
                 f"requested {width}x{height} adjusted to {rw}x{rh} "
-                f"(multiple of 16, {config.MIN_SIDE}-{config.MAX_SIDE}px per side)"
+                f"(multiple of {m}, {config.MIN_SIDE}-{config.MAX_SIDE}px per side)"
             )
-        if rw * rh > workflows.MAX_PIXELS:
-            raise ValueError(f"{rw}x{rh} is {rw * rh / 1_000_000:.1f}MP, over Flux.2 Klein 9B's 4MP limit.")
+        if rw * rh > g["max_pixels"]:
+            raise ValueError(f"{rw}x{rh} is {rw * rh / 1_000_000:.1f}MP, over the {g['model']!r} "
+                             f"pipeline's {g['max_pixels'] / 1_000_000:.0f}MP limit.")
         return rw, rh, notes
     if width or height:
         raise ValueError("Provide both width and height, or neither.")
 
     if aspect_ratio and aspect_ratio.lower() != "auto":
-        preset = workflows.ASPECT_PRESETS.get(aspect_ratio.lower().strip())
+        preset = g["aspect_presets"].get(aspect_ratio.lower().strip())
         if not preset:
             raise ValueError(
-                f"Unknown aspect_ratio '{aspect_ratio}'. Choose 'auto' or one of: {', '.join(workflows.ASPECT_PRESETS)}."
+                f"Unknown aspect_ratio '{aspect_ratio}'. Choose 'auto' or one of: {', '.join(g['aspect_presets'])}."
             )
         return preset[0], preset[1], notes
 
     dims = _dims_from_bytes(source_bytes)
     if not dims or dims[0] <= 0 or dims[1] <= 0:
+        sq = g["aspect_presets"]["square"]
         notes.append(
-            f"could not detect source image size, defaulting to square "
-            f"{workflows.ASPECT_PRESETS['square'][0]}x{workflows.ASPECT_PRESETS['square'][1]}"
+            f"could not detect source image size, defaulting to square {sq[0]}x{sq[1]}"
         )
-        return workflows.ASPECT_PRESETS["square"][0], workflows.ASPECT_PRESETS["square"][1], notes
+        return sq[0], sq[1], notes
     src_w, src_h = dims
-    scale = min(1.0, (AUTO_BUDGET_PIXELS / (src_w * src_h)) ** 0.5)
-    w = max(config.MIN_SIDE, min(config.MAX_SIDE, _round16(src_w * scale)))
-    h = max(config.MIN_SIDE, min(config.MAX_SIDE, _round16(src_h * scale)))
+    scale = min(1.0, (g["practical_max_pixels"] / (src_w * src_h)) ** 0.5)
+    w = max(config.MIN_SIDE, min(config.MAX_SIDE, _round_to(src_w * scale, m)))
+    h = max(config.MIN_SIDE, min(config.MAX_SIDE, _round_to(src_h * scale, m)))
     notes.append(f"preserving source aspect ratio: {src_w}x{src_h} -> {w}x{h}")
     return w, h, notes
 
@@ -457,7 +470,8 @@ def _max_size_for_ratio(src_w: int, src_h: int, max_pixels: int, max_side: int) 
     return w, h
 
 
-async def _autodetect_source_aspect(ctx: Context, api_key: str) -> tuple[int, int, str] | None:
+async def _autodetect_source_aspect(ctx: Context, api_key: str,
+                                    geometry: dict | None = None) -> tuple[int, int, str] | None:
     """For a REIMAGINE-style bare generate_image call, best-effort matches the most recent
     photo's aspect ratio in this chat, so the model doesn't have to guess it by eye (visually
     distinguishing e.g. 4:3 from 16:9 from a rendered image is unreliable -- this reads the
@@ -485,7 +499,7 @@ async def _autodetect_source_aspect(ctx: Context, api_key: str) -> tuple[int, in
         if not dims or dims[0] <= 0 or dims[1] <= 0:
             return None
         src_w, src_h = dims
-        w, h = _max_size_for_ratio(src_w, src_h, workflows.PRACTICAL_MAX_PIXELS, config.MAX_SIDE)
+        w, h = _max_size_for_ratio(src_w, src_h, (geometry or workflows._GEOMETRY_DEFAULTS)["practical_max_pixels"], config.MAX_SIDE)
         return w, h, f"aspect_ratio auto-matched from the referenced photo: {src_w}x{src_h} -> {w}x{h}"
     except Exception:
         logger.exception("generate_image: aspect-ratio auto-detect failed, falling back to square")
@@ -876,8 +890,9 @@ async def generate_image(
         aspect_ratio = ""
 
     notes = []
+    geom = workflows.geometry_for(model_name)
     if not aspect_ratio and not width and not height:
-        detected = await _autodetect_source_aspect(ctx, api_key)
+        detected = await _autodetect_source_aspect(ctx, api_key, geom)
         if detected:
             width, height, note = detected
             notes.append(note)
@@ -885,7 +900,7 @@ async def generate_image(
             aspect_ratio = "square"
 
     try:
-        w, h, more_notes = _resolve_dimensions_no_source(aspect_ratio, width, height)
+        w, h, more_notes = _resolve_dimensions_no_source(aspect_ratio, width, height, geom)
         notes.extend(more_notes)
     except ValueError as e:
         return json.dumps({"error": str(e)})
@@ -1126,6 +1141,26 @@ async def edit_image(
     _n, model_meta = workflows.model_entry(model_name)
     edit_spec = ((model_meta.get("tools") or {}).get("edit")) or {}
 
+    # Masked precision edits run on the klein-layout inpaint graphs only. A model whose
+    # `edit` spec declares no builtin inpaint graph (qwen-image-2-1: nothing masked is
+    # published for it, and the CLIPSeg path was tuned against flux2 latent stats) must
+    # fail HERE, before the Open WebUI fetch/upload -- load_inpaint_graph would otherwise
+    # raise ToolUnsupported from inside _submit_edit, which the network try-block below
+    # does not catch (it only handles httpx/TimeoutError).
+    if target_region and edit_spec.get("inpaint") != "builtin":
+        _inpaint_models = ", ".join(
+            n for n, e in workflows.MODELS_MANIFEST["models"].items()
+            if ((e.get("tools") or {}).get("edit") or {}).get("inpaint") == "builtin"
+        )
+        return json.dumps({
+            "error": (
+                f"Image model '{model_name}' does not support masked edits (no builtin "
+                f"inpaint graph; target_region is wired for: {_inpaint_models}). Drop "
+                "target_region for a whole-image edit on this model, or name an "
+                "inpaint-capable image_model."
+            )
+        })
+
     if target_region and not invert_mask:
         # invert_mask edits select a broad region specifically so everything OUTSIDE it can
         # be changed instead (e.g. target_region="the people and the dog", invert_mask=True
@@ -1196,7 +1231,9 @@ async def edit_image(
         )})
 
     try:
-        w, h, notes = _resolve_dimensions_from_source(source_bytes, aspect_ratio, width, height)
+        w, h, notes = _resolve_dimensions_from_source(
+            source_bytes, aspect_ratio, width, height, workflows.geometry_for(model_name)
+        )
     except ValueError as e:
         return json.dumps({"error": str(e)})
 
@@ -1271,6 +1308,15 @@ async def edit_image(
             workflows.set_node(workflow, nodes.get("seed"), "seed", seed)
             workflows.set_node(workflow, nodes.get("image"), "image", comfy_filename)
             workflows.set_node(workflow, nodes.get("denoise"), "denoise", edit_strength)
+            if nodes.get("denoise") is None:
+                # Model-family specific (today: qwen-image-2-1): the source rides in the
+                # TE's reference conditioning and the sampler runs at the template's
+                # denoise=1, so there is no denoise input for edit_strength to steer.
+                # Say so rather than let the caller believe it moved something.
+                notes.append(
+                    "edit_strength is a no-op on this pipeline (the source is carried "
+                    "by reference conditioning at full denoise, not a low-denoise restyle)"
+                )
             fetch_nodes = {save_node}
         _g0 = time.monotonic()
         prompt_id = await comfyui_client.submit_workflow(workflow, base=comfy_base)
@@ -1422,7 +1468,7 @@ async def stylize_image(
 
     try:
         source_bytes = comfyui_client.downscale_to_pixel_budget(
-            source_bytes, workflows.PRACTICAL_MAX_PIXELS / (upscale_by**2)
+            source_bytes, workflows.geometry_for(profile)["practical_max_pixels"] / (upscale_by**2)
         )
         comfy_filename = await comfyui_client.upload_to_comfy(source_bytes, "stylize_src", base=comfy_base)
         _n, workflow, nodes, _e = workflows.load_model("stylize", profile)
