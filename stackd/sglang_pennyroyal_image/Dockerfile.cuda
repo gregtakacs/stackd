@@ -98,10 +98,43 @@ ARG SGLANG_FORK_REPO=https://github.com/jpezzulli/sglang-rtxpro6000.git
 #              chunked-prefill boundary fix (adapted from sglang#39575), and
 #              an optional C6 (1,048,576 shared KV token) Flash-Next launch
 #              profile — opt-in, not used by any model YAML here.
-# BUILD.md @ v2.5.1 keeps the toolchain this Dockerfile uses (Python 3.12,
+#   v2.5.2   — SKIPPED (folded into v2.5.3's linear lineage). PLE table built
+#              host-side instead of GPU-first, exact-sized pinned backing,
+#              QSA single-gather prefill, HiCache shortfall-only reclaim, TP2
+#              prep, and the launchers now export
+#              SGLANG_FORWARD_UNKNOWN_TOOLS=true. That last one is launcher-
+#              only (server default still off) and deliberately NOT adopted
+#              here: stackd's serve._extract_leaked_toolcall recovers a
+#              hallucinated-name call from the dropped-to-text form by
+#              parameter shape, which beats forwarding a bogus name for Cline
+#              to fail on (AI_NoSuchToolError).
+#   v2.5.3   — Bumped 2026-10-04 from v2.5.1 (dbc1e9be), 45 commits, NO
+#              rebase, SAME dependency stack (BUILD.md). (a) Fork issue #17:
+#              native MTP checkpointed the recurrent state at the wrong
+#              accepted-token boundary -> phantom tokens / broken file
+#              writes; a plausible root cause under some of the tool-call
+#              corruption serve.py's gate still screens for. (b) BF16 NVMe
+#              PLE staging sizing (we run the FP8 table, unaffected). (c)
+#              qwen3_coder streams string tool arguments incrementally —
+#              serve._ToolCallGate folds fragments per index, so still fine,
+#              but it holds the call whole, so clients don't see the progress.
+#              (d) quoted tool markup split across reasoning chunks. (e)
+#              HiCache NIXL: hybrid (Mamba) storage-component count fix +
+#              write-through backup fix — changes what lands on disk, so
+#              every model YAML's NIXL namespace was bumped with this. Also
+#              parallel prompt tokenization (>=32K chars), `thinking` <->
+#              `enable_thinking` mirroring, optional l3_cleaner_max_cache_gb.
+#              Re-verified at v2.5.3: qwen3_coder _is_declared_tool gate and
+#              reasoning_parser _tool_start_confirmed both still present;
+#              upstream froggeric-v22.5.jinja byte-identical to v2.5.1's (our
+#              vendored copy differs only by our own line 209); ple-backend.sh,
+#              check_ple_nvme.py, ple_nvme/install.sh, nixl-posix.toml all
+#              unchanged, so entrypoint.sh's NVMe wiring needs no update.
+#              Rollback: v2.5.1 image tagged sglang-pennyroyal:v2.5.1.
+# BUILD.md @ v2.5.3 keeps the toolchain this Dockerfile uses (Python 3.12,
 # CUDA 13.3, GCC 15, PyTorch 2.13.0+cu130) and the same NIXL_REF below. The
 # git-checkout layer changes, so a from-scratch ~20 min sm120 rebuild.
-ARG SGLANG_FORK_REF=pennyroyal-v2.5.1
+ARG SGLANG_FORK_REF=pennyroyal-v2.5.3
 # NIXL commit from the fork's BUILD.md (POSIX FILE plugin for the HiCache
 # storage backend). Only needed once phase-2 NIXL persistence is turned on, but
 # built now so the image is complete.

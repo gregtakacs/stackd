@@ -48,7 +48,7 @@ services:
     build:
       context: stackd/sglang_pennyroyal_image
       dockerfile: Dockerfile.cuda
-    # pinned via Dockerfile ARG SGLANG_FORK_REF=pennyroyal-v2.5.1
+    # pinned via Dockerfile ARG SGLANG_FORK_REF=pennyroyal-v2.5.3
     # (jpezzulli/sglang-rtxpro6000; v2.5.1 bumped 2026-09-17, same CUDA/
     # PyTorch/FlashInfer/NIXL stack as v2.5.0 -- see Dockerfile.cuda's
     # changelog comment). Adds optional online FP8 (SGLANG_SM120_ONLINE_MXFP8)
