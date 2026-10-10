@@ -2747,6 +2747,11 @@ function xpDerive(n) {
     engCtx: n.engine_ctx_max || 0,
   };
 }
+function xpCacheCell(node) {
+  const td = el("td", "num", node.tin ? (100 * node.tcache / node.tin).toFixed(1) + "%" : "–");
+  if (node.tin) td.title = fmtSI(node.tcache) + " of " + fmtSI(node.tin) + " input tokens would be cache reads";
+  return td;
+}
 function xpTpCells(node) {
   const d = xpDerive(node);
   const g = el("td", "num", d.gen ? rnd1(d.gen) : "–");
@@ -2764,6 +2769,7 @@ const XP_TIMING = ["prefill_ms", "prefill_tok", "decode_ms", "decode_tok",
 function xpAcc(node, r, tiers) {
   node.reqs += r.reqs || 0;
   node.tin += r.prompt_tokens || 0;
+  node.tcache += r.cached_tokens || 0;
   node.tout += r.completion_tokens || 0;
   for (const k of XP_TIMING) node[k] += r[k] || 0;
   node.ctx_max = Math.max(node.ctx_max, r.ctx_tokens_max || 0);
@@ -2773,7 +2779,7 @@ function xpAcc(node, r, tiers) {
 function xpBuild() {
   const dims = XP.order.filter(k => XP.active.includes(k));
   const tiers = xpTiers();
-  const mk = () => ({ reqs: 0, tin: 0, tout: 0, ctx_max: 0, engine_ctx_max: 0,
+  const mk = () => ({ reqs: 0, tin: 0, tcache: 0, tout: 0, ctx_max: 0, engine_ctx_max: 0,
                       ...Object.fromEntries(XP_TIMING.map(k => [k, 0])),
                       gross: Object.fromEntries(tiers.map(t => [t.label, 0])), kids: new Map() });
   const root = mk();
@@ -2976,7 +2982,9 @@ function renderExplorer() {
   const t = el("table", "xp-table");
   t.innerHTML = "<thead><tr><th>" +
     (dims.length ? dims.map(dimLabel).join(" › ") : "total") +
-    "</th><th class=num>reqs</th><th class=num>tok in</th><th class=num>tok out</th>" +
+    "</th><th class=num>reqs</th><th class=num>tok in</th>" +
+    "<th class=num title='share of input tokens a frontier API prefix cache (Anthropic-style: 5-min TTL, 1024-token minimum prefix) would have served as cache reads — the synthetic estimate the savings already price in, not the local engine&#39;s own cache reuse'>cache %</th>" +
+    "<th class=num>tok out</th>" +
     "<th class=num title='engine-measured generation tok/s (from /metrics counters, pro-rated by token share)'>gen t/s</th>" +
     "<th class=num title='engine-measured prompt/prefill tok/s (from /metrics counters, pro-rated by token share)'>pre t/s</th>" +
     "<th class=num title='token-weighted mean context per request (Σctx² / Σctx — weights each request by its own size, so tiny agent calls do not swamp it; hover for arith. mean, biggest request, engine peak)'>ctx</th>" +
@@ -2991,6 +2999,7 @@ function renderExplorer() {
   totR.append(tc0);
   totR.append(el("td", "num", fmtNum(root.reqs)));
   totR.append(el("td", "num", fmtSI(root.tin)));
+  totR.append(xpCacheCell(root));
   totR.append(el("td", "num", fmtSI(root.tout)));
   totR.append(...xpTpCells(root));
   for (const t2 of tiers) {
@@ -3020,6 +3029,7 @@ function renderExplorer() {
       tr.append(c0);
       tr.append(el("td", "num", fmtNum(kn.reqs)));
       tr.append(el("td", "num", fmtSI(kn.tin)));
+      tr.append(xpCacheCell(kn));
       tr.append(el("td", "num", fmtSI(kn.tout)));
       tr.append(...xpTpCells(kn));
       for (const t2 of tiers) {
@@ -3273,7 +3283,7 @@ function xpMetricValue(node, metric) {
 }
 function xpPivot() {
   const tiers = xpTiers();
-  const mk = () => ({ reqs: 0, tin: 0, tout: 0, ctx_max: 0, engine_ctx_max: 0, brave: 0,
+  const mk = () => ({ reqs: 0, tin: 0, tcache: 0, tout: 0, ctx_max: 0, engine_ctx_max: 0, brave: 0,
                       ...Object.fromEntries(XP_TIMING.map(k => [k, 0])),
                       gross: Object.fromEntries(tiers.map(t => [t.label, 0])) });
   const xMap = new Map();          // xKey -> Map(seriesKey -> accum node)
