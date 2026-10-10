@@ -1251,7 +1251,10 @@ class _Handler(BaseHTTPRequestHandler):
         # stops without finishing it. A call that never closes gets swallowed
         # — dropped — and replaced with a clean finish_reason=length turn
         # carrying no tool_calls, instead of forwarding half-written JSON a
-        # client's own validator would reject. There is no retry: the model
+        # client's own validator would reject. (A call that closed but came out
+        # malformed gets continuation retries first, on SGLang, and if those fail
+        # ends as finish_reason=stop with a note — see _continue_toolcall /
+        # _malformed_note.) There is no retry for a truncated call: the model
         # is already asked for its full native output length up front (see
         # each model's max_output_tokens config), so there's no bigger number
         # left to ask for on a second attempt — and a second generation
@@ -1267,13 +1270,17 @@ class _Handler(BaseHTTPRequestHandler):
                                    and isinstance(body.get("tools"), list)
                                    and len(body["tools"]) > 0) else None)
         declared_tools = body.get("tools") if toolcall_safe_model else None
+        # SGLang only: a malformed (not truncated) call gets continuation retries
+        # from the already-streamed prefix — see _continue_toolcall.
+        toolcall_continue = body if (toolcall_safe_model and serving_tmpl.startswith("sglang")) else None
         on_chunk = (lambda: _inflight_tick(rr.stack, inflight_rid)) if inflight_rid is not None else None
         try:
             self._relay(rr.endpoint.rstrip("/") + self.path, "POST",
                         json.dumps(body).encode(), streaming=streaming, on_body=_on_body,
                         inject_timings=_INJECT_TIMINGS and not is_embeddings,
                         alias_token_ids=not is_embeddings, on_chunk=on_chunk,
-                        toolcall_safe_model=toolcall_safe_model, declared_tools=declared_tools)
+                        toolcall_safe_model=toolcall_safe_model, declared_tools=declared_tools,
+                        toolcall_continue=toolcall_continue)
         finally:
             # Safety net: on_body (above) is the normal finish path, but a couple of
             # _relay's error branches (upstream unreachable/timeout) return without
@@ -1452,7 +1459,7 @@ class _Handler(BaseHTTPRequestHandler):
     def _relay(self, url: str, method: str, body: bytes | None, *, streaming: bool,
                on_body=None, inject_timings: bool = False, alias_token_ids: bool = False,
                on_chunk=None, toolcall_safe_model: str | None = None,
-               declared_tools: list | None = None):
+               declared_tools: list | None = None, toolcall_continue: dict | None = None):
         """Forward one request upstream and relay the response. `streaming` chunk-
         relays a response with no content-length (SSE); otherwise buffers and sends
         with a real content-length. `on_body(bytes, status)` gets the full response
@@ -1487,7 +1494,9 @@ class _Handler(BaseHTTPRequestHandler):
         relaying it live — see that class for the hold/flush/swallow behavior.
         `declared_tools` (the request's own `tools` list) rides along so the gate can
         recover a call the model leaked into plain content under a name that isn't
-        declared — see _extract_leaked_toolcall."""
+        declared — see _extract_leaked_toolcall. `toolcall_continue` (the request
+        body as sent, SGLang upstreams only) arms the gate's continuation retries
+        for a malformed call — see _continue_toolcall."""
         fwd_ct = self.headers.get("content-type", "application/json")
         req = urllib.request.Request(
             url, data=body, method=method,
@@ -1536,7 +1545,9 @@ class _Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 lb = b""            # line buffer — relay whole SSE events (\n\n-delimited)
                 usage_merged = False
-                gate = _ToolCallGate(toolcall_safe_model, declared_tools) if toolcall_safe_model else None
+                gate = (_ToolCallGate(toolcall_safe_model, declared_tools,
+                                      continuation=(url, toolcall_continue) if toolcall_continue else None)
+                        if toolcall_safe_model else None)
                 while True:
                     chunk = up.read(8192)
                     if not chunk:
@@ -1568,7 +1579,9 @@ class _Handler(BaseHTTPRequestHandler):
                 data = up.read()
                 _tee(data)
                 if toolcall_safe_model:
-                    data = _sanitize_toolcall_body(data, toolcall_safe_model, declared_tools) or data
+                    data = _sanitize_toolcall_body(
+                        data, toolcall_safe_model, declared_tools,
+                        continuation=(url, toolcall_continue) if toolcall_continue else None) or data
                 if inject_timings:
                     data = _inject_body_timings(data, t0, time.monotonic()) or data
                 if alias_token_ids:
@@ -1629,11 +1642,147 @@ def _extract_usage(buf: bytes) -> dict:
 # call at all: _ToolCallGate (streaming) / _sanitize_toolcall_body (non-streaming) drop
 # it and report a clean finish_reason="length" turn with no tool_calls — the same shape
 # a client already handles as "ran out of room" (Cline: throws a specific, readable
-# error instead of a bare validation failure). No retry: each tool-capable model is
-# configured with its own full native max_output_tokens (see manager.model_max_output_
-# tokens), so there is no bigger number left to ask for on a second attempt, and a
-# second generation could not safely replace content already streamed to the client
-# anyway (SSE is append-only, and generation is not deterministic run to run).
+# error instead of a bare validation failure). No retry for a TRUNCATED call: each
+# tool-capable model is configured with its own full native max_output_tokens (see
+# manager.model_max_output_tokens), so there is no bigger number left to ask for on a
+# second attempt, and a second generation could not safely replace content already
+# streamed to the client anyway (SSE is append-only, and generation is not
+# deterministic run to run).
+#
+# A MALFORMED call (it closed, finish_reason != "length", but the arguments are bad
+# JSON / self-wrapped / off-schema) is a different story: on SGLang, it gets up to
+# _TOOLCALL_CONTINUE_ATTEMPTS continuation retries (_continue_toolcall), and if none
+# comes out well-formed — on any engine — the turn ends finish_reason="stop" with a
+# note saying what was wrong (_malformed_note), never the misleading "length". The
+# gate never forwarded any of the
+# call, so the client has seen precisely the reasoning + content that streamed live;
+# stackd hands exactly that back to the engine as a `continue_final_message`
+# assistant prefix and lets the model write the call again from the same point. The
+# client's stream stays append-only — it just sees the call arrive after a pause.
+
+
+# --- continuation retry for a malformed call -------------------------------------
+# Live data (2026-10-09/10): 9 of 11 malformed calls were fixed by ONE retry; the two
+# that weren't failed malformed again — so a few cheap attempts, then an honest
+# stop-with-a-note (_malformed_note) instead of the misleading length swallow.
+_TOOLCALL_CONTINUE_ATTEMPTS = max(1, int(os.environ.get("STACKD_TOOLCALL_CONTINUE_ATTEMPTS", "3")))
+
+
+def _continuation_prefix(reasoning: str, content: str) -> str:
+    """The assistant text the model had produced before its tool call, rebuilt in
+    the shape the froggeric template renders a past thinking turn in — the engine's
+    generation prompt already ends `<think>\\n`, so the prefix is the reasoning, the
+    close tag, then the content. No streamed reasoning (thinking off, where the
+    generation prompt already closed the block) → just the content."""
+    reasoning, content = reasoning.strip(), content.lstrip()
+    if reasoning:
+        return reasoning + "\n</think>\n\n" + content
+    return content
+
+
+def _continue_toolcall(url: str, body: dict, reasoning: str, content: str,
+                       tools: list | None, model_name: str) -> tuple[dict | None, list[str]]:
+    """Up to _TOOLCALL_CONTINUE_ATTEMPTS non-streamed retries of a malformed tool
+    call, each continuing from exactly what the client already has (`reasoning` +
+    `content`) — the prefix is in the engine's prompt cache after the first, so each
+    is only the cost of re-generating the call. Returns ``(message, problems)``: the
+    first retry's assistant `message` dict ({content, tool_calls, ...}) that produced
+    a well-formed call, else None plus the last bad attempt's problem descriptions
+    (empty if it never got that far). Never raises. Stops early on an upstream error
+    or a retry that itself hit the length limit — neither gets better by repeating.
+    SGLang-specific: `continue_final_message` appends the last assistant message's
+    text verbatim after the generation prompt; and since pennyroyal's serving_chat
+    doesn't hand that prefix to the reasoning parser, a prefix that already closed
+    </think> must disable reasoning separation, or the whole continuation would be
+    classed as reasoning and its call never parsed."""
+    req = json.loads(json.dumps(body))             # deep copy
+    req["stream"] = False
+    req.pop("stream_options", None)
+    req.pop("n", None)
+    prefix = _continuation_prefix(reasoning, content)
+    if prefix:
+        req["messages"] = list(req.get("messages") or []) + [{"role": "assistant", "content": prefix}]
+        req["continue_final_message"] = True
+        if "</think>" in prefix:
+            req["separate_reasoning"] = False
+    payload = json.dumps(req).encode()
+    last_problems: list[str] = []
+    for attempt in range(1, _TOOLCALL_CONTINUE_ATTEMPTS + 1):
+        tag = f"attempt {attempt}/{_TOOLCALL_CONTINUE_ATTEMPTS}"
+        try:
+            r = urllib.request.Request(url, data=payload, method="POST",
+                                       headers={"content-type": "application/json"})
+            with urllib.request.urlopen(r, timeout=_PROXY_READ_TIMEOUT_S) as up:
+                data = up.read()
+        except (urllib.error.URLError, TimeoutError, ConnectionError, ValueError) as e:
+            events.record("toolcall-continue-failed", stack=model_name, detail=f"{tag}: upstream: {e}")
+            return None, last_problems
+        has, finish, problems = _completion_toolcall_state(data, tools, with_problems=True)
+        if not has or problems or "length" in finish:
+            last_problems = problems or last_problems
+            why = "; ".join(problems) if problems else ("no tool call" if not has else "cut off")
+            events.record("toolcall-continue-failed", stack=model_name,
+                          detail=f"{tag}: {why}, finish_reason={sorted(finish)}")
+            if "length" in finish:
+                return None, last_problems
+            continue
+        try:
+            msg = json.loads(data)["choices"][0]["message"]
+        except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+            return None, last_problems
+        if not isinstance(msg, dict):
+            return None, last_problems
+        for i, tc in enumerate(msg.get("tool_calls") or []):
+            if isinstance(tc, dict):
+                tc.setdefault("index", i)
+                tc.setdefault("type", "function")
+        events.record("toolcall-continued", stack=model_name,
+                      detail=f"{tag}, prefix={len(prefix)} chars, calls="
+                             + ",".join(((tc.get("function") or {}).get("name") or "?")
+                                        for tc in msg["tool_calls"] if isinstance(tc, dict)))
+        return msg, []
+    return None, last_problems
+
+
+def _malformed_note(problems: list[str], content_so_far: str) -> str:
+    """The visible assistant text a malformed call that couldn't be repaired is
+    replaced with: says what was wrong, in words the model reads back next turn
+    (it's part of the conversation history from here on) — so the client's own
+    "you didn't use a tool" nudge gets a model that knows what to fix, instead of
+    a misleading finish_reason="length" the client reports as a token-limit error."""
+    what = "; ".join(problems) if problems else "arguments did not match the tool's schema"
+    sep = "\n\n" if content_so_far.strip() else ""
+    return (f"{sep}[stackd: dropped a malformed tool call — {what}. "
+            "Issue the tool call again with its parameters exactly as declared.]")
+
+
+def _continued_events(doc: dict, msg: dict) -> tuple[bytes, ...]:
+    """SSE events carrying a continuation retry's result in place of the swallowed
+    call, modelled on the terminal chunk `doc`: an optional content delta for any
+    text the retry wrote before its call, then one tool_calls delta that also carries
+    finish_reason="tool_calls"."""
+    out = []
+    extra = (msg.get("content") or "")
+    if extra.strip():
+        ev = _clean_toolcall_finish(doc)
+        ev.pop("usage", None)                       # only the terminal event keeps it
+        ev["choices"][0]["delta"] = {"content": extra}
+        ev["choices"][0]["finish_reason"] = None
+        out.append(ev)
+    fin = _clean_toolcall_finish(doc)
+    fin["choices"][0]["delta"] = {"tool_calls": msg["tool_calls"]}
+    fin["choices"][0]["finish_reason"] = "tool_calls"
+    out.append(fin)
+    return tuple(b"data: " + json.dumps(e).encode() + b"\n\n" for e in out)
+
+
+def _malformed_stop_events(doc: dict, note: str) -> tuple[bytes, ...]:
+    """The terminal SSE event for a malformed call that couldn't be repaired: the
+    _malformed_note as a content delta, finish_reason="stop", no tool_calls."""
+    fin = _clean_toolcall_finish(doc)
+    fin["choices"][0]["delta"] = {"content": note}
+    fin["choices"][0]["finish_reason"] = "stop"
+    return (b"data: " + json.dumps(fin).encode() + b"\n\n",)
 
 
 # --- recovering a call the model leaked into plain content -------------------------
@@ -1715,26 +1864,32 @@ def _toolcall_args_self_wrapped(name: str | None, parsed, tool_schema: dict | No
     parameter altogether (live example: ``{}`` for a tool whose schema requires
     "commands"). Conservative here too: skipped when the schema declares no
     properties/required at all, so a genuinely argument-less tool is never flagged."""
+    return _args_shape_problem(name, parsed, tool_schema) is not None
+
+
+def _args_shape_problem(name: str | None, parsed, tool_schema: dict | None = None) -> str | None:
+    """_toolcall_args_self_wrapped's checks, saying WHICH one tripped (for the event
+    log and the model-facing fallback note) — None if the shape is fine."""
     if not isinstance(parsed, dict):
-        return False
+        return None
     keys = set(parsed.keys())
     if keys == {"arguments"}:
-        return True
+        return "self-wrapped in {arguments}"
     if keys == {"name", "arguments"}:
-        return True
+        return "self-wrapped in {name, arguments}"
     if name and name in parsed:
-        return True
+        return f"its own name {name!r} used as a parameter"
     if tool_schema:
         props = set((tool_schema.get("properties") or {}).keys())
-        if props and not keys <= props:
-            return True                             # a key the schema never declared
+        if props and not keys <= props:                 # a key the schema never declared
+            return f"unknown params {sorted(keys - props)} (declared: {sorted(props)})"
         required = set(tool_schema.get("required") or [])
-        if required and not required <= keys:
-            return True                             # missing a declared required param
-    return False
+        if required and not required <= keys:           # missing a declared required param
+            return f"missing required params {sorted(required - keys)}"
+    return None
 
 
-def _completion_toolcall_state(buf: bytes, tools: list | None = None):
+def _completion_toolcall_state(buf: bytes, tools: list | None = None, *, with_problems: bool = False):
     """Scan a chat/completions response (JSON body OR an SSE capture) and rebuild the
     assistant tool calls. Returns ``(has_tool_calls, finish_reasons, bad_args)`` where
     ``bad_args`` is True if any tool call's accumulated ``arguments`` is non-empty but
@@ -1744,7 +1899,9 @@ def _completion_toolcall_state(buf: bytes, tools: list | None = None):
     of that check possible — omit it and only the self-wrap shapes get caught).
     Deliberately conservative: never raises, and an empty ``arguments`` (a genuinely
     argument-less call) is NOT flagged — only unparseable/wrongly-shaped content or a
-    finish_reason of "length" alongside a tool call marks it broken."""
+    finish_reason of "length" alongside a tool call marks it broken.
+    `with_problems=True` returns the list of per-call problem descriptions (see
+    _args_shape_problem) in place of the ``bad_args`` bool — empty means not bad."""
     schemas = {
         fn["name"]: (fn.get("parameters") or {})
         for fn in (((t or {}).get("function") or {}) for t in (tools or []))
@@ -1791,7 +1948,7 @@ def _completion_toolcall_state(buf: bytes, tools: list | None = None):
                         finish.add(ch["finish_reason"])
                     _absorb_tools((ch.get("delta") or {}).get("tool_calls"))
 
-    bad = False
+    problems = []
     for name, args in acc.values():
         a = (args or "").strip()
         if not a:
@@ -1799,11 +1956,14 @@ def _completion_toolcall_state(buf: bytes, tools: list | None = None):
         try:
             parsed = json.loads(a)
         except (json.JSONDecodeError, ValueError):
-            bad = True
+            problems.append(f"{name or '?'}: unparseable JSON ({len(a)} chars, ends {a[-40:]!r})")
             continue
-        if _toolcall_args_self_wrapped(name, parsed, schemas.get(name)):
-            bad = True
-    return bool(acc), finish, bad
+        p = _args_shape_problem(name, parsed, schemas.get(name))
+        if p:
+            problems.append(f"{name or '?'}: {p}")
+    if with_problems:
+        return bool(acc), finish, problems
+    return bool(acc), finish, bool(problems)
 
 
 def _toolcall_truncated(buf: bytes) -> bool:
@@ -1837,9 +1997,10 @@ class _ToolCallGate:
     until it's known to be whole. At the terminal (finish_reason-bearing) event: if a
     held NATIVE tool call closed with valid JSON, flush everything held, in order, as
     if it had streamed normally (just delayed by however long the call itself took to
-    generate). If it didn't — cut off by the output limit, or invalid for any other
-    reason — discard everything held and emit one synthetic _clean_toolcall_finish
-    event instead. If there was no native tool call at all, try to recover a leaked one
+    generate). If it was cut off by the output limit, discard everything held and
+    emit one synthetic _clean_toolcall_finish event instead; if it closed but came
+    out malformed, try the continuation retries (below), else discard it and end the
+    turn finish_reason="stop" with a _malformed_note. If there was no native tool call at all, try to recover a leaked one
     from the held content before falling back to flushing it as plain text. Either
     way, events after the decision (a trailing `usage` chunk, `[DONE]`) relay live
     again untouched; nothing about them needed to be buffered.
@@ -1852,15 +2013,25 @@ class _ToolCallGate:
 
     Also logs (without altering anything) the sibling failure mode this same terminal
     event can reveal: reasoning alone ran the whole budget out before any tool call
-    began, so there was never anything to hold in the first place."""
+    began, so there was never anything to hold in the first place.
 
-    def __init__(self, model_name: str, tools: list | None = None):
+    `continuation` — ``(upstream_url, request_body)``, SGLang upstreams only — arms
+    the _continue_toolcall retries for a held native call that closed but came out
+    malformed (never for a truncated one). The retry continues from `live_reasoning`
+    + `live_content`: exactly what was relayed before holding began, i.e. exactly
+    what the client already has."""
+
+    def __init__(self, model_name: str, tools: list | None = None,
+                 continuation: tuple[str, dict] | None = None):
         self.model_name = model_name
         self.tools = tools or []
+        self.continuation = continuation
         self.holding = False
         self.resolved = False
         self.pending: list[bytes] = []
         self.content_seen = ""
+        self.live_reasoning = ""
+        self.live_content = ""
 
     def handle(self, evt: bytes) -> tuple[bytes, ...]:
         """Feed one raw `\\n\\n`-terminated SSE event. Returns the events to relay to
@@ -1876,6 +2047,7 @@ class _ToolCallGate:
                 doc = None
         has_tc = False
         finish_reason = None
+        evt_reasoning = evt_content = ""
         if isinstance(doc, dict):
             for ch in (doc.get("choices") or []):
                 if not isinstance(ch, dict):
@@ -1885,6 +2057,10 @@ class _ToolCallGate:
                     has_tc = True
                 if delta.get("content"):
                     self.content_seen += delta["content"]
+                    evt_content += delta["content"]
+                r = delta.get("reasoning_content") or delta.get("reasoning")
+                if isinstance(r, str):
+                    evt_reasoning += r
                 if ch.get("finish_reason"):
                     finish_reason = ch["finish_reason"]
         leaking = "<tool_call" in self.content_seen
@@ -1892,6 +2068,8 @@ class _ToolCallGate:
             if finish_reason == "length":
                 events.record("toolcall-unstarted-length", stack=self.model_name,
                               detail="hit the output limit before any tool call began")
+            self.live_reasoning += evt_reasoning
+            self.live_content += evt_content
             return (evt,)
         self.holding = True
         self.pending.append(evt)
@@ -1899,11 +2077,23 @@ class _ToolCallGate:
             return ()                                  # still accumulating the call
         self.resolved = True
         held, self.pending = self.pending, []
-        has, finish, bad = _completion_toolcall_state(b"".join(held), self.tools)
-        if has and (("length" in finish) or bad):
+        has, finish, problems = _completion_toolcall_state(b"".join(held), self.tools, with_problems=True)
+        if has and "length" in finish:
             events.record("toolcall-swallowed", stack=self.model_name,
-                          detail=f"finish_reason={finish_reason}")
+                          detail=f"truncated, finish_reason={finish_reason} → length")
             return (b"data: " + json.dumps(_clean_toolcall_finish(doc)).encode() + b"\n\n",)
+        if has and problems:
+            events.record("toolcall-malformed", stack=self.model_name, detail="; ".join(problems))
+            if self.continuation:
+                url, body = self.continuation
+                msg, retry_problems = _continue_toolcall(url, body, self.live_reasoning, self.live_content,
+                                                         self.tools, self.model_name)
+                if msg:
+                    return _continued_events(doc, msg)
+                problems = retry_problems or problems
+            events.record("toolcall-swallowed", stack=self.model_name,
+                          detail=f"malformed, finish_reason={finish_reason} → stop + note")
+            return _malformed_stop_events(doc, _malformed_note(problems, self.live_content))
         if not has:
             recovered = _extract_leaked_toolcall(self.content_seen, self.tools)
             if recovered:
@@ -1922,15 +2112,19 @@ class _ToolCallGate:
         return tuple(held)
 
 
-def _sanitize_toolcall_body(data: bytes, model_name: str, tools: list | None = None) -> bytes | None:
+def _sanitize_toolcall_body(data: bytes, model_name: str, tools: list | None = None,
+                            continuation: tuple[str, dict] | None = None) -> bytes | None:
     """Non-streamed counterpart to _ToolCallGate: if the (already complete, in hand)
     response has a tool call that never became valid JSON, OR parsed into a self-
     wrapped envelope (see _toolcall_args_self_wrapped), log it and return a rewritten
-    body with tool_calls cleared and finish_reason forced to "length" instead of
-    forwarding the broken call. Also logs the reasoning-ran-out-the-budget sibling
+    body with tool_calls cleared instead of forwarding the broken call:
+    finish_reason="length" if it was truncated, "stop" plus a _malformed_note if it
+    was malformed (after the continuation retries, when armed). Also logs the reasoning-ran-out-the-budget sibling
     case, unchanged. If there's no tool call at all, try to recover one leaked into
     plain `message.content` under a hallucinated name (see _extract_leaked_toolcall)
-    before giving up. None if nothing needs to change."""
+    before giving up. None if nothing needs to change. `continuation` arms the same
+    malformed-call retries as _ToolCallGate's, continuing from the response's
+    own reasoning_content + content."""
     has, finish, bad = _completion_toolcall_state(data, tools)
     if not has:
         try:
@@ -1959,18 +2153,46 @@ def _sanitize_toolcall_body(data: bytes, model_name: str, tools: list | None = N
         return None
     if not (("length" in finish) or bad):
         return None
-    events.record("toolcall-swallowed", stack=model_name,
-                  detail=f"finish_reason={sorted(finish)}")
     try:
         doc = json.loads(data)
     except (json.JSONDecodeError, ValueError, TypeError):
-        return None
+        doc = None
     if not isinstance(doc, dict) or not isinstance(doc.get("choices"), list):
+        events.record("toolcall-swallowed", stack=model_name,
+                      detail=f"finish_reason={sorted(finish)}")
         return None
+    if "length" in finish:
+        events.record("toolcall-swallowed", stack=model_name,
+                      detail=f"truncated, finish_reason={sorted(finish)} → length")
+        for ch in doc["choices"]:
+            if isinstance(ch, dict) and isinstance(ch.get("message"), dict):
+                ch["message"]["tool_calls"] = []
+                ch["finish_reason"] = "length"
+        return json.dumps(doc).encode()
+    _, _, problems = _completion_toolcall_state(data, tools, with_problems=True)
+    events.record("toolcall-malformed", stack=model_name, detail="; ".join(problems))
+    ch0 = doc["choices"][0] if doc["choices"] and isinstance(doc["choices"][0], dict) else {}
+    m0 = ch0.get("message") if isinstance(ch0.get("message"), dict) else {}
+    content = m0.get("content") if isinstance(m0.get("content"), str) else ""
+    if continuation:
+        reasoning = m0.get("reasoning_content") or m0.get("reasoning") or ""
+        msg, retry_problems = _continue_toolcall(continuation[0], continuation[1],
+                                                 reasoning if isinstance(reasoning, str) else "",
+                                                 content, tools, model_name)
+        if msg and m0:
+            m0["content"] = content + (msg.get("content") or "")
+            m0["tool_calls"] = msg["tool_calls"]
+            ch0["finish_reason"] = "tool_calls"
+            return json.dumps(doc).encode()
+        problems = retry_problems or problems
+    events.record("toolcall-swallowed", stack=model_name,
+                  detail=f"malformed, finish_reason={sorted(finish)} → stop + note")
     for ch in doc["choices"]:
         if isinstance(ch, dict) and isinstance(ch.get("message"), dict):
+            c = ch["message"].get("content") if isinstance(ch["message"].get("content"), str) else ""
+            ch["message"]["content"] = c + _malformed_note(problems, c)
             ch["message"]["tool_calls"] = []
-            ch["finish_reason"] = "length"
+            ch["finish_reason"] = "stop"
     return json.dumps(doc).encode()
 
 
