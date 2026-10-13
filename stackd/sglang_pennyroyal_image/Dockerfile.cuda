@@ -131,10 +131,37 @@ ARG SGLANG_FORK_REPO=https://github.com/jpezzulli/sglang-rtxpro6000.git
 #              check_ple_nvme.py, ple_nvme/install.sh, nixl-posix.toml all
 #              unchanged, so entrypoint.sh's NVMe wiring needs no update.
 #              Rollback: v2.5.1 image tagged sglang-pennyroyal:v2.5.1.
-# BUILD.md @ v2.5.3 keeps the toolchain this Dockerfile uses (Python 3.12,
+#   v3.0.0/.1 — Bumped 2026-10-13 from v2.5.3, 221 commits, linear (no
+#              rebase). MAJOR: same PyTorch 2.13.0 / sglang-kernel 0.4.6.post1
+#              / NIXL_REF, but FlashInfer 0.6.17 -> 0.7.0.post1 PLUS a new
+#              mandatory packaging step (scripts/pennyroyal/flashinfer/
+#              install.py: git-applies the fork's accepted SM120 MoE/GDN
+#              sources onto the installed flashinfer package and AOT-builds
+#              fused_moe_120.so) and the matching flashinfer-jit-cache wheels
+#              — see the install steps below, transcribed from BUILD.md and the
+#              fork's own docker/pennyroyal/Dockerfile. Runtime: adaptive MTP
+#              (launcher-level opt-in: --speculative-adaptive + policy file,
+#              steps 7 / draft tokens 8 — set in the model YAMLs), online FP8
+#              now AUTOMATIC when SGLANG_SM120_ONLINE_MXFP8 is unset (explicit
+#              true is a force/debug hatch — removed from the YAMLs), patched
+#              FlashInfer GDN FP16-accumulate mode (FLASHINFER_GDN_FP16_ACCUM_MMA,
+#              launcher default 1, set in the YAMLs), new persistent-cache
+#              identities (NIXL namespaces bumped in every YAML). v3.0.1: NVMe
+#              PLE reader compatibility hashes fixed (v3.0.0's stale hashes
+#              refused to start NVMe PLE — our floor stack's mode), TileLang
+#              cache moved under the cache dir (TILELANG_CACHE_DIR below).
+#              ple-backend.sh moved scripts/ -> configs/pennyroyal/; its nvme
+#              branch is unchanged, so entrypoint.sh's replica still matches.
+#              Re-verified at v3.0.1: _is_declared_tool / SGLANG_FORWARD_
+#              UNKNOWN_TOOLS (still launcher-only, still NOT adopted) and
+#              _tool_start_confirmed present; froggeric-v22.5.jinja upstream
+#              unchanged (ours still differs only by our line 209);
+#              check_ple_nvme.py unchanged. Rollback: v2.5.3 image tagged
+#              sglang-pennyroyal:v2.5.3.
+# BUILD.md @ v3.0.1 keeps the toolchain this Dockerfile uses (Python 3.12,
 # CUDA 13.3, GCC 15, PyTorch 2.13.0+cu130) and the same NIXL_REF below. The
 # git-checkout layer changes, so a from-scratch ~20 min sm120 rebuild.
-ARG SGLANG_FORK_REF=pennyroyal-v2.5.3
+ARG SGLANG_FORK_REF=pennyroyal-v3.0.1
 # NIXL commit from the fork's BUILD.md (POSIX FILE plugin for the HiCache
 # storage backend). Only needed once phase-2 NIXL persistence is turned on, but
 # built now so the image is complete.
@@ -242,12 +269,37 @@ ENV VIRTUAL_ENV=/opt/pennyroyal/.venv PATH=/opt/pennyroyal/.venv/bin:${PATH}
 # a fresh `uv venv` has none. setuptools/wheel/packaging for the editable sglang
 # build; `wheel-stub` is the PEP 517 backend NVIDIA's stub wheels (cuda-tile, …)
 # use to redirect to the real platform wheel at build time.
-RUN uv pip install setuptools wheel packaging pip wheel-stub
+# v3.0: BUILD.md adds setuptools-rust / setuptools-scm / build / ninja to the
+# pre-installed backend set.
+RUN uv pip install setuptools wheel packaging pip wheel-stub \
+        setuptools-rust setuptools-scm build ninja
 
-# SGLang + FlashInfer 0.6.17 + PyTorch 2.13.0+cu130 from the fork's cu130 index.
+# SGLang + FlashInfer 0.7.0.post1 + PyTorch 2.13.0+cu130 from the fork's cu130
+# index. v3.0: constrained by the fork's own docker/pennyroyal/constraints.txt
+# (torch/torchvision/torchaudio/triton exact +cu130 builds) with the PyTorch
+# cu130 index, as its Dockerfile does — pins what the unsafe-best-match
+# resolver may pick (see the 2026-09-17 note above on a resolver drift once
+# causing a boot hang).
 RUN uv pip install --prerelease=allow --index-strategy unsafe-best-match \
+        --extra-index-url https://download.pytorch.org/whl/cu130 \
         --extra-index-url https://docs.sglang.ai/whl/cu130/ \
+        --constraint docker/pennyroyal/constraints.txt \
         --no-build-isolation -e python
+
+# v3.0: the FlashInfer JIT-cache family must match flashinfer-python exactly
+# (FlashInfer refuses a mismatched family at import), then the fork's packaging
+# step patches the installed FlashInfer with its accepted SM120 MoE/GDN sources
+# and AOT-builds fused_moe_120.so (no GPU/download needed; nvcc + git apply).
+# Job count throttled — this box OOM'd a 24-parallel CUDA compile before.
+RUN uv pip install --no-deps --index-url https://flashinfer.ai/whl/cu130 \
+        'flashinfer-jit-cache==0.7.0.post1+cu130' \
+        'flashinfer-jit-cache-sm120f==0.7.0.post1+cu130'
+ARG FLASHINFER_BUILD_JOBS=4
+RUN MAX_JOBS=${FLASHINFER_BUILD_JOBS} FLASHINFER_NINJA_JOBS=${FLASHINFER_BUILD_JOBS} \
+    FLASHINFER_NVCC_THREADS=1 FLASHINFER_WORKSPACE_BASE=/tmp/penny-fi-sm120 \
+    python scripts/pennyroyal/flashinfer/install.py \
+    && python scripts/pennyroyal/flashinfer/install.py --check \
+    && rm -rf /tmp/penny-fi-sm120
 
 # --- NIXL 1.4.0 (POSIX FILE plugin) — HiCache L3 persistence backend ------
 # `ninja install` (-Dprefix=/usr/local) lays down libnixl*.so, the POSIX plugin
@@ -284,6 +336,10 @@ ENV PENNY_PLE_PLUGIN_DIR=/opt/pennyroyal/.ple-nvme
 RUN CARGO_BUILD_JOBS=4 PYTHON=/opt/pennyroyal/.venv/bin/python \
       bash tools/ple_nvme/install.sh
 
+# v3.0: the fork's dependency gate (FlashInfer family / accepted-source state),
+# run last in its own Dockerfile's build stage too.
+RUN python scripts/pennyroyal/flashinfer/check_dependencies.py
+
 # Late runtime deps kept out of the ~20 min sm120 build cache above:
 #  * ffmpeg    — torchcodec dlopen's libavutil.so.* at import; without it every
 #                startup spews OSError tracebacks (harmless for text, just noise)
@@ -306,7 +362,13 @@ ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     TRITON_CACHE_DIR=/cache/triton CUDA_CACHE_PATH=/cache/cuda \
     FLASHINFER_WORKSPACE_BASE=/cache/flashinfer \
     SGLANG_CACHE_DIR=/cache/sglang SGLANG_JIT_CACHE_DIR=/cache/sglang/jit \
-    TORCH_EXTENSIONS_DIR=/cache/torch_extensions
+    TORCH_EXTENSIONS_DIR=/cache/torch_extensions \
+    TILELANG_CACHE_DIR=/cache/tilelang \
+    SGLANG_MM_PREPROCESS_DEVICE=cpu NUMPY_MADVISE_HUGEPAGE=0
+# ^ v3.0.1 puts TileLang's compiled kernels under the cache dir by default;
+#   set explicitly here so it's on the /cache bind mount regardless. The last
+#   two are the v3 launchers' defaults (CPU image preprocessing, matching our
+#   --image-processor-backend pil; no NumPy huge-page madvise).
 
 # NIXL POSIX-FILE backend config for phase-2 HiCache persistence. Baked in (vs a
 # host mount) since it changes rarely; the model YAML references it with

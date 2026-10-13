@@ -9,7 +9,7 @@ set -euo pipefail
 # Compiler / JIT cache tree — CACHE_BASE (=/cache) is a bind mount in the real
 # deployment so the second cold start skips torch.compile + FlashInfer JIT.
 : "${CACHE_BASE:=/cache}"
-mkdir -p "${CACHE_BASE}"/{huggingface,torch,torchinductor,triton,cuda,flashinfer,sglang/jit,torch_extensions}
+mkdir -p "${CACHE_BASE}"/{huggingface,torch,torchinductor,triton,cuda,flashinfer,sglang/jit,torch_extensions,tilelang}
 
 # Phase-2 NIXL FILE persistence writes here when the --hicache-storage-backend
 # nixl flags are added back to cmd_extra; harmless to pre-create.
@@ -28,6 +28,8 @@ mkdir -p "${CACHE_BASE}"/{huggingface,torch,torchinductor,triton,cuda,flashinfer
 # nvme branch reassigns TARGET_MODEL and clears PLE_ARGS for exactly that
 # reason; this script can't rewrite argv, so those two must be set correctly
 # by the caller (see coding-img.yaml).
+# (pennyroyal v3.0 moved ple-backend.sh to configs/pennyroyal/; its nvme branch
+# is unchanged, so this replica still matches it as of v3.0.1.)
 PENNY_PLE_BACKEND="${PENNY_PLE_BACKEND:-ram}"
 if [ "${PENNY_PLE_BACKEND}" = "nvme" ]; then
     : "${PENNY_PLE_NVME_MODEL:?Set PENNY_PLE_NVME_MODEL to the prepared NVMe snapshot}"
