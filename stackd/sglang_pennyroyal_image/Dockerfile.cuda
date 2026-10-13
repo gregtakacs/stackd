@@ -336,9 +336,23 @@ ENV PENNY_PLE_PLUGIN_DIR=/opt/pennyroyal/.ple-nvme
 RUN CARGO_BUILD_JOBS=4 PYTHON=/opt/pennyroyal/.venv/bin/python \
       bash tools/ple_nvme/install.sh
 
-# v3.0: the fork's dependency gate (FlashInfer family / accepted-source state),
-# run last in its own Dockerfile's build stage too.
-RUN python scripts/pennyroyal/flashinfer/check_dependencies.py
+# v3.0: the fork's dependency gate (`pip check`, exempting only the five
+# FlashInfer jit-cache providers it deliberately omits), run last in its own
+# Dockerfile's build stage too. One extra known line is allowed here and ONLY
+# here: `nixl 1.4.0 requires nixl-cu13, which is not installed.` — our NIXL is
+# meson-installed into the system site-packages and bridged via
+# _nixl_system.pth (see the NIXL steps above), so nixl_cu13 has no pip
+# dist-info even though it imports fine (asserted right here). The fork pip-
+# installs NIXL instead, so its checker doesn't expect that line. Any OTHER
+# pip-check line still fails the build.
+RUN set -e; \
+    python -c "import nixl_cu13; from nixl._api import nixl_agent"; \
+    python -m pip check > /tmp/pipcheck.txt 2>&1 || true; \
+    if grep -vxE 'nixl 1\.4\.0 requires nixl-cu13, which is not installed\.|flashinfer-jit-cache 0\.7\.0\.post1\+cu130 requires flashinfer-jit-cache-(sm100a|sm103a|sm80|sm89|sm90a), which is not installed\.' \
+         /tmp/pipcheck.txt; then echo 'unexpected pip check output above' >&2; exit 1; fi; \
+    python scripts/pennyroyal/flashinfer/install.py --check > /dev/null; \
+    rm -f /tmp/pipcheck.txt; \
+    echo 'dependency gate passed (fork exemptions + bridged nixl-cu13)'
 
 # Late runtime deps kept out of the ~20 min sm120 build cache above:
 #  * ffmpeg    — torchcodec dlopen's libavutil.so.* at import; without it every
