@@ -158,18 +158,37 @@ ARG SGLANG_FORK_REPO=https://github.com/jpezzulli/sglang-rtxpro6000.git
 #              unchanged (ours still differs only by our line 209);
 #              check_ple_nvme.py unchanged. Rollback: v2.5.3 image tagged
 #              sglang-pennyroyal:v2.5.3.
-# BUILD.md @ v3.0.1 keeps the toolchain this Dockerfile uses (Python 3.12,
-# CUDA 13.3, GCC 15, PyTorch 2.13.0+cu130) and the same NIXL_REF below. The
-# git-checkout layer changes, so a from-scratch ~20 min sm120 rebuild.
-ARG SGLANG_FORK_REF=pennyroyal-v3.0.1
-# NIXL commit from the fork's BUILD.md (POSIX FILE plugin for the HiCache
-# storage backend). Only needed once phase-2 NIXL persistence is turned on, but
-# built now so the image is complete.
-ARG NIXL_REF=aecbc3846d92c34c7507a58d776e1fda50ff4fba
-# Fork validated on 3.12.13; `uv` only ships python-build-standalone for the patch
-# levels its own release knows, so pin the MINOR and let uv pick the newest 3.12
-# patch — any 3.12.x is fine for the runtime venv.
-ARG PYTHON_VERSION=3.12
+#   v3.1.4   — Bumped 2026-11-01 from v3.0.1 (skips v3.1.0-.3), 223 commits,
+#              linear (no rebase). SAME PyTorch 2.13.0 / FlashInfer 0.7.0.post1
+#              / sglang-kernel 0.4.6.post1 / NIXL 1.4.0 @ aecbc38 / CUDA 13.3.
+#              PACKAGING REWORK: the fork dropped the constraints.txt + resolver
+#              install for an exact-pin one — docker/pennyroyal/native-
+#              baseline.json names every distribution (transitive deps too) of
+#              its qualified native venv, installed --no-deps per index via
+#              scripts/pennyroyal/dependency_parity.py, then gated by
+#              check_dependencies.py + `dependency_parity.py check`. NIXL now
+#              builds as real nixl-cu13/nixl wheels via the fork's
+#              docker/pennyroyal/build-nixl.sh, which retires our meson-install
+#              + _nixl_system.pth bridge AND the pip-check allowlist line it
+#              needed. Python is the baseline's exact 3.12.13 (uv bumped to a
+#              release that ships it). Runtime: KV pool auto-sized (no preset
+#              cap; our YAMLs never set one); FR-Spec static fraction 0.981 ->
+#              0.97 (fork PR #95, headroom once the cap went); adaptive-next.json
+#              is now the `tiered` width policy (W8 at C1, W4 at C>=2 — the
+#              maintained default; the old acceptance-adaptive file is
+#              adaptive-next-v3.0.2.json); NVMe PLE source-hash gate removed
+#              (v3.1.1); hybrid-Mamba truncated-chunk keys page-floored + short
+#              NIXL restores refused (v3.1.3) — NIXL namespaces bumped in every
+#              YAML. Re-verified at v3.1.4: froggeric-v22.5.jinja, nixl-posix.toml,
+#              ple-backend.sh's nvme branch upstream unchanged (entrypoint.sh
+#              needs no update). Rollback: v3.0.1 image tagged
+#              sglang-pennyroyal:v3.0.1.
+# BUILD.md @ v3.1.4 keeps the toolchain this Dockerfile uses (Python 3.12.13,
+# CUDA 13.3, GCC 15, PyTorch 2.13.0+cu130). The git-checkout layer changes, so
+# a from-scratch ~20 min sm120 rebuild.
+ARG SGLANG_FORK_REF=pennyroyal-v3.1.4
+# Exact interpreter of the fork's native-baseline.json ("qualified.python").
+ARG PYTHON_VERSION=3.12.13
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -182,8 +201,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 ARG TOOLCHAIN_PPA_KEY=60C317803A41BA51845E371A1E9377A2BA9EF27F
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl git gnupg \
-        build-essential ninja-build meson pkg-config \
-        libnuma-dev libibverbs-dev librdmacm-dev \
+        build-essential ninja-build meson pkg-config cmake protobuf-compiler \
+        libnuma-dev libibverbs-dev librdmacm-dev libaio-dev liburing-dev \
     && for i in 1 2 3 4 5; do \
          curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&options=mr&search=0x${TOOLCHAIN_PPA_KEY}" \
            | gpg --dearmor -o /usr/share/keyrings/ubuntu-toolchain-r.gpg && break || sleep 15; \
@@ -197,7 +216,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # --- uv (pinned) ------------------------------------------------------------
-ARG UV_VERSION=0.9.2
+# 0.12.24: first pin that ships python-build-standalone 3.12.13 (0.9.2 topped
+# out at 3.12.12), which the v3.1 baseline requires exactly.
+ARG UV_VERSION=0.12.24
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
 ENV PATH=/root/.local/bin:${PATH}
 
@@ -265,35 +286,31 @@ RUN uv python install ${PYTHON_VERSION} \
     && uv venv --python ${PYTHON_VERSION} .venv
 ENV VIRTUAL_ENV=/opt/pennyroyal/.venv PATH=/opt/pennyroyal/.venv/bin:${PATH}
 
-# `--no-build-isolation` means every build backend must already live in the venv —
-# a fresh `uv venv` has none. setuptools/wheel/packaging for the editable sglang
-# build; `wheel-stub` is the PEP 517 backend NVIDIA's stub wheels (cuda-tile, …)
-# use to redirect to the real platform wheel at build time.
-# v3.0: BUILD.md adds setuptools-rust / setuptools-scm / build / ninja to the
-# pre-installed backend set.
-RUN uv pip install setuptools wheel packaging pip wheel-stub \
-        setuptools-rust setuptools-scm build ninja
+# v3.1: dependencies are INSTALLED, not resolved — transcribed from the fork's
+# own docker/pennyroyal/Dockerfile. native-baseline.json pins every distribution
+# of the qualified native venv (build backends, torch/FlashInfer +cu130 builds,
+# the jit-cache providers and transitive deps alike); each index's group goes in
+# --no-deps so no resolver can add or move anything (this also closes the
+# 2026-09-17 resolver-drift class of failure for good). Then the editable sglang
+# install, also --no-deps, and the fork's two gates before the compile below.
+RUN for index in $(python scripts/pennyroyal/dependency_parity.py indexes); do \
+         python scripts/pennyroyal/dependency_parity.py requirements \
+           --index "$index" > /tmp/penny-pins.txt \
+         && uv pip install --no-deps --prerelease=allow \
+              --index-url "$index" -r /tmp/penny-pins.txt; \
+       done \
+    && rm -f /tmp/penny-pins.txt
+RUN SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SGLANG="0.5.19+g$(git rev-parse --short=12 HEAD)" \
+      CARGO_TARGET_DIR=/tmp/penny-cargo \
+      uv pip install --no-deps --no-build-isolation-package sglang -e python \
+    && rm -rf /tmp/penny-cargo \
+    && python scripts/pennyroyal/flashinfer/check_dependencies.py \
+    && python scripts/pennyroyal/dependency_parity.py check --pending-source-build
 
-# SGLang + FlashInfer 0.7.0.post1 + PyTorch 2.13.0+cu130 from the fork's cu130
-# index. v3.0: constrained by the fork's own docker/pennyroyal/constraints.txt
-# (torch/torchvision/torchaudio/triton exact +cu130 builds) with the PyTorch
-# cu130 index, as its Dockerfile does — pins what the unsafe-best-match
-# resolver may pick (see the 2026-09-17 note above on a resolver drift once
-# causing a boot hang).
-RUN uv pip install --prerelease=allow --index-strategy unsafe-best-match \
-        --extra-index-url https://download.pytorch.org/whl/cu130 \
-        --extra-index-url https://docs.sglang.ai/whl/cu130/ \
-        --constraint docker/pennyroyal/constraints.txt \
-        --no-build-isolation -e python
-
-# v3.0: the FlashInfer JIT-cache family must match flashinfer-python exactly
-# (FlashInfer refuses a mismatched family at import), then the fork's packaging
-# step patches the installed FlashInfer with its accepted SM120 MoE/GDN sources
-# and AOT-builds fused_moe_120.so (no GPU/download needed; nvcc + git apply).
-# Job count throttled — this box OOM'd a 24-parallel CUDA compile before.
-RUN uv pip install --no-deps --index-url https://flashinfer.ai/whl/cu130 \
-        'flashinfer-jit-cache==0.7.0.post1+cu130' \
-        'flashinfer-jit-cache-sm120f==0.7.0.post1+cu130'
+# The fork's packaging step patches the installed FlashInfer with its accepted
+# SM120 MoE/GDN sources and AOT-builds fused_moe_120.so (no GPU/download needed;
+# nvcc + git apply). Job count throttled — this box OOM'd a 24-parallel CUDA
+# compile before.
 ARG FLASHINFER_BUILD_JOBS=4
 RUN MAX_JOBS=${FLASHINFER_BUILD_JOBS} FLASHINFER_NINJA_JOBS=${FLASHINFER_BUILD_JOBS} \
     FLASHINFER_NVCC_THREADS=1 FLASHINFER_WORKSPACE_BASE=/tmp/penny-fi-sm120 \
@@ -302,28 +319,13 @@ RUN MAX_JOBS=${FLASHINFER_BUILD_JOBS} FLASHINFER_NINJA_JOBS=${FLASHINFER_BUILD_J
     && rm -rf /tmp/penny-fi-sm120
 
 # --- NIXL 1.4.0 (POSIX FILE plugin) — HiCache L3 persistence backend ------
-# `ninja install` (-Dprefix=/usr/local) lays down libnixl*.so, the POSIX plugin
-# (/usr/local/lib/x86_64-linux-gnu/plugins/libplugin_POSIX.so) and the CUDA-13
-# bindings package `nixl_cu13` into the *system* site-packages — which the venv
-# doesn't see. SGLang's storage/nixl/hicache_nixl.py does `from nixl._api import
-# ...`, so the next RUN bridges /usr/local site-packages onto the venv path and
-# installs the thin `nixl` meta wheel (it re-exports nixl_cu13 by CUDA version).
-RUN git clone https://github.com/ai-dynamo/nixl.git /opt/nixl \
-    && cd /opt/nixl && git checkout ${NIXL_REF} \
-    && uv pip install meson-python pybind11 \
-    && meson setup build --buildtype=release -Dprefix=/usr/local -Denable_plugins=POSIX \
-    && ninja -C build && ninja -C build install
-ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/local/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}
-ENV NIXL_PLUGIN_DIR=/usr/local/lib/x86_64-linux-gnu/plugins
-# Make `nixl` importable from the venv (ninja put nixl_cu13 in the system
-# site-packages, and libnixl.so under /usr/local/lib*). ldconfig registers the
-# libs, a .pth bridges the system site-packages onto the venv, then the thin
-# `nixl` meta wheel goes in; assert it actually loads.
-RUN ldconfig \
-    && echo "/usr/local/lib/python3.12/site-packages" \
-      > /opt/pennyroyal/.venv/lib/python3.12/site-packages/_nixl_system.pth \
-    && uv pip install --no-deps /opt/nixl/build/src/bindings/python/nixl-meta/nixl-*-py3-none-any.whl \
-    && /opt/pennyroyal/.venv/bin/python -c "from nixl._api import nixl_agent, nixl_agent_config; print('nixl venv import OK')"
+# v3.1: built by the fork's own docker/pennyroyal/build-nixl.sh (NIXL commit
+# pinned inside it, still aecbc38) as real nixl-cu13 + nixl wheels in the venv,
+# with the POSIX plugin bundled — the parity gate below expects both
+# distributions with metadata, which our old meson-install + .pth bridge never
+# produced. Assert the venv import and the POSIX plugin before moving on.
+RUN bash docker/pennyroyal/build-nixl.sh \
+    && python -c "from nixl._api import nixl_agent, nixl_agent_config; print('nixl venv import OK')"
 
 # --- optional NVMe PLE reader (v2.5.0, tools/ple_nvme) ----------------------
 # Isolated Rust/Cargo build, separate from the main venv per NVME-PLE.md ("does
@@ -336,23 +338,16 @@ ENV PENNY_PLE_PLUGIN_DIR=/opt/pennyroyal/.ple-nvme
 RUN CARGO_BUILD_JOBS=4 PYTHON=/opt/pennyroyal/.venv/bin/python \
       bash tools/ple_nvme/install.sh
 
-# v3.0: the fork's dependency gate (`pip check`, exempting only the five
-# FlashInfer jit-cache providers it deliberately omits), run last in its own
-# Dockerfile's build stage too. One extra known line is allowed here and ONLY
-# here: `nixl 1.4.0 requires nixl-cu13, which is not installed.` — our NIXL is
-# meson-installed into the system site-packages and bridged via
-# _nixl_system.pth (see the NIXL steps above), so nixl_cu13 has no pip
-# dist-info even though it imports fine (asserted right here). The fork pip-
-# installs NIXL instead, so its checker doesn't expect that line. Any OTHER
-# pip-check line still fails the build.
-RUN set -e; \
-    python -c "import nixl_cu13; from nixl._api import nixl_agent"; \
-    python -m pip check > /tmp/pipcheck.txt 2>&1 || true; \
-    if grep -vxE 'nixl 1\.4\.0 requires nixl-cu13, which is not installed\.|flashinfer-jit-cache 0\.7\.0\.post1\+cu130 requires flashinfer-jit-cache-(sm100a|sm103a|sm80|sm89|sm90a), which is not installed\.' \
-         /tmp/pipcheck.txt; then echo 'unexpected pip check output above' >&2; exit 1; fi; \
-    python scripts/pennyroyal/flashinfer/install.py --check > /dev/null; \
-    rm -f /tmp/pipcheck.txt; \
-    echo 'dependency gate passed (fork exemptions + bridged nixl-cu13)'
+# v3.1: the fork's closing gates, exactly as its own build stage runs them —
+# requirement closure, then full parity against native-baseline.json (now with
+# the two source-built NIXL wheels, so no --pending-source-build), then the
+# packaged FlashInfer module. No local exemptions any more: our NIXL is the
+# fork's wheel build now. The freeze is the record of what this image installed.
+RUN python scripts/pennyroyal/flashinfer/check_dependencies.py \
+    && python scripts/pennyroyal/dependency_parity.py check \
+    && python scripts/pennyroyal/flashinfer/install.py --check > /dev/null \
+    && python -m pip freeze > /opt/pennyroyal-container-packages.txt \
+    && echo 'dependency gates passed (check_dependencies + baseline parity)'
 
 # Late runtime deps kept out of the ~20 min sm120 build cache above:
 #  * ffmpeg    — torchcodec dlopen's libavutil.so.* at import; without it every
