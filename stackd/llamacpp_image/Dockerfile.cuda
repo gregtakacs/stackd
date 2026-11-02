@@ -59,10 +59,17 @@ WORKDIR /build/llama.cpp
 # DFlash2 / qwen4exp add CUDA kernels but no new cmake option -- the GGML_CUDA=ON
 # / GGML_CUDA_FA_ALL_QUANTS=ON build below covers them unchanged.
 #
+# 2026-11-01: bumped d7bd3bf (2026-08-28) -> a91eab67d (release b12030), the
+# same build as the digest-pinned LLAMACPP_VULKAN_IMAGE in AI-STACK/.env, so the
+# CUDA and Vulkan engines run one llama.cpp tree. DFlash2 / qwen4exp code still
+# present, and every flag the llamacpp adapter injects plus every flag in the
+# llama.cpp model YAMLs still parses in common/arg.cpp at this commit.
+# Roll back with: LLAMA_CPP_COMMIT=d7bd3bfcad3e29c7e49fd26f38c79ee3e9a3fd6b.
+#
 # compose-version-audit (Docker-Tools/compose-version-audit) tracks this pin
 # against upstream ggml-org/llama.cpp HEAD like any other git pin — see
 # LLM-Tools/stackd/stackd-images.audit.yml.
-ARG LLAMA_CPP_COMMIT=d7bd3bfcad3e29c7e49fd26f38c79ee3e9a3fd6b
+ARG LLAMA_CPP_COMMIT=a91eab67d8389d979d29fdf6633b2edd0718eb4b
 RUN git clone https://github.com/ggml-org/llama.cpp.git . && \
     git checkout ${LLAMA_CPP_COMMIT}
 

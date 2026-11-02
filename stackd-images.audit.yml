@@ -31,7 +31,7 @@ services:
   # config/runtime.yaml images.llamacpp-vulkan -- plain vendor pull, no local
   # build. Current value: AI-STACK/.env LLAMACPP_VULKAN_IMAGE
   llamacpp-vulkan:
-    image: ghcr.io/ggml-org/llama.cpp:server-vulkan
+    image: ghcr.io/ggml-org/llama.cpp@sha256:19e8907df49d0dbb61149b13325053f0c1eb786ab026e93ac9d73a687f2905f5   # b12030, digest-pinned 2026-11-01
 
   # config/models/coding-flash.yaml container.image -- plain vendor pull.
   # Current value: AI-STACK/.env VLLM_IMAGE
@@ -62,7 +62,7 @@ services:
   # config/media/image.yaml containers.cuda.image -- plain vendor pull.
   # Current value: AI-STACK/.env COMFYUI_CUDA_IMAGE
   comfyui-cuda:
-    image: yanwk/comfyui-boot:cu130-megapak-pt211-20260826
+    image: yanwk/comfyui-boot:cu130-megapak-pt211-20261027
 
   # config/media/image.yaml containers.vulkan -- local build, produced by
   # `docker exec stackd stackctl build image:vulkan`
