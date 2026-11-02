@@ -32,10 +32,17 @@ def model_identity(cfg: Config, model_name: str, device: str, port: int | None =
     unchanged identity, keeps the OLD container running on its OLD port, and
     stackd's own health_url points at the NEW port forever after — permanent
     "warming", never crashing, never healing on its own (found 2026-09-04,
-    code-autocomplete stuck this way across a `bench-image` -> `chat` switch)."""
+    code-autocomplete stuck this way across a `bench-image` -> `chat` switch).
+
+    A model with no `container.image` of its own launches on its template's
+    runtime.yaml `images:` default (base.py `c.image or ctx.images[...]`), which
+    `asdict(e.container)` can't see — so a LLAMACPP_VULKAN_IMAGE bump left
+    code-autocomplete on the old image forever (found 2026-11-01). That resolved
+    image is appended ONLY in that case, so every model that pins its own image
+    keeps a byte-identical identity and isn't recreated by this addition."""
     e = cfg.models[model_name].engine
     p = e.params
-    return [
+    ident = [
         model_name, e.template, device, e.model,
         p.get("ctx"), p.get("parallel"), p.get("kv_dtype"),
         list(p.get("extra_args", []) or []),
@@ -44,6 +51,9 @@ def model_identity(cfg: Config, model_name: str, device: str, port: int | None =
         asdict(e.container),
         port,
     ]
+    if not e.container.image and not e.container.adopt:
+        ident.append(cfg.runtime.images.get(e.template))
+    return ident
 
 
 @dataclass
