@@ -931,6 +931,14 @@ function hostRamSegs(host, st, gpu) {
                  color: modelColor("image:" + im.active_model), cls: "elastic",
                  gtt: im.device === "igpu0" });
   }
+  const au = st.audio;   // the audio tier's own ComfyUI (music), beside the image slot
+  if (au && au.container && cont[au.container]
+      && (cont[au.container].anon_gib || cont[au.container].shmem_gib)) {
+    pushEngine("audio · " + au.active_model, cont[au.container],
+               { budget: st.audio_ram_budget && st.audio_ram_budget.gib,
+                 color: modelColor("audio:" + au.active_model), cls: "elastic",
+                 gtt: au.device === "igpu0" });
+  }
   // ---- the iGPU family: what the driver holds inside THIS pool ----------------
   // Device-first, because the driver counter is the only number that sees all of
   // it. An APU's weights are GTT pages allocated in kernel context: they are in NO
@@ -958,6 +966,9 @@ function hostRamSegs(host, st, gpu) {
   if (im && im.device === "igpu0" && im.container)
     igpuTen.push({ n: "image · " + im.active_model, mv: 0,
                    color: modelColor("image:" + im.active_model) });
+  if (au && au.device === "igpu0" && au.container)
+    igpuTen.push({ n: "audio · " + au.active_model, mv: 0,
+                   color: modelColor("audio:" + au.active_model) });
   const tenOf = t => fam.find(x => x.label === t.n);
   const tenRss = t => { const f = tenOf(t); return f ? f.rss : 0; };
   // RSS-less tenants (a Vulkan llama.cpp server keeps its weights in GTT, so its
@@ -1253,7 +1264,8 @@ function hostRamRepaint(lane, host, st, gpu) {
 function renderMap(st, eng, img, gpu, host) {
   const engState = {};
   (eng.engines || []).forEach(e => engState[e.stack] = e.state);
-  const stackState = n => (st.stacks[n] && st.stacks[n].state) || engState[n] || engState["image:" + n];
+  const stackState = n => (st.stacks[n] && st.stacks[n].state) || engState[n] || engState["image:" + n]
+                          || engState["audio:" + n];
   const RESV_LBL = { host_reserve: "host + other processes (reserve)",
     load_slack: "page-cache load slack", "vram:cuda0": null };
   const srcTag = m => (st.sources || {})[m] || "";
