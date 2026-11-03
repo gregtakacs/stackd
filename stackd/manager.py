@@ -632,7 +632,7 @@ class Manager:
         return ("audio" in self.cfg.media and pr is not None
                 and pr.audio != ImageSupport.none)
 
-    def image_status(self) -> dict:
+    def image_status(self, kind: str = "image") -> dict:
         """State of the elastic image tier: what's resident, the free VRAM it has
         to work with under the active profile, and the load-order catalog with a
         server-side fit verdict per candidate per backend. The verdict comes from
@@ -640,12 +640,18 @@ class Manager:
         `footprint_gib` vs device headroom alone, which advertised
         flux2-dev-turbo on the iGPU while its `host_ram_gib` (122) alone exceeded
         the box's MemTotal (124.4): 'would load on igpu0' + a Load button on a
-        load that can never be permitted."""
-        tier = self.cfg.media.get("image")
-        slot = self.state.image
-        v = self.rec.image_verdicts(self.state, self.state.active_profile)
+        load that can never be permitted.
+
+        kind="audio" (GET /audio) is the same view of the audio tier; `enabled`
+        says whether the active profile runs it at all (`audio: none` -> music
+        lives in the image slot instead)."""
+        tier = self.cfg.media.get(kind)
+        slot = getattr(self.state, kind)
+        v = self.rec.image_verdicts(self.state, self.state.active_profile, kind=kind)
         declared = {l.active_model: l for l in (tier.prefer if tier else [])}
         return {
+            "kind": kind,
+            "enabled": tier is not None and (kind == "image" or self._audio_tier_on()),
             "resident": self._slot_entry(slot) if slot is not None else None,
             "headroom_gib": v["headroom_gib"],
             "host_ram_avail_gib": v.get("host_ram_avail_gib"),

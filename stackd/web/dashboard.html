@@ -179,6 +179,8 @@
      Reasons used to be printed inline, which turned every rung into a paragraph
      and pushed the numbers out of column; they live in the tooltip now. */
   .ladder { display:flex; flex-direction:column; gap:4px; }
+  .slothead { margin:16px 0 8px; font-size:.8rem; font-weight:600; color:var(--dim);
+              text-transform:uppercase; letter-spacing:.04em; }
   .rung { display:grid; grid-template-columns:minmax(0,1fr) 96px 78px 68px; align-items:center;
     gap:10px; font-size:.82rem; padding:6px 10px; border-radius:7px;
     background:var(--bg); border:1px solid var(--border); }
@@ -440,7 +442,7 @@
         <div id="profiles"></div>
       </div>
       <div class="card">
-        <h2>Image tier</h2>
+        <h2>Image &amp; music tiers</h2>
         <div id="imageTier"></div>
       </div>
     </div>
@@ -1261,7 +1263,7 @@ function hostRamRepaint(lane, host, st, gpu) {
   return true;
 }
 
-function renderMap(st, eng, img, gpu, host) {
+function renderMap(st, eng, img, gpu, host, aud) {
   const engState = {};
   (eng.engines || []).forEach(e => engState[e.stack] = e.state);
   const stackState = n => (st.stacks[n] && st.stacks[n].state) || engState[n] || engState["image:" + n]
@@ -1286,12 +1288,19 @@ function renderMap(st, eng, img, gpu, host) {
     cls: "elastic" + (img.resident.device === "igpu0" ? " gtt" : ""),
     tag: "elastic · pinned " + img.resident.pinned_by
        + (img.resident.device === "igpu0" ? " · GTT" : "") });
+  // the audio tier's own ComfyUI (music) — a second elastic slot beside the image one
+  const audRes = aud && aud.resident;
+  const audSeg = () => ({ label: "audio · " + audRes.active_model, gib: imgFootprint(aud),
+    cls: "elastic" + (audRes.device === "igpu0" ? " gtt" : ""),
+    tag: "elastic · pinned " + audRes.pinned_by
+       + (audRes.device === "igpu0" ? " · GTT" : "") });
   const pool = n => (st.pools || []).find(p => p.pool === n);
   const dev = n => (st.devices || []).find(d => d.device === n);
   const resKey = img && img.resident ? [img.resident.active_model, img.resident.device, img.resident.pinned_by] : null;
+  const audKey = audRes ? [audRes.active_model, audRes.device, audRes.pinned_by, audRes.state] : null;
 
   if (!unchanged("map", [st.pools, st.devices, st.flags, st.unplaced, st.sources,
-      st.placement, st.model_vram, st.model_ram, resKey,
+      st.placement, st.model_vram, st.model_ram, resKey, audKey,
       (host && host.mem_anon_gib != null),   // measured host-RAM lane available?
       (eng.engines||[]).map(e => [e.stack, e.state])])) {
     const lanes = $("#mapLanes"); lanes.innerHTML = "";
@@ -1308,6 +1317,7 @@ function renderMap(st, eng, img, gpu, host) {
         ? on.map(m => segFor(m, (st.model_vram || {})[m]))
         : Object.entries(cv.breakdown || {}).map(([k, v]) => segFor(k, v));
       if (resKey && img.resident.device === "cuda0") segs.push(imgSeg());
+      if (audRes && audRes.device === "cuda0") segs.push(audSeg());
       const budgeted = segs.reduce((a, s) => a + (s.gib || 0), 0);
       lanes.append(laneEl({
         name: "cuda0", sub: "RTX PRO 6000 · dedicated VRAM", limit: cv.limit, segs, budgeted,
@@ -1405,6 +1415,7 @@ function renderMap(st, eng, img, gpu, host) {
           }
         }
         if (resKey && img.resident.device === "igpu0") gttBase.push(imgSeg());
+        if (audRes && audRes.device === "igpu0") gttBase.push(audSeg());
         if (gttBase.length) segs.unshift(...gttBase);
         const huBudgeted = segs.reduce((a, s) => a + (s.gib || 0), 0) || hu.used;
         lanes.append(laneEl({
@@ -1718,9 +1729,23 @@ const axisOf = why => /host RAM/i.test(why || "") ? "RAM"
 // the capability tags on the line, shortened — full names in the tooltip
 const CAP_ABBR = { generate: "gen", edit: "edit", stylize: "styl" };
 
-function renderImage(img) {
-  if (unchanged("image", [img.resident, img.headroom_gib, img.host_ram_avail_gib, img.prefer])) return;
+// The card holds both elastic slots: the image tier, and — when the active
+// profile runs one (`audio: cold|warm`) — the audio tier's own ComfyUI for music.
+// Under `audio: none` music is a model in the image ladder instead.
+function renderImage(img, aud) {
+  const audOn = !!(aud && aud.enabled);
+  if (unchanged("image", [img.resident, img.headroom_gib, img.host_ram_avail_gib, img.prefer,
+      audOn && [aud.resident, aud.headroom_gib, aud.prefer]])) return;
   const box = $("#imageTier"); box.innerHTML = "";
+  box.append(slotBlock(img, ["generate", "edit", "stylize"]));
+  if (audOn) {
+    const h = el("h3", "slothead", "Music");
+    h.title = "The audio tier: music runs in its own ComfyUI, so a song never swaps the image model out.";
+    box.append(h, slotBlock(aud, ["compose", "cover"]));
+  }
+}
+function slotBlock(img, verbs) {
+  const box = el("div", null);
   const res = img.resident;
 
   const head = el("div", "imgline");
@@ -1789,18 +1814,20 @@ function renderImage(img) {
   box.append(ladder);
   const caps = el("div", "imgline"); caps.style.marginTop = "10px";
   caps.append(el("span", null, "need:"));
-  for (const v of ["generate", "edit", "stylize"]) {
+  for (const v of verbs) {
     const b = el("button", "sm", v);
     b.onclick = () => swapImage("capability", v);
     caps.append(b);
   }
   box.append(caps);
+  return box;
 }
 async function swapImage(kind, val) {
   try {
     const b = kind === "model" ? { name: val } : { need: val };
     const r = await api("/image/" + kind, { method: "POST", body: JSON.stringify(b) });
-    toast(r.note ? `image: ${r.active_model} — ${r.note}` : `image → ${r.active_model || val}`);
+    const k = r.kind || "image";
+    toast(r.note ? `${k}: ${r.active_model} — ${r.note}` : `${k} → ${r.active_model || val}`);
     tick();
   } catch (e) { toast("image swap failed: " + e.message, true); }
 }
@@ -3630,11 +3657,11 @@ async function tick() {
     // must not be able to reject the whole batch and drop the daemon-side
     // /gpu + /host data that feeds the GPU/CPU lines. A failed endpoint blanks
     // only its own panel; the chart snapshot still runs.
-    const [st, eng, img, models, gpu, host, cleaner] = await Promise.all([
+    const [st, eng, img, models, gpu, host, cleaner, aud] = await Promise.all([
       api("/status").catch(() => null), api("/engines").catch(() => null),
       api("/image").catch(() => null),   api("/v1/models").catch(() => null),
       api("/gpu").catch(() => ({})),     api("/host").catch(() => ({})),
-      api("/cleaner").catch(() => null),
+      api("/cleaner").catch(() => null), api("/audio").catch(() => null),
     ]);
     // Engine names for the telemetry loop; if /status missed, fall back to the
     // last known set so the engine chart lines still get fed from LAST_TEL.
@@ -3706,15 +3733,16 @@ async function tick() {
       // engine is ready.
       const anyWarm = !!st.switching ||
         Object.values(st.stacks || {}).some(v => v.state === "warming") ||
-        (st.image && st.image.state === "warming");
+        (st.image && st.image.state === "warming") ||
+        (st.audio && st.audio.state === "warming");
       if (anyWarm || tick._wasWarm) loadProfiles();
       tick._wasWarm = anyWarm;
       engineSkeleton(names);
       for (const n of names) fillEngine(n, st.stacks[n], tel[n]);
     }
     renderGauges(gpu, host);
-    if (st && eng && img) renderMap(st, eng, img, gpu, host);
-    if (img) renderImage(img);
+    if (st && eng && img) renderMap(st, eng, img, gpu, host, aud);
+    if (img) renderImage(img, aud);
     if (st && models) renderCatalog(models, st.active_profile);
 
     // events are fire-and-forget: awaiting them used to extend the tick (and

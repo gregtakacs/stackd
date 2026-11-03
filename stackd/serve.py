@@ -533,6 +533,9 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path == "/image":
             with self.lock:
                 return self._send_json(200, self.mgr.image_status())
+        if self.path == "/audio":
+            with self.lock:
+                return self._send_json(200, self.mgr.image_status("audio"))
         if self.path == "/engines":
             with self.lock:
                 return self._send_json(200, {"engines": self.mgr.engines()})

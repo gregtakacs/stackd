@@ -845,6 +845,11 @@ def t_audio_tier_beside_image() -> None:
     check("both slots ready side by side", m.state.audio.state == EngineState.ready
           and m.state.image.state == EngineState.ready)
     caps = m.capabilities()
+    av = m.image_status("audio")
+    check("GET /audio view: enabled, its own resident + ladder",
+          av["kind"] == "audio" and av["enabled"] and av["resident"]["active_model"] == "yue2"
+          and [r["active_model"] for r in av["prefer"]] == ["yue2"]
+          and m.image_status()["resident"]["active_model"] == img0.active_model)
     check("capabilities list both slots", caps["audio"]["active_model"] == "yue2"
           and caps["image"]["active_model"] == img0.active_model and len(caps["engines"]) == 2)
     check("comfyui_target per kind", m.comfyui_target("audio")[0] == caps["audio"]["endpoint"]
@@ -908,6 +913,7 @@ def t_audio_tier_off_uses_image_tier() -> None:
     check("audio: none -> compose served by the image tier",
           r["ok"] and r["kind"] == "image" and m.state.audio is None
           and m.state.image.active_model == "yue2")
+    check("audio: none -> GET /audio says the tier is off", m.image_status("audio")["enabled"] is False)
 
 
 def t_audio_tier_headroom_counts_the_image_slot() -> None:
