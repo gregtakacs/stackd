@@ -131,3 +131,23 @@ prefer:
     # reclaimable page cache (measured whole-machine delta <= 1.7G).
     footprint_gib: { vulkan: 13, cuda: 20 }
     host_ram_gib: { vulkan: 18 }
+  # YuE2 3B text-to-music (Comfy-Org int8-convrot repack, ~3.7G on disk) -- the
+  # `compose` + `cover` verbs (compose_music / cover_song MCP tools; cover also
+  # needs models/audio_encoders/sheetsage2_bf16.safetensors). explicit_only: never the
+  # auto-pick; it loads only when a compose_music call (or `stackctl image use
+  # yue2`) asks for it, and the next image call swaps back. Needs ComfyUI with the
+  # YuE2 nodes (v0.43.0 has them) + yue2_3b_int8_convrot.safetensors in
+  # models/checkpoints.
+  # MEASURED 2026-11-02, a 3.5-min song (210-240s cap, ABC plan on, tiled VAE):
+  #   igpu0/vulkan: 216-261s wall (~1x realtime), GTT peak +5.7G over baseline
+  #     (untiled VAE was +18.5G -- why the graph uses VAEDecodeAudioTiled); cgroup
+  #     anon peak 6.6G.
+  #   cuda0 (beside the 27B chat model, image-gen profile): 33-39s wall (~6x
+  #     realtime), VRAM peak +6.5G over the 27B baseline.
+  # footprint/host_ram = peak + ~3-4G cushion.
+  - active_model: yue2
+    capabilities: [compose, cover]
+    backends: [cuda, vulkan]
+    explicit_only: true
+    footprint_gib: { cuda: 10, vulkan: 10 }
+    host_ram_gib: { vulkan: 10 }

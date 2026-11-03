@@ -180,12 +180,15 @@ def mask_indicates_nothing_found(mask_bytes: bytes) -> bool:
 # -----------------------------------------------------------------------------
 
 
-async def upload_to_comfy(image_bytes: bytes, filename_prefix: str, base: str) -> str:
-    filename = f"{filename_prefix}_{uuid.uuid4().hex}.png"
-    async with httpx.AsyncClient(timeout=30) as client:
+async def upload_to_comfy(image_bytes: bytes, filename_prefix: str, base: str,
+                          ext: str = "png", content_type: str = "image/png") -> str:
+    """ComfyUI's /upload/image is its generic input-dir upload -- LoadAudio reads the
+    same dir, so cover_song pushes its source song through here with ext="flac"."""
+    filename = f"{filename_prefix}_{uuid.uuid4().hex}.{ext}"
+    async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(
             f"{base.rstrip('/')}/upload/image",
-            files={"image": (filename, image_bytes, "image/png")},
+            files={"image": (filename, image_bytes, content_type)},
             data={"overwrite": "true"},
         )
         resp.raise_for_status()
@@ -204,6 +207,8 @@ async def wait_and_fetch(
     timeout_s: float | None = None,
     on_poll=None,
     optional_nodes: set[str] | None = None,
+    output_key: str = "images",
+    text_nodes: set[str] | None = None,
 ) -> dict[str, list[bytes]]:
     """Polls /history until the prompt completes, then downloads every image any of
     include_node_ids produced. Returns images keyed by node id so callers can tell a
@@ -228,6 +233,14 @@ async def wait_and_fetch(
     from a full imagegen generation: inheriting one shared number meant a toolbox job was
     killed by a timeout calibrated for someone else's workload. None keeps the old
     behaviour exactly, so imagegen callers are untouched.
+
+    output_key is the history-output list to download: "images" for every image graph,
+    "audio" for a SaveAudio* node (compose_music) -- same {filename, subfolder, type}
+    entries, same /view route.
+
+    text_nodes names nodes whose `text` output (PreviewAny -- the YuE2 score) comes back
+    as UTF-8 bytes under the same node-id key. It has to be read here: this function
+    deletes the history entry before returning.
 
     on_poll, when given, is called as on_poll(elapsed_s) once per poll. It is a *liveness*
     seam, not a progress seam: /history says nothing about how far along a render is, and
@@ -254,11 +267,13 @@ async def wait_and_fetch(
 
     images_by_node: dict[str, list[bytes]] = {node_id: [] for node_id in include_node_ids}
     outputs = history[prompt_id].get("outputs", {})
+    for node_id in text_nodes or ():
+        images_by_node[node_id] = [t.encode() for t in (outputs.get(node_id) or {}).get("text", [])]
     for node_id, node_out in outputs.items():
         if node_id not in include_node_ids:
             continue
         optional = bool(optional_nodes) and node_id in optional_nodes
-        for img in node_out.get("images", []):
+        for img in node_out.get(output_key, []):
             params = urllib.parse.urlencode(
                 {
                     "filename": img["filename"],

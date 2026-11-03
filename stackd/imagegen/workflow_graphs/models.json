@@ -159,6 +159,36 @@
           }
         }
       }
+    },
+    "yue2": {
+      "label": "YuE2 3B -- text-to-music (a full song with vocals) from style + lyrics; the Comfy-Org int8-convrot repack. ABC melody/chord plan -> semantic AR -> 32-step flow sampler -> tiled VAE decode -> 48 kHz stereo FLAC. The graph is Comfy-Org's audio_yue2_text2music template flattened to API format, its numbers kept, except VAEDecodeAudio -> VAEDecodeAudioTiled (512/64): the untiled fp32 decode spiked igpu0 GTT to +18.5G on a 3.5-min song vs +5.7G tiled, for ~8s more decode (bench 2026-11-02).",
+      "validated": true,
+      "tools": {
+        "compose": {
+          "_note": "`plan` is the YuE2GenerateABC node and `score` the PreviewAny that surfaces its ABC (saved next to the song); `length` surfaces the music node's real seconds. tools.py runs the score stage as its OWN prompt first, measures the score, and sizes max_duration from it. compose_music drops both and sets music.abc to a saved score for reuse_score=true, or blanks it for plan_melody=false (the template's ABC_planning=off path, i.e. YuE2's own 'off' mode). style/lyrics/seed go to BOTH plan and music; `seed` is the flow sampler's.",
+          "graph": "compose/yue2.json",
+          "nodes": {
+            "plan": "24",
+            "score": "14",
+            "length": "16",
+            "music": "25",
+            "seed": "8",
+            "save": "10"
+          }
+        },
+        "cover": {
+          "_note": "Comfy-Org's audio_yue2_music_cover template flattened: LoadAudio (`source`, cover_song uploads the chat's song) -> SheetSage2AudioToABC melody transcription (needs sheetsage2_bf16.safetensors in models/audio_encoders) -> `score` PreviewAny -> the compose music/sampler/decode chain in melody mode.",
+          "graph": "cover/yue2.json",
+          "nodes": {
+            "source": "40",
+            "score": "14",
+            "length": "16",
+            "music": "25",
+            "seed": "8",
+            "save": "10"
+          }
+        }
+      }
     }
   }
 }

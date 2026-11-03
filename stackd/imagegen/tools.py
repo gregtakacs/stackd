@@ -50,6 +50,7 @@ import os
 import random
 import re
 import time
+from fractions import Fraction
 
 import anyio
 import httpx
@@ -1524,6 +1525,391 @@ async def stylize_image(
         detail += " (this pipeline's graph is not yet live-validated on this install)"
     return _success_response(detail, urls, note=model_note,
                              timing=_timing(t0, _g0, _g1))
+
+
+# -----------------------------------------------------------------------------
+# compose_music / cover_song — YuE2 text-to-music on the same elastic tier
+# -----------------------------------------------------------------------------
+
+# YuE2 is autoregressive, so wall time scales with song length (measured 2026-11-02,
+# see config.local/media/image.yaml's yue2 entry). The poll budget is a fixed load
+# allowance plus a per-second-of-audio rate with headroom over the slower (igpu0) path;
+# the image tools' shared TIMEOUT_S (300) would kill any song past ~2 minutes.
+#
+# A song with a score is never length-capped by a guess: the score stage (plan, or a
+# cover's transcription) runs as its own prompt first, the score is measured, and the
+# render gets max_duration = score length + a tail, so YuE2 ends on its own end token.
+# The caller's duration_s only bounds a plan_melody=false song. That fixed a live cut-off
+# (2026-11-03): the LLM passed 210s for a 252s score and the last chorus stopped dead.
+# _COMPOSE_MAX_S is a sanity ceiling well under the model's own -- a 24576-token context
+# at 25 tokens/s, minus the prompt, is ~12 min.
+_COMPOSE_MAX_S = 600
+_COMPOSE_TIMEOUT_BASE_S = 120
+_COMPOSE_TIMEOUT_PER_S = 3.0
+_SCORE_STAGE_TIMEOUT_S = 300
+_SCORE_TAIL_S = 15
+
+# Every song that has a score (a melody-planned compose, or a cover's transcription)
+# saves it to the user's Open WebUI files next to the FLAC, so the next call can sing
+# the SAME song with new words (reuse_score). The score is pure music -- key, tempo,
+# meter, sections, per-bar chords, the note-by-note vocal + instrument lines; YuE2 keeps
+# lyrics out of it -- so new lyrics just need the same section tags and a matching
+# syllable count. The first line is our own ABC comment carrying the seed + plan mode:
+# on igpu0 a song is bit-for-bit reproducible from (score, style, lyrics, seed) (verified
+# 2026-11-02), so reusing the seed keeps the performance as close as the new words allow.
+# It is stripped before the score goes back into YuE2.
+_SCORE_TAG = "%stackd-yue2"
+
+
+# The ABC is stored BYTE-EXACT: YuE2 tokenizes it, so even the plan's trailing newline
+# changes the render (a stripped copy came back 40ms longer, 2026-11-02).
+def _score_file(abc: str, seed: int, mode: str) -> bytes:
+    return f"{_SCORE_TAG} seed={seed} mode={mode}\n{abc}".encode()
+
+
+def _parse_score(raw: str) -> tuple[str, dict]:
+    meta, abc = {}, raw
+    if raw.startswith(_SCORE_TAG):
+        tag, _, abc = raw.partition("\n")
+        for kv in tag[len(_SCORE_TAG):].split():
+            k, _, v = kv.partition("=")
+            meta[k] = v
+    if meta.get("mode") not in ("full", "melody"):
+        # An uploaded score: chord symbols ("D", "Gm7"...) mean a full plan.
+        meta["mode"] = "full" if re.search(r'"[A-G][^"]*"', abc) else "melody"
+    return abc, meta
+
+
+def _score_summary(abc: str) -> dict:
+    def header(field: str) -> str | None:
+        m = re.search(rf"^{field}:\s*(.+)$", abc, re.M)
+        return m.group(1).strip() if m else None
+
+    sections = []
+    for m in re.finditer(r"^%\s*(\S.*)$", abc, re.M):
+        name = m.group(1).strip()
+        if not sections or sections[-1] != name:
+            sections.append(name)
+    tempo = header("Q")
+    return {"key": header("K"), "meter": header("M"),
+            "tempo_bpm": tempo.split("=")[-1] if tempo else None,
+            "sections": sections,
+            "chords": bool(re.search(r'"[A-G][^"]*"', abc))}
+
+
+def _score_seconds(abc: str) -> float | None:
+    """Playing time of an ABC score: bars (the longest voice; a `Z<n>` multi-bar rest
+    counts n) x meter / the Q: beat unit x 60 / bpm. None when it has no bars."""
+    m = re.search(r"^M:\s*(\d+)/(\d+)", abc, re.M)
+    meter = Fraction(int(m.group(1)), int(m.group(2))) if m else Fraction(1)
+    q = re.search(r"^Q:\s*(\d+)/(\d+)\s*=\s*(\d+)", abc, re.M)
+    unit, bpm = (Fraction(int(q.group(1)), int(q.group(2))), int(q.group(3))) if q else (Fraction(1, 4), 120)
+    bars: dict[str, int] = {}
+    voice = None
+    for line in abc.splitlines():
+        if line.startswith("V:"):
+            voice = (line[2:].split() or [""])[0]
+            continue
+        if voice is None or not line.strip() or line.startswith("%") or re.match(r"^[A-Za-z]:", line):
+            continue
+        for seg in (x.strip() for x in line.split("|")):
+            if seg:
+                z = re.fullmatch(r'(?:"[^"]*")?Z(\d*)', seg)
+                bars[voice] = bars.get(voice, 0) + (int(z.group(1) or 1) if z else 1)
+    if not bars or not bpm:
+        return None
+    return float(max(bars.values()) * meter / unit * 60 / bpm)
+
+
+def _upstream(graph: dict, roots: set[str]) -> set[str]:
+    """Node ids `roots` depend on (inclusive), following [node_id, slot] input links."""
+    seen, todo = set(), [r for r in roots if r in graph]
+    while todo:
+        nid = todo.pop()
+        if nid in seen:
+            continue
+        seen.add(nid)
+        for v in graph[nid].get("inputs", {}).values():
+            if isinstance(v, list) and len(v) == 2 and isinstance(v[0], str) and v[0] in graph:
+                todo.append(v[0])
+    return seen
+
+
+async def _resolve_song_ref(ctx: Context, api_key: str, kind: str) -> str:
+    """Most recent song ("audio") or score ("score") in this chat's active branch --
+    the _resolve_image_url rules (auto-detect only, never a model-supplied reference)."""
+    headers = ctx.headers or {}
+    chat_id = headers.get("X-OpenWebUI-Chat-Id")
+    if not chat_id:
+        raise ValueError(
+            "No chat id was forwarded to find the song to work from (requires Open WebUI's "
+            "ENABLE_FORWARD_USER_INFO_HEADERS=true)."
+        )
+    found = await openwebui_client.lookup_recent_song(
+        chat_id, headers.get("X-OpenWebUI-Message-Id"), api_key, kind)
+    if found:
+        return found
+    if kind == "score":
+        raise ValueError(
+            "No saved score was found in this chat's active branch (songs made with "
+            "plan_melody=false, or before scores were kept, have none). To keep the melody "
+            "of the most recent song anyway, call cover_song instead -- it transcribes the "
+            "melody from the audio itself."
+        )
+    raise ValueError(
+        "No song or audio file was found in this chat's active branch. Tell the user to "
+        "compose one or attach an audio file first."
+    )
+
+
+def _audio_ext(data: bytes) -> tuple[str, str]:
+    if data[:4] == b"fLaC":
+        return "flac", "audio/flac"
+    if data[:4] == b"RIFF":
+        return "wav", "audio/wav"
+    if data[:4] == b"OggS":
+        return "ogg", "audio/ogg"
+    if data[:3] == b"ID3" or data[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
+        return "mp3", "audio/mpeg"
+    return "flac", "application/octet-stream"
+
+
+async def _run_prompt(base: str, graph: dict, *, save_node: str | None, text_nodes: set[str],
+                      timeout_s: float) -> dict[str, list[bytes]]:
+    prompt_id = await comfyui_client.submit_workflow(graph, base=base)
+    return await comfyui_client.wait_and_fetch(
+        prompt_id, {save_node} if save_node else set(), base=base, output_key="audio",
+        text_nodes=text_nodes, timeout_s=timeout_s)
+
+
+async def _render_song(graph: dict, nodes: dict, *, style: str, lyrics: str, seed: int,
+                       mode: str, abc: str | None, duration_s: int,
+                       source: bytes | None = None) -> dict | str:
+    """Run a YuE2 graph in two prompts. `abc=None` with a `score` node in the graph
+    first runs only the score stage (plan, or a cover's transcription of `source`) and
+    reads the score back; a known `abc` (reuse_score) skips that. The score is then
+    measured to size max_duration, written into the music node as text, and the graph
+    is pruned to what the save + length nodes still need. `abc=""` = no score (YuE2's
+    off mode, capped by duration_s). Returns {audio, abc, length_s, max_s, g0, g1} or a
+    JSON error string."""
+    music, save_node, length_node, score_node = nodes["music"], nodes["save"], nodes["length"], nodes.get("score")
+    for node_id in (nodes.get("plan"), music):
+        workflows.set_node(graph, node_id, "style", style)
+        workflows.set_node(graph, node_id, "lyrics", lyrics)
+        workflows.set_node(graph, node_id, "seed", seed)
+    workflows.set_node(graph, music, "mode", mode)
+    workflows.set_node(graph, nodes["seed"], "seed", seed)
+
+    comfy_base, base_note = _comfy_base()
+    if not comfy_base:
+        return json.dumps({"error": base_note})
+    _g0 = time.monotonic()
+    try:
+        if source is not None:
+            ext, ctype = _audio_ext(source)
+            graph[nodes["source"]]["inputs"]["audio"] = await comfyui_client.upload_to_comfy(
+                source, "yue2-src", comfy_base, ext=ext, content_type=ctype)
+        if abc is None and score_node in graph:
+            stage = {k: graph[k] for k in _upstream(graph, {score_node})}
+            out = await _run_prompt(comfy_base, stage, save_node=None, text_nodes={score_node},
+                                    timeout_s=_SCORE_STAGE_TIMEOUT_S)
+            abc = b"".join(out.get(score_node) or []).decode()
+            if not abc.strip():
+                return json.dumps({"error": "The score stage finished but produced no score."})
+
+        score_s = _score_seconds(abc) if abc else None
+        max_s = min(_COMPOSE_MAX_S, score_s + _SCORE_TAIL_S) if score_s else duration_s
+        workflows.set_node(graph, music, "abc", abc or "")
+        workflows.set_node(graph, music, "max_duration", float(round(max_s, 2)))
+        render = {k: graph[k] for k in _upstream(graph, {save_node, length_node})}
+        out = await _run_prompt(comfy_base, render, save_node=save_node, text_nodes={length_node},
+                                timeout_s=_COMPOSE_TIMEOUT_BASE_S + _COMPOSE_TIMEOUT_PER_S * max_s)
+    except httpx.HTTPError as e:
+        logger.exception("yue2: ComfyUI proxy request failed")
+        return json.dumps({"error": f"Could not reach ComfyUI proxy: {e!r}"})
+    except TimeoutError as e:
+        logger.exception("yue2: timed out waiting for ComfyUI")
+        return json.dumps({"error": str(e)})
+    _g1 = time.monotonic()
+    audio = (out.get(save_node) or [None])[0]
+    if not audio:
+        return json.dumps({"error": "ComfyUI finished but returned no audio."})
+    try:
+        length_s = float(b"".join(out.get(length_node) or []).decode())
+    except ValueError:
+        length_s = None
+    return {"audio": audio, "abc": abc or None, "length_s": length_s, "max_s": max_s,
+            "g0": _g0, "g1": _g1}
+
+
+def _song_response(detail: str, audio_url: str, *, score_url: str | None,
+                   score_abc: str | None, seed: int, note: str | None, timing: dict,
+                   length_s: float | None, max_s: float, lyrics: str) -> str:
+    # The music node returns frames/25 -- equal to the cap only when the token budget
+    # ran out before YuE2's end token, i.e. the song was cut off.
+    truncated = length_s is not None and length_s >= max_s - 0.1
+    if length_s is not None:
+        detail = f"{length_s:.0f}s song, {detail}"
+    if truncated:
+        detail += (f" WARNING: it hit the {max_s:.0f}s cap before its natural end and is cut off"
+                   + (" -- raise duration_s or use plan_melody=true." if not score_url else "."))
+    if note:
+        detail = f"{detail} (note: {note})"
+    links = f"[🎵 Listen / download (FLAC)]({audio_url})"
+    if score_url:
+        links += f"\n[📜 Score (ABC)]({score_url})"
+    score = None
+    if score_url:
+        secs = _score_seconds(score_abc or "")
+        score = {"url": score_url, **_score_summary(score_abc or ""),
+                 "length_s": round(secs, 1) if secs else None}
+    return json.dumps(
+        {
+            "status": "success",
+            "detail": detail,
+            "seed": seed,
+            "length_s": round(length_s, 2) if length_s is not None else None,
+            "truncated": truncated,
+            "image_model_note": note,
+            "timing": timing,
+            "audio": [{"url": audio_url, "format": "flac"}],
+            "score": score,
+            "message": (
+                f"{detail} Done reasoning -- write your final reply to the user now "
+                f"(not further reasoning/thinking content). That reply must include these "
+                f"links exactly as given -- the song, and its score"
+                f"{' (compose_music reuse_score=true sings this same melody with new lyrics)' if score_url else ''}:\n"
+                f"{links}\n\n"
+                f"Below the links, write out the full lyrics exactly as sung, section tags "
+                f"included, so the user can read along:\n{lyrics.strip()}"
+            ),
+        },
+        ensure_ascii=False,
+    )
+
+
+@mcp.tool(description=_load_tool_doc("compose_music.md"))
+async def compose_music(
+    ctx: Context,
+    style: str,
+    lyrics: str,
+    duration_s: int = 180,
+    plan_melody: bool = True,
+    seed: int = -1,
+    reuse_score: bool = False,
+) -> str:
+    """Text-to-music (full song with vocals) on the resident pipeline that declares
+    `compose`, escalating the elastic tier to it if needed. reuse_score sings the most
+    recent saved score in the chat branch instead of writing a new one. LLM-facing
+    description: tool_docs/compose_music.md."""
+    if not (style or "").strip() or not (lyrics or "").strip():
+        return json.dumps({"error": "style and lyrics are both required."})
+    duration_s = max(10, min(int(duration_s or 180), _COMPOSE_MAX_S))
+
+    t0 = time.monotonic()
+    try:
+        profile, model_note = await _resident_model_for("compose")
+        model_name, graph, nodes, entry = workflows.load_model("compose", profile)
+    except (workflows.UnknownModel, workflows.ToolUnsupported) as e:
+        return json.dumps({"error": str(e)})
+
+    try:
+        api_key = await openwebui_client.resolve_user_api_key(ctx)
+    except openwebui_client.UserNotRegisteredError as e:
+        return _not_registered_response(e)
+
+    score_url, mode = None, "full"
+    abc = None if plan_melody else ""
+    if reuse_score:
+        try:
+            score_url = await _resolve_song_ref(ctx, api_key, "score")
+            abc, meta = _parse_score((await openwebui_client.fetch_image(score_url, api_key)).decode())
+        except ValueError as e:
+            return json.dumps({"error": str(e)})
+        except httpx.HTTPError as e:
+            return json.dumps({"error": f"Could not fetch the saved score: {e!r}"})
+        if seed < 0 and meta.get("seed", "").isdigit():
+            seed = int(meta["seed"])
+        mode = meta["mode"]
+    seed = seed if seed >= 0 else random.randint(0, 2**31 - 1)
+
+    res = await _render_song(graph, nodes, style=style, lyrics=lyrics, seed=seed, mode=mode,
+                             abc=abc, duration_s=duration_s)
+    if isinstance(res, str):
+        return res
+
+    try:
+        audio_url = await openwebui_client.save_image(res["audio"], "song.flac", api_key,
+                                                      content_type="audio/flac")
+        if res["abc"] and not reuse_score:
+            score_url = await openwebui_client.save_image(
+                _score_file(res["abc"], seed, mode), "song-score.abc", api_key, content_type="text/plain")
+    except Exception as e:
+        logger.exception("compose_music: failed to save result to Open WebUI")
+        return json.dumps({"error": f"Composed the song but failed to save it to Open WebUI: {e!r}"})
+
+    how = ("sung from the saved score" if reuse_score
+           else "with a melody plan" if plan_melody else "without a melody plan (no reusable score)")
+    return _song_response(f"{how}, seed {seed} ({model_name}).", audio_url, score_url=score_url,
+                          score_abc=res["abc"], seed=seed, note=model_note,
+                          timing=_timing(t0, res["g0"], res["g1"]),
+                          length_s=res["length_s"], max_s=res["max_s"], lyrics=lyrics)
+
+
+@mcp.tool(description=_load_tool_doc("cover_song.md"))
+async def cover_song(
+    ctx: Context,
+    style: str,
+    lyrics: str,
+    seed: int = -1,
+) -> str:
+    """Re-sing the most recent song/audio in the chat branch: SheetSage2 transcribes its
+    melody to a score, YuE2 performs that score with new style/lyrics. Saves the
+    transcribed score like compose_music does. LLM-facing description:
+    tool_docs/cover_song.md."""
+    if not (style or "").strip() or not (lyrics or "").strip():
+        return json.dumps({"error": "style and lyrics are both required."})
+
+    t0 = time.monotonic()
+    try:
+        profile, model_note = await _resident_model_for("cover")
+        model_name, graph, nodes, entry = workflows.load_model("cover", profile)
+    except (workflows.UnknownModel, workflows.ToolUnsupported) as e:
+        return json.dumps({"error": str(e)})
+
+    try:
+        api_key = await openwebui_client.resolve_user_api_key(ctx)
+    except openwebui_client.UserNotRegisteredError as e:
+        return _not_registered_response(e)
+
+    try:
+        source_url = await _resolve_song_ref(ctx, api_key, "audio")
+        source = await openwebui_client.fetch_image(source_url, api_key)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+    except httpx.HTTPError as e:
+        return json.dumps({"error": f"Could not fetch the source song: {e!r}"})
+    seed = seed if seed >= 0 else random.randint(0, 2**31 - 1)
+
+    res = await _render_song(graph, nodes, style=style, lyrics=lyrics, seed=seed, mode="melody",
+                             abc=None, duration_s=_COMPOSE_MAX_S, source=source)
+    if isinstance(res, str):
+        return res
+
+    try:
+        audio_url = await openwebui_client.save_image(res["audio"], "cover.flac", api_key,
+                                                      content_type="audio/flac")
+        score_url = (await openwebui_client.save_image(
+            _score_file(res["abc"], seed, "melody"), "cover-score.abc", api_key, content_type="text/plain")
+            if res["abc"] else None)
+    except Exception as e:
+        logger.exception("cover_song: failed to save result to Open WebUI")
+        return json.dumps({"error": f"Made the cover but failed to save it to Open WebUI: {e!r}"})
+
+    return _song_response(f"cover of the chat's most recent song, seed {seed} ({model_name}).",
+                          audio_url, score_url=score_url, score_abc=res["abc"], seed=seed,
+                          note=model_note, timing=_timing(t0, res["g0"], res["g1"]),
+                          length_s=res["length_s"], max_s=res["max_s"], lyrics=lyrics)
 
 
 # -----------------------------------------------------------------------------

@@ -10,6 +10,7 @@ no shared/fallback key, see its docstring). Arguably a cleaner boundary than in-
 access would have been anyway.
 """
 
+import json
 import re
 
 import httpx
@@ -206,6 +207,86 @@ async def lookup_recent_image(chat_id: str, message_id: str | None, api_key: str
     return None
 
 
+# compose_music / cover_song chain the same way edit_image does -- auto-detect from the
+# active branch, never a model-supplied reference (see fetch_image's docstring). Two kinds:
+# "audio" = a song (our own FLAC, or an uploaded audio file) and "score" = a YuE2 ABC score
+# (our own saved one, or an uploaded .abc). Our tool output names each under its own key
+# ({"audio": [{"url"}], "score": {"url"}}), and the final reply carries each behind its
+# own link label, so neither shape needs content sniffing.
+_SONG_LINK_RE = {
+    "audio": re.compile(r"\[🎵[^\]]*\]\((/api/v1/files/[^/\s)]+/content)\)"),
+    "score": re.compile(r"\[📜[^\]]*\]\((/api/v1/files/[^/\s)]+/content)\)"),
+}
+
+
+def _tool_output_ref(text: str, kind: str) -> str | None:
+    try:
+        data = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if kind == "audio":
+        items = data.get("audio") or []
+        return (items[-1] or {}).get("url") if items else None
+    return (data.get("score") or {}).get("url")
+
+
+def _find_song_ref(message: dict, kind: str) -> str | None:
+    for file in message.get("files") or []:
+        content_type = file.get("content_type") or file.get("file", {}).get("meta", {}).get("content_type", "")
+        name = (file.get("name") or file.get("file", {}).get("filename") or "").lower()
+        hit = (content_type.startswith("audio/") or file.get("type") == "audio") if kind == "audio" \
+            else name.endswith(".abc")
+        file_id = file.get("id") or file.get("url")
+        if hit and file_id:
+            return f"/api/v1/files/{file_id}/content"
+
+    # Newest-first within the message: a later tool call / the final reply wins.
+    for item in reversed(message.get("output") or []):
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "function_call_output":
+            out = item.get("output")
+            texts = [o.get("text", "") for o in out if isinstance(o, dict)] if isinstance(out, list) else [out]
+            for t in reversed(texts):
+                ref = _tool_output_ref(t, kind)
+                if ref:
+                    return ref
+        elif item.get("type") == "message":
+            for c in reversed(item.get("content") or []):
+                if isinstance(c, dict) and c.get("type") == "output_text":
+                    found = _SONG_LINK_RE[kind].findall(c.get("text", ""))
+                    if found:
+                        return found[-1]
+    content = message.get("content")
+    if isinstance(content, str):
+        found = _SONG_LINK_RE[kind].findall(content)
+        if found:
+            return found[-1]
+    return None
+
+
+async def lookup_recent_song(chat_id: str, message_id: str | None, api_key: str,
+                             kind: str) -> str | None:
+    """The most recent `kind` ("audio" | "score") in the chat's ACTIVE BRANCH -- the
+    lookup_recent_image walk (same branch rules, same per-user key boundary), different
+    matcher. Returns a /api/v1/files/{id}/content path or None."""
+    url = f"{config.OPENWEBUI_BASE_URL.rstrip('/')}/api/v1/chats/{chat_id}"
+    try:
+        data = await _authenticated_get_json(url, api_key)
+    except httpx.HTTPStatusError:
+        return None
+    history = data.get("chat", {}).get("history", {}).get("messages", {})
+    branch = _branch_messages(history, message_id)
+    messages = reversed(branch) if branch else sorted(history.values(), key=lambda m: m.get("timestamp", 0), reverse=True)
+    for message in messages:
+        ref = _find_song_ref(message, kind)
+        if ref:
+            return ref
+    return None
+
+
 async def _authenticated_get_json(url: str, api_key: str) -> dict:
     headers = {"Authorization": f"Bearer {api_key}"}
     async with httpx.AsyncClient(timeout=30) as client:
@@ -214,7 +295,8 @@ async def _authenticated_get_json(url: str, api_key: str) -> dict:
         return resp.json()
 
 
-async def save_image(image_bytes: bytes, filename: str, api_key: str) -> str:
+async def save_image(image_bytes: bytes, filename: str, api_key: str,
+                     content_type: str = "image/png") -> str:
     """Uploads a result image via POST /api/v1/files/ (process=False -- skips Open
     WebUI's RAG/content-extraction pipeline, irrelevant for an image result) and
     returns a relative /api/v1/files/{id}/content URL -- the same shape
@@ -223,13 +305,14 @@ async def save_image(image_bytes: bytes, filename: str, api_key: str) -> str:
     parameter for a caller to pass this back into any more -- see fetch_image's own
     docstring). api_key must be the calling user's own key (see resolve_user_api_key)
     so the saved file is actually owned by them -- there is no shared key to fall back
-    to any more, that's the entire point of per-user keys existing."""
+    to any more, that's the entire point of per-user keys existing. content_type lets
+    compose_music push its FLAC through the same route."""
     headers = {"Authorization": f"Bearer {api_key}"}
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(
             f"{config.OPENWEBUI_BASE_URL.rstrip('/')}/api/v1/files/",
             params={"process": "false"},
-            files={"file": (filename, image_bytes, "image/png")},
+            files={"file": (filename, image_bytes, content_type)},
             headers=headers,
         )
         resp.raise_for_status()

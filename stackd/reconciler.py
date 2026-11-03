@@ -375,6 +375,8 @@ class Reconciler:
         for ld in tier.prefer:
             if want_model is not None and ld.active_model != want_model:
                 continue
+            if ld.explicit_only and want_model is None and not want:
+                continue
             if want and not want <= set(ld.capabilities):
                 if reasons is not None:
                     reasons.append(f"{ld.active_model} lacks "
@@ -446,6 +448,13 @@ class Reconciler:
         host_ram_avail = self._real_host_ram_avail(tier, profile)
         slot = state.image
         live = slot is not None and slot.state in (EngineState.warming, EngineState.ready)
+        # The slot's verb list is a persisted copy; a config edit that adds a verb to
+        # the resident model (yue2 gaining `cover`) must not read as "lacks it" and
+        # dead-end every short-circuit below.
+        if live:
+            resident = self._loadable(tier, slot.active_model)
+            if resident is not None:
+                slot.capabilities = list(resident.capabilities)
 
         # already satisfied? (an unsafe request still re-checks backend below —
         # "already resident on the WRONG backend" must not short-circuit here)
@@ -935,6 +944,10 @@ class Reconciler:
             return
         slot = state.image
         if slot is None or slot.state != EngineState.ready or not slot.endpoint:
+            return
+        # The warm-up graph is the model's `generate` graph; a compose-only slot
+        # (yue2) has none, and its ~3s checkpoint load isn't worth one anyway.
+        if "generate" not in (slot.capabilities or []):
             return
         warm_key = f"{state.active_profile}:{slot.active_model}"
         if state.warmed_for == warm_key:

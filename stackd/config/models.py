@@ -236,6 +236,10 @@ class MediaLoadable:
     # a backend missing here skips the host-RAM fit check for that pick, same
     # as an un-benched footprint_gib falls back to no VRAM check.
     host_ram_gib: dict[str, float] = field(default_factory=dict)
+    # Never auto-picked: loads only by name or for a capability no earlier entry
+    # has (e.g. yue2's `compose` — a music model must not become the tier's
+    # default just because it is the only thing that fits).
+    explicit_only: bool = False
 
 
 @dataclass

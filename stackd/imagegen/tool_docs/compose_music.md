@@ -1,0 +1,19 @@
+Compose an original song -- full mix with sung vocals -- from a style description and lyrics (YuE2). Returns a FLAC link the user can play or download, plus a link to the song's SCORE (melody, chords, key, tempo, sections -- no lyrics in it).
+
+Use when the user asks for a song, jingle, track or music with lyrics. Not for sound effects, speech/TTS, or editing an existing recording.
+
+Parameters:
+- style: one or two sentences of music direction -- genre, mood, tempo (bpm), key instruments, vocal type (e.g. "warm female vocal", "gritty male vocal with harmonies"), production feel. Concrete beats vague: "anthemic indie rock, driving drums, overdriven guitars, male vocal, 124 bpm" beats "a rock song". For lyrics not in English, START the style with the language: "Hungarian, upbeat indie pop, ...".
+- lyrics: the full lyric sheet, YOU write it unless the user supplied one. Mark sections on their own line with [Verse], [Pre-Chorus], [Chorus], [Bridge], [Outro]; blank line between sections. Keep lines singable (6-10 syllables), repeat the chorus verbatim. A ~3 minute song is roughly verse / chorus / verse / chorus / bridge / chorus. For an instrumental, still pass short section tags with no words under them.
+- duration_s: ONLY used with plan_melody=false (10-600, default 180) -- an upper bound there, and long lyrics with a short duration get cut. With a score (plan_melody=true or reuse_score=true) the song always runs the score's full length; leave duration_s alone. To make a song shorter or longer, write fewer or more lyrics/sections.
+- plan_melody: true (default) writes a melody + chord plan (the score) first -- better structure, and the score is saved for reuse. false goes straight from lyrics to audio and leaves NO reusable score.
+- seed: -1 for random; reuse a returned seed with the same inputs to reproduce a take exactly.
+- reuse_score: false (default) writes a new score. true sings the MOST RECENT saved score in this chat instead -- the same melody, chords, key, tempo and structure -- with the lyrics/style you pass now. Use it for "the same song but with different lyrics", "translate this song into <language>", "same tune, different words", "same song in a different style". The seed defaults to the original song's seed (keep it -1), which keeps the performance as close as the new words allow.
+
+Writing lyrics for reuse_score (translations, new words to the same tune): keep EXACTLY the same section tags in the same order, the same number of lines in each section, and match each line's syllable count to the original line as closely as you can -- every syllable lands on a note of the saved melody, so a line with too many or too few syllables sounds crammed or stretched. Translate meaning freely to make the syllables fit; keep the chorus repeated verbatim; keep vocables like "la-la-la" as-is. Pass the original style with only what the user asked to change (e.g. the language prefix).
+
+The score always acts on the most recent song in the current chat branch; there is no parameter to pick a different one. If the user wants an older song's tune, they branch the conversation from that song. If no saved score exists (a plan_melody=false song, or an uploaded recording), use cover_song instead.
+
+This is slow -- expect roughly one to three minutes of generation per minute of song -- and it may first swap the image engine for the music model (and back on the next image request). Call it ONCE per request; do not retry on a slow response. Tell the user it is composing.
+
+On success, put BOTH returned markdown links (song and score) in your final reply exactly as given, followed by the full lyrics as sung. If the result says `truncated: true`, tell the user the song is cut off at the end.

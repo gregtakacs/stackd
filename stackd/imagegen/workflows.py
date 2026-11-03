@@ -333,6 +333,8 @@ _ROLE_KEY_BY_CLASS: dict[str, dict[str, str]] = {
         "KSamplerAdvanced": "seed",
         "SamplerCustomAdvanced": "noise_seed",
         "RandomNoise": "noise_seed",
+        "YuE2GenerateABC": "seed",
+        "YuE2GenerateMusic": "seed",
     },
 }
 

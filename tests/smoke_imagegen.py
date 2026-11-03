@@ -365,6 +365,69 @@ def main() -> int:
           _g[workflows.MASK_SEGMENT_NODE]["class_type"] == "CLIPSegMask"
           and _g["20"]["inputs"]["mask"][0] == workflows.MASK_GROW_NODE)
 
+    # -- YuE2 score round-trip + song/score lookup in chat messages --
+    from stackd.imagegen import openwebui_client as owc
+    abc = 'X:1\nM:4/4\nQ:1/4=126\nK:D\n% intro\nV: Vocal\n"D"z8|\n% verse\nV: Vocal\nf2f2|\n% verse\n'
+    raw = tools._score_file(abc, 63408217, "full").decode()
+    back, meta = tools._parse_score(raw)
+    check("score file round-trips byte-exact (trailing newline kept)", back == abc)
+    check("score file carries seed + mode", meta == {"seed": "63408217", "mode": "full"})
+    _, up = tools._parse_score("X:1\nK:C\nV: Vocal\nc2d2|\n")
+    check("untagged chordless score -> melody mode", up["mode"] == "melody")
+    s = tools._score_summary(back)
+    check("score summary: key/tempo/meter/sections",
+          s["key"] == "D" and s["tempo_bpm"] == "126" and s["meter"] == "4/4"
+          and s["sections"] == ["intro", "verse"] and s["chords"])
+    check("compose graph surfaces the plan's ABC via the score node",
+          workflows.load_model("compose", "yue2")[1]["14"]["inputs"]["source"] == ["24", 0])
+    check("cover graph transcribes into music.abc in melody mode",
+          (lambda g: g["25"]["inputs"]["abc"] == ["41", 0] and g["25"]["inputs"]["mode"] == "melody")(
+              workflows.load_model("cover", "yue2")[1]))
+    tool_out = json.dumps({"audio": [{"url": "/api/v1/files/AUD/content"}],
+                           "score": {"url": "/api/v1/files/SCO/content"}})
+    msg = {"output": [{"type": "function_call_output", "output": [{"type": "input_text", "text": tool_out}]}]}
+    check("tool output -> audio ref", owc._find_song_ref(msg, "audio") == "/api/v1/files/AUD/content")
+    check("tool output -> score ref", owc._find_song_ref(msg, "score") == "/api/v1/files/SCO/content")
+    old = {"output": [{"type": "function_call_output", "output": [{"type": "input_text",
+           "text": json.dumps({"audio": [{"url": "/api/v1/files/OLD/content"}]})}]}]}
+    check("pre-score song: audio found, no score", owc._find_song_ref(old, "audio") == "/api/v1/files/OLD/content"
+          and owc._find_song_ref(old, "score") is None)
+    reply = {"content": "[🎵 Listen](/api/v1/files/A2/content)\n[📜 Score (ABC)](/api/v1/files/S2/content)"}
+    check("reply links -> score by its label", owc._find_song_ref(reply, "score") == "/api/v1/files/S2/content")
+    up_msg = {"files": [{"id": "U1", "name": "tune.abc", "content_type": "text/plain"},
+                        {"id": "U2", "name": "x.mp3", "content_type": "audio/mpeg"}]}
+    check("uploaded .abc / audio files are found",
+          owc._find_song_ref(up_msg, "score") == "/api/v1/files/U1/content"
+          and owc._find_song_ref(up_msg, "audio") == "/api/v1/files/U2/content")
+    check("image refs never match as songs", owc._find_song_ref(
+        {"content": "![Image](/api/v1/files/IMG/content)"}, "audio") is None)
+    check("audio sniffing", tools._audio_ext(b"fLaC....")[0] == "flac"
+          and tools._audio_ext(b"ID3\x04")[0] == "mp3")
+
+    # -- score length drives max_duration (the 2026-11-03 cut-off fix) --
+    two_bars_120 = "M:4/4\nQ:1/4=120\nK:C\nV: Vocal\nc4d4e4f4|g16|\nV: Ins\nZ2|\n"
+    check("score seconds: 2 bars of 4/4 @120 = 4s", tools._score_seconds(two_bars_120) == 4.0)
+    check("score seconds: Z<n> counts n bars, longest voice wins",
+          tools._score_seconds("M:4/4\nQ:1/4=120\nV: Vocal\nc16|\nV: Ins\nZ4|\n") == 8.0)
+    check("score seconds: L: / 2/4 meter",
+          tools._score_seconds("M:2/4\nL:1/32\nQ:1/4=60\nV: Vocal\nz16|z16|\n") == 4.0)
+    check("score seconds: no bars -> None", tools._score_seconds("X:1\nK:C\n") is None)
+    g = workflows.load_model("compose", "yue2")[1]
+    check("upstream(score) = plan stage only", tools._upstream(g, {"14"}) == {"14", "24", "15"})
+    g["25"]["inputs"]["abc"] = "X:1"
+    check("render prunes the plan once abc is text",
+          "24" not in tools._upstream(g, {"10", "16"}) and {"25", "8", "9", "15"} <= tools._upstream(g, {"10", "16"}))
+    cut = json.loads(tools._song_response("x.", "/api/v1/files/A/content", score_url=None, score_abc=None,
+                                          seed=1, note=None, timing={}, length_s=210.0, max_s=210.0,
+                                          lyrics="[Verse]\nLa la la\n"))
+    check("length at the cap -> truncated + warning", cut["truncated"] and "cut off" in cut["detail"])
+    ok_ = json.loads(tools._song_response("x.", "/api/v1/files/A/content", score_url=None, score_abc=None,
+                                          seed=1, note=None, timing={}, length_s=251.3, max_s=267.2,
+                                          lyrics="x"))
+    check("natural end under the cap -> not truncated", not ok_["truncated"])
+    check("reply instructions carry the lyrics to write out",
+          cut["message"].rstrip().endswith("[Verse]\nLa la la") and "full lyrics" in cut["message"])
+
     ok = all(p for _, p in CHECKS)
     for name, passed in CHECKS:
         print(f"  {'PASS' if passed else 'FAIL'}  {name}")

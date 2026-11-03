@@ -1,0 +1,146 @@
+{
+  "15": {
+    "class_type": "CheckpointLoaderSimple",
+    "inputs": {
+      "ckpt_name": "yue2_3b_int8_convrot.safetensors"
+    }
+  },
+  "25": {
+    "class_type": "YuE2GenerateMusic",
+    "inputs": {
+      "clip": [
+        "15",
+        1
+      ],
+      "style": "",
+      "lyrics": "",
+      "abc": [
+        "41",
+        0
+      ],
+      "seed": 0,
+      "mode": "melody",
+      "max_duration": 180.0,
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "top_k": 100,
+      "repetition_penalty": 1.2
+    }
+  },
+  "18": {
+    "class_type": "ConditioningZeroOut",
+    "inputs": {
+      "conditioning": [
+        "25",
+        0
+      ]
+    }
+  },
+  "5": {
+    "class_type": "EmptyYuE2LatentAudio",
+    "inputs": {
+      "seconds": [
+        "25",
+        1
+      ],
+      "batch_size": 1
+    }
+  },
+  "8": {
+    "class_type": "KSampler",
+    "inputs": {
+      "model": [
+        "15",
+        0
+      ],
+      "positive": [
+        "25",
+        0
+      ],
+      "negative": [
+        "18",
+        0
+      ],
+      "latent_image": [
+        "5",
+        0
+      ],
+      "seed": 0,
+      "steps": 32,
+      "cfg": 1.0,
+      "sampler_name": "dpm_2",
+      "scheduler": "sgm_uniform",
+      "denoise": 1.0
+    }
+  },
+  "9": {
+    "class_type": "VAEDecodeAudioTiled",
+    "inputs": {
+      "samples": [
+        "8",
+        0
+      ],
+      "vae": [
+        "15",
+        2
+      ],
+      "tile_size": 512,
+      "overlap": 64
+    }
+  },
+  "10": {
+    "class_type": "SaveAudioAdvanced",
+    "inputs": {
+      "audio": [
+        "9",
+        0
+      ],
+      "filename_prefix": "audio/YuE2-cover",
+      "format": "flac"
+    }
+  },
+  "40": {
+    "class_type": "LoadAudio",
+    "inputs": {
+      "audio": ""
+    }
+  },
+  "43": {
+    "class_type": "AudioEncoderLoader",
+    "inputs": {
+      "audio_encoder_name": "sheetsage2_bf16.safetensors"
+    }
+  },
+  "41": {
+    "class_type": "SheetSage2AudioToABC",
+    "inputs": {
+      "audio_encoder": [
+        "43",
+        0
+      ],
+      "audio": [
+        "40",
+        0
+      ],
+      "mode": "melody"
+    }
+  },
+  "14": {
+    "class_type": "PreviewAny",
+    "inputs": {
+      "source": [
+        "41",
+        0
+      ]
+    }
+  },
+  "16": {
+    "class_type": "PreviewAny",
+    "inputs": {
+      "source": [
+        "25",
+        1
+      ]
+    }
+  }
+}

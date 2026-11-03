@@ -769,6 +769,50 @@ def t_image_host_ram_guard() -> None:
           r["ok"] and r["active_model"] == "flux2-klein" and r.get("backend") == "vulkan")
 
 
+def t_image_explicit_only() -> None:
+    """An `explicit_only` loadable (yue2's music model) is never the auto-pick,
+    even when it is the only entry that fits -- but a name or a capability only
+    it offers still loads it."""
+    import dataclasses
+    from stackd.config.models import MediaLoadable
+    from stackd.solver import headroom
+
+    m = mgr(FakeRunner(ready_after=1))
+    m.use("chat", now=0)
+    ready_all(m)
+    tier = m.cfg.media["image"]
+    music = MediaLoadable(active_model="yue2", capabilities=["compose"],
+                          backends=["cuda"], footprint_gib={"cuda": 1}, explicit_only=True)
+    hr = headroom(m.cfg, "chat", m.catalog, reserve_gib=tier.margin_gib)
+    only = dataclasses.replace(tier, prefer=[music])
+    check("explicit_only is skipped by auto-pick", m.rec._pick_image(only, hr) is None)
+    p = m.rec._pick_image(only, hr, want_model="yue2")
+    check("explicit_only loads by name", p is not None and p[2].active_model == "yue2")
+    p = m.rec._pick_image(only, hr, need_caps=["compose"])
+    check("explicit_only loads for its capability", p is not None and p[2].active_model == "yue2")
+    mixed = dataclasses.replace(tier, prefer=[music, *tier.prefer])
+    p = m.rec._pick_image(mixed, hr)
+    check("auto-pick passes over a leading explicit_only entry",
+          p is not None and p[2].active_model != "yue2")
+
+
+def t_image_stale_slot_caps() -> None:
+    """A verb added to the RESIDENT model's config entry (yue2 gaining `cover`)
+    is served in place -- the persisted slot copy of the verb list is refreshed,
+    not read as 'lacks it' (which used to dead-end swap_image's short-circuits)."""
+    m = mgr(FakeRunner(ready_after=1))
+    m.use("chat", now=0)
+    ready_all(m)
+    slot = m.state.image
+    h0 = slot.handle
+    slot.capabilities = ["generate"]          # persisted before the config grew verbs
+    r = m.set_image(need_capability="edit", now=10)
+    check("config-added verb on the resident model -> ok, same model",
+          r["ok"] and r["active_model"] == slot.active_model)
+    check("slot verb list refreshed from config", "edit" in m.state.image.capabilities)
+    check("no bounce for a stale verb list", m.state.image.handle == h0)
+
+
 def t_image_teardown_credit_and_refusals() -> None:
     """Two fixes from the 2026-09-08 flux2-dev-turbo investigation.
 
@@ -1074,6 +1118,8 @@ def main() -> int:
         t_image_tier_no_headroom,
         t_image_swap,
         t_image_host_ram_guard,
+        t_image_explicit_only,
+        t_image_stale_slot_caps,
         t_image_teardown_credit_and_refusals,
         t_image_unsafe_bench_bypass,
         t_ladder_verdicts_match_scheduler,
