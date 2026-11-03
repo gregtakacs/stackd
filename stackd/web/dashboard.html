@@ -633,7 +633,32 @@ const RESV_KEYS = /reserve|slack|headroom|budget|gtt|overhead/i;
 function hue(str){ let h=0; for(const c of str) h=(h*31+c.charCodeAt(0))>>>0; return h%360; }
 // one stable colour per model, shared by its placement-map segment and its
 // profile chip so a profile's memory is visually traceable to its models.
-const modelColor = n => `hsl(${hue(n)} 62% 60%)`;
+// A fixed 8-slot categorical palette (dataviz reference, dark steps; validated
+// on --surface #1a1d27: CVD ΔE >= 8.4, normal-vision >= 19.3, all >= 3:1), NOT a
+// hashed hue — two hashed hues 20° apart read as the same aqua. A model hashes
+// to a home slot and probes to the next free one, so everything on screen gets
+// a distinct colour; seedModelColors() books the resident set first (sorted) so
+// it's the same assignment on every reload. Only past 8 entities do slots repeat.
+const MODEL_PALETTE = ["#3987e5", "#d95926", "#199e70", "#c98500",
+                       "#d55181", "#008300", "#9085e9", "#e66767"];
+const MODEL_SLOT = new Map();
+const colorKey = n => String(n).replace(/^(image|audio) · /, "$1:");
+function modelColor(n) {
+  const k = colorKey(n);
+  if (!MODEL_SLOT.has(k)) {
+    const used = new Set(MODEL_SLOT.values());
+    let s = hue(k) % MODEL_PALETTE.length;
+    for (let i = 0; i < MODEL_PALETTE.length && used.has(s); i++) s = (s + 1) % MODEL_PALETTE.length;
+    MODEL_SLOT.set(k, s);
+  }
+  return MODEL_PALETTE[MODEL_SLOT.get(k)];
+}
+function seedModelColors(st) {
+  const names = Object.keys(st.stacks || {}).sort();
+  if (st.image && st.image.active_model) names.push("image:" + st.image.active_model);
+  if (st.audio && st.audio.active_model) names.push("audio:" + st.audio.active_model);
+  names.forEach(n => modelColor(n));
+}
 const profileColor = n => `hsl(${hue("profile∷" + n)} 50% 52%)`;
 
 function segColor(s) {
@@ -1285,12 +1310,14 @@ function renderMap(st, eng, img, gpu, host, aud) {
              tag: resv ? "reservation" : srcTag(label) };
   };
   const imgSeg = () => ({ label: "image · " + img.resident.active_model, gib: imgFootprint(img),
+    color: modelColor("image:" + img.resident.active_model),
     cls: "elastic" + (img.resident.device === "igpu0" ? " gtt" : ""),
     tag: "elastic · pinned " + img.resident.pinned_by
        + (img.resident.device === "igpu0" ? " · GTT" : "") });
   // the audio tier's own ComfyUI (music) — a second elastic slot beside the image one
   const audRes = aud && aud.resident;
   const audSeg = () => ({ label: "audio · " + audRes.active_model, gib: imgFootprint(aud),
+    color: modelColor("audio:" + audRes.active_model),
     cls: "elastic" + (audRes.device === "igpu0" ? " gtt" : ""),
     tag: "elastic · pinned " + audRes.pinned_by
        + (audRes.device === "igpu0" ? " · GTT" : "") });
@@ -3723,6 +3750,7 @@ async function tick() {
     if (uiLocked()) return;
     $("#topErr").classList.add("hidden");
     if (st) {
+      seedModelColors(st);
       renderHeader(st, cleaner);
       renderDead(st);
       renderNvidiaUpdate(st);
