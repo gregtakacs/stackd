@@ -6,6 +6,7 @@ Parameters:
 - style: the TARGET sound -- genre, tempo, instruments, vocal type -- not a description of the original. For lyrics not in English, start with the language: "Hungarian, acoustic folk, ...".
 - lyrics: the lyric sheet to sing, with [Verse]/[Chorus]/[Bridge]/[Outro] section tags. Follow the original's phrasing: the same sections in the same order, the same number of lines, and each line's syllable count close to the original line's -- every syllable lands on a transcribed note.
 - seed: -1 for random.
+- cfg_scale: how strictly YuE2 follows the lyrics and style. English: leave at -1 (the model default). NON-ENGLISH lyrics: use 1.75 -- a listening test of a Hungarian song rated the default clearly worse and 1.5-2.0 all good (2.0 a touch clearer than 1.5). Also raise it to 1.5-2.0 when the user asks for clearer or more literal singing. Even at 1.5-2.0 a take can swallow a short syllable; if the user hears that, offer another take (a different seed with the same score) rather than rewriting the lyrics.
 
 The cover runs the full length of the transcribed score -- there is no duration to set.
 

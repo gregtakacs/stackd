@@ -1684,7 +1684,7 @@ async def _run_prompt(base: str, graph: dict, *, save_node: str | None, text_nod
 
 async def _render_song(graph: dict, nodes: dict, *, style: str, lyrics: str, seed: int,
                        mode: str, abc: str | None, duration_s: int,
-                       source: bytes | None = None) -> dict | str:
+                       source: bytes | None = None, cfg_scale: float = -1) -> dict | str:
     """Run a YuE2 graph in two prompts. `abc=None` with a `score` node in the graph
     first runs only the score stage (plan, or a cover's transcription of `source`) and
     reads the score back; a known `abc` (reuse_score) skips that. The score is then
@@ -1699,6 +1699,11 @@ async def _render_song(graph: dict, nodes: dict, *, style: str, lyrics: str, see
         workflows.set_node(graph, node_id, "seed", seed)
     workflows.set_node(graph, music, "mode", mode)
     workflows.set_node(graph, nodes["seed"], "seed", seed)
+    # YuE2's autoregressive guidance on style + lyrics; absent = the node's own default
+    # (1.0 = off with a score, 1.01 in off mode), so a default call renders exactly as
+    # before and stays seed-reproducible.
+    if cfg_scale >= 0:
+        workflows.set_node(graph, music, "cfg_scale", float(cfg_scale))
 
     comfy_base, base_note = _comfy_base()
     if not comfy_base:
@@ -1797,6 +1802,7 @@ async def compose_music(
     plan_melody: bool = True,
     seed: int = -1,
     reuse_score: bool = False,
+    cfg_scale: float = -1,
 ) -> str:
     """Text-to-music (full song with vocals) on the resident pipeline that declares
     `compose`, escalating the elastic tier to it if needed. reuse_score sings the most
@@ -1834,7 +1840,7 @@ async def compose_music(
     seed = seed if seed >= 0 else random.randint(0, 2**31 - 1)
 
     res = await _render_song(graph, nodes, style=style, lyrics=lyrics, seed=seed, mode=mode,
-                             abc=abc, duration_s=duration_s)
+                             abc=abc, duration_s=duration_s, cfg_scale=cfg_scale)
     if isinstance(res, str):
         return res
 
@@ -1850,6 +1856,8 @@ async def compose_music(
 
     how = ("sung from the saved score" if reuse_score
            else "with a melody plan" if plan_melody else "without a melody plan (no reusable score)")
+    if cfg_scale >= 0:
+        how += f", cfg_scale {cfg_scale:g}"
     return _song_response(f"{how}, seed {seed} ({model_name}).", audio_url, score_url=score_url,
                           score_abc=res["abc"], seed=seed, note=model_note,
                           timing=_timing(t0, res["g0"], res["g1"]),
@@ -1862,6 +1870,7 @@ async def cover_song(
     style: str,
     lyrics: str,
     seed: int = -1,
+    cfg_scale: float = -1,
 ) -> str:
     """Re-sing the most recent song/audio in the chat branch: SheetSage2 transcribes its
     melody to a score, YuE2 performs that score with new style/lyrics. Saves the
@@ -1892,7 +1901,7 @@ async def cover_song(
     seed = seed if seed >= 0 else random.randint(0, 2**31 - 1)
 
     res = await _render_song(graph, nodes, style=style, lyrics=lyrics, seed=seed, mode="melody",
-                             abc=None, duration_s=_COMPOSE_MAX_S, source=source)
+                             abc=None, duration_s=_COMPOSE_MAX_S, source=source, cfg_scale=cfg_scale)
     if isinstance(res, str):
         return res
 
