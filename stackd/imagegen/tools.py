@@ -1621,6 +1621,62 @@ def _score_seconds(abc: str) -> float | None:
     return float(max(bars.values()) * meter / unit * 60 / bpm)
 
 
+# The melody plan is sampled, and a seed can derail it: Álmos's pop song (2026-11-03,
+# seed 144770374) planned ONE held note for 880 bars and a chorus/outro loop -- a 30-min
+# score, rendered to the 600s cap with no verses. It is deterministic per seed, and 8
+# other seeds on the same lyrics planned fine (9/9 for tidier lyrics). Separately, ~2 in
+# 3 healthy plans drop or add sung sections (pre-choruses most often), so lyrics land in
+# the wrong slots. A plan costs ~30s on igpu0 against minutes of render, so up to
+# _PLAN_TRIES plans are drawn: degenerate ones are rejected, the first whose sung
+# sections match the lyrics wins, otherwise the closest one.
+_PLAN_TRIES = 4
+_PLAN_MIN_PITCHES = 3          # healthy plans seen: 7-13 distinct vocal pitches
+_SUNG_SECTIONS = ("verse", "pre-chorus", "chorus", "bridge")
+
+
+def _sung_sections(names: list[str]) -> list[str]:
+    """Section names -> the sung skeleton: normalized ("[Verse 2]" / "Pre Chorus" ->
+    verse / pre-chorus), intros/outros/solos/interludes dropped, repeats collapsed."""
+    out = []
+    for name in names:
+        n = name.lower()
+        n = ("pre-chorus" if "pre" in n and "chorus" in n
+             else next((s for s in _SUNG_SECTIONS if s in n), None))
+        if n and (not out or out[-1] != n):
+            out.append(n)
+    return out
+
+
+def _lyric_sections(lyrics: str) -> list[str]:
+    return _sung_sections(re.findall(r"^\s*\[([^\]]+)\]", lyrics, re.M))
+
+
+def _edit_distance(a: list[str], b: list[str]) -> int:
+    row = list(range(len(b) + 1))
+    for i, x in enumerate(a, 1):
+        prev, row[0] = row[0], i
+        for j, y in enumerate(b, 1):
+            prev, row[j] = row[j], min(row[j] + 1, row[j - 1] + 1, prev + (x != y))
+    return row[-1]
+
+
+def _plan_fit(abc: str, lyrics: str) -> dict:
+    """{ok, reason, distance} for a planned score against the lyrics. Not ok = never
+    render it: a near-monotone vocal line, or longer than the render cap."""
+    vocal = "".join(re.findall(r"^V:\s*Vocal\b[^\n]*\n(.*?)(?=^V:|\Z)", abc, re.M | re.S))
+    vocal = "\n".join(l for l in vocal.splitlines() if not l.startswith("%"))
+    pitches = set(re.findall(r"[A-Ga-g][,']*", re.sub(r'"[^"]*"', "", vocal)))
+    secs = _score_seconds(abc)
+    reason = None
+    if len(pitches) < _PLAN_MIN_PITCHES:
+        reason = f"melody has only {len(pitches)} distinct pitch(es)"
+    elif secs and secs > _COMPOSE_MAX_S:
+        reason = f"score runs {secs:.0f}s, over the {_COMPOSE_MAX_S}s cap"
+    want, got = _lyric_sections(lyrics), _sung_sections(_score_summary(abc)["sections"])
+    return {"ok": reason is None, "reason": reason, "distance": _edit_distance(want, got),
+            "sections": got}
+
+
 def _upstream(graph: dict, roots: set[str]) -> set[str]:
     """Node ids `roots` depend on (inclusive), following [node_id, slot] input links."""
     seen, todo = set(), [r for r in roots if r in graph]
@@ -1684,14 +1740,16 @@ async def _run_prompt(base: str, graph: dict, *, save_node: str | None, text_nod
 
 async def _render_song(graph: dict, nodes: dict, *, style: str, lyrics: str, seed: int,
                        mode: str, abc: str | None, duration_s: int,
-                       source: bytes | None = None, cfg_scale: float = -1) -> dict | str:
+                       source: bytes | None = None, cfg_scale: float = -1,
+                       keep_seed: bool = False) -> dict | str:
     """Run a YuE2 graph in two prompts. `abc=None` with a `score` node in the graph
     first runs only the score stage (plan, or a cover's transcription of `source`) and
     reads the score back; a known `abc` (reuse_score) skips that. The score is then
     measured to size max_duration, written into the music node as text, and the graph
     is pruned to what the save + length nodes still need. `abc=""` = no score (YuE2's
-    off mode, capped by duration_s). Returns {audio, abc, length_s, max_s, g0, g1} or a
-    JSON error string."""
+    off mode, capped by duration_s). A melody plan goes through _plan_score, which may
+    move to another seed (keep_seed: only past a broken plan). Returns {audio, abc,
+    length_s, max_s, seed, plan, g0, g1} or a JSON error string."""
     music, save_node, length_node, score_node = nodes["music"], nodes["save"], nodes["length"], nodes.get("score")
     for node_id in (nodes.get("plan"), music):
         workflows.set_node(graph, node_id, "style", style)
@@ -1714,7 +1772,17 @@ async def _render_song(graph: dict, nodes: dict, *, style: str, lyrics: str, see
             ext, ctype = _audio_ext(source)
             graph[nodes["source"]]["inputs"]["audio"] = await comfyui_client.upload_to_comfy(
                 source, "yue2-src", comfy_base, ext=ext, content_type=ctype)
-        if abc is None and score_node in graph:
+        plan = None
+        if abc is None and score_node in graph and nodes.get("plan"):
+            got = await _plan_score(comfy_base, graph, nodes, lyrics=lyrics, seed=seed,
+                                    keep_seed=keep_seed)
+            if isinstance(got, str):
+                return got
+            abc, plan = got
+            seed = plan["seed"]
+            for node_id in (nodes["plan"], music, nodes["seed"]):
+                workflows.set_node(graph, node_id, "seed", seed)
+        elif abc is None and score_node in graph:
             stage = {k: graph[k] for k in _upstream(graph, {score_node})}
             out = await _run_prompt(comfy_base, stage, save_node=None, text_nodes={score_node},
                                     timeout_s=_SCORE_STAGE_TIMEOUT_S)
@@ -1744,12 +1812,47 @@ async def _render_song(graph: dict, nodes: dict, *, style: str, lyrics: str, see
     except ValueError:
         length_s = None
     return {"audio": audio, "abc": abc or None, "length_s": length_s, "max_s": max_s,
-            "g0": _g0, "g1": _g1}
+            "seed": seed, "plan": plan, "g0": _g0, "g1": _g1}
+
+
+async def _plan_score(comfy_base: str, graph: dict, nodes: dict, *, lyrics: str,
+                      seed: int, keep_seed: bool = False) -> tuple[str, dict] | str:
+    """Draw up to _PLAN_TRIES melody plans (the caller's seed first, then random ones)
+    and keep the best by _plan_fit. keep_seed (a seed the user chose, e.g. to redo a
+    take) accepts that seed's plan whenever it is not degenerate, structure or not. Returns (abc, {seed, tries, structure_match,
+    sections, rejected}) or a JSON error string when every plan was degenerate."""
+    score_node, plan_node = nodes["score"], nodes["plan"]
+    best, rejected = None, []
+    tries = 0
+    for tries in range(1, _PLAN_TRIES + 1):
+        workflows.set_node(graph, plan_node, "seed", seed)
+        stage = {k: graph[k] for k in _upstream(graph, {score_node})}
+        out = await _run_prompt(comfy_base, stage, save_node=None, text_nodes={score_node},
+                                timeout_s=_SCORE_STAGE_TIMEOUT_S)
+        abc = b"".join(out.get(score_node) or []).decode()
+        fit = _plan_fit(abc, lyrics) if abc.strip() else {"ok": False, "reason": "empty score"}
+        if not fit["ok"]:
+            logger.warning("yue2: rejected plan seed %s: %s", seed, fit["reason"])
+            rejected.append({"seed": seed, "reason": fit["reason"]})
+        elif best is None or fit["distance"] < best[1]["distance"]:
+            best = (abc, fit, seed)
+            if fit["distance"] == 0 or keep_seed:
+                break
+        seed = random.randint(0, 2**31 - 1)
+    if best is None:
+        return json.dumps({"error": (
+            f"All {tries} melody plans were unusable ({'; '.join(r['reason'] for r in rejected)}). "
+            "Rewrite the lyrics with shorter, evenly sized lines and 2-4 lines per section, "
+            "then call compose_music once more."), "rejected_plans": rejected})
+    abc, fit, seed = best
+    return abc, {"seed": seed, "tries": tries, "structure_match": fit["distance"] == 0,
+                 "sections": fit["sections"], "rejected": rejected}
 
 
 def _song_response(detail: str, audio_url: str, *, score_url: str | None,
                    score_abc: str | None, seed: int, note: str | None, timing: dict,
-                   length_s: float | None, max_s: float, lyrics: str) -> str:
+                   length_s: float | None, max_s: float, lyrics: str,
+                   plan: dict | None = None) -> str:
     # The music node returns frames/25 -- equal to the cap only when the token budget
     # ran out before YuE2's end token, i.e. the song was cut off.
     truncated = length_s is not None and length_s >= max_s - 0.1
@@ -1779,6 +1882,7 @@ def _song_response(detail: str, audio_url: str, *, score_url: str | None,
             "timing": timing,
             "audio": [{"url": audio_url, "format": "flac"}],
             "score": score,
+            "plan": plan,
             "message": (
                 f"{detail} Done reasoning -- write your final reply to the user now "
                 f"(not further reasoning/thinking content). That reply must include these "
@@ -1837,12 +1941,15 @@ async def compose_music(
         if seed < 0 and meta.get("seed", "").isdigit():
             seed = int(meta["seed"])
         mode = meta["mode"]
-    seed = seed if seed >= 0 else random.randint(0, 2**31 - 1)
+    keep_seed = seed >= 0
+    seed = seed if keep_seed else random.randint(0, 2**31 - 1)
 
     res = await _render_song(graph, nodes, style=style, lyrics=lyrics, seed=seed, mode=mode,
-                             abc=abc, duration_s=duration_s, cfg_scale=cfg_scale)
+                             abc=abc, duration_s=duration_s, cfg_scale=cfg_scale,
+                             keep_seed=keep_seed)
     if isinstance(res, str):
         return res
+    seed, plan = res["seed"], res["plan"]
 
     try:
         audio_url = await openwebui_client.save_image(res["audio"], "song.flac", api_key,
@@ -1858,10 +1965,15 @@ async def compose_music(
            else "with a melody plan" if plan_melody else "without a melody plan (no reusable score)")
     if cfg_scale >= 0:
         how += f", cfg_scale {cfg_scale:g}"
+    if plan:
+        fit = ("sections match the lyrics" if plan["structure_match"] else
+               f"closest plan sings {' / '.join(plan['sections'])} -- not the lyrics' exact "
+               f"section order, so some lines may land in other sections")
+        how += f" (best of {plan['tries']} plans; {fit})" if plan["tries"] > 1 else f" ({fit})"
     return _song_response(f"{how}, seed {seed} ({model_name}).", audio_url, score_url=score_url,
                           score_abc=res["abc"], seed=seed, note=model_note,
                           timing=_timing(t0, res["g0"], res["g1"]),
-                          length_s=res["length_s"], max_s=res["max_s"], lyrics=lyrics)
+                          length_s=res["length_s"], max_s=res["max_s"], lyrics=lyrics, plan=plan)
 
 
 @mcp.tool(description=_load_tool_doc("cover_song.md"))

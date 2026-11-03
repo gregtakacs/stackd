@@ -428,6 +428,56 @@ def main() -> int:
     check("reply instructions carry the lyrics to write out",
           cut["message"].rstrip().endswith("[Verse]\nLa la la") and "full lyrics" in cut["message"])
 
+    # -- melody-plan search (the 2026-11-03 one-note / 30-minute plan) --
+    check("sung skeleton: tags normalized, unsung dropped, repeats collapsed",
+          tools._sung_sections(["intro", "Verse 1", "Verse 2", "Pre Chorus", "Final Chorus",
+                                "Guitar Solo", "prechorus", "bridge", "outro", "silence"])
+          == ["verse", "pre-chorus", "chorus", "pre-chorus", "bridge"])
+    lyr = "[Verse]\na\n\n[Pre-Chorus]\nb\n\n[Chorus]\nc\n\n[Verse]\nd\n\n[Chorus]\nc\n\n[Outro]\ne\n"
+    check("lyric sections", tools._lyric_sections(lyr) == ["verse", "pre-chorus", "chorus", "verse", "chorus"])
+
+    def plan_abc(sections, notes="cdefgabc'", bars=8):
+        body = "".join(f"% {s}\nV: Vocal\n" + "|".join([notes] * bars) + "|\nV: Ins\nZ8|\n" for s in sections)
+        return "M:4/4\nL:1/16\nQ:1/4=120\nK:C\n" + body
+    good = plan_abc(["intro", "verse", "pre-chorus", "chorus", "verse", "chorus", "outro"])
+    fit = tools._plan_fit(good, lyr)
+    check("healthy plan matching the lyrics -> ok, distance 0", fit["ok"] and fit["distance"] == 0)
+    fit = tools._plan_fit(plan_abc(["intro", "verse", "chorus", "verse", "chorus"]), lyr)
+    check("plan dropping the pre-chorus -> ok, distance 1", fit["ok"] and fit["distance"] == 1)
+    fit = tools._plan_fit(plan_abc(["verse", "chorus"], notes="g16-"), lyr)
+    check("one held note -> rejected", not fit["ok"] and "1 distinct pitch" in fit["reason"])
+    fit = tools._plan_fit(plan_abc(["verse", "chorus"] * 20, bars=40), lyr)
+    check("score past the render cap -> rejected", not fit["ok"] and "cap" in fit["reason"])
+
+    def run_plans(abcs, keep_seed=False):
+        it = iter(abcs)
+        seeds = []
+
+        async def fake_run(base, graph, *, save_node, text_nodes, timeout_s):
+            seeds.append(graph["24"]["inputs"]["seed"])
+            return {"14": [next(it).encode()]}
+        orig, tools._run_prompt = tools._run_prompt, fake_run
+        try:
+            _, g, n, _ = workflows.load_model("compose", "yue2")
+            got = asyncio.run(tools._plan_score("http://x", g, n, lyrics=lyr, seed=7, keep_seed=keep_seed))
+        finally:
+            tools._run_prompt = orig
+        return got, seeds
+    drone = plan_abc(["verse"], notes="g16-")
+    near = plan_abc(["verse", "chorus", "verse", "chorus"])
+    (abc, plan), seeds = run_plans([drone, near, good, near])
+    check("plan search: skips the broken plan, stops at the exact match",
+          abc == good and plan["tries"] == 3 and plan["structure_match"]
+          and plan["seed"] == seeds[2] and seeds[0] == 7 and len(plan["rejected"]) == 1)
+    (abc, plan), _ = run_plans([near, near, near, near])
+    check("plan search: no exact match -> closest after all tries",
+          abc == near and plan["tries"] == tools._PLAN_TRIES and not plan["structure_match"])
+    (abc, plan), _ = run_plans([near, good], keep_seed=True)
+    check("plan search: a chosen seed's sound plan is kept", abc == near and plan["seed"] == 7 and plan["tries"] == 1)
+    err, _ = run_plans([drone] * tools._PLAN_TRIES)
+    check("plan search: every plan broken -> error, no render",
+          isinstance(err, str) and "unusable" in json.loads(err)["error"])
+
     ok = all(p for _, p in CHECKS)
     for name, passed in CHECKS:
         print(f"  {'PASS' if passed else 'FAIL'}  {name}")
