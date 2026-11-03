@@ -136,6 +136,30 @@ def main() -> int:
     check("token-weighted mean = Σctx² / Σctx (pulled toward the 2800 row vs. arith. 1825)",
           round(_sqs / _sms) == 1999)
 
+    # --- media ledger (v9): record, rollup, media_rows ---------------------------
+    for i in range(2):
+        st.record_media(user_email="u@x.com", tool="compose_music", model="yue2", backend="cuda",
+                        device="cuda0", profile="chat-code-music", ok=True, total_s=131.0,
+                        generate_s=37.0, wait_s=94.0, audio_s=180.0, now=old)
+    st.record_media(user_email="u@x.com", tool="compose_music", model="yue2", backend="cuda",
+                    device="cuda0", profile="chat-code-music", ok=False, total_s=2.0,
+                    error="x" * 500, now=old)
+    st.record_media(user_email=None, tool="generate_image", model="flux2-klein", backend="vulkan",
+                    device="igpu0", profile="chat-code-music", ok=True, total_s=33.0,
+                    generate_s=32.5, wait_s=0.5, images=1, megapixels=1.72)
+    check("media error text is capped",
+          len(st.conn.execute("SELECT error FROM media_usage WHERE ok=0").fetchone()[0]) == 300)
+    moved = st.rollup(retain_days=7)
+    check("rollup folds old media rows too", moved == 3)
+    mrows = st.media_rows()
+    song = next(r for r in mrows if r["tool"] == "compose_music")
+    check("media_rows: folded song row keeps counts, sums and the max wait",
+          song["reqs"] == 3 and song["ok_n"] == 2 and song["audio_s"] == 360.0
+          and song["wait_s"] == 188.0 and song["wait_s_max"] == 94.0 and song["user_email"] == "u@x.com")
+    img = next(r for r in mrows if r["tool"] == "generate_image")
+    check("media_rows: raw image row, anonymous caller -> 'direct'",
+          img["images"] == 1 and img["user_email"] == "direct" and "u" not in img)
+
     # --- v2 -> v3 migration: split the conflated column into stack + checkpoint --
     import sqlite3 as _sqm
     v2p = tmp / "v2.db"

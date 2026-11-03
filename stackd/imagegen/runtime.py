@@ -69,6 +69,18 @@ def image_pipelines() -> list[dict]:
         return RT.mgr.image_status().get("prefer", [])
 
 
+def record_media(**row) -> None:
+    """One media-ledger row (Store.record_media), tagged with the active profile and
+    the image-tier slot that is resident now. No store -> no-op."""
+    with RT.lock:
+        if RT.store is None:
+            return
+        entry = RT.mgr.capabilities().get("image") or {}
+        RT.store.record_media(model=row.pop("model", None) or entry.get("active_model"),
+                              backend=entry.get("backend"), device=entry.get("device"),
+                              profile=RT.mgr.state.active_profile, **row)
+
+
 def resolve_user_key(email: str) -> str | None:
     with RT.lock:
         return RT.store.resolve_key(email) if RT.store is not None else None

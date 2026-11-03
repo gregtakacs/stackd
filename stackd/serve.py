@@ -447,6 +447,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._savings()
         if self.path.split("?")[0] == "/savings/facts":
             return self._savings_facts()
+        if self.path.split("?")[0] == "/media":
+            return self._media()
         if self.path.split("?")[0] == "/events":
             return self._events()
         if self.path == "/gpu":
@@ -688,6 +690,23 @@ class _Handler(BaseHTTPRequestHandler):
                                 from_day=(q.get("from") or [None])[0],
                                 to_day=(q.get("to") or [None])[0])
         return self._send_json(200, out)
+
+    def _media(self):
+        """The image / music generation ledger (store.media_usage + media_daily) as
+        day-grain rows plus totals. `?from=YYYY-MM-DD&to=YYYY-MM-DD` like /savings."""
+        if self.store is None:
+            return self._send_json(503, {"error": {"message": "no datastore"}})
+        from urllib.parse import parse_qs, urlparse
+        q = parse_qs(urlparse(self.path).query)
+        with self.lock:
+            rows = self.store.media_rows((q.get("from") or [None])[0], (q.get("to") or [None])[0])
+        keys = ("reqs", "ok_n", "total_s", "generate_s", "wait_s", "images", "megapixels", "audio_s")
+        totals = {k: round(sum(r[k] or 0 for r in rows), 2) for k in keys}
+        totals["wait_s_max"] = max((r["wait_s_max"] or 0 for r in rows), default=0)
+        days = sorted({r["day"] for r in rows})
+        return self._send_json(200, {"from": days[0] if days else None,
+                                     "to": days[-1] if days else None,
+                                     "totals": totals, "rows": rows})
 
     def _savings_refresh(self):
         """Pull current tier-ref prices from OpenRouter (writes a new effective-

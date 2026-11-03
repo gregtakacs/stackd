@@ -42,6 +42,7 @@ else). Two consequences that shape this file's design:
 """
 
 import copy
+import functools
 import hashlib
 import hmac
 import json
@@ -541,6 +542,59 @@ def _timing(t0: float, gen0: float, gen1: float, rewrite_s: float = 0.0) -> dict
     return out
 
 
+# Every media tool call lands in the stackd media ledger (store.media_usage): who,
+# which tool/model/device, ok or the error, how long it ran vs how long it waited
+# for the image tier (swaps, cold container starts), and what it made. Recorded
+# from the tool's own JSON result, so the tools themselves stay unaware of it.
+def _ledgered(tool_name: str):
+    def wrap(fn):
+        @functools.wraps(fn)
+        async def inner(*args, **kwargs):
+            t0 = time.monotonic()
+            out = await fn(*args, **kwargs)
+            try:
+                ctx = kwargs.get("ctx") or next((a for a in args if isinstance(a, Context)), None)
+                runtime.record_media(tool=tool_name, **_media_row(out, time.monotonic() - t0,
+                                                                  _caller_email(ctx)))
+            except Exception:  # noqa: BLE001 -- the ledger never breaks a tool call
+                logger.exception("%s: media ledger write failed", tool_name)
+            return out
+        return inner
+    return wrap
+
+
+def _caller_email(ctx: Context | None) -> str | None:
+    try:
+        return (ctx.headers or {}).get("X-OpenWebUI-User-Email") if ctx is not None else None
+    except Exception:  # noqa: BLE001 -- no request context (direct call)
+        return None
+
+
+def _media_row(out: str, wall_s: float, user_email: str | None) -> dict:
+    """A media-ledger row from a tool's JSON result string."""
+    try:
+        r = json.loads(out) if isinstance(out, str) else {}
+    except ValueError:
+        r = {}
+    if not isinstance(r, dict):
+        r = {}
+    timing = r.get("timing") or {}
+    total = float(timing.get("total_s") or wall_s)
+    gen = float(timing.get("generate_s") or 0.0)
+    row = {"user_email": user_email, "ok": r.get("status") == "success",
+           "total_s": round(total, 2), "generate_s": round(gen, 2),
+           "wait_s": round(max(0.0, total - gen - float(timing.get("rewrite_s") or 0.0)), 2),
+           "error": None if r.get("status") == "success" else str(r.get("error") or out)[:300]}
+    if r.get("audio"):
+        row["audio_s"] = float(r.get("length_s") or 0.0)
+    elif r.get("images"):
+        row["images"] = len(r["images"])
+        m = re.search(r"(\d+)x(\d+)", r.get("detail") or "")
+        if m:
+            row["megapixels"] = round(int(m.group(1)) * int(m.group(2)) * len(r["images"]) / 1e6, 3)
+    return row
+
+
 def _success_response(detail: str, urls: list[str], *, note: str | None = None,
                       timing: dict | None = None) -> str:
     """Builds the JSON a tool call returns on success. There is no __event_emitter__
@@ -870,6 +924,7 @@ def _build_combined_prompt(
 
 
 @mcp.tool(description=_load_tool_doc("generate_image.md"))
+@_ledgered("generate_image")
 async def generate_image(
     ctx: Context,
     prompt: str,
@@ -1103,6 +1158,7 @@ def _submit_edit(
 
 
 @mcp.tool(description=_load_tool_doc("edit_image.md"))
+@_ledgered("edit_image")
 async def edit_image(
     ctx: Context,
     prompt: str = "",
@@ -1421,6 +1477,7 @@ async def edit_image(
 
 
 @mcp.tool(description=_load_tool_doc("stylize_image.md"))
+@_ledgered("stylize_image")
 async def stylize_image(
     ctx: Context,
     style: str = "",
@@ -1920,6 +1977,7 @@ def _song_response(detail: str, audio_url: str, *, score_url: str | None,
 
 
 @mcp.tool(description=_load_tool_doc("compose_music.md"))
+@_ledgered("compose_music")
 async def compose_music(
     ctx: Context,
     style: str,
@@ -1999,6 +2057,7 @@ async def compose_music(
 
 
 @mcp.tool(description=_load_tool_doc("cover_song.md"))
+@_ledgered("cover_song")
 async def cover_song(
     ctx: Context,
     style: str,

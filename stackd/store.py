@@ -14,7 +14,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 RETAIN_DAYS = 40
 
 _SCHEMA = """
@@ -117,8 +117,59 @@ CREATE TABLE IF NOT EXISTS brave_usage (
 );
 CREATE INDEX IF NOT EXISTS ix_brave_usage_day ON brave_usage(day);
 
+-- Image / music generation ledger (v9): one row per MCP media tool call
+-- (generate_image, edit_image, stylize_image, compose_music, cover_song), written
+-- by imagegen.tools._ledgered. `model`/`backend`/`device` are the image-tier slot
+-- that served the call. Timing: total_s = the whole call; generate_s = the
+-- ComfyUI run; wait_s = the rest (an image-tier swap, a cold ComfyUI start,
+-- waiting for a warming engine; prompt rewrites are excluded). Output: images +
+-- megapixels for image tools, audio_s for music. Errors are rows too (ok=0,
+-- `error` = the message). Folded into media_daily after RETAIN_DAYS like `usage`.
+CREATE TABLE IF NOT EXISTS media_usage (
+    id INTEGER PRIMARY KEY,
+    ts REAL NOT NULL,
+    day TEXT NOT NULL,
+    user_email TEXT,
+    tool TEXT NOT NULL,
+    model TEXT,
+    backend TEXT,
+    device TEXT,
+    profile TEXT,
+    ok INTEGER DEFAULT 1,
+    total_s REAL DEFAULT 0,
+    generate_s REAL DEFAULT 0,
+    wait_s REAL DEFAULT 0,
+    images INTEGER DEFAULT 0,
+    megapixels REAL DEFAULT 0,
+    audio_s REAL DEFAULT 0,
+    error TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_media_usage_day ON media_usage(day);
+
+CREATE TABLE IF NOT EXISTS media_daily (
+    day TEXT, user_email TEXT, tool TEXT, model TEXT, backend TEXT, profile TEXT,
+    reqs INTEGER DEFAULT 0,
+    ok_n INTEGER DEFAULT 0,
+    total_s REAL DEFAULT 0,
+    generate_s REAL DEFAULT 0,
+    wait_s REAL DEFAULT 0,
+    wait_s_max REAL DEFAULT 0,
+    images INTEGER DEFAULT 0,
+    megapixels REAL DEFAULT 0,
+    audio_s REAL DEFAULT 0,
+    PRIMARY KEY (day, user_email, tool, model, backend, profile)
+);
+
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 """
+
+
+# media_usage -> day-grain group (rollup + media_rows share it)
+_MEDIA_KEYS = ("day, COALESCE(user_email,'direct') u, tool, COALESCE(model,'?') model, "
+               "COALESCE(backend,'?') backend, COALESCE(profile,'?') profile")
+_MEDIA_SUMS = ("COUNT(*) reqs, SUM(ok) ok_n, SUM(total_s) total_s, SUM(generate_s) generate_s, "
+               "SUM(wait_s) wait_s, MAX(wait_s) wait_s_max, SUM(images) images, "
+               "SUM(megapixels) megapixels, SUM(audio_s) audio_s")
 
 
 def _utc_day(ts: float | None = None) -> str:
@@ -428,7 +479,64 @@ class Store:
                  r["cxs"] or 0, r["cxsq"] or 0, r["cxm"] or 0, r["cxn"] or 0),
             )
         cur = self.conn.execute("DELETE FROM usage WHERE day < ?", (cutoff,))
-        return cur.rowcount
+        n = cur.rowcount
+        for r in self.conn.execute(
+                f"SELECT {_MEDIA_KEYS}, {_MEDIA_SUMS} FROM media_usage WHERE day < ? "
+                "GROUP BY day,u,tool,model,backend,profile", (cutoff,)).fetchall():
+            self.conn.execute(
+                "INSERT INTO media_daily(day,user_email,tool,model,backend,profile,reqs,ok_n,"
+                "total_s,generate_s,wait_s,wait_s_max,images,megapixels,audio_s) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(day,user_email,tool,model,backend,profile) DO UPDATE SET "
+                "reqs=reqs+excluded.reqs, ok_n=ok_n+excluded.ok_n, "
+                "total_s=total_s+excluded.total_s, generate_s=generate_s+excluded.generate_s, "
+                "wait_s=wait_s+excluded.wait_s, wait_s_max=MAX(wait_s_max, excluded.wait_s_max), "
+                "images=images+excluded.images, megapixels=megapixels+excluded.megapixels, "
+                "audio_s=audio_s+excluded.audio_s",
+                (r["day"], r["u"], r["tool"], r["model"], r["backend"], r["profile"],
+                 r["reqs"], r["ok_n"], r["total_s"], r["generate_s"], r["wait_s"],
+                 r["wait_s_max"], r["images"], r["megapixels"], r["audio_s"]))
+        n += self.conn.execute("DELETE FROM media_usage WHERE day < ?", (cutoff,)).rowcount
+        return n
+
+    # -- media ledger ------------------------------------------------------------------
+    def record_media(self, *, user_email: str | None, tool: str, model: str | None,
+                     backend: str | None, device: str | None, profile: str | None,
+                     ok: bool, total_s: float = 0.0, generate_s: float = 0.0,
+                     wait_s: float = 0.0, images: int = 0, megapixels: float = 0.0,
+                     audio_s: float = 0.0, error: str | None = None,
+                     now: float | None = None) -> None:
+        now = time.time() if now is None else now
+        self.conn.execute(
+            "INSERT INTO media_usage(ts,day,user_email,tool,model,backend,device,profile,ok,"
+            "total_s,generate_s,wait_s,images,megapixels,audio_s,error) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (now, _utc_day(now), user_email or "direct", tool, model, backend, device, profile,
+             int(ok), total_s, generate_s, wait_s, images, megapixels, audio_s,
+             (error or None) and error[:300]))
+
+    def media_rows(self, start_day: str | None = None, end_day: str | None = None) -> list[dict]:
+        """Day-grain media rows over raw `media_usage` + folded `media_daily` (the
+        usage_rows() pattern)."""
+        w, args = [], []
+        if start_day:
+            w.append("day >= ?"); args.append(start_day)
+        if end_day:
+            w.append("day <= ?"); args.append(end_day)
+        where = (" WHERE " + " AND ".join(w)) if w else ""
+        raw = self.conn.execute(
+            f"SELECT {_MEDIA_KEYS}, {_MEDIA_SUMS} FROM media_usage{where} "
+            "GROUP BY day,u,tool,model,backend,profile", args).fetchall()
+        folded = self.conn.execute(
+            "SELECT day, user_email u, tool, model, backend, profile, reqs, ok_n, total_s, "
+            f"generate_s, wait_s, wait_s_max, images, megapixels, audio_s FROM media_daily{where}",
+            args).fetchall()
+        out = []
+        for r in list(raw) + list(folded):
+            d = dict(r)
+            d["user_email"] = d.pop("u")
+            out.append(d)
+        return out
 
     def usage_rows(self, start_day: str | None = None, end_day: str | None = None) -> list[dict]:
         """Unified view over raw `usage` + folded `usage_daily`, as day-grain rows."""

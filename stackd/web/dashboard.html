@@ -476,6 +476,13 @@
     </div>
 
     <div class="card" style="margin-bottom:16px;">
+      <div class="row"><h2 style="margin:0;">Image &amp; music generation</h2>
+        <span class="muted" style="font-size:.76rem;">wait = image-tier swaps / cold starts before the model ran</span></div>
+      <div class="statrow" id="mediaStats" style="margin-top:14px;"></div>
+      <div class="tblwrap" id="mediaTable" style="margin-top:12px;"></div>
+    </div>
+
+    <div class="card" style="margin-bottom:16px;">
       <div class="row"><h2 style="margin:0;">Comparison tiers</h2>
         <span class="muted" id="usgPricing" style="font-size:.76rem;"></span>
         <div class="spacer"></div>
@@ -3116,10 +3123,52 @@ async function loadUsage() {
   if (pay) { box.append(stat(fmtUsd(pay.gross), `would cost · ${pay.label}`)); box.append(stat(fmtUsd(pay.net), "net of energy")); }
   if (sv.energy) box.append(stat(fmtUsd(sv.energy.cost), `energy · ${(sv.energy.kwh||0).toFixed(1)} kWh @ $${sv.energy.price_per_kwh}`));
   renderTierCards(sv);
+  try { renderMedia(await api("/media" + (qs.toString() ? "?" + qs : ""))); }
+  catch (e) { toast("media: " + e.message, true); }
   if (h && h.days) renderHistoryCharts(h);
   renderExplorer();
   renderXpChart();
   markPreset();
+}
+function renderMedia(m) {
+  const tot = m.totals || {}, box = $("#mediaStats"), tbl = $("#mediaTable");
+  box.innerHTML = ""; tbl.innerHTML = "";
+  if (!tot.reqs) { box.append(el("span", "muted", "no image or music generations in this range")); return; }
+  const secs = v => v >= 90 ? rnd1(v / 60) + " min" : rnd1(v) + " s";
+  box.append(stat(fmtNum(tot.reqs), "media calls"));
+  if (tot.images) box.append(stat(fmtNum(tot.images), `images · ${rnd1(tot.megapixels)} MP`));
+  if (tot.audio_s) box.append(stat(secs(tot.audio_s), "music generated"));
+  box.append(stat(secs(tot.generate_s / Math.max(1, tot.reqs)), "avg run"));
+  box.append(stat(secs(tot.wait_s / Math.max(1, tot.reqs)), `avg wait · max ${secs(tot.wait_s_max || 0)}`));
+  if (tot.reqs - tot.ok_n) box.append(stat(fmtNum(tot.reqs - tot.ok_n), "failed"));
+  // tool x model x backend (users folded) — the per-pipeline view
+  const g = new Map();
+  for (const r of m.rows || []) {
+    const k = [r.tool, r.model, r.backend].join("\u0000");
+    const a = g.get(k) || { tool: r.tool, model: r.model, backend: r.backend, users: new Set(),
+                             reqs: 0, ok_n: 0, generate_s: 0, wait_s: 0, wait_s_max: 0, images: 0, audio_s: 0 };
+    for (const f of ["reqs", "ok_n", "generate_s", "wait_s", "images", "audio_s"]) a[f] += r[f] || 0;
+    a.wait_s_max = Math.max(a.wait_s_max, r.wait_s_max || 0);
+    a.users.add(r.user_email);
+    g.set(k, a);
+  }
+  const t = el("table");
+  t.innerHTML = "<thead><tr><th>tool</th><th>model</th><th>device</th><th class=num>calls</th>"
+    + "<th class=num>ok</th><th class=num>output</th><th class=num>avg run</th>"
+    + "<th class=num>avg / max wait</th><th class=num>users</th></tr></thead>";
+  const tb = el("tbody");
+  for (const a of [...g.values()].sort((x, y) => y.reqs - x.reqs)) {
+    const tr = el("tr");
+    const out = a.audio_s ? secs(a.audio_s) + " audio" : a.images ? fmtNum(a.images) + " img" : "–";
+    for (const [v, c] of [[a.tool], [a.model], [a.backend], [fmtNum(a.reqs), "num"],
+                          [Math.round(100 * a.ok_n / a.reqs) + "%", "num"], [out, "num"],
+                          [secs(a.generate_s / a.reqs), "num"],
+                          [secs(a.wait_s / a.reqs) + " / " + secs(a.wait_s_max), "num"],
+                          [fmtNum(a.users.size), "num"]])
+      tr.append(el("td", c || null, v));
+    tb.append(tr);
+  }
+  t.append(tb); tbl.append(t);
 }
 function markPreset() {
   const f = $("#usgFrom").value, to = $("#usgTo").value;

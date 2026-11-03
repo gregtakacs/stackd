@@ -450,6 +450,43 @@ def main() -> int:
     got, n = await_base([warm] * 5, timeout_s=0)
     check("still warming at the deadline -> gives up with the note", got[0] is None and "warming" in got[1])
 
+    # -- media ledger rows from tool results --
+    song_out = json.dumps({"status": "success", "detail": "273s song", "length_s": 273.4,
+                           "timing": {"total_s": 131.26, "generate_s": 36.82},
+                           "audio": [{"url": "/api/v1/files/A/content"}]})
+    row = tools._media_row(song_out, 999.0, "u@x.com")
+    check("media row: song -> audio seconds, wait = total - generate",
+          row["ok"] and row["audio_s"] == 273.4 and row["wait_s"] == 94.44 and row["total_s"] == 131.26)
+    img_out = json.dumps({"status": "success", "detail": "1312x1312, seed 1.",
+                          "timing": {"total_s": 40.0, "generate_s": 30.0, "rewrite_s": 6.0},
+                          "images": [{"url": "a"}, {"url": "b"}]})
+    row = tools._media_row(img_out, 0, None)
+    check("media row: images -> count + megapixels, rewrite time is not wait",
+          row["images"] == 2 and row["megapixels"] == 3.443 and row["wait_s"] == 4.0)
+    row = tools._media_row(json.dumps({"error": "no image engine resident"}), 1.5, None)
+    check("media row: error result -> ok=False, wall clock, the message",
+          not row["ok"] and row["total_s"] == 1.5 and row["error"] == "no image engine resident")
+
+    seen = []
+    orig_rec = tools.runtime.record_media
+    tools.runtime.record_media = lambda **kw: seen.append(kw)
+    try:
+        @tools._ledgered("compose_music")
+        async def fake_tool(ctx, style: str = ""):
+            return song_out
+        got = asyncio.run(fake_tool(None, style="x"))
+    finally:
+        tools.runtime.record_media = orig_rec
+    check("_ledgered returns the tool's result and records one row",
+          got == song_out and len(seen) == 1 and seen[0]["tool"] == "compose_music"
+          and seen[0]["audio_s"] == 273.4)
+    tools.runtime.record_media = lambda **kw: (_ for _ in ()).throw(RuntimeError("db gone"))
+    try:
+        got = asyncio.run(fake_tool(None))
+    finally:
+        tools.runtime.record_media = orig_rec
+    check("a failing ledger write never breaks the tool call", got == song_out)
+
     # -- melody-plan search (the 2026-11-03 one-note / 30-minute plan) --
     check("sung skeleton: tags normalized, unsung dropped, repeats collapsed",
           tools._sung_sections(["intro", "Verse 1", "Verse 2", "Pre Chorus", "Final Chorus",

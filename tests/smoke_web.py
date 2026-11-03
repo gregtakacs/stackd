@@ -85,6 +85,9 @@ def main() -> int:
                        served_profile="chat",
                        prompt_tokens=2000, completion_tokens=800, cached_tokens=200)
     store.add_energy(day, gpu_wh=120, host_wh=90)
+    store.record_media(user_email="u@x.com", tool="compose_music", model="yue2", backend="cuda",
+                       device="cuda0", profile="chat", ok=True, total_s=60.0, generate_s=40.0,
+                       wait_s=20.0, audio_s=150.0)
 
     mgr = Manager(CFG, tmp / "state.json", FakeRunner(ready_after=1))
     mgr.use("chat", now=0)
@@ -370,6 +373,13 @@ def main() -> int:
         check("/history honours an explicit from/to range",
               code == 200 and j["days"] == ["2026-08-20", "2026-08-21", "2026-08-22",
                                             "2026-08-23", "2026-08-24"])
+
+        # --- /media (image + music generation ledger) -----------------
+        code, j = _json_req(f"{base}/media", token="admin")
+        check("/media -> 200 with rows + totals", code == 200 and j["totals"]["reqs"] == 1
+              and j["totals"]["audio_s"] == 150.0 and j["rows"][0]["model"] == "yue2")
+        code, j = _json_req(f"{base}/media", token=None)
+        check("/media requires auth", code == 401)
 
         # --- /savings/facts (cost explorer feed) ------------------------
         code, j = _json_req(f"{base}/savings/facts", token="admin")
