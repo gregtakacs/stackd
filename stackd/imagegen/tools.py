@@ -85,6 +85,24 @@ def _comfy_base() -> tuple[str | None, str]:
     serveable (e.g. the image engine is still warming after a profile switch)."""
     return runtime.comfyui_endpoint()
 
+
+# A swap onto another backend starts a different ComfyUI container (e.g. yue2 moving
+# from comfyui-rocm onto comfyui-cuda under chat-code-music): ~60-90s cold before it
+# answers. A same-container swap is instant, which is why nothing waited before --
+# the first cross-backend compose_music (2026-11-03) failed with "not serveable
+# (warming)" 34s in. Wait only while the engine is warming; any other "no engine"
+# answer returns at once.
+_COMFY_WARM_WAIT_S = 300
+
+
+async def _await_comfy_base(timeout_s: float = _COMFY_WARM_WAIT_S) -> tuple[str | None, str]:
+    deadline = time.monotonic() + timeout_s
+    while True:
+        base, note = _comfy_base()
+        if base or "not serveable" not in note or time.monotonic() >= deadline:
+            return base, note
+        await anyio.sleep(2)
+
 # The LLM-facing text for each @mcp.tool() below (prompting guidance: routing rules,
 # parameter tuning, failure modes confirmed in practice, etc.) lives in tool_docs/*.md
 # instead of each function's own docstring -- these are prompt content, not code
@@ -933,7 +951,7 @@ async def generate_image(
     workflows.set_node(graph, nodes.get("height"), "height", h)
     workflows.set_node(graph, nodes.get("seed"), "seed", seed)
 
-    comfy_base, base_note = _comfy_base()
+    comfy_base, base_note = await _await_comfy_base()
     if not comfy_base:
         return json.dumps({"error": base_note})
 
@@ -1279,7 +1297,7 @@ async def edit_image(
         )
         rewrite_s = time.monotonic() - _rw0
 
-    comfy_base, base_note = _comfy_base()
+    comfy_base, base_note = await _await_comfy_base()
     if not comfy_base:
         return json.dumps({"error": base_note})
 
@@ -1468,7 +1486,7 @@ async def stylize_image(
         logger.exception("stylize_image: failed to fetch source image")
         return json.dumps({"error": f"Could not fetch source image: {e!r}"})
 
-    comfy_base, base_note = _comfy_base()
+    comfy_base, base_note = await _await_comfy_base()
     if not comfy_base:
         return json.dumps({"error": base_note})
 
@@ -1767,7 +1785,7 @@ async def _render_song(graph: dict, nodes: dict, *, style: str, lyrics: str, see
     if cfg_scale >= 0:
         workflows.set_node(graph, music, "cfg_scale", float(cfg_scale))
 
-    comfy_base, base_note = _comfy_base()
+    comfy_base, base_note = await _await_comfy_base()
     if not comfy_base:
         return json.dumps({"error": base_note})
     _g0 = time.monotonic()

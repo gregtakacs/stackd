@@ -144,10 +144,21 @@ prefer:
   #     anon peak 6.6G.
   #   cuda0 (beside the 27B chat model, image-gen profile): 33-39s wall (~6x
   #     realtime), VRAM peak +6.5G over the 27B baseline.
-  # footprint/host_ram = peak + ~3-4G cushion.
+  # RE-MEASURED 2026-11-03 on cuda0 beside qwen3.8-flash-next-music (chat-code-music,
+  # 50ms nvidia-smi sampling -- the 0.5s sampling above under-read the VAE spike):
+  #   512-sample VAE tiles: +8.5G total peak, of which the decode spike alone was
+  #     +6.8G for ~1.6s (left 0.6G free on the card). 384/64 tiles: spike +0.7G,
+  #     audio 51.9 dB SNR vs the 512 decode (inaudible) -> graphs now use 384/64.
+  #   With 384 tiles the peak is the generate stage: +4.4G over the LLM baseline.
+  #   A 304s song: 73s wall including the melody plan (~4x realtime).
+  # cuda footprint 5 = that 4.4G peak + 0.6G; the tier's margin_gib (4) is the
+  # cushion here, not a second 3-4G on top -- double-padding would cost
+  # qwen3.8-flash-next-music ~260k KV tokens for no measured risk. vulkan figures
+  # are still the 512-tile measurement (conservative now).
+  # Elsewhere: footprint/host_ram = peak + ~3-4G cushion.
   - active_model: yue2
     capabilities: [compose, cover]
     backends: [cuda, vulkan]
     explicit_only: true
-    footprint_gib: { cuda: 10, vulkan: 10 }
+    footprint_gib: { cuda: 5, vulkan: 10 }
     host_ram_gib: { vulkan: 10 }

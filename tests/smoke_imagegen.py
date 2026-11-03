@@ -428,6 +428,28 @@ def main() -> int:
     check("reply instructions carry the lyrics to write out",
           cut["message"].rstrip().endswith("[Verse]\nLa la la") and "full lyrics" in cut["message"])
 
+    # -- a cross-backend swap waits for the new ComfyUI instead of failing "warming" --
+    def await_base(answers, timeout_s=300):
+        it = iter(answers)
+        calls = []
+        orig_base, orig_sleep = tools._comfy_base, tools.anyio.sleep
+        tools._comfy_base = lambda: (calls.append(1), next(it))[1]
+
+        async def no_sleep(_s):
+            return None
+        tools.anyio.sleep = no_sleep
+        try:
+            return asyncio.run(tools._await_comfy_base(timeout_s)), len(calls)
+        finally:
+            tools._comfy_base, tools.anyio.sleep = orig_base, orig_sleep
+    warm = (None, "image engine image:yue2 not serveable (warming)")
+    got, n = await_base([warm, warm, ("http://comfyui-cuda:8188", "")])
+    check("warming engine -> waits until it is serveable", got[0] == "http://comfyui-cuda:8188" and n == 3)
+    got, n = await_base([(None, "no image engine resident — no device headroom under profile 'x'")])
+    check("no headroom -> returns at once", got[0] is None and n == 1)
+    got, n = await_base([warm] * 5, timeout_s=0)
+    check("still warming at the deadline -> gives up with the note", got[0] is None and "warming" in got[1])
+
     # -- melody-plan search (the 2026-11-03 one-note / 30-minute plan) --
     check("sung skeleton: tags normalized, unsung dropped, repeats collapsed",
           tools._sung_sections(["intro", "Verse 1", "Verse 2", "Pre Chorus", "Final Chorus",

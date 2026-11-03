@@ -103,7 +103,7 @@
         "15",
         2
       ],
-      "tile_size": 512,
+      "tile_size": 384,
       "overlap": 64
     }
   },
