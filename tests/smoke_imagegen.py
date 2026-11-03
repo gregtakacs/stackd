@@ -433,6 +433,9 @@ def main() -> int:
           tools._sung_sections(["intro", "Verse 1", "Verse 2", "Pre Chorus", "Final Chorus",
                                 "Guitar Solo", "prechorus", "bridge", "outro", "silence"])
           == ["verse", "pre-chorus", "chorus", "pre-chorus", "bridge"])
+    check("rap = a verse slot, spoken = unsung (as the planner lays them out)",
+          tools._sung_sections(["Verse", "Chorus", "Rap", "Chorus", "Spoken", "Chorus"])
+          == ["verse", "chorus", "verse", "chorus"])
     lyr = "[Verse]\na\n\n[Pre-Chorus]\nb\n\n[Chorus]\nc\n\n[Verse]\nd\n\n[Chorus]\nc\n\n[Outro]\ne\n"
     check("lyric sections", tools._lyric_sections(lyr) == ["verse", "pre-chorus", "chorus", "verse", "chorus"])
 

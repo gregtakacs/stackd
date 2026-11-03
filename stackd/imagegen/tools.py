@@ -1636,11 +1636,15 @@ _SUNG_SECTIONS = ("verse", "pre-chorus", "chorus", "bridge")
 
 def _sung_sections(names: list[str]) -> list[str]:
     """Section names -> the sung skeleton: normalized ("[Verse 2]" / "Pre Chorus" ->
-    verse / pre-chorus), intros/outros/solos/interludes dropped, repeats collapsed."""
+    verse / pre-chorus), intros/outros/solos/interludes/spoken parts dropped, repeats
+    collapsed."""
     out = []
     for name in names:
         n = name.lower()
-        n = ("pre-chorus" if "pre" in n and "chorus" in n
+        # The planner gives a [Rap] its own verse slot and a [Spoken] part an
+        # instrumental interlude (2026-11-03 probes): rap counts as a verse, spoken as
+        # unsung.
+        n = ("pre-chorus" if "pre" in n and "chorus" in n else "verse" if "rap" in n
              else next((s for s in _SUNG_SECTIONS if s in n), None))
         if n and (not out or out[-1] != n):
             out.append(n)
