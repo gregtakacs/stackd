@@ -7,8 +7,8 @@ Parameters:
 - lyrics: the full lyric sheet, YOU write it unless the user supplied one. Mark sections on their own line with [Verse], [Pre-Chorus], [Chorus], [Bridge], [Outro]; blank line between sections. Write SONG lyrics -- the melody planner reads the sung sections as a shape:
   - every line 6-10 syllables, never more than 12; split a longer thought over two lines. Count the syllables, do not guess.
   - lines in a section roughly the same length (within 2-3 syllables of each other); paired lines rhyme.
-  - 4 lines per verse and chorus, 2 per pre-chorus, 2-4 per bridge. No lists of facts, no full sentences of explanation -- one image or idea per line.
-  - repeat the chorus verbatim every time. A ~3 minute song is roughly verse / chorus / verse / chorus / bridge / chorus (add pre-choruses only if the user wants them).
+  - 4 lines per verse and chorus, 2-4 per bridge (2 per pre-chorus, if the user wants one). No lists of facts, no full sentences of explanation -- one image or idea per line.
+  - repeat the chorus verbatim every time. A ~3 minute song is roughly verse / chorus / verse / chorus / bridge / chorus -- NO [Pre-Chorus] unless the user asks for one: the melody planner rarely plans pre-choruses (kept in ~1 of 9 tries), so their lines get squeezed into other sections.
   - for an instrumental, still pass short section tags with no words under them.
   - talking over the music is allowed when the user wants it: tag it [Spoken] and write it as plain speech (2-4 short sentences), and add "with a spoken-word interlude over the beat" to the style -- the planner leaves that slot instrumental for the voice. For rhythmic talking use [Rap] with rhyming lines; it is planned like a verse. The line-length rules above are for SUNG sections only.
 - duration_s: ONLY used with plan_melody=false (10-600, default 180) -- an upper bound there, and long lyrics with a short duration get cut. With a score (plan_melody=true or reuse_score=true) the song always runs the score's full length; leave duration_s alone. To make a song shorter or longer, write fewer or more lyrics/sections.
