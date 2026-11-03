@@ -868,6 +868,35 @@ def t_audio_tier_beside_image() -> None:
     check("a profile change tears the audio slot down", m.state.audio is None)
 
 
+def t_audio_tier_warm_preloads() -> None:
+    """`audio: warm` loads the music model as soon as the profile is up (no request
+    needed), warms it exactly once, and refills it after a profile round trip."""
+    from unittest import mock
+    from stackd.reconciler import Reconciler
+    fired = []
+    with mock.patch.object(Reconciler, "_fire_warm_generation",
+                           staticmethod(lambda model, endpoint, verb="generate": fired.append((model, verb)))):
+        m = Manager(_audio_cfg("warm"), pathlib.Path(tempfile.mkdtemp()) / "state.json",
+                    FakeRunner(ready_after=1))
+        m.use("chat", now=0)
+        now = ready_all(m)
+        for i in range(4):
+            now += 5
+            m.tick(now=now)
+        import time as _t
+        _t.sleep(0.2)   # the warm-fire runs on a thread
+        check("audio: warm -> yue2 loaded without a request",
+              m.state.audio is not None and m.state.audio.active_model == "yue2"
+              and m.state.audio.pinned_by == "auto")
+        check("both slots resident", m.state.image is not None)
+        check("audio warm-up fired once with the compose graph",
+              fired.count(("yue2", "compose")) == 1)
+        m.use("coding", now=now + 100)
+        m.use("chat", now=now + 200)
+        ready_all(m, now_start=now + 200)
+        check("refilled after a profile round trip", m.state.audio is not None)
+
+
 def t_audio_tier_off_uses_image_tier() -> None:
     """`audio: none` (the default) keeps the old path: music swaps into the image
     tier's container, and no audio container ever starts."""
@@ -1209,6 +1238,7 @@ def main() -> int:
         t_image_explicit_only,
         t_image_stale_slot_caps,
         t_audio_tier_beside_image,
+        t_audio_tier_warm_preloads,
         t_audio_tier_off_uses_image_tier,
         t_audio_tier_headroom_counts_the_image_slot,
         t_image_teardown_credit_and_refusals,

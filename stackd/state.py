@@ -118,6 +118,7 @@ class RuntimeState:
     # profile, since the resident model in the key changes — see
     # Reconciler._maybe_warm_image.
     warmed_for: str | None = None
+    audio_warmed_for: str | None = None   # the same, for the `audio: warm` slot
     # profile name -> DeadMark, for a profile evicted after its engine gave up.
     dead: dict[str, DeadMark] = field(default_factory=dict)
     # the nvidia driver package version a human has already acknowledged on the

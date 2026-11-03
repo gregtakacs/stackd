@@ -195,7 +195,9 @@ class ProfileSpec:
     # Audio tier (config/media/audio.yaml): `none` (default) = music runs in the
     # image tier's container, swapping its pipeline (cheap when both share the
     # iGPU's ComfyUI); `cold` = music gets its own ComfyUI, loaded on the first
-    # music request and kept beside the image slot. `warm` behaves as `cold`.
+    # music request and kept beside the image slot; `warm` = that ComfyUI is
+    # loaded as soon as the profile is up, plus one short throwaway render so the
+    # checkpoint is in memory before the first real song.
     audio: ImageSupport = ImageSupport.none
 
 

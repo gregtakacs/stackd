@@ -716,6 +716,18 @@ class Reconciler:
         if kind == "audio":
             if slot is not None and not healthy:
                 setattr(state, kind, None)
+                slot = None
+            if policy != ImageSupport.warm or slot is not None or not tier.prefer:
+                return
+            # `audio: warm` fills the empty slot with the tier's first model. A miss
+            # (no headroom yet, e.g. the LLM still loading) just retries next tick.
+            pick = self._pick_image(tier, self._tier_headroom(state, profile, tier),
+                                    host_ram_avail=self._real_host_ram_avail(tier, profile),
+                                    want_model=tier.prefer[0].active_model)
+            if pick is not None:
+                dev, backend, ld = pick
+                self._stagger_device(dev, avoid_devices)
+                self._spawn_image(state, tier, dev, backend, ld, now)
             return
 
         hr = self._tier_headroom(state, profile, tier)
@@ -785,6 +797,7 @@ class Reconciler:
         now = time.time() if now is None else now
         self.events.clear()
         state.warmed_for = None   # every entry re-arms the `image: warm` trigger
+        state.audio_warmed_for = None
         pl = self._solve(target)
         want = pl.placed
         target_models = set(self.cfg.profiles[target].models)
@@ -976,9 +989,9 @@ class Reconciler:
         return list(self.events)
 
     def _maybe_warm_image(self, state: RuntimeState, now: float) -> None:
-        """`image: warm` profiles force one throwaway generation as soon as both
-        this profile's own LLM stacks and the image tier are ready, so the first
-        real request doesn't pay ComfyUI's model-load latency. Fire-and-forget:
+        """`image: warm` / `audio: warm` profiles force one throwaway generation as
+        soon as both this profile's own LLM stacks and the slot are ready, so the
+        first real request doesn't pay ComfyUI's model-load latency. Fire-and-forget:
         the generation itself runs in ComfyUI's own queue, so we only need the
         submit call (a fast POST) off the tick thread, not the full render.
 
@@ -988,29 +1001,34 @@ class Reconciler:
         warmed the same way a fresh profile activation does, instead of only
         the very first image model a profile ever lands on."""
         pr = self.cfg.profiles.get(state.active_profile)
-        if pr is None or pr.image != ImageSupport.warm:
+        if pr is None:
             return
-        slot = state.image
-        if slot is None or slot.state != EngineState.ready or not slot.endpoint:
-            return
-        # The warm-up graph is the model's `generate` graph; a compose-only slot
-        # (yue2) has none, and its ~3s checkpoint load isn't worth one anyway.
-        if "generate" not in (slot.capabilities or []):
-            return
-        warm_key = f"{state.active_profile}:{slot.active_model}"
-        if state.warmed_for == warm_key:
-            return
-        if not all(state.stacks.get(n) and state.stacks[n].state == EngineState.ready
-                   for n in pr.models):
-            return
-        state.warmed_for = warm_key   # arm before firing — never resubmit mid-flight
-        model, endpoint = slot.active_model, slot.endpoint
-        self._emit(f"image:{model}", "warm-fire", f"forcing a generation under {state.active_profile}")
-        threading.Thread(target=self._fire_warm_generation, args=(model, endpoint),
-                         daemon=True).start()
+        # (kind, policy, the verb whose graph warms it, bookkeeping attribute)
+        for kind, policy, verb, key_attr in (("image", pr.image, "generate", "warmed_for"),
+                                             ("audio", pr.audio, "compose", "audio_warmed_for")):
+            if policy != ImageSupport.warm:
+                continue
+            slot = getattr(state, kind)
+            if slot is None or slot.state != EngineState.ready or not slot.endpoint:
+                continue
+            # The warm-up graph is the model's `generate` (image) / `compose` (audio)
+            # graph; a slot without that verb (yue2 in the image slot) is skipped.
+            if verb not in (slot.capabilities or []):
+                continue
+            warm_key = f"{state.active_profile}:{slot.active_model}"
+            if getattr(state, key_attr) == warm_key:
+                continue
+            if not all(state.stacks.get(n) and state.stacks[n].state == EngineState.ready
+                       for n in pr.models):
+                continue
+            setattr(state, key_attr, warm_key)   # arm before firing — never resubmit mid-flight
+            model, endpoint = slot.active_model, slot.endpoint
+            self._emit(f"{kind}:{model}", "warm-fire", f"forcing a generation under {state.active_profile}")
+            threading.Thread(target=self._fire_warm_generation, args=(model, endpoint, verb),
+                             daemon=True).start()
 
     @staticmethod
-    def _fire_warm_generation(model: str, endpoint: str) -> None:
+    def _fire_warm_generation(model: str, endpoint: str, verb: str = "generate") -> None:
         # Everything -- imports included -- lives inside the try/except: this
         # runs on a daemon thread with nothing watching it, so an unhandled
         # exception here (e.g. the optional stackd[imagegen] extra isn't
@@ -1025,10 +1043,20 @@ class Reconciler:
             from stackd.imagegen.comfyui_client import submit_workflow
 
             async def _go() -> None:
-                _name, graph, nodes, _entry = workflows.load_model("generate", model)
-                nid = nodes.get("positive") or nodes.get("prompt")
-                if nid:
-                    workflows.set_node(graph, nid, "positive", DEFAULT_PROMPT)
+                _name, graph, nodes, _entry = workflows.load_model(verb, model)
+                if verb == "compose":
+                    # a few seconds of score-less music: loads the checkpoint, VAE
+                    # and text encoder without spending a melody plan
+                    from stackd.imagegen.tools import _upstream
+                    music = nodes["music"]
+                    for k, v in (("style", "pop"), ("lyrics", "[Verse]\nla la la\n"),
+                                 ("abc", ""), ("max_duration", 4.0)):
+                        workflows.set_node(graph, music, k, v)
+                    graph = {k: graph[k] for k in _upstream(graph, {nodes["save"]})}
+                else:
+                    nid = nodes.get("positive") or nodes.get("prompt")
+                    if nid:
+                        workflows.set_node(graph, nid, "positive", DEFAULT_PROMPT)
                 await submit_workflow(graph, endpoint)
 
             asyncio.run(_go())
