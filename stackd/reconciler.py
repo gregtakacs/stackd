@@ -19,7 +19,7 @@ from stackd.engines.base import EngineState
 from stackd.engines.registry import adapter_for
 from stackd.runner import LaunchContext, Mount, Runner
 from stackd.solver import Placed, headroom, host_ram_headroom, solve
-from stackd.state import ImageSlot, RuntimeState, StackRuntime
+from stackd.state import MEDIA_SLOTS, ImageSlot, RuntimeState, StackRuntime
 
 _UNHEALTHY_LIMIT = 3
 
@@ -175,13 +175,16 @@ class Reconciler:
         orphaned holding VRAM after the daemon exits. Best-effort: one engine that
         won't die doesn't abort the rest. Returns the names it removed."""
         removed: list[str] = []
-        if state.image is not None:
-            removed.append(f"image:{state.image.active_model}")
+        for kind in MEDIA_SLOTS:
+            slot = getattr(state, kind)
+            if slot is None:
+                continue
+            removed.append(f"{kind}:{slot.active_model}")
             try:
-                self._teardown_image(state, now, why=why)
+                self._teardown_image(state, now, why=why, kind=kind)
             except Exception as e:  # noqa: BLE001
-                self._emit("image", "teardown-error", repr(e))
-                state.image = None
+                self._emit(kind, "teardown-error", repr(e))
+                setattr(state, kind, None)
         for n in list(state.stacks):
             try:
                 self._stop(state, n, now, remove=True)
@@ -238,6 +241,29 @@ class Reconciler:
             time.sleep(self.same_device_spawn_stagger_s)
 
     # -------------------------------------------------------------- image tier ---
+    # The image and audio tiers share one implementation: every function below
+    # takes the tier (or its kind) and works on that kind's slot in RuntimeState.
+    def _tier_headroom(self, state: RuntimeState, profile: str, tier: MediaTier) -> dict[str, float]:
+        """`headroom()` for one media tier, minus what the OTHER media slots hold:
+        each resident slot's declared footprint on its device, and the whole of any
+        cuda device one of them is on -- two ComfyUIs on one CUDA card would both
+        run dynamic VRAM up to their reserve line and fight over it (measured
+        2026-11-03: one ComfyUI beside the LLM already touches 97.3/97.9 GB)."""
+        hr = headroom(self.cfg, profile, self.catalog, reserve_gib=tier.margin_gib)
+        for kind in MEDIA_SLOTS:
+            other = getattr(state, kind)
+            if kind == tier.kind or other is None or other.state not in (
+                    EngineState.warming, EngineState.ready):
+                continue
+            if self._dev_is_cuda(other.device):
+                hr[other.device] = 0.0
+                continue
+            otier = self.cfg.media.get(kind)
+            ld = self._loadable(otier, other.active_model) if otier else None
+            fp = (ld.footprint_gib or {}).get(other.backend, 0.0) if ld else 0.0
+            hr[other.device] = max(0.0, hr.get(other.device, 0.0) - fp)
+        return hr
+
     def _image_identity(self, tier: MediaTier, backend: str, active_model: str, device: str) -> list:
         return [active_model, backend, device, asdict(tier.containers[backend])]
 
@@ -298,24 +324,24 @@ class Reconciler:
 
     def _teardown_credit(self, state: RuntimeState, tier: MediaTier):
         """(GiB of host RAM freed, backend it is pinned to) if a swap destroys the
-        RESIDENT image model's container first — see `_pick_image` for why a
+        RESIDENT model's container (of this tier) first — see `_pick_image` for why a
         same-backend swap earns nothing. One helper because the ladder verdicts
         must credit exactly what `swap_image()` will."""
-        slot = state.image
+        slot = getattr(state, tier.kind)
         if slot is None or slot.state not in (EngineState.warming, EngineState.ready):
             return 0.0, None
         rl = self._loadable(tier, slot.active_model)
         rh = (rl.host_ram_gib or {}).get(slot.backend) if rl else None
         return (float(rh), slot.backend) if rh else (0.0, None)
 
-    def image_verdicts(self, state: RuntimeState, profile: str) -> dict:
+    def image_verdicts(self, state: RuntimeState, profile: str, kind: str = "image") -> dict:
         """The `prefer:` ladder as a click would experience it RIGHT NOW: same
         headroom, same live host-RAM reading, same teardown credit the scheduler
         uses. Consumed by GET /image; every row carries fits + why-not."""
-        tier = self.cfg.media.get("image")
+        tier = self.cfg.media.get(kind)
         if tier is None:
             return {"headroom_gib": {}, "prefer": []}
-        hr = headroom(self.cfg, profile, self.catalog, reserve_gib=tier.margin_gib)
+        hr = self._tier_headroom(state, profile, tier)
         avail = self._real_host_ram_avail(tier, profile)
         credit, credit_backend = self._teardown_credit(state, tier)
         from stackd.telemetry import host_stats
@@ -423,8 +449,9 @@ class Reconciler:
 
     def swap_image(self, state: RuntimeState, profile: str, *, model: str | None = None,
                    need_caps: list[str] | None = None, now: float, pinned_by: str,
-                   backend: str | None = None, unsafe: bool = False) -> dict:
-        """Programmatic image-tier swap — by explicit `model` or by `need_caps`
+                   backend: str | None = None, unsafe: bool = False,
+                   kind: str = "image") -> dict:
+        """Programmatic media-tier swap (`kind`: image | audio) — by explicit `model` or by `need_caps`
         (the capability the caller needs resident). Auto-downgrades to the next
         capable entry that fits and SAYS so; 409-style {ok:False} when nothing
         capable fits. Never touches an LLM engine.
@@ -440,13 +467,13 @@ class Reconciler:
         idle). The container's mem_limit_gib hard ceiling still applies
         regardless; this bypasses only the soft, estimate-based checks."""
         self.events.clear()
-        tier = self.cfg.media.get("image")
+        tier = self.cfg.media.get(kind)
         if tier is None:
-            return {"ok": False, "error": "no image tier configured (config/media/image.yaml)"}
-        hr = headroom(self.cfg, profile, self.catalog, reserve_gib=tier.margin_gib)
+            return {"ok": False, "error": f"no {kind} tier configured (config/media/{kind}.yaml)"}
+        hr = self._tier_headroom(state, profile, tier)
         hr_r = {k: round(v, 1) for k, v in hr.items()}
         host_ram_avail = self._real_host_ram_avail(tier, profile)
-        slot = state.image
+        slot = getattr(state, kind)
         live = slot is not None and slot.state in (EngineState.warming, EngineState.ready)
         # The slot's verb list is a persisted copy; a config edit that adds a verb to
         # the resident model (yue2 gaining `cover`) must not read as "lacks it" and
@@ -473,7 +500,7 @@ class Reconciler:
                 return {"ok": False, "error": "--unsafe requires both a model and a backend"}
             ld = self._loadable(tier, model)
             if ld is None:
-                return {"ok": False, "error": f"unknown image model {model!r}; "
+                return {"ok": False, "error": f"unknown {kind} model {model!r}; "
                         f"prefer: {[l.active_model for l in tier.prefer]}"}
             if backend not in ld.backends:
                 return {"ok": False, "error": f"{model!r} doesn't support backend {backend!r} "
@@ -486,13 +513,13 @@ class Reconciler:
                 return {"ok": True, "active_model": model, "device": dev, "backend": backend,
                         "warming": slot.state == EngineState.warming,
                         "note": "already resident on the requested backend", "unsafe": True}
-            self._emit(f"image:{ld.active_model}", "unsafe-load",
+            self._emit(f"{kind}:{ld.active_model}", "unsafe-load",
                        f"BYPASSING fit checks (device VRAM + real host RAM) — forced onto {dev}/{backend}")
             was_cuda = slot is not None and self._dev_is_cuda(slot.device)
             if slot is not None:
-                self._teardown_image(state, now, why=f"unsafe swap to {ld.active_model}")
+                self._teardown_image(state, now, why=f"unsafe swap to {ld.active_model}", kind=kind)
             if self.cuda_drain_enabled and was_cuda and self._dev_is_cuda(dev):
-                self._drain_cuda([f"image:{model}"])
+                self._drain_cuda([f"{kind}:{model}"])
             self._spawn_image(state, tier, dev, backend, ld, now, pinned_by=pinned_by)
             return {"ok": True, "active_model": ld.active_model, "device": dev, "backend": backend,
                     "warming": True, "unsafe": True,
@@ -520,7 +547,7 @@ class Reconciler:
         if pick is None and model is not None:
             req = self._loadable(tier, model)
             if req is None:
-                return {"ok": False, "error": f"unknown image model {model!r}; "
+                return {"ok": False, "error": f"unknown {kind} model {model!r}; "
                         f"prefer: {[l.active_model for l in tier.prefer]}"}
             reasons = []
             pick = self._pick_image(tier, hr, need_caps=need_caps or list(req.capabilities),
@@ -531,7 +558,7 @@ class Reconciler:
                 downgraded_from = model
         if pick is None:
             what = (f"a model providing {', '.join(need_caps)}" if need_caps
-                    else f"model {model!r}" if model else "an image model")
+                    else f"model {model!r}" if model else f"an {kind} model")
             return {"ok": False, "headroom": hr_r, "host_ram_headroom_gib": round(host_ram_avail, 1),
                     "error": f"no {what} fits the headroom under profile {profile!r} "
                              f"(device VRAM and/or real host-RAM budget)"
@@ -570,7 +597,7 @@ class Reconciler:
             slot.since = now
             slot.pinned_by = pinned_by
             slot.identity = self._image_identity(tier, backend, ld.active_model, dev)
-            self._emit(f"image:{ld.active_model}", "reload", "pipeline swapped in place (same container)")
+            self._emit(f"{kind}:{ld.active_model}", "reload", "pipeline swapped in place (same container)")
             return {"ok": True, "active_model": ld.active_model, "device": dev, "backend": backend,
                     "warming": slot.state == EngineState.warming, "in_place": True,
                     "downgraded_from": downgraded_from, "note": note, "headroom": hr_r,
@@ -578,9 +605,9 @@ class Reconciler:
 
         was_cuda = slot is not None and self._dev_is_cuda(slot.device)
         if slot is not None:
-            self._teardown_image(state, now, why=f"swap to {ld.active_model}")
+            self._teardown_image(state, now, why=f"swap to {ld.active_model}", kind=kind)
         if self.cuda_drain_enabled and was_cuda and self._dev_is_cuda(dev):
-            self._drain_cuda([f"image:{model or ld.active_model}"])
+            self._drain_cuda([f"{kind}:{model or ld.active_model}"])
         self._spawn_image(state, tier, dev, backend, ld, now, pinned_by=pinned_by)
 
         return {"ok": True, "active_model": ld.active_model, "device": dev, "backend": backend,
@@ -595,20 +622,22 @@ class Reconciler:
         spec = adapter.launch_spec(self._lc(device, 8188))
         handle = self.runner.spawn(spec)
         since = now
-        if state.image is not None and state.image.active_model == ld.active_model:
-            since = state.image.since or now
-        state.image = ImageSlot(
+        prev = getattr(state, tier.kind)
+        if prev is not None and prev.active_model == ld.active_model:
+            since = prev.since or now
+        setattr(state, tier.kind, ImageSlot(
             active_model=ld.active_model, kind=tier.kind, backend=backend, device=device,
             container=spec.name, handle=handle, endpoint=adapter.endpoint(8188),
             health_url=spec.health_url, state=EngineState.warming,
             capabilities=list(ld.capabilities), started_at=now,
             ready_timeout=spec.ready_timeout_s, since=since, pinned_by=pinned_by,
             identity=self._image_identity(tier, backend, ld.active_model, device),
-        )
-        self._emit(f"image:{ld.active_model}", "spawn", f"{spec.name} on {device} ({backend})")
+        ))
+        self._emit(f"{tier.kind}:{ld.active_model}", "spawn", f"{spec.name} on {device} ({backend})")
 
-    def _teardown_image(self, state: RuntimeState, now: float, *, why: str = "") -> None:
-        slot = state.image
+    def _teardown_image(self, state: RuntimeState, now: float, *, why: str = "",
+                        kind: str = "image") -> None:
+        slot = getattr(state, kind)
         if slot is None:
             return
         slot.intentional_stop = True
@@ -618,21 +647,23 @@ class Reconciler:
             try:
                 self.runner.stop(slot.handle or slot.container, remove=True, timeout=grace)
             except Exception as e:  # noqa: BLE001
-                self._emit(f"image:{slot.active_model}", "teardown-error", repr(e))
-        self._emit(f"image:{slot.active_model}", "teardown",
+                self._emit(f"{kind}:{slot.active_model}", "teardown-error", repr(e))
+        self._emit(f"{kind}:{slot.active_model}", "teardown",
                    f"remove ({slot.container}){' — ' + why if why else ''}")
-        state.image = None
+        setattr(state, kind, None)
 
     def _reconcile_image(self, state: RuntimeState, profile: str, *, now: float,
-                         repick: bool, avoid_devices: set[str] = frozenset()) -> None:
-        tier = self.cfg.media.get("image")
+                         repick: bool, avoid_devices: set[str] = frozenset(),
+                         kind: str = "image") -> None:
+        tier = self.cfg.media.get(kind)
         if tier is None:
-            if state.image is not None:
-                self._teardown_image(state, now, why="no image tier configured")
+            if getattr(state, kind) is not None:
+                self._teardown_image(state, now, why=f"no {kind} tier configured", kind=kind)
             return
 
         pr = self.cfg.profiles.get(profile)
-        if pr is not None and pr.image == ImageSupport.none:
+        policy = (pr.audio if kind == "audio" else pr.image) if pr is not None else ImageSupport.cold
+        if policy == ImageSupport.none:
             # A user-pinned slot survives `image: none` -- this policy means
             # "don't AUTO-fill the tier here", not "actively fight a deliberate
             # manual load". Without this carve-out, `bench-image` (the profile
@@ -640,20 +671,26 @@ class Reconciler:
             # ~20s reconciler tick, a few seconds after `stackctl image bench`
             # spawned it for measurement -- a self-inflicted thrash loop
             # discovered 2026-09-04 trying to bench flux2-dev-turbo on it.
-            if state.image is not None and state.image.pinned_by != "user":
-                self._teardown_image(state, now, why=f"image: none under {profile}")
+            cur = getattr(state, kind)
+            if cur is not None and cur.pinned_by != "user":
+                self._teardown_image(state, now, why=f"{kind}: none under {profile}", kind=kind)
             return
 
-        slot = state.image
+        slot = getattr(state, kind)
         healthy = bool(slot and slot.handle
                        and slot.state in (EngineState.warming, EngineState.ready))
         if healthy and not repick:
             want_id = self._image_identity(tier, slot.backend, slot.active_model, slot.device)
             if slot.identity == want_id:
                 return
-            self._emit(f"image:{slot.active_model}", "reload", "image container spec changed")
-            self._teardown_image(state, now)
-            slot, healthy = None, False
+            self._emit(f"{kind}:{slot.active_model}", "reload", f"{kind} container spec changed")
+            self._teardown_image(state, now, kind=kind)
+            if kind == "audio":
+                # on-demand tier: bring the same model back on its new spec
+                setattr(state, kind, slot)
+                slot.handle, healthy = None, False
+            else:
+                slot, healthy = None, False
 
         # A user-pinned slot that lost its container (force-removed for a clean bench
         # baseline, or crashed) must RESTORE the pinned model — not revert to the
@@ -661,22 +698,27 @@ class Reconciler:
         # This runs only while the slot is unhealthy (handle is None), so it self-limits:
         # once the respawned container is warming/ready, `healthy` is True and the
         # early-return above takes over. If the pinned model no longer fits, fall through
-        # to the auto-pick below.
-        if slot is not None and not healthy and slot.pinned_by == "user":
+        # to the auto-pick below. The audio tier is on-demand: it never auto-picks, so
+        # it restores ANY lost slot this way and otherwise stays empty until a request.
+        if slot is not None and not healthy and (slot.pinned_by == "user" or kind == "audio"):
             ld = self._loadable(tier, slot.active_model)
             if ld is not None and slot.backend in ld.backends:
-                pin_hr = headroom(self.cfg, profile, self.catalog, reserve_gib=tier.margin_gib)
+                pin_hr = self._tier_headroom(state, profile, tier)
                 pin_avail = self._real_host_ram_avail(tier, profile)
                 pin_pick = self._pick_image(tier, pin_hr, host_ram_avail=pin_avail,
                                             want_model=slot.active_model, want_backend=slot.backend)
                 if pin_pick is not None:
                     dev, backend, ld = pin_pick
                     self._stagger_device(dev, avoid_devices)
-                    self._spawn_image(state, tier, dev, backend, ld, now, pinned_by="user")
+                    self._spawn_image(state, tier, dev, backend, ld, now, pinned_by=slot.pinned_by)
                     return
             # Pinned model no longer fits (or is gone from the tier) -> fall through.
+        if kind == "audio":
+            if slot is not None and not healthy:
+                setattr(state, kind, None)
+            return
 
-        hr = headroom(self.cfg, profile, self.catalog, reserve_gib=tier.margin_gib)
+        hr = self._tier_headroom(state, profile, tier)
         host_ram_avail = self._real_host_ram_avail(tier, profile)
         pick = self._pick_image(tier, hr, host_ram_avail=host_ram_avail)
         if pick is None:
@@ -695,13 +737,13 @@ class Reconciler:
         self._stagger_device(dev, avoid_devices)
         self._spawn_image(state, tier, dev, backend, ld, now)
 
-    def _image_tick(self, state: RuntimeState, now: float) -> None:
-        slot = state.image
+    def _image_tick(self, state: RuntimeState, now: float, kind: str = "image") -> None:
+        slot = getattr(state, kind)
         if slot is None or slot.handle is None:
             return
         code = self.runner.poll(slot.handle)
         if code is not None and not slot.intentional_stop:
-            self._emit(f"image:{slot.active_model}", "crash", f"exit {code}")
+            self._emit(f"{kind}:{slot.active_model}", "crash", f"exit {code}")
             if slot.pinned_by == "user":
                 # A user-pinned slot whose container died (a force `docker rm -f` for a
                 # clean bench baseline, or a real crash) must RESTORE the pinned model —
@@ -715,7 +757,7 @@ class Reconciler:
                 slot.container = None
                 slot.state = EngineState.down
             else:
-                state.image = None
+                setattr(state, kind, None)
             return
         if not slot.health_url:
             return
@@ -725,18 +767,18 @@ class Reconciler:
                 slot.state = EngineState.ready
                 slot.ready_at = now
                 slot.unhealthy_ticks = 0
-                self._emit(f"image:{slot.active_model}", "ready")
+                self._emit(f"{kind}:{slot.active_model}", "ready")
             elif slot.started_at and now - slot.started_at > (slot.ready_timeout or 300.0):
-                self._emit(f"image:{slot.active_model}", "crash", "warmup timeout")
-                self._teardown_image(state, now)
+                self._emit(f"{kind}:{slot.active_model}", "crash", "warmup timeout")
+                self._teardown_image(state, now, kind=kind)
         elif slot.state == EngineState.ready:
             if healthy:
                 slot.unhealthy_ticks = 0
             else:
                 slot.unhealthy_ticks += 1
                 if slot.unhealthy_ticks >= _UNHEALTHY_LIMIT:
-                    self._emit(f"image:{slot.active_model}", "crash", "health flatlined")
-                    self._teardown_image(state, now)
+                    self._emit(f"{kind}:{slot.active_model}", "crash", "health flatlined")
+                    self._teardown_image(state, now, kind=kind)
 
     # ------------------------------------------------------------------ converge ---
     def converge(self, state: RuntimeState, target: str, *, now: float | None = None) -> None:
@@ -778,11 +820,14 @@ class Reconciler:
         # back first (the new profile may need all of it; we can't know ahead of
         # a real free). It rebuilds from headroom after the LLM stacks are placed.
         llm_changed = bool(spawn or reload_ or teardown)
-        if llm_changed and state.image is not None:
-            if _is_cuda(state.image.device):
-                freed_cuda.append(f"image:{state.image.active_model}")
+        for kind in MEDIA_SLOTS if llm_changed else ():
+            slot = getattr(state, kind)
+            if slot is None:
+                continue
+            if _is_cuda(slot.device):
+                freed_cuda.append(f"{kind}:{slot.active_model}")
                 spawns_on_cuda = True
-            self._teardown_image(state, now, why=f"profile change to {target}")
+            self._teardown_image(state, now, why=f"profile change to {target}", kind=kind)
 
         for n in current:  # re-tag kept
             if n in want and state.stacks[n].identity == want[n].identity:
@@ -835,6 +880,8 @@ class Reconciler:
         # slot is missing/unhealthy or its container spec changed under a reload.
         self._reconcile_image(state, target, now=now, repick=llm_changed,
                               avoid_devices=started_devices)
+        self._reconcile_image(state, target, now=now, repick=False,
+                              avoid_devices=started_devices, kind="audio")
 
         # Backstop: any adopt-model container from *another* profile that is not
         # wanted here — stop it (compose may have auto-started it; e.g. the two
@@ -921,8 +968,9 @@ class Reconciler:
 
         # Image tier: advance its health, then refill the slot if it died or was
         # never placed (e.g. boot_reset dropped it). No repick — sticky.
-        self._image_tick(state, now)
-        self._reconcile_image(state, state.active_profile, now=now, repick=False)
+        for kind in MEDIA_SLOTS:
+            self._image_tick(state, now, kind=kind)
+            self._reconcile_image(state, state.active_profile, now=now, repick=False, kind=kind)
         self._maybe_warm_image(state, now)
 
         return list(self.events)

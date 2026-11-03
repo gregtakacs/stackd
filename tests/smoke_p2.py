@@ -813,6 +813,94 @@ def t_image_stale_slot_caps() -> None:
     check("no bounce for a stale verb list", m.state.image.handle == h0)
 
 
+def _audio_cfg(audio: str = "cold") -> pathlib.Path:
+    """A copy of the repo config whose `chat` profile runs the audio tier."""
+    import shutil
+    d = pathlib.Path(tempfile.mkdtemp()) / "config"
+    shutil.copytree(CFG, d)
+    pf = d / "profiles" / "chat.yaml"
+    pf.write_text(pf.read_text() + f"audio: {audio}\n")
+    return d
+
+
+def t_audio_tier_beside_image() -> None:
+    """Music gets its own ComfyUI (the audio tier) under an `audio: cold` profile,
+    so compose never swaps the image slot -- and the two never share a cuda card."""
+    m = Manager(_audio_cfg(), pathlib.Path(tempfile.mkdtemp()) / "state.json",
+                FakeRunner(ready_after=1))
+    m.use("chat", now=0)
+    ready_all(m)
+    img0 = m.state.image
+    check("audio tier stays empty until asked (on-demand)", m.state.audio is None and img0 is not None)
+    r = m.set_image(need_capability="compose", now=10)
+    check("compose -> the audio tier, its own container",
+          r["ok"] and r["kind"] == "audio" and m.state.audio is not None
+          and m.state.audio.active_model == "yue2"
+          and m.state.audio.container == m.cfg.media["audio"].containers[m.state.audio.backend].name
+          and m.state.audio.container != img0.container)
+    check("the image slot is untouched", m.state.image is img0 and m.state.image.handle == img0.handle)
+    if m.rec._dev_is_cuda(img0.device):
+        check("never a second ComfyUI on the image slot's cuda card", m.state.audio.device != img0.device)
+    now = ready_all(m, now_start=10)
+    check("both slots ready side by side", m.state.audio.state == EngineState.ready
+          and m.state.image.state == EngineState.ready)
+    caps = m.capabilities()
+    check("capabilities list both slots", caps["audio"]["active_model"] == "yue2"
+          and caps["image"]["active_model"] == img0.active_model and len(caps["engines"]) == 2)
+    check("comfyui_target per kind", m.comfyui_target("audio")[0] == caps["audio"]["endpoint"]
+          and m.comfyui_target("image")[0] == caps["image"]["endpoint"])
+    r = m.set_image(need_capability="generate", now=now + 1)
+    check("an image request leaves music loaded", r["ok"] and r["kind"] == "image"
+          and m.state.audio is not None and m.state.audio.active_model == "yue2")
+    r = m.set_image(need_capability="compose", now=now + 2)
+    check("a second compose is already resident (no reload)", r["ok"] and "already" in (r.get("note") or ""))
+    for i in range(5):
+        m.tick(now=now + 10 + i * 5)
+    check("ticks keep the audio slot (no auto teardown)", m.state.audio is not None)
+    st = m.state
+    st.save(m.state_path)
+    from stackd.state import RuntimeState
+    back = RuntimeState.load(m.state_path, "chat")
+    check("audio slot persists through state save/load",
+          back.audio is not None and back.audio.active_model == "yue2"
+          and back.audio.state == EngineState.ready)
+    m.use("coding", now=now + 100)
+    check("a profile change tears the audio slot down", m.state.audio is None)
+
+
+def t_audio_tier_off_uses_image_tier() -> None:
+    """`audio: none` (the default) keeps the old path: music swaps into the image
+    tier's container, and no audio container ever starts."""
+    m = Manager(_audio_cfg("none"), pathlib.Path(tempfile.mkdtemp()) / "state.json",
+                FakeRunner(ready_after=1))
+    m.use("chat", now=0)
+    ready_all(m)
+    r = m.set_image(need_capability="compose", now=10)
+    check("audio: none -> compose served by the image tier",
+          r["ok"] and r["kind"] == "image" and m.state.audio is None
+          and m.state.image.active_model == "yue2")
+
+
+def t_audio_tier_headroom_counts_the_image_slot() -> None:
+    """A vulkan image slot's footprint comes off the audio tier's headroom on that
+    device; a cuda image slot blocks its whole card for the other tier."""
+    m = Manager(_audio_cfg(), pathlib.Path(tempfile.mkdtemp()) / "state.json",
+                FakeRunner(ready_after=1))
+    m.use("chat", now=0)
+    ready_all(m)
+    from stackd.solver import headroom
+    at = m.cfg.media["audio"]
+    raw = headroom(m.cfg, "chat", m.catalog, reserve_gib=at.margin_gib)
+    hr = m.rec._tier_headroom(m.state, "chat", at)
+    img = m.state.image
+    ld = m.rec._loadable(m.cfg.media["image"], img.active_model)
+    want = 0.0 if m.rec._dev_is_cuda(img.device) else max(0.0, raw[img.device] - ld.footprint_gib[img.backend])
+    check("audio headroom = LLM headroom minus the image slot", abs(hr[img.device] - want) < 1e-6)
+    check("the image tier's own headroom ignores itself",
+          m.rec._tier_headroom(m.state, "chat", m.cfg.media["image"])
+          == headroom(m.cfg, "chat", m.catalog, reserve_gib=m.cfg.media["image"].margin_gib))
+
+
 def t_image_teardown_credit_and_refusals() -> None:
     """Two fixes from the 2026-09-08 flux2-dev-turbo investigation.
 
@@ -1120,6 +1208,9 @@ def main() -> int:
         t_image_host_ram_guard,
         t_image_explicit_only,
         t_image_stale_slot_caps,
+        t_audio_tier_beside_image,
+        t_audio_tier_off_uses_image_tier,
+        t_audio_tier_headroom_counts_the_image_slot,
         t_image_teardown_credit_and_refusals,
         t_image_unsafe_bench_bypass,
         t_ladder_verdicts_match_scheduler,

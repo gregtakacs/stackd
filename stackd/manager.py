@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, field
 
 from stackd.config.loader import load_config
-from stackd.config.models import Config
+from stackd.config.models import Config, ImageSupport
 from stackd.engines.base import EngineState
 from stackd.engines.registry import adapter_for
 from stackd.reconciler import Reconciler
@@ -608,7 +608,7 @@ class Manager:
         codev = any(rt.device == slot.device and rt.state == EngineState.warming
                     for rt in self.state.stacks.values())
         return {
-            "stack": f"image:{slot.active_model}", "kind": slot.kind,
+            "stack": f"{slot.kind}:{slot.active_model}", "kind": slot.kind,
             "active_model": slot.active_model,
             "capabilities": list(slot.capabilities),
             "state": slot.state.value,
@@ -619,12 +619,18 @@ class Manager:
         }
 
     def capabilities(self) -> dict:
-        slot = self.state.image
-        entry = self._slot_entry(slot) if slot is not None else None
-        by_kind = {entry["kind"]: entry} if entry else {}
+        entries = [self._slot_entry(s) for s in (self.state.image, self.state.audio) if s is not None]
+        by_kind = {e["kind"]: e for e in entries}
         return {"active_profile": self.state.active_profile,
-                "engines": [entry] if entry else [],
-                "image": by_kind.get("image"), "video": by_kind.get("video")}
+                "engines": entries,
+                "image": by_kind.get("image"), "audio": by_kind.get("audio"),
+                "video": by_kind.get("video")}
+
+    def _audio_tier_on(self) -> bool:
+        """Music gets its own ComfyUI (the audio tier) under this profile?"""
+        pr = self.cfg.profiles.get(self.state.active_profile)
+        return ("audio" in self.cfg.media and pr is not None
+                and pr.audio != ImageSupport.none)
 
     def image_status(self) -> dict:
         """State of the elastic image tier: what's resident, the free VRAM it has
@@ -666,9 +672,30 @@ class Manager:
         now = time.time() if now is None else now
         caps = [need_capability] if need_capability else None
         pinned = "user" if model else ("capability" if need_capability else "auto")
+        # A verb (or model) the audio tier serves goes to its own ComfyUI when this
+        # profile runs one, so music never swaps the image slot out. If the audio
+        # tier can't place it, fall back to the image tier's in-place swap.
+        atier = self.cfg.media.get("audio")
+        if atier is not None and self._audio_tier_on() and any(
+                (need_capability in l.capabilities) if need_capability else l.active_model == model
+                for l in atier.prefer):
+            res = self.rec.swap_image(self.state, self.state.active_profile,
+                                      model=model, need_caps=caps, now=now, pinned_by=pinned,
+                                      backend=backend, unsafe=unsafe, kind="audio")
+            if res.get("ok"):
+                res["kind"] = "audio"
+                self.state.last_served_at = now
+                self._save()
+                return res
+            fallback = f"audio tier unavailable ({res.get('error')}) — using the image tier"
+        else:
+            fallback = None
         res = self.rec.swap_image(self.state, self.state.active_profile,
                                   model=model, need_caps=caps, now=now, pinned_by=pinned,
                                   backend=backend, unsafe=unsafe)
+        res["kind"] = "image"
+        if fallback and res.get("ok"):
+            res["note"] = "; ".join(x for x in (res.get("note"), fallback) if x)
         if res.get("ok"):
             self.state.last_served_at = now
         self._save()
@@ -685,9 +712,10 @@ class Manager:
             out.append({"stack": name, "owner_profile": rt.owner_profile, "state": d.state.value,
                         "active_model": d.active_model, "served": d.served,
                         "endpoint": rt.endpoint or d.endpoint, "extra": d.extra})
-        slot = self.state.image
-        if slot is not None:
-            out.append({"stack": f"image:{slot.active_model}", "owner_profile": "media:image",
+        for slot in (self.state.image, self.state.audio):
+            if slot is None:
+                continue
+            out.append({"stack": f"{slot.kind}:{slot.active_model}", "owner_profile": f"media:{slot.kind}",
                         "state": slot.state.value, "active_model": slot.active_model,
                         "served": list(slot.capabilities), "endpoint": slot.endpoint,
                         "extra": {"kind": slot.kind, "device": slot.device,
@@ -804,15 +832,17 @@ class Manager:
         # number to compare against the box's RAM. (Runtime placement already
         # honours it: reconciler._pick_image / swap_image guard on it.)
         image_ram_budget = None
-        img = self.state.image
-        if img is not None:
-            tier = self.cfg.media.get("image")
+        budgets = {}
+        for img in (self.state.image, self.state.audio):
+            if img is None:
+                continue
+            tier = self.cfg.media.get(img.kind)
             ld = next((l for l in tier.prefer if l.active_model == img.active_model),
                       None) if tier else None
             gib = ld.host_ram_gib.get(img.backend) if ld else None
             if gib:
                 fp = (ld.footprint_gib or {}).get(img.backend)
-                image_ram_budget = {"model": img.active_model, "backend": img.backend,
+                budgets[img.kind] = {"model": img.active_model, "backend": img.backend,
                                     "device": img.device, "gib": round(gib, 2),
                                     # The GPU part of that allowance. On igpu0 the GPU
                                     # memory IS host RAM (GTT), so host_ram_gib is the
@@ -828,7 +858,8 @@ class Manager:
                     pd["used"] = round(pd["used"] + gib, 2)
                     pd["headroom"] = round(pd["limit"] - pd["used"], 2)
                     pd["ok"] = pd["used"] <= pd["limit"] + 1e-6
-                    pd["breakdown"][f"image:{img.active_model}"] = round(gib, 2)
+                    pd["breakdown"][f"{img.kind}:{img.active_model}"] = round(gib, 2)
+        image_ram_budget = budgets.get("image")
 
         return {
             "active_profile": self.state.active_profile,
@@ -857,18 +888,19 @@ class Manager:
                 for n, rt in self.state.stacks.items()
             },
             "timings": stack_tm,
-            "image": (
-                {"active_model": self.state.image.active_model,
-                 "state": self.state.image.state.value,
-                 "device": self.state.image.device,
-                 "backend": self.state.image.backend,
-                 "container": self.state.image.container,
-                 "pinned_by": self.state.image.pinned_by}
-                if self.state.image is not None else None
-            ),
+            **{kind: (
+                {"active_model": slot.active_model,
+                 "state": slot.state.value,
+                 "device": slot.device,
+                 "backend": slot.backend,
+                 "container": slot.container,
+                 "pinned_by": slot.pinned_by}
+                if slot is not None else None
+            ) for kind, slot in (("image", self.state.image), ("audio", self.state.audio))},
             "missing": [n for n in report.resident if n not in running],
             "pools": pools,
             "image_ram_budget": image_ram_budget,
+            "audio_ram_budget": budgets.get("audio"),
             "devices": [{"device": d.device, "budget": d.budget_gib, "used": d.used_gib,
                          # budget = CONFIGURED ceiling; budget_effective = what the
                          # fit math capped it at (min with the measured GTT window),

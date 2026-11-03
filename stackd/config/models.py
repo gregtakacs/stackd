@@ -192,6 +192,11 @@ class ProfileSpec:
     models: list[str] = field(default_factory=list)
     # Elastic image tier behavior while this profile is active — see ImageSupport.
     image: ImageSupport = ImageSupport.cold
+    # Audio tier (config/media/audio.yaml): `none` (default) = music runs in the
+    # image tier's container, swapping its pipeline (cheap when both share the
+    # iGPU's ComfyUI); `cold` = music gets its own ComfyUI, loaded on the first
+    # music request and kept beside the image slot. `warm` behaves as `cold`.
+    audio: ImageSupport = ImageSupport.none
 
 
 @dataclass

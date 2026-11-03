@@ -79,12 +79,12 @@ logger = logging.getLogger("stackd.imagegen")
 mcp = MCPServer("comfyui-flux2-klein")
 
 
-def _comfy_base() -> tuple[str | None, str]:
+def _comfy_base(kind: str = "image") -> tuple[str | None, str]:
     """(endpoint, error_note) for the ComfyUI the active profile has resident right now
     -- comfyui-cuda in 'chat', comfyui-rocm in 'coding' -- via stackd's
     Manager.comfyui_target(). endpoint is None (with a human note) when nothing is
     serveable (e.g. the image engine is still warming after a profile switch)."""
-    return runtime.comfyui_endpoint()
+    return runtime.comfyui_endpoint(kind)
 
 
 # A swap onto another backend starts a different ComfyUI container (e.g. yue2 moving
@@ -96,10 +96,11 @@ def _comfy_base() -> tuple[str | None, str]:
 _COMFY_WARM_WAIT_S = 300
 
 
-async def _await_comfy_base(timeout_s: float = _COMFY_WARM_WAIT_S) -> tuple[str | None, str]:
+async def _await_comfy_base(timeout_s: float = _COMFY_WARM_WAIT_S,
+                            kind: str = "image") -> tuple[str | None, str]:
     deadline = time.monotonic() + timeout_s
     while True:
-        base, note = _comfy_base()
+        base, note = _comfy_base(kind)
         if base or "not serveable" not in note or time.monotonic() >= deadline:
             return base, note
         await anyio.sleep(2)
@@ -196,15 +197,24 @@ async def _select_pipeline(image_model: str) -> tuple[str | None, str | None]:
 
 
 async def _resident_model_for(tool: str) -> tuple[str, str | None]:
-    """(active_model, note) for the image pipeline that will serve `tool`. If the
-    resident model doesn't declare `tool`, ask the elastic image tier to bring a
-    capable one up (auto-downgrading if the best doesn't fit — `note` says so).
-    Raises workflows.UnknownModel / workflows.ToolUnsupported (each tool catches
-    both -> a JSON error) when nothing capable can be made resident."""
-    cap = runtime.image_capability() or {}
-    model = cap.get("active_model")
-    if model and tool in (cap.get("capabilities") or []):
-        return model, None
+    """(active_model, note) for the pipeline that will serve `tool` -- see
+    _resident_slot_for."""
+    model, note, _kind = await _resident_slot_for(tool)
+    return model, note
+
+
+async def _resident_slot_for(tool: str) -> tuple[str, str | None, str]:
+    """(active_model, note, kind) for the media slot that will serve `tool`: the
+    audio slot (music's own ComfyUI, when the profile runs one) or the image slot.
+    If no resident model declares `tool`, ask stackd to bring a capable one up
+    (auto-downgrading if the best doesn't fit — `note` says so). Raises
+    workflows.UnknownModel / workflows.ToolUnsupported (each tool catches both ->
+    a JSON error) when nothing capable can be made resident."""
+    caps = runtime.media_capabilities()
+    for kind in ("audio", "image"):
+        cap = caps.get(kind) or {}
+        if cap.get("active_model") and tool in (cap.get("capabilities") or []):
+            return cap["active_model"], None, kind
 
     res = runtime.request_capability(tool)
     if not res.get("ok"):
@@ -212,15 +222,16 @@ async def _resident_model_for(tool: str) -> tuple[str, str | None]:
             res.get("error")
             or f"no resident image model provides {tool!r} and none could be loaded"
         )
-    cap = runtime.image_capability() or {}
+    kind = res.get("kind") or "image"
+    cap = runtime.media_capabilities().get(kind) or {}
     model = cap.get("active_model")
     if not model:
-        raise workflows.UnknownModel("no image engine is resident in the active stackd profile")
+        raise workflows.UnknownModel(f"no {kind} engine is resident in the active stackd profile")
     if tool not in (cap.get("capabilities") or []):
         raise workflows.ToolUnsupported(
-            f"the image tier loaded {model!r}, which still does not provide {tool!r}"
+            f"the {kind} tier loaded {model!r}, which still does not provide {tool!r}"
         )
-    return model, res.get("note")
+    return model, res.get("note"), kind
 
 
 async def _maybe_rewrite(
@@ -546,6 +557,10 @@ def _timing(t0: float, gen0: float, gen1: float, rewrite_s: float = 0.0) -> dict
 # which tool/model/device, ok or the error, how long it ran vs how long it waited
 # for the image tier (swaps, cold container starts), and what it made. Recorded
 # from the tool's own JSON result, so the tools themselves stay unaware of it.
+_TOOL_VERB = {"generate_image": "generate", "edit_image": "edit", "stylize_image": "stylize",
+              "compose_music": "compose", "cover_song": "cover"}
+
+
 def _ledgered(tool_name: str):
     def wrap(fn):
         @functools.wraps(fn)
@@ -554,8 +569,8 @@ def _ledgered(tool_name: str):
             out = await fn(*args, **kwargs)
             try:
                 ctx = kwargs.get("ctx") or next((a for a in args if isinstance(a, Context)), None)
-                runtime.record_media(tool=tool_name, **_media_row(out, time.monotonic() - t0,
-                                                                  _caller_email(ctx)))
+                runtime.record_media(tool=tool_name, verb=_TOOL_VERB.get(tool_name, ""),
+                                     **_media_row(out, time.monotonic() - t0, _caller_email(ctx)))
             except Exception:  # noqa: BLE001 -- the ledger never breaks a tool call
                 logger.exception("%s: media ledger write failed", tool_name)
             return out
@@ -1820,7 +1835,7 @@ async def _run_prompt(base: str, graph: dict, *, save_node: str | None, text_nod
 async def _render_song(graph: dict, nodes: dict, *, style: str, lyrics: str, seed: int,
                        mode: str, abc: str | None, duration_s: int,
                        source: bytes | None = None, cfg_scale: float = -1,
-                       keep_seed: bool = False) -> dict | str:
+                       keep_seed: bool = False, kind: str = "image") -> dict | str:
     """Run a YuE2 graph in two prompts. `abc=None` with a `score` node in the graph
     first runs only the score stage (plan, or a cover's transcription of `source`) and
     reads the score back; a known `abc` (reuse_score) skips that. The score is then
@@ -1842,7 +1857,7 @@ async def _render_song(graph: dict, nodes: dict, *, style: str, lyrics: str, see
     if cfg_scale >= 0:
         workflows.set_node(graph, music, "cfg_scale", float(cfg_scale))
 
-    comfy_base, base_note = await _await_comfy_base()
+    comfy_base, base_note = await _await_comfy_base(kind=kind)
     if not comfy_base:
         return json.dumps({"error": base_note})
     _g0 = time.monotonic()
@@ -1998,7 +2013,7 @@ async def compose_music(
 
     t0 = time.monotonic()
     try:
-        profile, model_note = await _resident_model_for("compose")
+        profile, model_note, slot_kind = await _resident_slot_for("compose")
         model_name, graph, nodes, entry = workflows.load_model("compose", profile)
     except (workflows.UnknownModel, workflows.ToolUnsupported) as e:
         return json.dumps({"error": str(e)})
@@ -2026,7 +2041,7 @@ async def compose_music(
 
     res = await _render_song(graph, nodes, style=style, lyrics=lyrics, seed=seed, mode=mode,
                              abc=abc, duration_s=duration_s, cfg_scale=cfg_scale,
-                             keep_seed=keep_seed)
+                             keep_seed=keep_seed, kind=slot_kind)
     if isinstance(res, str):
         return res
     seed, plan = res["seed"], res["plan"]
@@ -2074,7 +2089,7 @@ async def cover_song(
 
     t0 = time.monotonic()
     try:
-        profile, model_note = await _resident_model_for("cover")
+        profile, model_note, slot_kind = await _resident_slot_for("cover")
         model_name, graph, nodes, entry = workflows.load_model("cover", profile)
     except (workflows.UnknownModel, workflows.ToolUnsupported) as e:
         return json.dumps({"error": str(e)})
@@ -2094,7 +2109,8 @@ async def cover_song(
     seed = seed if seed >= 0 else random.randint(0, 2**31 - 1)
 
     res = await _render_song(graph, nodes, style=style, lyrics=lyrics, seed=seed, mode="melody",
-                             abc=None, duration_s=_COMPOSE_MAX_S, source=source, cfg_scale=cfg_scale)
+                             abc=None, duration_s=_COMPOSE_MAX_S, source=source, cfg_scale=cfg_scale,
+                             kind=slot_kind)
     if isinstance(res, str):
         return res
 

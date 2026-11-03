@@ -32,12 +32,12 @@ def bind(mgr, store, lock: threading.Lock | None = None) -> None:
         RT.lock = lock
 
 
-def comfyui_endpoint() -> tuple[str | None, str]:
-    """(endpoint, note) for the serveable image ComfyUI right now -- cuda or rocm,
-    whichever the active profile has resident. `endpoint` is None (with a human note)
-    when nothing is serveable."""
+def comfyui_endpoint(kind: str = "image") -> tuple[str | None, str]:
+    """(endpoint, note) for the serveable ComfyUI of media slot `kind` (image |
+    audio) right now -- cuda or rocm, whichever the active profile has resident.
+    `endpoint` is None (with a human note) when nothing is serveable."""
     with RT.lock:
-        return RT.mgr.comfyui_target()
+        return RT.mgr.comfyui_target(kind)
 
 
 def image_capability() -> dict | None:
@@ -47,10 +47,17 @@ def image_capability() -> dict | None:
         return RT.mgr.capabilities().get("image")
 
 
+def media_capabilities() -> dict:
+    """Manager.capabilities(): {image, audio, engines, ...} -- every media slot."""
+    with RT.lock:
+        return RT.mgr.capabilities()
+
+
 def request_capability(verb: str) -> dict:
     """Ask the elastic image tier to bring a model that provides `verb` resident
     (in-process — same daemon as the Manager). Returns Manager.set_image()'s dict:
-    {ok, active_model, downgraded_from, note, ...} or {ok: False, error}."""
+    {ok, active_model, kind, downgraded_from, note, ...} or {ok: False, error} --
+    `kind` names the slot (image | audio) that now serves `verb`."""
     with RT.lock:
         return RT.mgr.set_image(need_capability=verb)
 
@@ -69,13 +76,16 @@ def image_pipelines() -> list[dict]:
         return RT.mgr.image_status().get("prefer", [])
 
 
-def record_media(**row) -> None:
+def record_media(*, verb: str, **row) -> None:
     """One media-ledger row (Store.record_media), tagged with the active profile and
-    the image-tier slot that is resident now. No store -> no-op."""
+    the media slot that serves `verb` now (audio before image, as the tools pick).
+    No store -> no-op."""
     with RT.lock:
         if RT.store is None:
             return
-        entry = RT.mgr.capabilities().get("image") or {}
+        caps = RT.mgr.capabilities()
+        entry = next((e for e in (caps.get("audio"), caps.get("image"))
+                      if e and verb in (e.get("capabilities") or [])), caps.get("image") or {})
         RT.store.record_media(model=row.pop("model", None) or entry.get("active_model"),
                               backend=entry.get("backend"), device=entry.get("device"),
                               profile=RT.mgr.state.active_profile, **row)

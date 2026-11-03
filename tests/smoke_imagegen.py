@@ -433,7 +433,7 @@ def main() -> int:
         it = iter(answers)
         calls = []
         orig_base, orig_sleep = tools._comfy_base, tools.anyio.sleep
-        tools._comfy_base = lambda: (calls.append(1), next(it))[1]
+        tools._comfy_base = lambda *_a: (calls.append(1), next(it))[1]
 
         async def no_sleep(_s):
             return None
@@ -449,6 +449,27 @@ def main() -> int:
     check("no headroom -> returns at once", got[0] is None and n == 1)
     got, n = await_base([warm] * 5, timeout_s=0)
     check("still warming at the deadline -> gives up with the note", got[0] is None and "warming" in got[1])
+
+    # -- the audio slot serves music when the profile runs one --
+    orig_caps = tools.runtime.media_capabilities
+    tools.runtime.media_capabilities = lambda: {
+        "image": {"active_model": "flux2-klein", "capabilities": ["generate", "edit"]},
+        "audio": {"active_model": "yue2", "capabilities": ["compose", "cover"]}}
+    try:
+        check("compose -> the audio slot", asyncio.run(tools._resident_slot_for("compose"))
+              == ("yue2", None, "audio"))
+        check("generate -> the image slot", asyncio.run(tools._resident_slot_for("generate"))
+              == ("flux2-klein", None, "image"))
+    finally:
+        tools.runtime.media_capabilities = orig_caps
+    kinds = []
+    orig_base = tools._comfy_base
+    tools._comfy_base = lambda kind="image": (kinds.append(kind), ("http://comfyui-audio-cuda:8188", ""))[1]
+    try:
+        asyncio.run(tools._await_comfy_base(kind="audio"))
+    finally:
+        tools._comfy_base = orig_base
+    check("music asks for the audio slot's ComfyUI", kinds == ["audio"])
 
     # -- media ledger rows from tool results --
     song_out = json.dumps({"status": "success", "detail": "273s song", "length_s": 273.4,

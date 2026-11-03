@@ -82,6 +82,11 @@ def _fmt_status(s: dict) -> str:
                    f"  ({img['pinned_by']})")
     elif "image" in s:
         out.append("  (no image tier resident — no device headroom)")
+    aud = s.get("audio")
+    if aud:
+        out.append(f"  {aud['state']:<8} audio:{aud['active_model']:<18} "
+                   f"{aud['device']}/{aud['backend']:<7} {aud['container'] or ''}"
+                   f"  ({aud['pinned_by']})")
     out.append("pools:")
     for p in s["pools"]:
         mark = "ok  " if p["ok"] else "FAIL"

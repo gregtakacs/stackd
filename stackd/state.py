@@ -62,6 +62,11 @@ class DeadMark:
     since: float
 
 
+# RuntimeState attributes holding a media tier's resident slot, one per
+# config/media/<kind>.yaml tier stackd runs.
+MEDIA_SLOTS = ("image", "audio")
+
+
 @dataclass
 class ImageSlot:
     """The elastic image tier's single resident ComfyUI (config/media/image.yaml).
@@ -102,6 +107,10 @@ class RuntimeState:
     last_served_at: float | None = None
     stacks: dict[str, StackRuntime] = field(default_factory=dict)
     image: "ImageSlot | None" = None
+    # The audio tier's own resident ComfyUI (config/media/audio.yaml) — music
+    # (yue2) in a second container so it can sit beside the image slot instead of
+    # swapping it out. Same slot type, kind="audio". None when absent/unused.
+    audio: "ImageSlot | None" = None
     # "<profile>:<resident image active_model>" the `image: warm` forced
     # generation has already fired for. Reset to None on every profile switch
     # (converge()) so re-activating a warm profile warms it again; also
@@ -139,13 +148,14 @@ class RuntimeState:
             for k, v in raw.get("dead", {}).items()
         }
         raw["stacks"] = stacks
-        img = raw.get("image")
         _is = {f.name for f in fields(ImageSlot)}
-        raw["image"] = (
-            ImageSlot(**{**{kk: vv for kk, vv in img.items() if kk in _is},
-                         "state": EngineState(img.get("state", "down"))})
-            if img else None
-        )
+        for kind in MEDIA_SLOTS:
+            img = raw.get(kind)
+            raw[kind] = (
+                ImageSlot(**{**{kk: vv for kk, vv in img.items() if kk in _is},
+                             "state": EngineState(img.get("state", "down"))})
+                if img else None
+            )
         # tolerate keys from a newer/older schema (e.g. a since-removed field)
         known = {f.name for f in fields(cls)}
         return cls(**{k: v for k, v in raw.items() if k in known})
@@ -178,14 +188,16 @@ class RuntimeState:
                 rt.restarts = 0
                 rt.backoff_until = None
                 rt.unhealthy_ticks = 0
-        if self.image is not None and (
-            self.image.handle is None
-            or self.image.state in (EngineState.error, EngineState.down)
-        ):
-            dropped.append(f"image:{self.image.active_model}")
-            self.image = None
-        elif self.image is not None:
-            self.image.unhealthy_ticks = 0
+        for kind in MEDIA_SLOTS:
+            slot = getattr(self, kind)
+            if slot is not None and (
+                slot.handle is None
+                or slot.state in (EngineState.error, EngineState.down)
+            ):
+                dropped.append(f"{kind}:{slot.active_model}")
+                setattr(self, kind, None)
+            elif slot is not None:
+                slot.unhealthy_ticks = 0
         return dropped
 
     def save(self, path: str | pathlib.Path) -> None:
@@ -194,9 +206,10 @@ class RuntimeState:
         payload = asdict(self)
         for s in payload["stacks"].values():
             s["state"] = s["state"].value if isinstance(s["state"], EngineState) else s["state"]
-        if payload.get("image"):
-            st = payload["image"]["state"]
-            payload["image"]["state"] = st.value if isinstance(st, EngineState) else st
+        for kind in MEDIA_SLOTS:
+            if payload.get(kind):
+                st = payload[kind]["state"]
+                payload[kind]["state"] = st.value if isinstance(st, EngineState) else st
         fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
         with os.fdopen(fd, "w") as f:
             json.dump(payload, f, indent=2, default=str)

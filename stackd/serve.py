@@ -731,8 +731,9 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             mgr = self.mgr
             names = [rt.container for rt in mgr.state.stacks.values() if rt.container]
-            if mgr.state.image is not None and mgr.state.image.container:
-                names.append(mgr.state.image.container)
+            for slot in (mgr.state.image, mgr.state.audio):
+                if slot is not None and slot.container:
+                    names.append(slot.container)
             base = getattr(mgr.runner, "base", None)  # DockerApiRunner only
             if base and names:
                 from stackd.telemetry import container_mem
@@ -854,9 +855,9 @@ class _Handler(BaseHTTPRequestHandler):
             pinned = self.mgr.state.pinned
             run_state = {n: rt.state.value for n, rt in self.mgr.state.stacks.items()}
             running = set(run_state)
-            img = self.mgr.state.image
-            if img is not None:
-                run_state[f"image:{img.active_model}"] = img.state.value
+            for img in (self.mgr.state.image, self.mgr.state.audio):
+                if img is not None:
+                    run_state[f"{img.kind}:{img.active_model}"] = img.state.value
             out = []
             for name, pr in sorted(cfg.profiles.items(), key=lambda kv: -kv[1].priority):
                 try:
