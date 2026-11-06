@@ -57,6 +57,12 @@ class Reconciler:
     # engine on one physical GPU.
     same_device_spawn_stagger_s: float = 3.0
     events: list[ReconcileEvent] = field(default_factory=list)
+    # Per media kind crash budget: {"n", "until", "gave_up", "why"}. A media slot
+    # used to respawn every tick forever — 2026-11-04 the RTX fell off the bus and
+    # audio:yue2 crash-looped ~3,000 times overnight while the tools kept saying
+    # "starting". Same budget/backoff as an LLM stack; cleared when the slot comes
+    # up ready and on every converge (profile change / reload / daemon restart).
+    media_fail: dict = field(default_factory=dict)
 
     # ------------------------------------------------------------------ helpers ---
     def _emit(self, stack: str, action: str, detail: str = "") -> None:
@@ -470,6 +476,9 @@ class Reconciler:
         tier = self.cfg.media.get(kind)
         if tier is None:
             return {"ok": False, "error": f"no {kind} tier configured (config/media/{kind}.yaml)"}
+        failing = self.media_failure(kind, now)
+        if failing and not unsafe:
+            return {"ok": False, "error": f"{kind} engine {failing}"}
         hr = self._tier_headroom(state, profile, tier)
         hr_r = {k: round(v, 1) for k, v in hr.items()}
         host_ram_avail = self._real_host_ram_avail(tier, profile)
@@ -692,6 +701,10 @@ class Reconciler:
             else:
                 slot, healthy = None, False
 
+        # Crash budget: no respawn while backing off, none at all after a give-up.
+        if not healthy and self.media_failure(kind, now):
+            return
+
         # A user-pinned slot that lost its container (force-removed for a clean bench
         # baseline, or crashed) must RESTORE the pinned model — not revert to the
         # auto-preferred tier. Re-spawn the pinned model on its original backend/device.
@@ -749,13 +762,40 @@ class Reconciler:
         self._stagger_device(dev, avoid_devices)
         self._spawn_image(state, tier, dev, backend, ld, now)
 
+    def _media_crashed(self, kind: str, model: str, why: str, now: float) -> None:
+        f = self.media_fail.setdefault(kind, {"n": 0, "until": None, "gave_up": False, "why": ""})
+        f["n"] += 1
+        f["why"] = why
+        if f["n"] >= self.max_restarts:
+            f["gave_up"], f["until"] = True, None
+            self._emit(f"{kind}:{model}", "give-up", f"{why}; {f['n']} restarts exhausted")
+        else:
+            f["until"] = now + self._backoff(f["n"])
+            self._emit(f"{kind}:{model}", "restart", f"{why}; retry in {f['until'] - now:.0f}s")
+
+    def media_failure(self, kind: str, now: float | None = None) -> str | None:
+        """Why `kind`'s slot can't be brought up right now (gave up / backing off
+        after a crash), or None. Callers surface this instead of 'warming'."""
+        f = self.media_fail.get(kind)
+        if not f:
+            return None
+        if f["gave_up"]:
+            return f"gave up after {f['n']} crashes — {f['why']}"
+        now = time.time() if now is None else now
+        if f["until"] and now < f["until"]:
+            return f"crashed {f['n']}x, retrying in {f['until'] - now:.0f}s — {f['why']}"
+        return None
+
     def _image_tick(self, state: RuntimeState, now: float, kind: str = "image") -> None:
         slot = getattr(state, kind)
         if slot is None or slot.handle is None:
             return
         code = self.runner.poll(slot.handle)
         if code is not None and not slot.intentional_stop:
-            self._emit(f"{kind}:{slot.active_model}", "crash", f"exit {code}")
+            err = self.runner.last_error(slot.handle)
+            why = f"exit {code}" + (f" — {err}" if err else "")
+            self._emit(f"{kind}:{slot.active_model}", "crash", why)
+            self._media_crashed(kind, slot.active_model, why, now)
             if slot.pinned_by == "user":
                 # A user-pinned slot whose container died (a force `docker rm -f` for a
                 # clean bench baseline, or a real crash) must RESTORE the pinned model —
@@ -779,9 +819,11 @@ class Reconciler:
                 slot.state = EngineState.ready
                 slot.ready_at = now
                 slot.unhealthy_ticks = 0
+                self.media_fail.pop(kind, None)
                 self._emit(f"{kind}:{slot.active_model}", "ready")
             elif slot.started_at and now - slot.started_at > (slot.ready_timeout or 300.0):
                 self._emit(f"{kind}:{slot.active_model}", "crash", "warmup timeout")
+                self._media_crashed(kind, slot.active_model, "warmup timeout", now)
                 self._teardown_image(state, now, kind=kind)
         elif slot.state == EngineState.ready:
             if healthy:
@@ -790,6 +832,7 @@ class Reconciler:
                 slot.unhealthy_ticks += 1
                 if slot.unhealthy_ticks >= _UNHEALTHY_LIMIT:
                     self._emit(f"{kind}:{slot.active_model}", "crash", "health flatlined")
+                    self._media_crashed(kind, slot.active_model, "health flatlined", now)
                     self._teardown_image(state, now, kind=kind)
 
     # ------------------------------------------------------------------ converge ---
@@ -798,6 +841,7 @@ class Reconciler:
         self.events.clear()
         state.warmed_for = None   # every entry re-arms the `image: warm` trigger
         state.audio_warmed_for = None
+        self.media_fail.clear()   # a profile entry / reload is a fresh crash budget
         pl = self._solve(target)
         want = pl.placed
         target_models = set(self.cfg.profiles[target].models)

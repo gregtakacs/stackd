@@ -737,6 +737,11 @@ class Manager:
             self.state.last_served_at = now
             self._save()
             return entry["endpoint"], ""
+        failing = self.rec.media_failure(kind, now)
+        if failing:
+            # crash-looping / given up: say so now, don't make the caller wait out
+            # a "warming" that never ends (the tools only wait on "not serveable")
+            return None, f"{kind} engine {failing}"
         if entry and not entry["serveable"]:
             why = "co-device stack warming" if entry["co_device_warming"] else entry["state"]
             return None, f"image engine {entry['stack']} not serveable ({why})"

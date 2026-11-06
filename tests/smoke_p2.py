@@ -902,6 +902,54 @@ def t_audio_tier_warm_preloads() -> None:
         check("refilled after a profile round trip", m.state.audio is not None)
 
 
+def t_media_slot_crash_loop_gives_up() -> None:
+    """A media slot whose container can't start (2026-11-04: the RTX fell off the
+    bus, every CUDA container died in the nvidia prestart hook) backs off and gives
+    up after max_restarts like an LLM stack, instead of respawning every tick
+    forever; the tools hear the real reason instead of 'warming'."""
+    from unittest import mock
+    from stackd.reconciler import Reconciler
+    with mock.patch.object(Reconciler, "_fire_warm_generation",
+                           staticmethod(lambda model, endpoint, verb="generate": None)):
+        fr = FakeRunner(ready_after=1)
+        m = Manager(_audio_cfg("warm"), pathlib.Path(tempfile.mkdtemp()) / "state.json", fr)
+        m.use("chat", now=0)
+        now = ready_all(m)
+        audio_names = {c.name for c in m.cfg.media["audio"].containers.values()}
+        real_spawn, spawns = fr.spawn, []
+        def dead_spawn(spec):
+            h = real_spawn(spec)
+            if spec.name in audio_names:
+                spawns.append(now)
+                c = fr.containers[h]
+                c.running, c.exit_code = False, 128
+                c.error = "nvidia-container-cli: detection error: nvml error: unknown error"
+            return h
+        fr.spawn = dead_spawn
+        if m.state.audio is not None and m.state.audio.handle:   # kill the resident one too
+            c = fr.containers[m.state.audio.handle]
+            c.running, c.exit_code = False, 128
+            c.error = "nvidia-container-cli: detection error: nvml error: unknown error"
+        for _ in range(200):           # ~33 min of 10s ticks
+            now += 10
+            m.tick(now=now)
+        f = m.rec.media_fail.get("audio") or {}
+        check("audio crash loop stops at max_restarts", f.get("gave_up") is True
+              and len(spawns) <= m.rec.max_restarts)
+        r = m.rec.swap_image(m.state, m.state.active_profile, need_caps=["compose"],
+                             now=now, pinned_by="capability", kind="audio")
+        check("the audio tier refuses with the real reason, not 'warming'",
+              not r["ok"] and "gave up" in r["error"] and "nvml" in r["error"])
+        r = m.set_image(need_capability="compose", now=now)
+        check("a compose request falls back to the image tier, says why, no new spawn",
+              r["ok"] and r["kind"] == "image" and "gave up" in (r.get("note") or "")
+              and len(spawns) <= m.rec.max_restarts and m.state.audio is None)
+        fr.spawn = real_spawn
+        m.use("coding", now=now + 10)
+        m.use("chat", now=now + 20)
+        check("a profile entry is a fresh budget", "audio" not in m.rec.media_fail)
+
+
 def t_audio_tier_off_uses_image_tier() -> None:
     """`audio: none` (the default) keeps the old path: music swaps into the image
     tier's container, and no audio container ever starts."""
@@ -1246,6 +1294,7 @@ def main() -> int:
         t_audio_tier_beside_image,
         t_audio_tier_warm_preloads,
         t_audio_tier_off_uses_image_tier,
+        t_media_slot_crash_loop_gives_up,
         t_audio_tier_headroom_counts_the_image_slot,
         t_image_teardown_credit_and_refusals,
         t_image_unsafe_bench_bypass,
