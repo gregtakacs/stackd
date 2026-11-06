@@ -63,6 +63,7 @@ class Reconciler:
     # "starting". Same budget/backoff as an LLM stack; cleared when the slot comes
     # up ready and on every converge (profile change / reload / daemon restart).
     media_fail: dict = field(default_factory=dict)
+    _deferred_media: set = field(default_factory=set)   # kinds waiting on a loading LLM
 
     # ------------------------------------------------------------------ helpers ---
     def _emit(self, stack: str, action: str, detail: str = "") -> None:
@@ -245,6 +246,30 @@ class Reconciler:
                        f"{device} already spawning this converge — "
                        f"{self.same_device_spawn_stagger_s:.0f}s gap before piling on")
             time.sleep(self.same_device_spawn_stagger_s)
+
+    def _llm_loading_on(self, state: RuntimeState, device: str) -> str | None:
+        """The LLM stack still warming on `device` if it is a CUDA card, else None.
+        A media slot must not cold-start beside a loading LLM on the RTX: two big
+        concurrent allocations on that card is the pattern behind its earlier
+        wedges, and the 2026-11-04 bus drop followed days of exactly that (yue2 +
+        the LLM spawning 3s apart on every profile entry). The slot is placed on
+        a later tick, once the LLM is ready."""
+        if not self._dev_is_cuda(device):
+            return None
+        for name, rt in state.stacks.items():
+            if rt.device == device and rt.state == EngineState.warming:
+                return name
+        return None
+
+    def _defer_media_spawn(self, state: RuntimeState, kind: str, model: str, device: str) -> bool:
+        llm = self._llm_loading_on(state, device)
+        if llm is None:
+            self._deferred_media.discard(kind)
+            return False
+        if kind not in self._deferred_media:   # say it once per wait, not every tick
+            self._deferred_media.add(kind)
+            self._emit(f"{kind}:{model}", "defer", f"waiting for {llm} to finish loading on {device}")
+        return True
 
     # -------------------------------------------------------------- image tier ---
     # The image and audio tiers share one implementation: every function below
@@ -722,6 +747,8 @@ class Reconciler:
                                             want_model=slot.active_model, want_backend=slot.backend)
                 if pin_pick is not None:
                     dev, backend, ld = pin_pick
+                    if self._defer_media_spawn(state, kind, ld.active_model, dev):
+                        return
                     self._stagger_device(dev, avoid_devices)
                     self._spawn_image(state, tier, dev, backend, ld, now, pinned_by=slot.pinned_by)
                     return
@@ -739,6 +766,8 @@ class Reconciler:
                                     want_model=tier.prefer[0].active_model)
             if pick is not None:
                 dev, backend, ld = pick
+                if self._defer_media_spawn(state, kind, ld.active_model, dev):
+                    return
                 self._stagger_device(dev, avoid_devices)
                 self._spawn_image(state, tier, dev, backend, ld, now)
             return
@@ -756,6 +785,8 @@ class Reconciler:
         dev, backend, ld = pick
         if (slot is not None and healthy and slot.active_model == ld.active_model
                 and slot.device == dev):
+            return
+        if self._defer_media_spawn(state, kind, ld.active_model, dev):
             return
         if slot is not None:
             self._teardown_image(state, now)

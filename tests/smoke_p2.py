@@ -54,12 +54,20 @@ def t_converge_chat() -> None:
         "chat", "code-autocomplete"})
     check("all warming after converge",
           all(s.state == EngineState.warming for s in m.state.stacks.values()))
-    check("elastic image tier placed dev-turbo on the RTX",
-          m.state.image is not None and m.state.image.active_model == "flux2-dev-turbo"
-          and m.state.image.device == "cuda0")
-    ready_all(m)
+    check("RTX image slot waits while the LLM on cuda0 is loading",
+          m.state.image is None
+          and any(e.action == "defer" and "chat" in e.detail for e in m.rec.events))
+    now = ready_all(m)
     check("all LLM stacks ready after ticks",
           all(s.state == EngineState.ready for s in m.state.stacks.values()))
+    for _ in range(4):
+        if m.state.image is not None and m.state.image.state == EngineState.ready:
+            break
+        now += 5
+        m.tick(now=now)
+    check("elastic image tier placed dev-turbo on the RTX once the LLM is up",
+          m.state.image is not None and m.state.image.active_model == "flux2-dev-turbo"
+          and m.state.image.device == "cuda0")
     check("image slot ready after ticks", m.state.image.state == EngineState.ready)
     check("chat got a process port", m.state.stacks["chat"].port is not None)
     check("image slot has a container name", bool(m.state.image.container))
