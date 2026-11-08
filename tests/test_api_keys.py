@@ -273,6 +273,19 @@ def test_mint_scope_is_honoured_only_by_the_toolbox_verifier():
         assert not _named_key_can_mint(m)                              # revocation reaches it too
 
 
+
+def test_image_scope():
+    with _Srv() as s:
+        k = s.mint("archviz", scope="image")
+        assert s.req("GET", "/v1/models", k)[0] == 200 and s.chat(k)[0] == 200
+        assert s.req("GET", "/image", k)[0] not in (401, 403)
+        assert s.req("GET", "/comfyui/system_stats", k)[0] not in (401, 403)
+        assert s.req("POST", "/image/capability", k, {"capability": "generate"})[0] not in (401, 403)
+        for method, path in [("GET", "/status"), ("POST", "/reload"), ("POST", "/profiles/chat/activate"),
+                             ("GET", "/keys"), ("POST", "/brave/hit"), ("DELETE", "/keys/archviz")]:
+            assert s.req(method, path, k)[0] in (401, 403), (method, path)
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in list(globals().items()):

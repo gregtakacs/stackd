@@ -122,7 +122,8 @@ stackctl keys revoke delegate-docker-boy
 
 - Scopes: `inference` = `GET /v1/models`, `/v1/model/info`, `POST /v1/chat/completions`,
   `/v1/completions`, `/v1/embeddings`. `brave` = `POST /brave/hit` only (SearXNG's reporter).
-  `mint` = `/toolbox/mint` only (Open WebUI's Comfy Toolbox tool). `admin` = everything the admin
+  `mint` = `/toolbox/mint` only (Open WebUI's Comfy Toolbox tool). `image` = inference plus
+  `/comfyui/*`, `GET /image` and `POST /image/{model,capability}` (image-generation tools). `admin` = everything the admin
   key can do, for example a dashboard login you can revoke. Anything else answers 401/403.
 - `--trust-user-headers` (dashboard: "trust forwarded user"): book usage to the
   `X-OpenWebUI-User-Email` the caller forwards. Only for Open WebUI's own connection key.

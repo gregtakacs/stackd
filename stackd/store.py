@@ -183,8 +183,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS ix_api_keys_live_name ON api_keys(name) WHERE 
 """
 
 # inference: /v1 models + completions. brave: POST /brave/hit (SearXNG's credit reporter).
-# mint: /toolbox/mint (Open WebUI's Comfy Toolbox tool). admin: everything.
-API_KEY_SCOPES = ("inference", "brave", "mint", "admin")
+# mint: /toolbox/mint (Open WebUI's Comfy Toolbox tool). image: inference + the /comfyui/*
+# proxy + reading/switching the image tier (image-generation tools). admin: everything.
+API_KEY_SCOPES = ("inference", "brave", "mint", "image", "admin")
 _API_KEY_NAME_RE = r"^[a-z0-9][a-z0-9._-]{0,47}$"
 
 

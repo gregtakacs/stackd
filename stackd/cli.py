@@ -264,9 +264,9 @@ def _build_parser() -> argparse.ArgumentParser:
     kl.add_argument("--all", action="store_true", help="include revoked keys")
     kc = kys.add_parser("create", help="mint a key; the plaintext is printed ONCE")
     kc.add_argument("name", help="e.g. delegate-docker-boy (a-z 0-9 . _ -)")
-    kc.add_argument("--scope", choices=["inference", "brave", "mint", "admin"], default="inference",
+    kc.add_argument("--scope", choices=["inference", "brave", "mint", "image", "admin"], default="inference",
                     help="inference = /v1 models + completions (default); brave = POST /brave/hit; "
-                         "mint = /toolbox/mint; admin = everything")
+                         "mint = /toolbox/mint; image = inference + /comfyui/* + image tier; admin = everything")
     kc.add_argument("--trust-user-headers", action="store_true",
                     help="book usage to the forwarded X-OpenWebUI-User-Email (Open WebUI's own key)")
     kc.add_argument("--out", type=pathlib.Path, default=None,

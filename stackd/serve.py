@@ -437,7 +437,15 @@ class _Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         if c["scope"] == "brave":
             return self.command == "POST" and path == "/brave/hit"
-        if c["scope"] != "inference":
+        if c["scope"] == "image":
+            if path == "/comfyui" or path.startswith("/comfyui/"):
+                return self.command in ("GET", "POST")
+            if path == "/image":
+                return self.command == "GET"
+            if path in ("/image/model", "/image/capability"):
+                return self.command == "POST"
+            # and everything an inference key may do (image tools also prompt the LLM)
+        elif c["scope"] != "inference":
             return False              # 'mint' is only honoured by the toolbox's own mint route
         if self.command == "GET":
             return path in self._INFERENCE_GET
