@@ -176,12 +176,15 @@ CREATE TABLE IF NOT EXISTS api_keys (
     scope TEXT NOT NULL,
     created_at REAL NOT NULL,
     last_used_at REAL,
-    revoked_at REAL
+    revoked_at REAL,
+    trust_user_headers INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ix_api_keys_live_name ON api_keys(name) WHERE revoked_at IS NULL;
 """
 
-API_KEY_SCOPES = ("inference", "admin")
+# inference: /v1 models + completions. brave: POST /brave/hit (SearXNG's credit reporter).
+# mint: /toolbox/mint (Open WebUI's Comfy Toolbox tool). admin: everything.
+API_KEY_SCOPES = ("inference", "brave", "mint", "admin")
 _API_KEY_NAME_RE = r"^[a-z0-9][a-z0-9._-]{0,47}$"
 
 
@@ -279,6 +282,11 @@ class Store:
         for col in ("ctx_tokens_sum", "ctx_tokens_sq_sum", "ctx_tokens_max", "ctx_n"):
             if col not in dcols:
                 self.conn.execute(f"ALTER TABLE usage_daily ADD COLUMN {col} INTEGER DEFAULT 0")
+
+        # api_keys gained trust_user_headers after it shipped (same v10 deploy day).
+        kcols = {r["name"] for r in self.conn.execute("PRAGMA table_info(api_keys)")}
+        if "trust_user_headers" not in kcols:
+            self.conn.execute("ALTER TABLE api_keys ADD COLUMN trust_user_headers INTEGER NOT NULL DEFAULT 0")
 
         # v10: which API key made the request — 'admin' (STACKD_API_KEY) or a named key.
         # Raw `usage` gets a plain column (NULL on old rows = 'admin': until v10 the admin
@@ -399,8 +407,13 @@ class Store:
         )
 
     # -- named API keys ------------------------------------------------------------
-    def create_api_key(self, name: str, scope: str = "inference", *, now: float | None = None) -> dict:
-        """Mint a key. Returns the row plus `key` (plaintext) — the only time it exists."""
+    def create_api_key(self, name: str, scope: str = "inference", *, trust_user_headers: bool = False,
+                       now: float | None = None) -> dict:
+        """Mint a key. Returns the row plus `key` (plaintext) — the only time it exists.
+
+        trust_user_headers: book usage to the X-OpenWebUI-User-Email the caller forwards
+        (for Open WebUI's own connection key). Otherwise a named key's usage is always
+        `key:<name>`, whatever headers it sends."""
         import re
         import secrets
         name = (name or "").strip().lower()
@@ -414,22 +427,25 @@ class Store:
         key = "sk-stackd-" + secrets.token_urlsafe(32)
         now = time.time() if now is None else now
         self.conn.execute(
-            "INSERT INTO api_keys(name,key_sha256,key_prefix,scope,created_at) VALUES(?,?,?,?,?)",
-            (name, api_key_sha256(key), key[:16], scope, now))
-        return {"name": name, "scope": scope, "key": key, "key_prefix": key[:16], "created_at": now}
+            "INSERT INTO api_keys(name,key_sha256,key_prefix,scope,created_at,trust_user_headers) "
+            "VALUES(?,?,?,?,?,?)",
+            (name, api_key_sha256(key), key[:16], scope, now, int(bool(trust_user_headers))))
+        return {"name": name, "scope": scope, "key": key, "key_prefix": key[:16], "created_at": now,
+                "trust_user_headers": bool(trust_user_headers)}
 
     def list_api_keys(self, *, include_revoked: bool = False) -> list[dict]:
         q = "SELECT * FROM api_keys" + ("" if include_revoked else " WHERE revoked_at IS NULL")
         return [{"name": r["name"], "scope": r["scope"], "key_prefix": r["key_prefix"],
                  "created_at": r["created_at"], "last_used_at": r["last_used_at"],
-                 "revoked_at": r["revoked_at"]}
+                 "revoked_at": r["revoked_at"], "trust_user_headers": bool(r["trust_user_headers"])}
                 for r in self.conn.execute(q + " ORDER BY created_at").fetchall()]
 
     def live_api_key_hashes(self) -> dict[str, dict]:
-        """{sha256: {name, scope}} for every live key — the daemon's in-memory auth table."""
-        return {r["key_sha256"]: {"name": r["name"], "scope": r["scope"]}
+        """{sha256: {name, scope, trust}} for every live key — the daemon's in-memory auth table."""
+        return {r["key_sha256"]: {"name": r["name"], "scope": r["scope"],
+                                  "trust": bool(r["trust_user_headers"])}
                 for r in self.conn.execute(
-                    "SELECT key_sha256,name,scope FROM api_keys WHERE revoked_at IS NULL")}
+                    "SELECT key_sha256,name,scope,trust_user_headers FROM api_keys WHERE revoked_at IS NULL")}
 
     def revoke_api_key(self, name: str, *, now: float | None = None) -> bool:
         cur = self.conn.execute(

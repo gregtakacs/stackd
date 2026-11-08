@@ -232,6 +232,47 @@ def test_v10_migration_books_old_rows_to_admin_and_keeps_totals():
     Store.open(path)                                                    # idempotent
 
 
+def test_brave_scope_reaches_only_brave_hit():
+    with _Srv() as s:
+        k = s.mint("searxng", scope="brave")
+        code, _ = s.req("POST", "/brave/hit", k, {"engine": "braveapi"})
+        assert code not in (401, 403), code
+        assert s.req("GET", "/v1/models", k)[0] == 401
+        assert s.chat(k)[0] == 401
+        assert s.req("GET", "/status", k)[0] == 401
+
+
+def test_trusted_key_keeps_forwarded_users_untrusted_does_not():
+    with _Srv() as s:
+        code, body = s.req("POST", "/keys", ADMIN, {"name": "open-webui", "trust_user_headers": True})
+        assert code == 201 and body["trust_user_headers"] is True
+        owu = body["key"]
+        agent = s.mint("agent-c")
+        assert s.chat(owu, headers={"X-OpenWebUI-User-Email": "kid@example.com"})[0] == 200
+        assert s.chat(owu)[0] == 200                                   # no header -> key:<name>
+        assert s.chat(agent, headers={"X-OpenWebUI-User-Email": "kid@example.com"})[0] == 200
+        rows = {(r[0], r[1]) for r in s.store.conn.execute("SELECT user_email, api_key FROM usage")}
+        assert ("kid@example.com", "open-webui") in rows
+        assert ("key:open-webui", "open-webui") in rows
+        assert ("key:agent-c", "agent-c") in rows and ("kid@example.com", "agent-c") not in rows
+        listed = {k["name"]: k for k in s.req("GET", "/keys", ADMIN)[1]["keys"]}
+        assert listed["open-webui"]["trust_user_headers"] is True and listed["agent-c"]["trust_user_headers"] is False
+
+
+def test_mint_scope_is_honoured_only_by_the_toolbox_verifier():
+    from stackd.serve import _named_key_can_mint
+    with _Srv() as s:
+        m = s.mint("owu-toolbox", scope="mint")
+        i = s.mint("plain")
+        a = s.mint("ops", scope="admin")
+        assert _named_key_can_mint(m) and _named_key_can_mint(a)
+        assert not _named_key_can_mint(i) and not _named_key_can_mint("nope") and not _named_key_can_mint("")
+        assert s.req("GET", "/v1/models", m)[0] == 401                 # mint key can't infer
+        assert s.req("GET", "/status", m)[0] == 401
+        s.req("DELETE", "/keys/owu-toolbox", ADMIN)
+        assert not _named_key_can_mint(m)                              # revocation reaches it too
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in list(globals().items()):

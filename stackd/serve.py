@@ -412,7 +412,7 @@ class _Handler(BaseHTTPRequestHandler):
         if not row:
             return None
         self._touch_key(row["name"])
-        return {"kind": "key", "name": row["name"], "scope": row["scope"]}
+        return {"kind": "key", "name": row["name"], "scope": row["scope"], "trust": row.get("trust", False)}
 
     def _touch_key(self, name: str) -> None:
         """last_used_at, at most once a minute per key, and only if the lock is free now."""
@@ -435,6 +435,10 @@ class _Handler(BaseHTTPRequestHandler):
         if c["scope"] == "admin":
             return True
         path = self.path.split("?")[0]
+        if c["scope"] == "brave":
+            return self.command == "POST" and path == "/brave/hit"
+        if c["scope"] != "inference":
+            return False              # 'mint' is only honoured by the toolbox's own mint route
         if self.command == "GET":
             return path in self._INFERENCE_GET
         if self.command == "POST":
@@ -712,7 +716,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send_json(400, {"error": {"message": "invalid JSON"}})
         try:
             with self.lock:
-                row = self.store.create_api_key(body.get("name") or "", body.get("scope") or "inference")
+                row = self.store.create_api_key(body.get("name") or "", body.get("scope") or "inference",
+                                                trust_user_headers=bool(body.get("trust_user_headers")))
                 self._keys_reload()
         except ValueError as e:
             return self._send_json(400, {"error": {"message": str(e)}})
@@ -1437,8 +1442,11 @@ class _Handler(BaseHTTPRequestHandler):
         # A named key is its own identity: its caller cannot claim to be an Open WebUI user
         # by setting the forwarded-user headers.
         c = self._caller()
-        if c and c["kind"] == "key":
+        if c and c["kind"] == "key" and not c.get("trust"):
             email = f"key:{c['name']}"
+        elif c and c["kind"] == "key":
+            email = (self.headers.get("X-OpenWebUI-User-Email")
+                     or self.headers.get("X-OpenWebUI-User-Id") or f"key:{c['name']}")
         else:
             email = (self.headers.get("X-OpenWebUI-User-Email")
                      or self.headers.get("X-OpenWebUI-User-Id") or "direct")
@@ -2787,6 +2795,19 @@ def _alias_response_token_ids(data: bytes) -> bytes | None:
     return json.dumps(doc).encode() if changed else None
 
 
+# The live handler class, so code built before make_server (the toolbox) can consult the
+# same in-memory named-key table the HTTP front uses.
+_LIVE_HANDLER: list = []
+
+
+def _named_key_can_mint(token: str) -> bool:
+    """A named key with scope 'mint' or 'admin' may call /toolbox/mint."""
+    if not token or not _LIVE_HANDLER:
+        return False
+    row = _LIVE_HANDLER[0]._scoped_keys.get(api_key_sha256(token))
+    return bool(row and row["scope"] in ("mint", "admin"))
+
+
 def make_server(mgr: Manager, host: str, port: int, api_key: str | None,
                 warm_wait_s: float = 120.0, *, store: Store | None = None,
                 owu_base_url: str | None = None,
@@ -2801,6 +2822,7 @@ def make_server(mgr: Manager, host: str, port: int, api_key: str | None,
     })
     srv = ThreadingHTTPServer((host, port), handler)
     handler.httpd = srv          # so POST /shutdown can stop serve_forever()
+    _LIVE_HANDLER[:] = [handler]
     return srv
 
 
@@ -2872,7 +2894,7 @@ def serve(mgr: Manager, host: str, port: int, api_key: str | None,
             click_segmenter=_tb_engine.comfy_segment_click,
             worker=jobs_q, prewarm=_tb_engine.prewarm_edit,
             logger=logging.getLogger("stackd.toolbox"),
-            mint_key=api_key or "", chat_source=_tb_chat_source,
+            mint_key=api_key or "", mint_verify=_named_key_can_mint, chat_source=_tb_chat_source,
             user_registered=_tb_registered, public_base=tb_public,
         )
         print(f"comfy toolbox mounted at /toolbox/* (queue {tb_db}, "

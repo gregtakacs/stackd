@@ -264,8 +264,11 @@ def _build_parser() -> argparse.ArgumentParser:
     kl.add_argument("--all", action="store_true", help="include revoked keys")
     kc = kys.add_parser("create", help="mint a key; the plaintext is printed ONCE")
     kc.add_argument("name", help="e.g. delegate-docker-boy (a-z 0-9 . _ -)")
-    kc.add_argument("--scope", choices=["inference", "admin"], default="inference",
-                    help="inference = /v1 models + completions only (default); admin = everything")
+    kc.add_argument("--scope", choices=["inference", "brave", "mint", "admin"], default="inference",
+                    help="inference = /v1 models + completions (default); brave = POST /brave/hit; "
+                         "mint = /toolbox/mint; admin = everything")
+    kc.add_argument("--trust-user-headers", action="store_true",
+                    help="book usage to the forwarded X-OpenWebUI-User-Email (Open WebUI's own key)")
     kc.add_argument("--out", type=pathlib.Path, default=None,
                     help="write the key to this file (mode 600) instead of printing it")
     kr = kys.add_parser("revoke", help="revoke a key by name (usage history is kept)")
@@ -526,7 +529,8 @@ def _cmd_keys(args) -> int:
         req = urllib.request.Request(base + ("?all=1" if args.all else ""), headers=headers)
     elif args.keys_cmd == "create":
         req = urllib.request.Request(base, method="POST", headers=headers,
-                                     data=_json.dumps({"name": args.name, "scope": args.scope}).encode())
+                                     data=_json.dumps({"name": args.name, "scope": args.scope,
+                                                       "trust_user_headers": args.trust_user_headers}).encode())
     else:
         req = urllib.request.Request(f"{base}/{args.name}", method="DELETE", headers=headers)
     try:

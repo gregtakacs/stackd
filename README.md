@@ -120,9 +120,12 @@ stackctl keys list [--all]
 stackctl keys revoke delegate-docker-boy
 ```
 
-- `inference` scope: `GET /v1/models`, `/v1/model/info`, and `POST /v1/chat/completions`,
-  `/v1/completions`, `/v1/embeddings`. Everything else answers 401/403. `--scope admin` makes a
-  named key equal to the admin key, for example to give a dashboard its own revocable key.
+- Scopes: `inference` = `GET /v1/models`, `/v1/model/info`, `POST /v1/chat/completions`,
+  `/v1/completions`, `/v1/embeddings`. `brave` = `POST /brave/hit` only (SearXNG's reporter).
+  `mint` = `/toolbox/mint` only (Open WebUI's Comfy Toolbox tool). `admin` = everything the admin
+  key can do, for example a dashboard login you can revoke. Anything else answers 401/403.
+- `--trust-user-headers` (dashboard: "trust forwarded user"): book usage to the
+  `X-OpenWebUI-User-Email` the caller forwards. Only for Open WebUI's own connection key.
 - The dashboard has an **API keys** card (admin only) to create, show-once, copy and revoke keys,
   and the usage explorer and chart have an **API key** dimension: `admin` for the admin key,
   otherwise the key's name. Ledger rows from before v10 count as `admin`, which they were.

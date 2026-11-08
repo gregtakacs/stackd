@@ -118,7 +118,7 @@ class Toolbox:
 
     def __init__(self, *, secret: str = "", spike_enabled: bool = False, source=None,
                  segmenter=None, image_engine_up=None, logger=None, worker=None,
-                 prewarm=None, click_segmenter=None, mint_key: str = "",
+                 prewarm=None, click_segmenter=None, mint_key: str = "", mint_verify=None,
                  chat_source=None, user_registered=None, public_base: str = ""):
         self.secret = secret or ""
         self.spike_enabled = bool(spike_enabled)
@@ -151,6 +151,9 @@ class Toolbox:
         # and it never reaches a browser. Empty mint_key disables the route entirely
         # (deny-by-default, health reports mint:false).
         self.mint_key = mint_key or ""
+        # Optional second check: stackd's named API keys with scope 'mint' (or 'admin'), so
+        # Open WebUI's tool can hold a key that can mint but cannot run the daemon.
+        self._mint_verify = mint_verify
         # public_base: the browser-reachable base for minted embed URLs. Required
         # for a usable link (an iframe fetches cfg.api from the USER's machine, so
         # a container-internal Host header is useless there). No request-derived
@@ -763,7 +766,9 @@ class Toolbox:
         hdr = (http.headers.get("authorization") or "").strip()
         supplied = hdr[7:].strip() if hdr[:7].lower() == "bearer " else ""
         # compare_digest, not ==: this is an attacker-reachable secret.
-        if not supplied or not hmac.compare_digest(supplied, self.mint_key):
+        ok = bool(supplied) and (hmac.compare_digest(supplied, self.mint_key)
+                                 or bool(self._mint_verify and self._mint_verify(supplied)))
+        if not ok:
             http._send_json(403, {"error": "mint requires the server-to-server bearer",
                                   "reason": "mint_requires_caller_auth"}, self._cors())
             return

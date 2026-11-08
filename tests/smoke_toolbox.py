@@ -1376,6 +1376,18 @@ def test_mint_seam():
     r = mint({"source_ref": "/api/v1/files/x/content"})
     check("mint: no email is a 400, never an unattributable token",
           r.status == 400 and "email" in (r.payload.get("error") or ""), r.payload)
+    # A named stackd key with scope mint/admin (the injected verifier) also passes the
+    # caller-auth gate; anything the verifier refuses is still a 403 before body handling.
+    tb_named = make_tb(mint_key="minty", public_base="https://lab.example",
+                       mint_verify=lambda t: t == "named-mint-key",
+                       source=lambda email, ref: PHOTO if (email and ref) else None)
+    r = post(tb_named, "/toolbox/mint", {"email": EMAIL, "source_ref": "/api/v1/files/x/content"},
+             headers={"authorization": "Bearer named-mint-key"})
+    check("mint: a named key the verifier accepts passes caller-auth", r.status == 200, r.payload)
+    r = post(tb_named, "/toolbox/mint", {"email": EMAIL, "source_ref": "/api/v1/files/x/content"},
+             headers={"authorization": "Bearer named-inference-key"})
+    check("mint: a named key the verifier refuses is still refused", r.status == 403
+          and r.payload.get("reason") == "mint_requires_caller_auth", r.payload)
     tb_reg = make_tb(mint_key="minty", public_base="https://lab.example",
                      user_registered=lambda e: e == EMAIL)
     r = post(tb_reg, "/toolbox/mint", {"email": "ghost@x.io", "source_ref": "files/g"},

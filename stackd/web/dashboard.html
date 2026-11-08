@@ -514,16 +514,21 @@
   <div class="card hidden" id="keysCard" style="margin-top:16px;">
     <h2 class="collapse-h" id="keysH">API keys</h2>
     <div id="keys" class="hidden" style="margin-top:10px;">
-      <p class="muted" style="margin:0 0 10px;">Named keys for agents and other machines. <b>inference</b> keys can list
-        models and run completions, nothing else; <b>admin</b> keys can do everything the admin key can. Usage shows
-        up under the <i>API key</i> dimension in the explorer and as user <code>key:&lt;name&gt;</code>.</p>
+      <p class="muted" style="margin:0 0 10px;">Named keys for agents, services and other machines. <b>inference</b>:
+        models and completions only. <b>brave</b>: SearXNG's Brave-credit reporter. <b>mint</b>: the Comfy Toolbox launch
+        links. <b>admin</b>: everything the admin key can do. Usage shows up under the <i>API key</i> dimension, and as
+        user <code>key:&lt;name&gt;</code> unless the key trusts forwarded users.</p>
       <div class="row" style="gap:8px; flex-wrap:wrap; margin-bottom:10px;">
         <input type="text" id="keyName" placeholder="name, e.g. delegate-laptop" autocomplete="off"
                style="max-width:260px;" maxlength="48" aria-label="new key name">
         <select id="keyScope" aria-label="new key scope">
           <option value="inference" selected>inference</option>
+          <option value="brave">brave (SearXNG reporter)</option>
+          <option value="mint">mint (Comfy Toolbox)</option>
           <option value="admin">admin</option>
         </select>
+        <label class="muted" style="font-size:.8rem;" title="Book usage to the X-OpenWebUI-User-Email this key's caller forwards. Only for Open WebUI's own connection key.">
+          <input type="checkbox" id="keyTrust"> trust forwarded user</label>
         <button id="keyCreate">create key</button>
         <div class="spacer"></div>
         <label class="muted" style="font-size:.8rem;"><input type="checkbox" id="keysAll"> show revoked</label>
@@ -3690,7 +3695,8 @@ async function loadKeys() {
     const tr = el("tr");
     if (row.revoked_at) tr.style.opacity = ".55";
     tr.append(el("td", null, row.name));
-    tr.append(el("td", row.scope === "admin" ? null : "muted", row.scope));
+    tr.append(el("td", row.scope === "admin" ? null : "muted",
+      row.scope + (row.trust_user_headers ? " · trusts users" : "")));
     const kc = el("td"); kc.append(el("code", null, row.key_prefix + "…")); tr.append(kc);
     tr.append(el("td", "muted", fmtWhen(row.created_at)));
     tr.append(el("td", "muted", row.revoked_at ? "revoked " + fmtWhen(row.revoked_at) : fmtWhen(row.last_used_at)));
@@ -3712,17 +3718,18 @@ async function loadKeys() {
 }
 async function createKey() {
   const name = $("#keyName").value.trim().toLowerCase(), scope = $("#keyScope").value;
+  const trust = $("#keyTrust").checked;
   if (!/^[a-z0-9][a-z0-9._-]{0,47}$/.test(name)) {
     toast("name: 1–48 chars of a-z 0-9 . _ - , starting with a letter or digit", true); $("#keyName").focus(); return;
   }
   if (scope === "admin" && !confirm(`Create an ADMIN key "${name}"? It can switch profiles, reload and shut stackd down.`)) return;
   $("#keyCreate").disabled = true;
   try {
-    const r = await api("/keys", { method: "POST", body: JSON.stringify({ name, scope }) });
+    const r = await api("/keys", { method: "POST", body: JSON.stringify({ name, scope, trust_user_headers: trust }) });
     $("#keyNewMsg").textContent = `Key "${r.name}" (${r.scope}) created. Copy it now: it is not stored and will not be shown again.`;
     $("#keyNewVal").textContent = r.key;
     $("#keyNew").classList.remove("hidden");
-    $("#keyName").value = "";
+    $("#keyName").value = ""; $("#keyTrust").checked = false;
     loadKeys();
   } catch (e) { toast("create failed: " + e.message, true); }
   finally { $("#keyCreate").disabled = false; }
