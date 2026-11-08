@@ -161,7 +161,31 @@ CREATE TABLE IF NOT EXISTS media_daily (
 );
 
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+
+-- Named, scoped API keys for non-human callers (agents, other boxes), beside the one admin
+-- key from STACKD_API_KEY. Only the SHA-256 of a key is stored; the plaintext is shown once
+-- at creation. scope 'inference' = /v1 models + completions only; 'admin' = everything the
+-- admin key can do. Revoked rows are kept (revoked_at set) so usage stays attributable.
+CREATE TABLE IF NOT EXISTS api_keys (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    key_sha256 TEXT NOT NULL UNIQUE,
+    key_prefix TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    last_used_at REAL,
+    revoked_at REAL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ix_api_keys_live_name ON api_keys(name) WHERE revoked_at IS NULL;
 """
+
+API_KEY_SCOPES = ("inference", "admin")
+_API_KEY_NAME_RE = r"^[a-z0-9][a-z0-9._-]{0,47}$"
+
+
+def api_key_sha256(key: str) -> str:
+    import hashlib
+    return hashlib.sha256(key.encode()).hexdigest()
 
 
 # media_usage -> day-grain group (rollup + media_rows share it)
@@ -332,6 +356,49 @@ class Store:
             "UPDATE user_keys SET last_validated_at=? WHERE email=?",
             (time.time() if now is None else now, email.strip().lower()),
         )
+
+    # -- named API keys ------------------------------------------------------------
+    def create_api_key(self, name: str, scope: str = "inference", *, now: float | None = None) -> dict:
+        """Mint a key. Returns the row plus `key` (plaintext) — the only time it exists."""
+        import re
+        import secrets
+        name = (name or "").strip().lower()
+        if not re.match(_API_KEY_NAME_RE, name):
+            raise ValueError("name must be 1-48 chars of a-z 0-9 . _ - (starting alphanumeric)")
+        if scope not in API_KEY_SCOPES:
+            raise ValueError(f"scope must be one of {', '.join(API_KEY_SCOPES)}")
+        if self.conn.execute("SELECT 1 FROM api_keys WHERE name=? AND revoked_at IS NULL",
+                             (name,)).fetchone():
+            raise ValueError(f"a live key named {name!r} already exists (revoke it first)")
+        key = "sk-stackd-" + secrets.token_urlsafe(32)
+        now = time.time() if now is None else now
+        self.conn.execute(
+            "INSERT INTO api_keys(name,key_sha256,key_prefix,scope,created_at) VALUES(?,?,?,?,?)",
+            (name, api_key_sha256(key), key[:16], scope, now))
+        return {"name": name, "scope": scope, "key": key, "key_prefix": key[:16], "created_at": now}
+
+    def list_api_keys(self, *, include_revoked: bool = False) -> list[dict]:
+        q = "SELECT * FROM api_keys" + ("" if include_revoked else " WHERE revoked_at IS NULL")
+        return [{"name": r["name"], "scope": r["scope"], "key_prefix": r["key_prefix"],
+                 "created_at": r["created_at"], "last_used_at": r["last_used_at"],
+                 "revoked_at": r["revoked_at"]}
+                for r in self.conn.execute(q + " ORDER BY created_at").fetchall()]
+
+    def live_api_key_hashes(self) -> dict[str, dict]:
+        """{sha256: {name, scope}} for every live key — the daemon's in-memory auth table."""
+        return {r["key_sha256"]: {"name": r["name"], "scope": r["scope"]}
+                for r in self.conn.execute(
+                    "SELECT key_sha256,name,scope FROM api_keys WHERE revoked_at IS NULL")}
+
+    def revoke_api_key(self, name: str, *, now: float | None = None) -> bool:
+        cur = self.conn.execute(
+            "UPDATE api_keys SET revoked_at=? WHERE name=? AND revoked_at IS NULL",
+            (time.time() if now is None else now, (name or "").strip().lower()))
+        return cur.rowcount > 0
+
+    def touch_api_key(self, name: str, *, now: float | None = None) -> None:
+        self.conn.execute("UPDATE api_keys SET last_used_at=? WHERE name=? AND revoked_at IS NULL",
+                          (time.time() if now is None else now, name))
 
     def import_user_keys_json(self, data: dict) -> int:
         """data = {email: {api_key, registered_at?, ...}} (prior-proxy export format)."""

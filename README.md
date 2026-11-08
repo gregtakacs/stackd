@@ -99,6 +99,7 @@ stackctl bench <model> [--verify <prof>]   # measure a model's real VRAM/RAM foo
 stackctl build <target>                    # build a local image — a model, or "image:vulkan"
 stackctl serve                             # the daemon: OpenAI front + MCP + supervisor
 stackctl down                              # tear down every engine the daemon spawned, then stop it
+stackctl keys list | create <name> | revoke <name>   # named, scoped API keys (see API keys)
 stackctl --fake use|tick|route|status      # dry-run the control loop with no GPUs/docker
 ```
 
@@ -107,6 +108,27 @@ Switch profiles on a running daemon via the control plane, not `stackctl use`:
 ```
 curl -XPOST localhost:11444/profiles/<name>/activate -H "Authorization: Bearer $STACKD_API_KEY"
 ```
+
+### API keys
+
+`STACKD_API_KEY` is the **admin** key: every route, including profile switches, reloads and
+shutdown. Agents and other boxes should get a **named key** instead:
+
+```
+stackctl keys create delegate-docker-boy --out ~/.config/delegate/api-key   # scope inference (default)
+stackctl keys list [--all]
+stackctl keys revoke delegate-docker-boy
+```
+
+- `inference` scope: `GET /v1/models`, `/v1/model/info`, and `POST /v1/chat/completions`,
+  `/v1/completions`, `/v1/embeddings`. Everything else answers 401/403. `--scope admin` makes a
+  named key equal to the admin key, for example to give a dashboard its own revocable key.
+- Usage is booked to `key:<name>` in the ledger. A named key's `X-OpenWebUI-User-*` headers are
+  ignored, so an agent cannot charge its tokens to a person.
+- Only the SHA-256 is stored, and the plaintext is shown once. Revoking takes effect on the next request;
+  revoked rows stay, so their usage history keeps a name. Same API over HTTP: `GET /keys`,
+  `POST /keys {"name","scope"}`, `DELETE /keys/<name>` (admin only).
+- Auth is answered from an in-memory table and never waits on the server lock, which a converge holds.
 
 ## Layout
 

@@ -255,6 +255,22 @@ def _build_parser() -> argparse.ArgumentParser:
     rl.add_argument("--port", type=int, default=int(os.environ.get("STACKD_PORT", "11444")))
     rl.add_argument("--api-key", default=_env_or_file("STACKD_API_KEY"))
 
+    ky = sub.add_parser("keys", help="named API keys for agents/other boxes (talks to the daemon; needs the admin key)")
+    ky.add_argument("--host", default=os.environ.get("STACKD_HOST", "127.0.0.1"))
+    ky.add_argument("--port", type=int, default=int(os.environ.get("STACKD_PORT", "11444")))
+    ky.add_argument("--api-key", default=_env_or_file("STACKD_API_KEY"))
+    kys = ky.add_subparsers(dest="keys_cmd", required=True)
+    kl = kys.add_parser("list", help="live keys (prefix, scope, last used)")
+    kl.add_argument("--all", action="store_true", help="include revoked keys")
+    kc = kys.add_parser("create", help="mint a key; the plaintext is printed ONCE")
+    kc.add_argument("name", help="e.g. delegate-docker-boy (a-z 0-9 . _ -)")
+    kc.add_argument("--scope", choices=["inference", "admin"], default="inference",
+                    help="inference = /v1 models + completions only (default); admin = everything")
+    kc.add_argument("--out", type=pathlib.Path, default=None,
+                    help="write the key to this file (mode 600) instead of printing it")
+    kr = kys.add_parser("revoke", help="revoke a key by name (usage history is kept)")
+    kr.add_argument("name")
+
     dn = sub.add_parser("down", help="tear down every engine the running daemon spawned, then stop it")
     dn.add_argument("--host", default=os.environ.get("STACKD_HOST", "127.0.0.1"))
     dn.add_argument("--port", type=int, default=int(os.environ.get("STACKD_PORT", "11444")))
@@ -490,6 +506,64 @@ def _cmd_control_local(args) -> int:
     except ManagerError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
+    return 0
+
+
+def _cmd_keys(args) -> int:
+    """stackctl keys list|create|revoke — over HTTP to the running daemon (the in-memory
+    auth table lives there; writing the DB behind its back would not take effect)."""
+    import datetime as _dt
+    import json as _json
+    import os as _os
+    import urllib.error
+    import urllib.request
+
+    base = f"http://{args.host}:{args.port}/keys"
+    headers = {"content-type": "application/json"}
+    if args.api_key:
+        headers["authorization"] = f"Bearer {args.api_key}"
+    if args.keys_cmd == "list":
+        req = urllib.request.Request(base + ("?all=1" if args.all else ""), headers=headers)
+    elif args.keys_cmd == "create":
+        req = urllib.request.Request(base, method="POST", headers=headers,
+                                     data=_json.dumps({"name": args.name, "scope": args.scope}).encode())
+    else:
+        req = urllib.request.Request(f"{base}/{args.name}", method="DELETE", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            body = _json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            msg = _json.loads(e.read() or b"{}").get("error", {}).get("message", "")
+        except Exception:  # noqa: BLE001
+            msg = ""
+        print(f"error: HTTP {e.code} {msg}".rstrip(), file=sys.stderr)
+        return 1
+    except OSError as e:
+        print(f"error: daemon unreachable at {args.host}:{args.port}: {e}", file=sys.stderr)
+        return 1
+
+    def ts(v):
+        return _dt.datetime.fromtimestamp(v).strftime("%Y-%m-%d %H:%M") if v else "-"
+
+    if args.keys_cmd == "list":
+        rows = body.get("keys") or []
+        if not rows:
+            print("(no named keys)")
+        for k in rows:
+            state = f"revoked {ts(k['revoked_at'])}" if k.get("revoked_at") else f"last used {ts(k.get('last_used_at'))}"
+            print(f"{k['name']:<32} {k['scope']:<9} {k['key_prefix']}...  created {ts(k['created_at'])}  {state}")
+    elif args.keys_cmd == "create":
+        if args.out:
+            fd = _os.open(str(args.out), _os.O_WRONLY | _os.O_CREAT | _os.O_EXCL, 0o600)
+            with _os.fdopen(fd, "w") as f:
+                f.write(body["key"] + "\n")
+            print(f"created {body['name']} ({body['scope']}); key written to {args.out} (mode 600)")
+        else:
+            print(f"created {body['name']} ({body['scope']}) — store this now, it is not shown again:")
+            print(body["key"])
+    else:
+        print(f"revoked {body.get('name')}" if body.get("revoked") else f"no live key named {args.name}")
     return 0
 
 
@@ -809,6 +883,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "reload":
         return _cmd_reload(args)
+    if args.cmd == "keys":
+        return _cmd_keys(args)
     if args.cmd == "down":
         return _cmd_down(args)
 

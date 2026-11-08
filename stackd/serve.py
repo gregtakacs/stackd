@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -27,7 +28,7 @@ from stackd import events
 from stackd.engines.base import EngineState
 from stackd.manager import Manager
 from stackd.promptcache import PromptCacheModel, pc_units
-from stackd.store import Store, _utc_day
+from stackd.store import Store, _utc_day, api_key_sha256
 
 _WEB_DIR = pathlib.Path(__file__).resolve().parent / "web"
 _STATIC_TYPES = {".js": "text/javascript", ".css": "text/css", ".html": "text/html"}
@@ -343,6 +344,11 @@ class _Handler(BaseHTTPRequestHandler):
     # on the pre-switch snapshot). Refreshed whenever the lock IS free.
     _status_cache: dict | None = None
     _profiles_cache: dict | None = None
+    # Named API keys (store.api_keys): {sha256: {name, scope}}, loaded by make_server and
+    # replaced wholesale on create/revoke. Read without the lock — a converge holds `lock`
+    # for ~40s and auth must never wait on it.
+    _scoped_keys: dict = {}
+    _key_touched: dict = {}
     # {"to": <profile>, "since": <epoch>} while an activate is converging, so the
     # dashboard header can show the switch immediately even though status() is
     # still returning the stale (pre-switch) snapshot.
@@ -386,17 +392,62 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send_bytes(304, b"", ctype, cache_s=cache_s, etag=etag)
         return self._send_bytes(200, raw, ctype, cache_s=cache_s, etag=etag)
 
-    def _authed(self) -> bool:
+    # Paths a scope='inference' key may use: the model list and the OpenAI completion routes.
+    _INFERENCE_GET = ("/v1/models", "/models", "/v1/model/info", "/model/info")
+    _INFERENCE_POST = ("/v1/chat/completions", "/v1/completions", "/v1/embeddings")
+
+    def _caller(self) -> dict | None:
+        """Who is calling: {"kind": "admin"|"key", "name", "scope"}, or None if the bearer is
+        neither the admin key nor a live named key. Recomputed per request (a keep-alive
+        connection reuses this handler instance across requests)."""
         if not self.api_key:
+            return {"kind": "admin", "name": None, "scope": "admin"}
+        auth = self.headers.get("authorization", "")
+        if not auth.startswith("Bearer "):
+            return None
+        tok = auth[len("Bearer "):].strip()
+        if tok and hmac.compare_digest(tok, self.api_key):
+            return {"kind": "admin", "name": None, "scope": "admin"}
+        row = self._scoped_keys.get(api_key_sha256(tok)) if tok else None
+        if not row:
+            return None
+        self._touch_key(row["name"])
+        return {"kind": "key", "name": row["name"], "scope": row["scope"]}
+
+    def _touch_key(self, name: str) -> None:
+        """last_used_at, at most once a minute per key, and only if the lock is free now."""
+        now = time.time()
+        if self.store is None or now - self._key_touched.get(name, 0) < 60:
+            return
+        if self.lock.acquire(blocking=False):
+            try:
+                self.store.touch_api_key(name, now=now)
+                self._key_touched[name] = now
+            except Exception:  # noqa: BLE001 — bookkeeping must never fail a request
+                pass
+            finally:
+                self.lock.release()
+
+    def _authed(self) -> bool:
+        c = self._caller()
+        if c is None:
+            return False
+        if c["scope"] == "admin":
             return True
-        return self.headers.get("authorization", "") == f"Bearer {self.api_key}"
+        path = self.path.split("?")[0]
+        if self.command == "GET":
+            return path in self._INFERENCE_GET
+        if self.command == "POST":
+            return path in self._INFERENCE_POST
+        return False
 
     def _read_body(self) -> bytes:
         n = int(self.headers.get("content-length") or 0)
         return self.rfile.read(n) if n else b""
 
     def _admin(self) -> bool:
-        return not self.api_key or self.headers.get("authorization", "") == f"Bearer {self.api_key}"
+        c = self._caller()
+        return c is not None and c["scope"] == "admin"
 
     # -- GET --------------------------------------------------------------------
     def do_GET(self):
@@ -443,6 +494,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send_asset(hit[0], hit[1], cache_s=86400)
         if not self._authed():
             return self._send_json(401, {"error": {"message": "unauthorized"}})
+        if self.path.split("?")[0] == "/keys":
+            return self._keys_get()
         if self.path.split("?")[0] == "/savings":
             return self._savings()
         if self.path.split("?")[0] == "/savings/facts":
@@ -558,6 +611,9 @@ class _Handler(BaseHTTPRequestHandler):
         if not self._authed():
             return self._send_json(401, {"error": {"message": "unauthorized"}})
 
+        if self.path == "/keys":
+            return self._keys_create()
+
         if self.path.startswith("/profiles/"):
             return self._control()
 
@@ -603,6 +659,8 @@ class _Handler(BaseHTTPRequestHandler):
         return self._send_json(404, {"error": {"message": f"no route for {self.path}"}})
 
     def do_DELETE(self):
+        if self.path.startswith("/keys/"):
+            return self._keys_revoke(self.path[len("/keys/"):].split("?")[0].strip("/"))
         if self.path.startswith("/register/users/"):
             if not self._admin():
                 return self._send_json(401, {"error": {"message": "unauthorized"}})
@@ -620,6 +678,58 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/toolbox/") and _toolbox_dispatch(self):
             return
         return self._send_json(405, {"error": {"message": f"{self.path} does not serve OPTIONS"}})
+
+    # -- named API keys (admin only) ----------------------------------------------------
+    def _need_admin(self):
+        """None if the caller is admin, else the 401/403 response already sent."""
+        c = self._caller()
+        if c is None:
+            return self._send_json(401, {"error": {"message": "unauthorized"}}) or True
+        if c["scope"] != "admin":
+            return self._send_json(403, {"error": {"message": "admin key required"}}) or True
+        return None
+
+    def _keys_reload(self) -> None:
+        type(self)._scoped_keys = self.store.live_api_key_hashes()
+
+    def _keys_get(self):
+        if self._need_admin():
+            return
+        if self.store is None:
+            return self._send_json(503, {"error": {"message": "no datastore"}})
+        all_ = "all=1" in (self.path.split("?", 1)[1] if "?" in self.path else "")
+        with self.lock:
+            return self._send_json(200, {"keys": self.store.list_api_keys(include_revoked=all_)})
+
+    def _keys_create(self):
+        if self._need_admin():
+            return
+        if self.store is None:
+            return self._send_json(503, {"error": {"message": "no datastore"}})
+        try:
+            body = json.loads(self._read_body() or b"{}")
+        except json.JSONDecodeError:
+            return self._send_json(400, {"error": {"message": "invalid JSON"}})
+        try:
+            with self.lock:
+                row = self.store.create_api_key(body.get("name") or "", body.get("scope") or "inference")
+                self._keys_reload()
+        except ValueError as e:
+            return self._send_json(400, {"error": {"message": str(e)}})
+        events.record("api_key_created", detail=f"{row['name']} ({row['scope']})", source="keys")
+        return self._send_json(201, row)
+
+    def _keys_revoke(self, name: str):
+        if self._need_admin():
+            return
+        if self.store is None:
+            return self._send_json(503, {"error": {"message": "no datastore"}})
+        with self.lock:
+            gone = self.store.revoke_api_key(name)
+            self._keys_reload()
+        if gone:
+            events.record("api_key_revoked", detail=name, source="keys")
+        return self._send_json(200 if gone else 404, {"revoked": gone, "name": name})
 
     # -- user key registration ----------------------------------------------------
     def _register_submit(self):
@@ -1324,8 +1434,14 @@ class _Handler(BaseHTTPRequestHandler):
         if self.store is None or embeddings:
             return
         usage = _extract_usage(buf)
-        email = (self.headers.get("X-OpenWebUI-User-Email")
-                 or self.headers.get("X-OpenWebUI-User-Id") or "direct")
+        # A named key is its own identity: its caller cannot claim to be an Open WebUI user
+        # by setting the forwarded-user headers.
+        c = self._caller()
+        if c and c["kind"] == "key":
+            email = f"key:{c['name']}"
+        else:
+            email = (self.headers.get("X-OpenWebUI-User-Email")
+                     or self.headers.get("X-OpenWebUI-User-Id") or "direct")
         prompt = usage.get("prompt_tokens", 0)
         completion = usage.get("completion_tokens", 0)
         try:
@@ -2679,6 +2795,8 @@ def make_server(mgr: Manager, host: str, port: int, api_key: str | None,
         "mgr": mgr, "lock": threading.Lock(), "api_key": api_key, "warm_wait_s": warm_wait_s,
         "store": store, "owu_base_url": owu_base_url, "pricing_path": pricing_path,
         "cleaner": cleaner, "toolbox": toolbox,
+        "_scoped_keys": store.live_api_key_hashes() if store is not None else {},
+        "_key_touched": {},
     })
     srv = ThreadingHTTPServer((host, port), handler)
     handler.httpd = srv          # so POST /shutdown can stop serve_forever()
