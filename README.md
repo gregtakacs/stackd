@@ -123,6 +123,9 @@ stackctl keys revoke delegate-docker-boy
 - `inference` scope: `GET /v1/models`, `/v1/model/info`, and `POST /v1/chat/completions`,
   `/v1/completions`, `/v1/embeddings`. Everything else answers 401/403. `--scope admin` makes a
   named key equal to the admin key, for example to give a dashboard its own revocable key.
+- The dashboard has an **API keys** card (admin only) to create, show-once, copy and revoke keys,
+  and the usage explorer and chart have an **API key** dimension: `admin` for the admin key,
+  otherwise the key's name. Ledger rows from before v10 count as `admin`, which they were.
 - Usage is booked to `key:<name>` in the ledger. A named key's `X-OpenWebUI-User-*` headers are
   ignored, so an agent cannot charge its tokens to a person.
 - Only the SHA-256 is stored, and the plaintext is shown once. Revoking takes effect on the next request;

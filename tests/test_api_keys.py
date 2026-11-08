@@ -186,6 +186,52 @@ def test_auth_does_not_wait_on_the_server_lock():
             s.handler.lock.release()
         assert s.req("GET", "/v1/models", k)[0] == 200
 
+def test_usage_records_the_key_dimension_and_facts_carry_it():
+    from stackd.pricing import savings_facts
+    with _Srv() as s:
+        k = s.mint("agent-b")
+        assert s.chat(k)[0] == 200 and s.chat(ADMIN)[0] == 200
+        got = {r[0] for r in s.store.conn.execute("SELECT api_key FROM usage")}
+        assert got == {"agent-b", "admin"}
+        cfg = {"electricity_price_per_kwh": 0, "tiers": [], "currency": "USD"}
+        facts = savings_facts(s.store, cfg)["facts"]
+        by_key = {}
+        for f in facts:
+            by_key[f["api_key"]] = by_key.get(f["api_key"], 0) + f["reqs"]
+        assert by_key.get("agent-b") == 1 and by_key.get("admin") == 1
+
+
+def test_v10_migration_books_old_rows_to_admin_and_keeps_totals():
+    import sqlite3
+    import tempfile
+    path = tempfile.mktemp(suffix=".db")
+    c = sqlite3.connect(path)
+    # a v9-shaped ledger: no api_key anywhere, PK without it
+    c.executescript("""
+        CREATE TABLE usage (id INTEGER PRIMARY KEY, ts REAL NOT NULL, day TEXT NOT NULL, user_email TEXT,
+            requested_model TEXT, served_stack TEXT, served_model TEXT, served_profile TEXT,
+            off_home INTEGER DEFAULT 0, prompt_tokens INTEGER DEFAULT 0, completion_tokens INTEGER DEFAULT 0,
+            cached_tokens INTEGER DEFAULT 0, ok INTEGER DEFAULT 1, ctx_tokens INTEGER DEFAULT 0);
+        CREATE TABLE usage_daily (day TEXT, user_email TEXT, requested_model TEXT, served_profile TEXT,
+            served_stack TEXT NOT NULL DEFAULT '?', served_model TEXT NOT NULL DEFAULT '?',
+            reqs INTEGER DEFAULT 0, prompt_tokens INTEGER DEFAULT 0, completion_tokens INTEGER DEFAULT 0,
+            cached_tokens INTEGER DEFAULT 0, ctx_tokens_sum INTEGER DEFAULT 0, ctx_tokens_sq_sum INTEGER DEFAULT 0,
+            ctx_tokens_max INTEGER DEFAULT 0, ctx_n INTEGER DEFAULT 0,
+            PRIMARY KEY (day, user_email, requested_model, served_profile, served_stack, served_model));
+        INSERT INTO usage(ts,day,user_email,requested_model,prompt_tokens) VALUES (1,'2026-01-01','a@x','m',10);
+        INSERT INTO usage_daily(day,user_email,requested_model,served_profile,reqs,prompt_tokens)
+            VALUES ('2025-01-01','a@x','m','p',7,700), ('2025-01-02','b@x','m','p',3,300);
+    """)
+    c.close()
+    st = Store.open(path)
+    rows = st.conn.execute("SELECT api_key, SUM(reqs), SUM(prompt_tokens) FROM usage_daily GROUP BY 1").fetchall()
+    assert [tuple(r) for r in rows] == [("admin", 10, 1000)]
+    pk = [r[1] for r in st.conn.execute("PRAGMA table_info(usage_daily)") if r[5]]
+    assert "api_key" in pk
+    assert {r["api_key"] for r in st.usage_rows()} == {"admin"}       # raw NULL reads as admin
+    Store.open(path)                                                    # idempotent
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in list(globals().items()):

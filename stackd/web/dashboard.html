@@ -211,6 +211,8 @@
 
   /* tables */
   .tblwrap { min-width:0; max-width:100%; overflow-x:auto; }
+  .tblwrap table.keys-table { table-layout:auto; }
+  .tblwrap table.keys-table td, .tblwrap table.keys-table th { white-space:nowrap; overflow-wrap:normal; }
   /* breakdown tables: wrap the key column instead of scrolling — narrower, better spaced */
   .tblwrap table { table-layout:fixed; }
   .tblwrap td:first-child, .tblwrap th:first-child { white-space:normal; overflow-wrap:anywhere; }
@@ -507,6 +509,36 @@
     <div class="card" id="usgPivot" style="margin-bottom:16px;"></div>
 
     <div class="card" id="usgExplorer"></div>
+  </div>
+
+  <div class="card hidden" id="keysCard" style="margin-top:16px;">
+    <h2 class="collapse-h" id="keysH">API keys</h2>
+    <div id="keys" class="hidden" style="margin-top:10px;">
+      <p class="muted" style="margin:0 0 10px;">Named keys for agents and other machines. <b>inference</b> keys can list
+        models and run completions, nothing else; <b>admin</b> keys can do everything the admin key can. Usage shows
+        up under the <i>API key</i> dimension in the explorer and as user <code>key:&lt;name&gt;</code>.</p>
+      <div class="row" style="gap:8px; flex-wrap:wrap; margin-bottom:10px;">
+        <input type="text" id="keyName" placeholder="name, e.g. delegate-laptop" autocomplete="off"
+               style="max-width:260px;" maxlength="48" aria-label="new key name">
+        <select id="keyScope" aria-label="new key scope">
+          <option value="inference" selected>inference</option>
+          <option value="admin">admin</option>
+        </select>
+        <button id="keyCreate">create key</button>
+        <div class="spacer"></div>
+        <label class="muted" style="font-size:.8rem;"><input type="checkbox" id="keysAll"> show revoked</label>
+      </div>
+      <div id="keyNew" class="hidden" role="status" style="border:1px solid var(--accent); border-radius:var(--radius);
+           padding:10px 12px; margin-bottom:10px;">
+        <div class="muted" style="font-size:.8rem; margin-bottom:6px;" id="keyNewMsg"></div>
+        <div class="row" style="gap:8px;">
+          <code id="keyNewVal" style="word-break:break-all; user-select:all; flex:1;"></code>
+          <button class="sm" id="keyCopy">copy</button>
+          <button class="sm" id="keyNewDone">done</button>
+        </div>
+      </div>
+      <div id="keysTable"></div>
+    </div>
   </div>
 
   <div class="card hidden" id="usersCard" style="margin-top:16px;">
@@ -2748,9 +2780,10 @@ const XP_DIMS = [
   { k: "requested_model", label: "API name" },
   { k: "served_profile",  label: "Profile" },
   { k: "user_email",      label: "User" },
+  { k: "api_key",         label: "API key" },     // 'admin' (STACKD_API_KEY) or a named key
   { k: "day",             label: "Day" },
 ];
-const XP_DEF = { order: ["served_stack", "served_model", "requested_model", "served_profile", "user_email", "day"],
+const XP_DEF = { order: ["served_stack", "served_model", "requested_model", "served_profile", "user_email", "api_key", "day"],
                  active: ["served_model", "user_email", "day"], filters: {}, daySort: "date", dateGran: "day" };
 const DATE_GRANS = ["day", "week", "month", "quarter", "year"];
 function loadXP() {
@@ -3638,6 +3671,63 @@ function renderXpChart() {
   drawPivotChart(host, xcats, series, { type: XC.type, valFmt: fmt, showLegend: !!XC.series });
 }
 
+// ---- named API keys (admin only; the card stays hidden for anyone else) ----
+const fmtWhen = t => (t ? new Date(t * 1000).toLocaleString(undefined,
+  { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "–");
+async function loadKeys() {
+  let k;
+  try { k = await api("/keys" + ($("#keysAll").checked ? "?all=1" : "")); }
+  catch (e) { return; }                       // not admin / older daemon: leave the card hidden
+  $("#keysCard").classList.remove("hidden");
+  const box = $("#keysTable"); box.innerHTML = "";
+  const rows = k.keys || [];
+  if (!rows.length) { box.append(el("p", "muted", "No named keys yet.")); return; }
+  const t = el("table", "keys-table");
+  t.innerHTML = "<thead><tr><th>name</th><th>scope</th><th>key</th><th>created</th>"
+    + "<th>last used</th><th></th></tr></thead>";
+  const tb = el("tbody");
+  for (const row of rows) {
+    const tr = el("tr");
+    if (row.revoked_at) tr.style.opacity = ".55";
+    tr.append(el("td", null, row.name));
+    tr.append(el("td", row.scope === "admin" ? null : "muted", row.scope));
+    const kc = el("td"); kc.append(el("code", null, row.key_prefix + "…")); tr.append(kc);
+    tr.append(el("td", "muted", fmtWhen(row.created_at)));
+    tr.append(el("td", "muted", row.revoked_at ? "revoked " + fmtWhen(row.revoked_at) : fmtWhen(row.last_used_at)));
+    const bc = el("td");
+    if (!row.revoked_at) {
+      const b = el("button", "sm", "revoke");
+      b.onclick = async () => {
+        if (!confirm(`Revoke "${row.name}"? Anything using it stops working immediately. Its usage history is kept.`)) return;
+        try { await api("/keys/" + encodeURIComponent(row.name), { method: "DELETE" }); toast(`revoked ${row.name}`); }
+        catch (e) { toast("revoke failed: " + e.message, true); }
+        loadKeys();
+      };
+      bc.append(b);
+    }
+    tr.append(bc); tb.append(tr);
+  }
+  t.append(tb);
+  const w = el("div", "tblwrap"); w.append(t); box.append(w);
+}
+async function createKey() {
+  const name = $("#keyName").value.trim().toLowerCase(), scope = $("#keyScope").value;
+  if (!/^[a-z0-9][a-z0-9._-]{0,47}$/.test(name)) {
+    toast("name: 1–48 chars of a-z 0-9 . _ - , starting with a letter or digit", true); $("#keyName").focus(); return;
+  }
+  if (scope === "admin" && !confirm(`Create an ADMIN key "${name}"? It can switch profiles, reload and shut stackd down.`)) return;
+  $("#keyCreate").disabled = true;
+  try {
+    const r = await api("/keys", { method: "POST", body: JSON.stringify({ name, scope }) });
+    $("#keyNewMsg").textContent = `Key "${r.name}" (${r.scope}) created. Copy it now: it is not stored and will not be shown again.`;
+    $("#keyNewVal").textContent = r.key;
+    $("#keyNew").classList.remove("hidden");
+    $("#keyName").value = "";
+    loadKeys();
+  } catch (e) { toast("create failed: " + e.message, true); }
+  finally { $("#keyCreate").disabled = false; }
+}
+
 // ---- users -----------------------------------------------
 async function loadUsers() {
   try {
@@ -3880,7 +3970,7 @@ async function start() {
   await backfillLive();
   await tick();
   try { renderEvents(await api("/events"), true); } catch (e) {}
-  loadProfiles(); loadUsers();
+  loadProfiles(); loadUsers(); loadKeys();
   schedule();
   setInterval(pumpCharts, SAMPLE_MS);   // the chart grid: 1 s regardless of poll rate
   setInterval(loadProfiles, 15000);
@@ -3926,6 +4016,16 @@ $("#btnCleaner").onclick = async () => {
   } catch (e) { toast("cleaner toggle failed: " + e.message, true); }
 };
 $("#usersH").onclick = () => { $("#usersH").classList.toggle("open"); $("#users").classList.toggle("hidden"); };
+$("#keysH").onclick = () => { $("#keysH").classList.toggle("open"); $("#keys").classList.toggle("hidden"); };
+$("#keysAll").onchange = loadKeys;
+$("#keyCreate").onclick = createKey;
+$("#keyName").onkeydown = e => { if (e.key === "Enter") createKey(); };
+$("#keyCopy").onclick = async () => {
+  try { await navigator.clipboard.writeText($("#keyNewVal").textContent); toast("copied"); }
+  catch (e) { const r = document.createRange(); r.selectNodeContents($("#keyNewVal"));
+    const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r); toast("selected — press Ctrl+C", true); }
+};
+$("#keyNewDone").onclick = () => { $("#keyNewVal").textContent = ""; $("#keyNew").classList.add("hidden"); };
 $("#events").addEventListener("mouseenter", () => evPaused = true);
 $("#events").addEventListener("mouseleave", () => evPaused = false);
 let rT; addEventListener("resize", () => { clearTimeout(rT); rT = setTimeout(() => {

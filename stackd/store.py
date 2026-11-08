@@ -14,7 +14,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 RETAIN_DAYS = 40
 
 _SCHEMA = """
@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS usage (
     completion_tokens INTEGER DEFAULT 0,
     cached_tokens INTEGER DEFAULT 0,
     ok INTEGER DEFAULT 1,
-    ctx_tokens INTEGER DEFAULT 0    -- context size this request occupied (prompt + completion)
+    ctx_tokens INTEGER DEFAULT 0,   -- context size this request occupied (prompt + completion)
+    api_key TEXT                    -- which key: 'admin' or a named api_keys.name (v10)
 );
 CREATE INDEX IF NOT EXISTS ix_usage_day ON usage(day);
 
@@ -62,7 +63,8 @@ CREATE TABLE IF NOT EXISTS usage_daily (
     ctx_tokens_sq_sum INTEGER DEFAULT 0,  -- Σ ctx_tokens² (for the token-weighted mean)
     ctx_tokens_max INTEGER DEFAULT 0,
     ctx_n INTEGER DEFAULT 0,              -- count of those rows -> arith. mean = sum / ctx_n
-    PRIMARY KEY (day, user_email, requested_model, served_profile, served_stack, served_model)
+    api_key TEXT NOT NULL DEFAULT 'admin',  -- v10: which key made the requests
+    PRIMARY KEY (day, user_email, requested_model, served_profile, served_stack, served_model, api_key)
 );
 
 -- engine-measured throughput, sampled from each running engine's own /metrics
@@ -278,6 +280,45 @@ class Store:
             if col not in dcols:
                 self.conn.execute(f"ALTER TABLE usage_daily ADD COLUMN {col} INTEGER DEFAULT 0")
 
+        # v10: which API key made the request — 'admin' (STACKD_API_KEY) or a named key.
+        # Raw `usage` gets a plain column (NULL on old rows = 'admin': until v10 the admin
+        # key was the only key). `usage_daily` needs it in the primary key, so it is
+        # rebuilt once, every existing row booked to 'admin'.
+        if "api_key" not in ucols:
+            self.conn.execute("ALTER TABLE usage ADD COLUMN api_key TEXT")
+        if "api_key" not in dcols:
+            self.conn.executescript("""
+                BEGIN;
+                CREATE TABLE usage_daily_v10 (
+                    day TEXT, user_email TEXT, requested_model TEXT, served_profile TEXT,
+                    served_stack TEXT NOT NULL DEFAULT '?',
+                    served_model TEXT NOT NULL DEFAULT '?',
+                    reqs INTEGER DEFAULT 0,
+                    prompt_tokens INTEGER DEFAULT 0,
+                    completion_tokens INTEGER DEFAULT 0,
+                    cached_tokens INTEGER DEFAULT 0,
+                    ctx_tokens_sum INTEGER DEFAULT 0,
+                    ctx_tokens_sq_sum INTEGER DEFAULT 0,
+                    ctx_tokens_max INTEGER DEFAULT 0,
+                    ctx_n INTEGER DEFAULT 0,
+                    api_key TEXT NOT NULL DEFAULT 'admin',
+                    PRIMARY KEY (day, user_email, requested_model, served_profile,
+                                 served_stack, served_model, api_key)
+                );
+                INSERT INTO usage_daily_v10
+                    (day,user_email,requested_model,served_profile,served_stack,served_model,
+                     reqs,prompt_tokens,completion_tokens,cached_tokens,
+                     ctx_tokens_sum,ctx_tokens_sq_sum,ctx_tokens_max,ctx_n,api_key)
+                SELECT day,user_email,requested_model,served_profile,served_stack,served_model,
+                       reqs,prompt_tokens,completion_tokens,cached_tokens,
+                       ctx_tokens_sum,ctx_tokens_sq_sum,ctx_tokens_max,ctx_n,'admin'
+                FROM usage_daily;
+                DROP TABLE usage_daily;
+                ALTER TABLE usage_daily_v10 RENAME TO usage_daily;
+                COMMIT;
+            """)
+            dcols = {r["name"] for r in self.conn.execute("PRAGMA table_info(usage_daily)")}
+
         # v6: drop the dead per-request throughput fold (-> engine_daily). Needs
         # SQLite >= 3.35 DROP COLUMN; guarded by table_info so it's a one-time
         # no-op, and best-effort — an ancient SQLite just keeps the empty columns.
@@ -451,7 +492,7 @@ class Store:
                     "INSERT INTO usage_daily(day,user_email,requested_model,served_profile,"
                     "served_stack,served_model,reqs,prompt_tokens,completion_tokens,cached_tokens) "
                     "VALUES(?,?,?,?,'?','?',?,?,?,?) "
-                    "ON CONFLICT(day,user_email,requested_model,served_profile,served_stack,served_model) "
+                    "ON CONFLICT(day,user_email,requested_model,served_profile,served_stack,served_model,api_key) "
                     "DO UPDATE SET "
                     "reqs=reqs+excluded.reqs, prompt_tokens=prompt_tokens+excluded.prompt_tokens, "
                     "completion_tokens=completion_tokens+excluded.completion_tokens, "
@@ -494,7 +535,7 @@ class Store:
                      served_model: str | None = None,
                      prompt_tokens: int = 0, completion_tokens: int = 0,
                      cached_tokens: int = 0, off_home: bool = False, ok: bool = True,
-                     ctx_tokens: int | None = None,
+                     ctx_tokens: int | None = None, api_key: str | None = None,
                      now: float | None = None) -> None:
         # No per-request timing: tok/s comes from engine_daily (the /metrics
         # sampler). The vestigial usage.{prefill_ms,decode_ms} columns are left
@@ -504,11 +545,12 @@ class Store:
             ctx_tokens = (prompt_tokens or 0) + (completion_tokens or 0)
         self.conn.execute(
             "INSERT INTO usage(ts,day,user_email,requested_model,served_stack,served_model,"
-            "served_profile,off_home,prompt_tokens,completion_tokens,cached_tokens,ok,ctx_tokens) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "served_profile,off_home,prompt_tokens,completion_tokens,cached_tokens,ok,ctx_tokens,"
+            "api_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (now, _utc_day(now), (user_email or "direct"), requested_model, served_stack,
              served_model, served_profile, int(off_home),
-             prompt_tokens, completion_tokens, cached_tokens, int(ok), int(ctx_tokens or 0)),
+             prompt_tokens, completion_tokens, cached_tokens, int(ok), int(ctx_tokens or 0),
+             api_key or "admin"),
         )
 
     def rollup(self, *, retain_days: int = RETAIN_DAYS, now: float | None = None) -> int:
@@ -517,22 +559,22 @@ class Store:
         rows = self.conn.execute(
             "SELECT day, COALESCE(user_email,'direct') u, COALESCE(requested_model,'?') m, "
             "COALESCE(served_profile,'?') p, COALESCE(served_stack,'?') sk, "
-            "COALESCE(served_model,'?') sm, "
+            "COALESCE(served_model,'?') sm, COALESCE(api_key,'admin') ak, "
             "COUNT(*) reqs, SUM(prompt_tokens) pt, "
             "SUM(completion_tokens) ct, SUM(cached_tokens) cc, "
             "SUM(CASE WHEN ctx_tokens>0 THEN ctx_tokens ELSE 0 END) cxs, "
             "SUM(CASE WHEN ctx_tokens>0 THEN ctx_tokens*ctx_tokens ELSE 0 END) cxsq, "
             "MAX(ctx_tokens) cxm, "
             "SUM(CASE WHEN ctx_tokens>0 THEN 1 ELSE 0 END) cxn "
-            "FROM usage WHERE day < ? GROUP BY day,u,m,p,sk,sm", (cutoff,)
+            "FROM usage WHERE day < ? GROUP BY day,u,m,p,sk,sm,ak", (cutoff,)
         ).fetchall()
         for r in rows:
             self.conn.execute(
                 "INSERT INTO usage_daily(day,user_email,requested_model,served_profile,"
                 "served_stack,served_model,reqs,prompt_tokens,completion_tokens,cached_tokens,"
-                "ctx_tokens_sum,ctx_tokens_sq_sum,ctx_tokens_max,ctx_n) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
-                "ON CONFLICT(day,user_email,requested_model,served_profile,served_stack,served_model) "
+                "ctx_tokens_sum,ctx_tokens_sq_sum,ctx_tokens_max,ctx_n,api_key) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(day,user_email,requested_model,served_profile,served_stack,served_model,api_key) "
                 "DO UPDATE SET "
                 "reqs=reqs+excluded.reqs, prompt_tokens=prompt_tokens+excluded.prompt_tokens, "
                 "completion_tokens=completion_tokens+excluded.completion_tokens, "
@@ -543,7 +585,7 @@ class Store:
                 "ctx_n=ctx_n+excluded.ctx_n",
                 (r["day"], r["u"], r["m"], r["p"], r["sk"], r["sm"],
                  r["reqs"], r["pt"], r["ct"], r["cc"],
-                 r["cxs"] or 0, r["cxsq"] or 0, r["cxm"] or 0, r["cxn"] or 0),
+                 r["cxs"] or 0, r["cxsq"] or 0, r["cxm"] or 0, r["cxn"] or 0, r["ak"]),
             )
         cur = self.conn.execute("DELETE FROM usage WHERE day < ?", (cutoff,))
         n = cur.rowcount
@@ -617,16 +659,18 @@ class Store:
             "SELECT day, COALESCE(user_email,'direct') user_email, "
             "COALESCE(requested_model,'?') requested_model, COALESCE(served_profile,'?') served_profile, "
             "COALESCE(served_stack,'?') served_stack, COALESCE(served_model,'?') served_model, "
+            "COALESCE(api_key,'admin') api_key, "
             "COUNT(*) reqs, SUM(prompt_tokens) prompt_tokens, SUM(completion_tokens) completion_tokens, "
             "SUM(cached_tokens) cached_tokens, "
             "SUM(CASE WHEN ctx_tokens>0 THEN ctx_tokens ELSE 0 END) ctx_tokens_sum, "
             "SUM(CASE WHEN ctx_tokens>0 THEN ctx_tokens*ctx_tokens ELSE 0 END) ctx_tokens_sq_sum, "
             "MAX(ctx_tokens) ctx_tokens_max, "
             "SUM(CASE WHEN ctx_tokens>0 THEN 1 ELSE 0 END) ctx_n FROM usage" + where +
-            " GROUP BY day,user_email,requested_model,served_profile,served_stack,served_model", args
+            " GROUP BY day,user_email,requested_model,served_profile,served_stack,served_model,"
+            "COALESCE(api_key,'admin')", args
         ).fetchall()
         folded = self.conn.execute(
-            "SELECT day,user_email,requested_model,served_profile,served_stack,served_model,reqs,"
+            "SELECT day,user_email,requested_model,served_profile,served_stack,served_model,api_key,reqs,"
             "prompt_tokens,completion_tokens,cached_tokens,ctx_tokens_sum,ctx_tokens_max,ctx_n,"
             # rows folded before v7 have no Σctx² -> fall back to n·mean²
             # (= ctx_tokens_sum²/ctx_n), i.e. assume weighted == arithmetic for

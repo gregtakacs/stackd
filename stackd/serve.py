@@ -1456,6 +1456,7 @@ class _Handler(BaseHTTPRequestHandler):
                     served_stack=rr.stack, served_model=rr.artifact, served_profile=rr.profile,
                     prompt_tokens=prompt, completion_tokens=completion, cached_tokens=cached,
                     ctx_tokens=prompt + completion,
+                    api_key=(c["name"] if c and c["kind"] == "key" else "admin"),
                     off_home=(rr.route_kind != "native"),
                     ok=(200 <= status < 300),
                 )

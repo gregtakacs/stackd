@@ -249,7 +249,8 @@ def _join_engine_throughput(facts: list[dict], erows: list[dict], keys) -> None:
     for (day, stack), b in buckets.items():
         grp = by_ds.get((day, stack))
         if not grp:
-            f = {k: v for k, v in zip(keys, (day, "(engine)", "(engine)", stack, "(engine)", "(engine)"))}
+            f = {k: v for k, v in zip(keys, (day, "(engine)", "(engine)", stack, "(engine)", "(engine)",
+                                              "(engine)"))}
             f.update(reqs=0, prompt_tokens=0, completion_tokens=0, cached_tokens=0,
                      ctx_tokens_sum=0, ctx_tokens_sq_sum=0, ctx_n=0, ctx_tokens_max=0,
                      prefill_ms=0, prefill_tok=0, decode_ms=0, decode_tok=0,
@@ -270,7 +271,7 @@ def savings_facts(store: Store, cfg: dict, *, from_day: str | None = None,
                   to_day: str | None = None) -> dict:
     """Priced fact table at finest grain, for the dashboard's interactive
     drill-down. One entry per distinct
-    ``(day, user_email, requested_model, served_stack, served_model, served_profile)``
+    ``(day, user_email, requested_model, served_stack, served_model, served_profile, api_key)``
     in range, with per-tier gross. ``served_stack`` is the stackd unit (``coding``);
     ``served_model`` is the checkpoint on disk (``Qwen3.8-Flash-Next-NVFP4``). Net is
     left to the caller and apportioned exactly as ``savings()`` does::
@@ -292,7 +293,7 @@ def savings_facts(store: Store, cfg: dict, *, from_day: str | None = None,
                  for t in tiers]
 
     keys = ("day", "user_email", "requested_model",
-            "served_stack", "served_model", "served_profile")
+            "served_stack", "served_model", "served_profile", "api_key")
     groups: dict[tuple, list[dict]] = {}
     for r in rows:
         groups.setdefault(tuple(r[k] for k in keys), []).append(r)
