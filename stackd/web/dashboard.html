@@ -3740,7 +3740,7 @@ function agRender(d, a, now) {
   head.append(el("span", "ag-task", a.task));
   if (a.kind === "claude") head.append(el("span", "pill info", "Claude agent"));
   const st = a.final ? (a.status || "finished") : (a.phase || "running");
-  const cls = !a.final ? "prog" : /^(done)$/.test(st) ? "ok" : /aborted|error|timeout|failed|truncated/.test(st) ? "bad" : "warn";
+  const cls = !a.final ? "prog" : /^(done|finished)$/.test(st) ? "ok" : /aborted|error|timeout|failed|truncated/.test(st) ? "bad" : "warn";
   head.append(el("span", "pill " + cls, (a.final ? "" : "● ") + st));
   if (a.kind !== "claude") head.append(el("span", "muted", `round ${a.round ?? "?"}`));
   const where = [(a.repo || "").split("/").pop(), a.branch].filter(Boolean).join(" · ");
