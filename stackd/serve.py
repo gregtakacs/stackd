@@ -349,6 +349,11 @@ class _Handler(BaseHTTPRequestHandler):
     # for ~40s and auth must never wait on it.
     _scoped_keys: dict = {}
     _key_touched: dict = {}
+    # Live coding-agent sessions (the `delegate` harness posts progress snapshots while a
+    # worker round runs). In memory only, keyed by (reporting key, task); display-only, never
+    # persisted, never trusted for anything. Own small lock — never the server lock.
+    _agents: dict = {}
+    _agents_lock = threading.Lock()
     # {"to": <profile>, "since": <epoch>} while an activate is converging, so the
     # dashboard header can show the switch immediately even though status() is
     # still returning the stale (pre-switch) snapshot.
@@ -394,7 +399,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     # Paths a scope='inference' key may use: the model list and the OpenAI completion routes.
     _INFERENCE_GET = ("/v1/models", "/models", "/v1/model/info", "/model/info")
-    _INFERENCE_POST = ("/v1/chat/completions", "/v1/completions", "/v1/embeddings")
+    _INFERENCE_POST = ("/v1/chat/completions", "/v1/completions", "/v1/embeddings",
+                       "/agents/progress")   # an agent harness reporting its own session
 
     def _caller(self) -> dict | None:
         """Who is calling: {"kind": "admin"|"key", "name", "scope"}, or None if the bearer is
@@ -508,6 +514,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send_json(401, {"error": {"message": "unauthorized"}})
         if self.path.split("?")[0] == "/keys":
             return self._keys_get()
+        if self.path.split("?")[0] == "/agents/live":
+            return self._agents_live()
         if self.path.split("?")[0] == "/savings":
             return self._savings()
         if self.path.split("?")[0] == "/savings/facts":
@@ -626,6 +634,9 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path == "/keys":
             return self._keys_create()
 
+        if self.path == "/agents/progress":
+            return self._agents_progress()
+
         if self.path.startswith("/profiles/"):
             return self._control()
 
@@ -690,6 +701,80 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/toolbox/") and _toolbox_dispatch(self):
             return
         return self._send_json(405, {"error": {"message": f"{self.path} does not serve OPTIONS"}})
+
+    # -- live agent sessions (delegate harness progress) ---------------------------------
+    AGENT_STALE_S = 120      # no update for this long: the harness died; drop it
+    AGENT_LINGER_S = 90      # a finished round stays visible this long, then goes
+    AGENT_MAX = 50
+
+    @staticmethod
+    def _clip(v, n):
+        return str(v)[:n] if v is not None else None
+
+    @classmethod
+    def _agent_record(cls, b: dict, reporter: str) -> dict:
+        def num(k, typ=int):
+            try:
+                return typ(b.get(k)) if b.get(k) is not None else None
+            except (TypeError, ValueError):
+                return None
+        todos = [{"content": cls._clip(t.get("content"), 200), "status": cls._clip(t.get("status"), 20)}
+                 for t in (b.get("todos") or [])[:30] if isinstance(t, dict)]
+        recent = [{"t": (float(r.get("t")) if isinstance(r.get("t"), (int, float)) else None),
+                   "kind": cls._clip(r.get("kind"), 20), "text": cls._clip(r.get("text"), 300),
+                   "ok": (bool(r["ok"]) if isinstance(r.get("ok"), bool) else None)}
+                  for r in (b.get("recent") or [])[-30:] if isinstance(r, dict)]
+        nudges = {cls._clip(k, 20): int(v) for k, v in list((b.get("nudges") or {}).items())[:10]
+                  if isinstance(v, int)}
+        return {
+            "task": cls._clip(b.get("task"), 120), "round": num("round"),
+            "repo": cls._clip(b.get("repo"), 200), "branch": cls._clip(b.get("branch"), 120),
+            "model": cls._clip(b.get("model"), 80), "host": cls._clip(b.get("host"), 60),
+            "phase": cls._clip(b.get("phase"), 40), "status": cls._clip(b.get("status"), 40),
+            "started_at": num("started_at", float), "steps": num("steps"),
+            "tool_calls": num("tool_calls"), "tool_errors": num("tool_errors"),
+            "output_tokens": num("output_tokens"), "context_tokens": num("context_tokens"),
+            "nudges": nudges, "todos": todos, "recent": recent,
+            "last_text": cls._clip(b.get("last_text"), 600),
+            "final": bool(b.get("final")), "reporter": reporter, "updated_at": time.time(),
+        }
+
+    @classmethod
+    def _agents_prune(cls, now: float) -> None:
+        for k, r in list(cls._agents.items()):
+            age = now - r["updated_at"]
+            if age > (cls.AGENT_LINGER_S if r["final"] else cls.AGENT_STALE_S):
+                del cls._agents[k]
+
+    def _agents_progress(self):
+        if int(self.headers.get("content-length") or 0) > 262144:
+            return self._send_json(413, {"error": {"message": "progress snapshot too large"}})
+        try:
+            body = json.loads(self._read_body() or b"{}")
+        except json.JSONDecodeError:
+            return self._send_json(400, {"error": {"message": "invalid JSON"}})
+        if not isinstance(body, dict) or not str(body.get("task") or "").strip():
+            return self._send_json(400, {"error": {"message": "missing 'task'"}})
+        c = self._caller()
+        reporter = c["name"] if c and c["kind"] == "key" else "admin"
+        rec = self._agent_record(body, reporter)
+        now = time.time()
+        with self._agents_lock:
+            self._agents_prune(now)
+            key = (reporter, rec["task"])
+            if key not in self._agents and len(self._agents) >= self.AGENT_MAX:
+                return self._send_json(429, {"error": {"message": "too many live agent sessions"}})
+            self._agents[key] = rec
+        return self._send_json(200, {"ok": True})
+
+    def _agents_live(self):
+        if self._need_admin():
+            return
+        now = time.time()
+        with self._agents_lock:
+            self._agents_prune(now)
+            rows = sorted(self._agents.values(), key=lambda r: r.get("started_at") or 0)
+        return self._send_json(200, {"now": now, "sessions": rows})
 
     # -- named API keys (admin only) ----------------------------------------------------
     def _need_admin(self):
@@ -2827,6 +2912,7 @@ def make_server(mgr: Manager, host: str, port: int, api_key: str | None,
         "cleaner": cleaner, "toolbox": toolbox,
         "_scoped_keys": store.live_api_key_hashes() if store is not None else {},
         "_key_touched": {},
+        "_agents": {}, "_agents_lock": threading.Lock(),
     })
     srv = ThreadingHTTPServer((host, port), handler)
     handler.httpd = srv          # so POST /shutdown can stop serve_forever()

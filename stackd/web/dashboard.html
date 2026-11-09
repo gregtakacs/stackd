@@ -167,6 +167,27 @@
   .prof.active { border-color:var(--accent); background:#161a2b; }
   .prof.pending { border-color:var(--yellow); border-style:dashed; animation:pulse 1.4s infinite; }
   .prof .chips { display:flex; flex-wrap:wrap; gap:5px; margin:7px 0; }
+  /* live coding-agent sessions (delegate) */
+  .ag { border:1px solid var(--border); border-radius:var(--radius); padding:12px 14px; background:var(--surface2); }
+  .ag + .ag { margin-top:10px; }
+  .ag-head { display:flex; align-items:baseline; gap:8px; flex-wrap:wrap; }
+  .ag-task { font-weight:700; font-size:.95rem; overflow-wrap:anywhere; }
+  .ag-stats { display:flex; gap:14px; flex-wrap:wrap; font-size:.78rem; color:var(--dim); margin:6px 0 10px;
+    font-variant-numeric:tabular-nums; }
+  .ag-stats b { color:var(--text); font-weight:600; }
+  .ag-cols { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1.6fr); gap:14px; }
+  @media (max-width:760px) { .ag-cols { grid-template-columns:minmax(0,1fr); } }
+  .ag-sub { font-size:.7rem; text-transform:uppercase; letter-spacing:.05em; color:var(--dim); margin-bottom:4px; }
+  .ag-todo { font-size:.8rem; line-height:1.45; }
+  .ag-todo .done { color:var(--dim); text-decoration:line-through; }
+  .ag-todo .now { color:var(--yellow); }
+  .ag-feed { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:.74rem; line-height:1.5;
+    max-height:210px; overflow:auto; background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:6px 8px; }
+  .ag-feed div { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .ag-feed .t { color:var(--dim); }
+  .ag-feed .k { color:var(--accent); }
+  .ag-feed .fail { color:var(--red); }
+  .ag-feed .say { color:var(--dim); font-style:italic; }
   .chip { font-size:.73rem; padding:2px 8px; border-radius:6px; background:var(--surface2); border:1px solid var(--border); }
   .chip-sw { display:inline-block; width:8px; height:8px; border-radius:2px; margin-right:5px;
     vertical-align:middle; text-decoration:none; }
@@ -422,6 +443,12 @@
 
   <!-- ============ MAIN VIEW ============ -->
   <div id="viewMain">
+    <div class="card hidden" id="agentsCard" style="margin-bottom:16px;" aria-live="polite">
+      <div class="row"><h2 style="margin:0;">Coding agents · live</h2><div class="spacer"></div>
+        <span class="muted" style="font-size:.72rem;">delegate worker rounds · read-only</span></div>
+      <div id="agents" style="margin-top:12px;"></div>
+    </div>
+
     <div class="card" style="margin-bottom:16px;">
       <h2>Loaded where</h2>
       <div id="gauges"></div>
@@ -3677,6 +3704,70 @@ function renderXpChart() {
   drawPivotChart(host, xcats, series, { type: XC.type, valFmt: fmt, showLegend: !!XC.series });
 }
 
+// ---- live coding-agent sessions (delegate) — read-only, live rounds only ----
+const agDur = s => { s = Math.max(0, Math.round(s)); const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60);
+  return h ? `${h}h${p2(m)}m` : `${m}m${p2(s % 60)}s`; };
+async function loadAgents() {
+  let r;
+  try { r = await api("/agents/live"); } catch (e) { return; }    // not admin / older daemon
+  const ss = r.sessions || [], card = $("#agentsCard"), box = $("#agents");
+  card.classList.toggle("hidden", !ss.length);
+  if (!ss.length) { box.innerHTML = ""; return; }
+  const now = r.now || Date.now() / 1000;
+  box.innerHTML = "";
+  for (const a of ss) {
+    const d = el("div", "ag");
+    const head = el("div", "ag-head");
+    head.append(el("span", "ag-task", a.task));
+    const st = a.final ? (a.status || "finished") : (a.phase || "running");
+    const cls = !a.final ? "prog" : /^(done)$/.test(st) ? "ok" : /aborted|error|timeout|failed|truncated/.test(st) ? "bad" : "warn";
+    head.append(el("span", "pill " + cls, (a.final ? "" : "● ") + st));
+    head.append(el("span", "muted", `round ${a.round ?? "?"}`));
+    const where = [(a.repo || "").split("/").pop(), a.branch].filter(Boolean).join(" · ");
+    if (where) head.append(el("span", "muted", where));
+    const right = el("span", "muted"); right.style.marginLeft = "auto"; right.style.fontSize = ".74rem";
+    right.textContent = [a.model, a.reporter && "key " + a.reporter, a.host].filter(Boolean).join(" · ");
+    head.append(right);
+    d.append(head);
+    const stats = el("div", "ag-stats");
+    const age = now - (a.updated_at || now);
+    const add = (label, val) => { const x = el("span"); x.append(el("b", null, val), " " + label); stats.append(x); };
+    if (a.started_at) add("elapsed", agDur((a.final ? a.updated_at : now) - a.started_at));
+    add("steps", fmtNum(a.steps ?? 0));
+    add(`tool calls${a.tool_errors ? ` (${a.tool_errors} failed)` : ""}`, fmtNum(a.tool_calls ?? 0));
+    add("tokens out", fmtSI(a.output_tokens ?? 0));
+    if (a.context_tokens) add("context", fmtSI(a.context_tokens));
+    const nud = Object.entries(a.nudges || {}).map(([k, v]) => `${k}×${v}`).join(", ");
+    if (nud) add("retries", nud);
+    if (!a.final && age > 20) { const w = el("span", null, `no update for ${agDur(age)}`); w.style.color = "var(--yellow)"; stats.append(w); }
+    d.append(stats);
+    const cols = el("div", "ag-cols");
+    const left = el("div");
+    left.append(el("div", "ag-sub", "plan"));
+    const todo = el("div", "ag-todo");
+    if (!(a.todos || []).length) todo.append(el("div", "muted", "no todo list yet"));
+    for (const t of a.todos || []) {
+      const mark = t.status === "completed" ? "✓" : t.status === "in_progress" ? "▸" : "○";
+      todo.append(el("div", t.status === "completed" ? "done" : t.status === "in_progress" ? "now" : null, `${mark} ${t.content}`));
+    }
+    left.append(todo);
+    const right2 = el("div");
+    right2.append(el("div", "ag-sub", "activity"));
+    const feed = el("div", "ag-feed");
+    for (const e of (a.recent || []).slice().reverse()) {
+      const line = el("div", e.ok === false ? "fail" : e.kind === "says" ? "say" : null);
+      line.title = e.text || "";
+      line.append(el("span", "t", e.t ? hms(e.t) + " " : ""), el("span", "k", (e.kind || "") + " "), e.text || "");
+      feed.append(line);
+    }
+    if (!(a.recent || []).length) feed.append(el("div", "muted", "starting…"));
+    right2.append(feed);
+    cols.append(left, right2);
+    d.append(cols);
+    box.append(d);
+  }
+}
+
 // ---- named API keys (admin only; the card stays hidden for anyone else) ----
 const fmtWhen = t => (t ? new Date(t * 1000).toLocaleString(undefined,
   { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "–");
@@ -3776,6 +3867,7 @@ function uiLocked() {
 async function tick() {
   if (tick._busy) return;                  // no pile-up: 1 s cadence, ~10 endpoints
   tick._busy = true;
+  if (Date.now() - (loadAgents._at || 0) > 2000) { loadAgents._at = Date.now(); loadAgents(); }
   try {
     // Every endpoint degrades independently. /v1/models proxies to the engine
     // and is the one most likely to be slow while a session is running, so it

@@ -137,6 +137,14 @@ stackctl keys revoke delegate-docker-boy
   `POST /keys {"name","scope"}`, `DELETE /keys/<name>` (admin only).
 - Auth is answered from an in-memory table and never waits on the server lock, which a converge holds.
 
+### Live coding agents
+
+`POST /agents/progress` (any `inference` key) takes a compact progress snapshot from an agent
+harness such as `delegate`. `GET /agents/live` (admin) serves them to the dashboard's **Coding
+agents · live** card, which only appears while sessions exist. The data is in memory only,
+keyed by (reporting key, task), clipped and capped at 50 sessions. A session is dropped 2 min
+after its last update, or 90 s after its final one.
+
 ## Layout
 
 ```
