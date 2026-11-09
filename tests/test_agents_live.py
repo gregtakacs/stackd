@@ -109,6 +109,20 @@ def test_claude_agents_kind_and_longer_quiet_window():
         assert rows == ["G1 agent"]
 
 
+
+def test_waiting_claude_agent_outlives_the_working_window():
+    with _Srv() as s:
+        k = s.mint("claude-agents")
+        s.req("POST", "/agents/progress", k, snap(task="W4 lead", kind="claude", phase="waiting", round=None))
+        s.req("POST", "/agents/progress", k, snap(task="W5 lead", kind="claude", phase="working", round=None))
+        H = s.handler
+        with H._agents_lock:
+            for r in H._agents.values():
+                r["updated_at"] -= H.AGENT_STALE_CLAUDE_S + 60     # quiet past the working window
+        rows = {r["task"]: r for r in s.req("GET", "/agents/live", ADMIN)[1]["sessions"]}
+        assert list(rows) == ["W4 lead"] and rows["W4 lead"]["final"] is False   # still live, no dismiss
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in list(globals().items()):

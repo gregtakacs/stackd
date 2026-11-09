@@ -3768,7 +3768,9 @@ function agRender(d, a, now) {
   if (!a.final && age > 45) {
     // A Claude agent's hook only fires on tool calls; long quiet spells (thinking, waiting on
     // a delegate round) are normal for it, so say "quiet", not a warning.
-    const w = el("span", null, a.kind === "claude" ? `last action ${agDur(age)} ago` : `no update for ${agDur(age)}`);
+    const w = el("span", null, a.kind === "claude"
+      ? (a.phase === "waiting" ? `waiting ${agDur(age)} (on its delegate rounds or a reply)` : `last action ${agDur(age)} ago`)
+      : `no update for ${agDur(age)}`);
     if (a.kind !== "claude") w.style.color = "var(--yellow)"; stats.append(w);
   }
   const todo = d.querySelector(".ag-todo"); todo.innerHTML = "";
