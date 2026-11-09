@@ -78,7 +78,7 @@ def test_expiry_finished_and_stale():
         with H._agents_lock:
             H._agents[("ttl", "done")]["updated_at"] -= H.AGENT_LINGER_S + 1
             H._agents[("ttl", "dead")]["updated_at"] -= H.AGENT_STALE_S + 1
-            H._agents[("ttl", "alive")]["updated_at"] -= H.AGENT_LINGER_S + 1   # running: within stale window
+            H._agents[("ttl", "alive")]["updated_at"] -= H.AGENT_STALE_S - 10    # running, heard from recently
         rows = s.req("GET", "/agents/live", ADMIN)[1]["sessions"]
         assert [r["task"] for r in rows] == ["alive"]
 

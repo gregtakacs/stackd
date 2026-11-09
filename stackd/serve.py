@@ -704,7 +704,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     # -- live agent sessions (delegate harness progress) ---------------------------------
     AGENT_STALE_S = 120      # no update for this long: the harness died; drop it
-    AGENT_LINGER_S = 90      # a finished round stays visible this long, then goes
+    AGENT_LINGER_S = 900     # a finished round stays visible this long (time to review it)
     AGENT_MAX = 50
 
     @staticmethod
