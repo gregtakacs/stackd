@@ -188,6 +188,14 @@
   .ag-feed .k { color:var(--accent); }
   .ag-feed .fail { color:var(--red); }
   .ag-feed .say { color:var(--dim); font-style:italic; }
+  /* a session's full prompt / response */
+  dialog.ag-doc { width:min(1000px, calc(100vw - 32px)); max-height:calc(100vh - 48px); padding:0;
+    background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:var(--radius); }
+  dialog.ag-doc::backdrop { background:rgba(0,0,0,.55); }
+  .ag-doc-bar { display:flex; align-items:center; gap:8px; padding:10px 14px; border-bottom:1px solid var(--border); }
+  .ag-doc-bar .ttl { font-weight:700; overflow-wrap:anywhere; }
+  .ag-doc pre { margin:0; padding:12px 14px; max-height:calc(100vh - 140px); overflow:auto; white-space:pre-wrap;
+    overflow-wrap:anywhere; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:.78rem; line-height:1.5; }
   .chip { font-size:.73rem; padding:2px 8px; border-radius:6px; background:var(--surface2); border:1px solid var(--border); }
   .chip-sw { display:inline-block; width:8px; height:8px; border-radius:2px; margin-right:5px;
     vertical-align:middle; text-decoration:none; }
@@ -3748,6 +3756,16 @@ function agRender(d, a, now) {
   const right = el("span", "muted"); right.style.marginLeft = "auto"; right.style.fontSize = ".74rem";
   right.textContent = [a.model, a.reporter && "key " + a.reporter, a.host].filter(Boolean).join(" · ");
   head.append(right);
+  // what was sent to the agent, and what it sent back (the worker's round report, a Claude
+  // agent's hand-back), in full; fetched on demand so the poll stays small
+  for (const [which, label, has, tip] of [
+    ["prompt", "prompt", a.has_prompt, a.kind === "claude" ? "the brief this agent was started with" : "the prompt this round was sent"],
+    ["report", "response", a.has_report, a.kind === "claude" ? "what this agent handed back" : "the round's report: what came back to the orchestrator"]]) {
+    if (!has) continue;
+    const b = el("button", "sm", label); b.title = tip;
+    b.onclick = () => agDoc(a, which, label);
+    head.append(b);
+  }
   if (a.final) {
     const x = el("button", "sm", "×"); x.title = "dismiss"; x.setAttribute("aria-label", "dismiss this finished round");
     x.onclick = () => { try { localStorage.setItem(agDismissKey(a), "1"); } catch (e) {} loadAgents._at = 0; loadAgents(); };
@@ -3818,6 +3836,36 @@ function agRender(d, a, now) {
     if (anchor) feed.scrollTop = anchor.offsetTop - anchorOff;   // the text being read stays put
     d._pending += fresh;
     if (d._pending) { jump.textContent = `↑ ${d._pending} new`; jump.classList.remove("hidden"); }
+  }
+}
+async function agDoc(a, which, label) {
+  let dlg = $("#agDoc");
+  if (!dlg) {
+    dlg = el("dialog", "ag-doc"); dlg.id = "agDoc";
+    dlg.innerHTML = `<div class="ag-doc-bar"><span class="ttl"></span><span class="muted sz"></span>
+      <span style="margin-left:auto"></span><button class="sm cp">copy</button><button class="sm cl" aria-label="close">×</button></div><pre></pre>`;
+    dlg.querySelector(".cl").onclick = () => dlg.close();
+    dlg.addEventListener("click", e => { if (e.target === dlg) dlg.close(); });   // a click on the backdrop
+    dlg.querySelector(".cp").onclick = async () => {
+      try { await navigator.clipboard.writeText(dlg.querySelector("pre").textContent); toast("copied"); }
+      catch (e) { toast("copy failed: " + e.message); }
+    };
+    document.body.append(dlg);
+  }
+  const pre = dlg.querySelector("pre");
+  dlg.querySelector(".ttl").textContent = `${a.task}${a.round != null ? ` · round ${a.round}` : ""} — ${label}`;
+  dlg.querySelector(".sz").textContent = "";
+  pre.textContent = "loading…";
+  if (!dlg.open) dlg.showModal();
+  pre.scrollTop = 0;
+  try {
+    const q = new URLSearchParams({ reporter: a.reporter || "", task: a.task || "", which });
+    const r = await api("/agents/doc?" + q);
+    pre.textContent = r.text || "";
+    dlg.querySelector(".sz").textContent = `${fmtNum((r.text || "").length)} chars`;
+  } catch (e) {
+    pre.textContent = `couldn't load the ${label}: ${e.message}` +
+      (e.status === 404 ? " (the daemon restarted since, or the reporter predates this)" : "");
   }
 }
 async function loadAgents() {

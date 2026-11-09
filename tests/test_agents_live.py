@@ -64,8 +64,8 @@ def test_sanitized_and_clipped():
         assert len(r["todos"]) == 30 and len(r["todos"][0]["content"]) == 200
         assert r["steps"] is None and "evil" not in r
         assert s.req("POST", "/agents/progress", k, {"round": 1})[0] == 400     # no task
-        huge = snap(recent=[{"t": 1, "kind": "bash", "text": "x" * 5000}] * 100)
-        assert s.req("POST", "/agents/progress", k, huge)[0] == 413            # > 256 KB
+        huge = snap(recent=[{"t": 1, "kind": "bash", "text": "x" * 9000}] * 100)
+        assert s.req("POST", "/agents/progress", k, huge)[0] == 413            # > 768 KB
 
 
 def test_expiry_finished_and_stale():
@@ -121,6 +121,34 @@ def test_waiting_claude_agent_outlives_the_working_window():
                 r["updated_at"] -= H.AGENT_STALE_CLAUDE_S + 60     # quiet past the working window
         rows = {r["task"]: r for r in s.req("GET", "/agents/live", ADMIN)[1]["sessions"]}
         assert list(rows) == ["W4 lead"] and rows["W4 lead"]["final"] is False   # still live, no dismiss
+
+
+def test_prompt_and_report_kept_beside_the_card():
+    with _Srv() as s:
+        k = s.mint("delegate-docs")
+        t0 = time.time() - 30
+        code, r = s.req("POST", "/agents/progress", k, snap(started_at=t0))
+        assert code == 200 and r["need_prompt"] is True                    # nothing sent yet: ask for it
+        prompt = "P" * 150_000
+        r = s.req("POST", "/agents/progress", k, snap(started_at=t0, prompt=prompt))[1]
+        assert r["need_prompt"] is False
+        s.req("POST", "/agents/progress", k, snap(started_at=t0, steps=7))     # a light heartbeat keeps it
+        row = s.req("GET", "/agents/live", ADMIN)[1]["sessions"][0]
+        assert row["has_prompt"] is True and row["has_report"] is False
+        assert "prompt" not in row and "report" not in row                  # the poll stays light
+        q = "/agents/doc?reporter=delegate-docs&task=repo-feat&which="
+        code, d = s.req("GET", q + "prompt", ADMIN)
+        assert code == 200 and d["text"] == prompt
+        assert s.req("GET", q + "report", ADMIN)[0] == 404
+        assert s.req("GET", q + "prompt", k)[0] in (401, 403)               # an agent cannot read texts
+        assert s.req("GET", q + "secrets", ADMIN)[0] == 400
+        s.req("POST", "/agents/progress", k, snap(started_at=t0, final=True, status="done", report="R" * 300_000))
+        d = s.req("GET", q + "report", ADMIN)[1]
+        assert d["text"] == "R" * 200_000                                   # capped
+        assert s.req("GET", q + "prompt", ADMIN)[1]["text"] == prompt       # still there at the end
+        # the next round of the same task starts without the old texts
+        r = s.req("POST", "/agents/progress", k, snap(started_at=time.time(), round=2))[1]
+        assert r["need_prompt"] is True and s.req("GET", q + "report", ADMIN)[0] == 404
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ import signal
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -353,6 +354,9 @@ class _Handler(BaseHTTPRequestHandler):
     # worker round runs). In memory only, keyed by (reporting key, task); display-only, never
     # persisted, never trusted for anything. Own small lock — never the server lock.
     _agents: dict = {}
+    # The round's full texts, beside the card so /agents/live stays light: what was sent
+    # (prompt) and what came back (report), same key as _agents. GET /agents/doc reads them.
+    _agent_docs: dict = {}
     _agents_lock = threading.Lock()
     # {"to": <profile>, "since": <epoch>} while an activate is converging, so the
     # dashboard header can show the switch immediately even though status() is
@@ -516,6 +520,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._keys_get()
         if self.path.split("?")[0] == "/agents/live":
             return self._agents_live()
+        if self.path.split("?")[0] == "/agents/doc":
+            return self._agents_doc()
         if self.path.split("?")[0] == "/savings":
             return self._savings()
         if self.path.split("?")[0] == "/savings/facts":
@@ -709,6 +715,7 @@ class _Handler(BaseHTTPRequestHandler):
                                       # silent for hours: its hook only fires when it works
     AGENT_LINGER_S = 900     # a finished round stays visible this long (time to review it)
     AGENT_MAX = 50
+    AGENT_DOC_MAX = 200_000   # chars per text (a delegate prompt is capped at ~120 KB)
 
     @staticmethod
     def _clip(v, n):
@@ -755,9 +762,10 @@ class _Handler(BaseHTTPRequestHandler):
                 stale = cls.AGENT_STALE_CLAUDE_S
             if age > (cls.AGENT_LINGER_S if r["final"] else stale):
                 del cls._agents[k]
+                cls._agent_docs.pop(k, None)
 
     def _agents_progress(self):
-        if int(self.headers.get("content-length") or 0) > 262144:
+        if int(self.headers.get("content-length") or 0) > 786432:
             return self._send_json(413, {"error": {"message": "progress snapshot too large"}})
         try:
             body = json.loads(self._read_body() or b"{}")
@@ -774,8 +782,35 @@ class _Handler(BaseHTTPRequestHandler):
             key = (reporter, rec["task"])
             if key not in self._agents and len(self._agents) >= self.AGENT_MAX:
                 return self._send_json(429, {"error": {"message": "too many live agent sessions"}})
+            # texts arrive once (prompt at the start, report at the end) and are kept across
+            # the light snapshots in between; a new round of the same task starts fresh
+            docs = self._agent_docs.get(key)
+            if docs is None or docs.get("round") != rec["round"] or docs.get("started_at") != rec["started_at"]:
+                docs = {"round": rec["round"], "started_at": rec["started_at"]}
+            for k in ("prompt", "report"):
+                v = body.get(k)
+                if isinstance(v, str) and v:
+                    docs[k] = v[:self.AGENT_DOC_MAX]
+            self._agent_docs[key] = docs
+            rec["has_prompt"], rec["has_report"] = bool(docs.get("prompt")), bool(docs.get("report"))
             self._agents[key] = rec
-        return self._send_json(200, {"ok": True})
+        # need_prompt: the daemon lost it (a restart mid-round), so the reporter sends it again
+        return self._send_json(200, {"ok": True, "need_prompt": not rec["has_prompt"]})
+
+    def _agents_doc(self):
+        """One text of a live session (admin): ?reporter=&task=&which=prompt|report."""
+        if self._need_admin():
+            return
+        q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        which = (q.get("which") or [""])[0]
+        if which not in ("prompt", "report"):
+            return self._send_json(400, {"error": {"message": "which must be prompt or report"}})
+        key = ((q.get("reporter") or [""])[0], (q.get("task") or [""])[0])
+        with self._agents_lock:
+            text = (self._agent_docs.get(key) or {}).get(which)
+        if not text:
+            return self._send_json(404, {"error": {"message": f"no {which} for that session"}})
+        return self._send_json(200, {"which": which, "text": text})
 
     def _agents_live(self):
         if self._need_admin():
