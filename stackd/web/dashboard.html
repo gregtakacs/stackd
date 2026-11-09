@@ -3727,7 +3727,7 @@ function agBuild(a) {
       <button class="sm ag-new hidden" style="padding:0 8px;font-size:.7rem;"></button></div>
       <div class="ag-feed" tabindex="0" aria-label="agent activity, newest first"></div></div></div>`;
   const feed = d.querySelector(".ag-feed"), jump = d.querySelector(".ag-new");
-  d._pending = 0; d._lines = [];
+  d._pending = 0; d._lines = null;          // null: nothing rendered yet (an empty feed still needs its placeholder)
   jump.onclick = () => { feed.scrollTop = 0; };
   feed.addEventListener("scroll", () => {
     if (feed.scrollTop <= 4 && d._pending) { d._pending = 0; jump.classList.add("hidden"); }
@@ -3772,18 +3772,27 @@ function agRender(d, a, now) {
     if (a.kind !== "claude") w.style.color = "var(--yellow)"; stats.append(w);
   }
   const todo = d.querySelector(".ag-todo"); todo.innerHTML = "";
-  if (!(a.todos || []).length) todo.append(el("div", "muted", "no todo list yet"));
-  for (const t of a.todos || []) {
-    const mark = t.status === "completed" ? "✓" : t.status === "in_progress" ? "▸" : "○";
-    todo.append(el("div", t.status === "completed" ? "done" : t.status === "in_progress" ? "now" : null, `${mark} ${t.content}`));
+  const todos = a.todos || [];
+  if (!todos.length) todo.append(el("div", "muted", a.kind === "claude"
+    ? "no plan list (Claude agents don't keep one)" : a.final ? "no todo list" : "no todo list yet"));
+  // A round the harness verified as done is done, whatever the worker last ticked: workers
+  // often stop updating their list mid-round. Show it finished, and say how many items the
+  // worker left unticked. Any other final status keeps the list exactly as the worker left it.
+  const verifiedDone = a.final && a.status === "done" && a.kind !== "claude";
+  const unticked = verifiedDone ? todos.filter(t => t.status !== "completed").length : 0;
+  for (const t of todos) {
+    const st = verifiedDone ? "completed" : t.status;
+    const mark = st === "completed" ? "✓" : st === "in_progress" ? "▸" : "○";
+    todo.append(el("div", st === "completed" ? "done" : st === "in_progress" ? "now" : null, `${mark} ${t.content}`));
   }
+  if (unticked) todo.append(el("div", "muted", `worker left ${unticked} item${unticked > 1 ? "s" : ""} unticked; the round was verified done`));
   // feed: newest first; keep the reader's place when they have scrolled down
   const feed = d.querySelector(".ag-feed"), jump = d.querySelector(".ag-new");
   const lines = (a.recent || []).slice().reverse();
   const keys = lines.map(agLineKey);
-  const prev = new Set(d._lines);
-  const fresh = d._lines.length ? keys.filter(k => !prev.has(k)).length : 0;
-  if (keys.join("\n") === d._lines.join("\n")) return;
+  const prev = new Set(d._lines || []);
+  const fresh = (d._lines && d._lines.length) ? keys.filter(k => !prev.has(k)).length : 0;
+  if (d._lines && keys.join("\n") === d._lines.join("\n")) return;
   // Anchor on the line the reader is looking at (first one not scrolled past) and its offset in
   // the viewport. The feed is capped at 30 lines, so its total height often doesn't change when
   // a new line arrives — the old line drops off the bottom — and only an anchor keeps the text put.
