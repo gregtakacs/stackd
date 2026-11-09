@@ -93,6 +93,22 @@ def test_session_cap():
         assert s.req("POST", "/agents/progress", k, snap(task="t0", steps=5))[0] == 200   # updates still fine
 
 
+
+def test_claude_agents_kind_and_longer_quiet_window():
+    with _Srv() as s:
+        k = s.mint("claude-agents")
+        s.req("POST", "/agents/progress", k, snap(task="G1 agent", kind="claude", steps=None, round=None))
+        s.req("POST", "/agents/progress", k, snap(task="worker", kind="bogus"))
+        H = s.handler
+        rows = {r["task"]: r for r in s.req("GET", "/agents/live", ADMIN)[1]["sessions"]}
+        assert rows["G1 agent"]["kind"] == "claude" and rows["worker"]["kind"] == "worker"
+        with H._agents_lock:
+            for r in H._agents.values():
+                r["updated_at"] -= H.AGENT_STALE_S + 60          # past a worker's window
+        rows = [r["task"] for r in s.req("GET", "/agents/live", ADMIN)[1]["sessions"]]
+        assert rows == ["G1 agent"]
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in list(globals().items()):

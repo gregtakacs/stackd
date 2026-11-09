@@ -3738,10 +3738,11 @@ function agRender(d, a, now) {
   const head = d.querySelector(".ag-head");
   head.innerHTML = "";
   head.append(el("span", "ag-task", a.task));
+  if (a.kind === "claude") head.append(el("span", "pill info", "Claude agent"));
   const st = a.final ? (a.status || "finished") : (a.phase || "running");
   const cls = !a.final ? "prog" : /^(done)$/.test(st) ? "ok" : /aborted|error|timeout|failed|truncated/.test(st) ? "bad" : "warn";
   head.append(el("span", "pill " + cls, (a.final ? "" : "● ") + st));
-  head.append(el("span", "muted", `round ${a.round ?? "?"}`));
+  if (a.kind !== "claude") head.append(el("span", "muted", `round ${a.round ?? "?"}`));
   const where = [(a.repo || "").split("/").pop(), a.branch].filter(Boolean).join(" · ");
   if (where) head.append(el("span", "muted", where));
   const right = el("span", "muted"); right.style.marginLeft = "auto"; right.style.fontSize = ".74rem";
@@ -3758,13 +3759,18 @@ function agRender(d, a, now) {
     x.append(b, " " + label); stats.append(x); };
   if (a.started_at) add(a.final ? "took" : "elapsed", agDur((a.final ? a.updated_at : now) - a.started_at));
   if (a.final) { const x = el("span"); x.append("finished ", el("b", null, agDur(age)), " ago"); stats.append(x); }
-  add("steps", fmtNum(a.steps ?? 0));
+  if (a.steps != null) add("steps", fmtNum(a.steps));
   add(`tool calls${a.tool_errors ? ` (${a.tool_errors} failed)` : ""}`, fmtNum(a.tool_calls ?? 0));
-  add("tokens out", fmtSI(a.output_tokens ?? 0));
+  if (a.output_tokens != null) add("tokens out", fmtSI(a.output_tokens));
   if (a.context_tokens) add("context", fmtSI(a.context_tokens));
   const nud = Object.entries(a.nudges || {}).map(([k, v]) => `${k}×${v}`).join(", ");
   if (nud) add("recovered", nud);
-  if (!a.final && age > 45) { const w = el("span", null, `no update for ${agDur(age)}`); w.style.color = "var(--yellow)"; stats.append(w); }
+  if (!a.final && age > 45) {
+    // A Claude agent's hook only fires on tool calls; long quiet spells (thinking, waiting on
+    // a delegate round) are normal for it, so say "quiet", not a warning.
+    const w = el("span", null, a.kind === "claude" ? `last action ${agDur(age)} ago` : `no update for ${agDur(age)}`);
+    if (a.kind !== "claude") w.style.color = "var(--yellow)"; stats.append(w);
+  }
   const todo = d.querySelector(".ag-todo"); todo.innerHTML = "";
   if (!(a.todos || []).length) todo.append(el("div", "muted", "no todo list yet"));
   for (const t of a.todos || []) {

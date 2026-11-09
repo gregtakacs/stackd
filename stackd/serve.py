@@ -704,6 +704,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     # -- live agent sessions (delegate harness progress) ---------------------------------
     AGENT_STALE_S = 120      # no update for this long: the harness died; drop it
+    AGENT_STALE_CLAUDE_S = 1800   # a Claude agent can wait on a delegate round for a long time
+                                  # without a tool call (its hook only fires on tool calls)
     AGENT_LINGER_S = 900     # a finished round stays visible this long (time to review it)
     AGENT_MAX = 50
 
@@ -728,6 +730,7 @@ class _Handler(BaseHTTPRequestHandler):
                   if isinstance(v, int)}
         return {
             "task": cls._clip(b.get("task"), 120), "round": num("round"),
+            "kind": ("claude" if b.get("kind") == "claude" else "worker"),
             "repo": cls._clip(b.get("repo"), 200), "branch": cls._clip(b.get("branch"), 120),
             "model": cls._clip(b.get("model"), 80), "host": cls._clip(b.get("host"), 60),
             "phase": cls._clip(b.get("phase"), 40), "status": cls._clip(b.get("status"), 40),
@@ -743,7 +746,8 @@ class _Handler(BaseHTTPRequestHandler):
     def _agents_prune(cls, now: float) -> None:
         for k, r in list(cls._agents.items()):
             age = now - r["updated_at"]
-            if age > (cls.AGENT_LINGER_S if r["final"] else cls.AGENT_STALE_S):
+            stale = cls.AGENT_STALE_CLAUDE_S if r.get("kind") == "claude" else cls.AGENT_STALE_S
+            if age > (cls.AGENT_LINGER_S if r["final"] else stale):
                 del cls._agents[k]
 
     def _agents_progress(self):
