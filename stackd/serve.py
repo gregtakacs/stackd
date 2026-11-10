@@ -740,9 +740,16 @@ class _Handler(BaseHTTPRequestHandler):
         m = b.get("mode") if isinstance(b.get("mode"), dict) else {}
         def ms(k, n):
             return cls._clip(m[k], n) if isinstance(m.get(k), str) and m[k] else None
+        def names(k):   # delegate grant / guard names: short a-z0-9._- words, at most 10
+            v = m.get(k)
+            if not isinstance(v, list):
+                return []
+            ok = [x for x in v[:50] if isinstance(x, str) and re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,47}", x)]
+            return ok[:10]
         mode = {"runner": ms("runner", 20), "here": m.get("here") is True, "raw": m.get("raw") is True,
-                "egress": ms("egress", 20), "orb": ms("orb", 60), "service": ms("service", 40),
-                "chain": ms("chain", 120)} if m else None
+                "egress": ms("egress", 20), "orb": ms("orb", 60), "orb_flash": m.get("orb_flash") is True,
+                "service": ms("service", 40),
+                "chain": ms("chain", 120), "grants": names("grants"), "allow": names("allow")} if m else None
         return {
             "task": cls._clip(b.get("task"), 120), "round": num("round"),
             "kind": ("claude" if b.get("kind") == "claude" else "worker"),

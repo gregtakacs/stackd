@@ -3761,8 +3761,14 @@ function agModeChips(m) {
     else if (m.egress === "filtered") out.push(["pill", "egress filtered", "model endpoint + public internet only, no LAN"]);
   }
   if (m.orb) out.push(["pill warn", "orb " + m.orb, "attached to a physical orb: LAN and serial access"]);
+  if (m.orb) out.push(m.orb_flash || (m.allow || []).includes("flash") ? ["pill bad", "may flash", "--allow flash (--orb-flash): the worker may flash or erase this orb over serial"]
+                                  : ["pill", "flash blocked", "esptool and idf.py refuse any write, erase or flash for this task"]);
   if (m.raw) out.push(["pill", "raw", "raw: the user's text sent verbatim, no spec"]);
   if (m.service) out.push(["pill", m.service, "throwaway " + m.service + " service for this task"]);
+  // grants (delegate --grant NAME): named access beyond the sandbox, and guards the task lifted
+  for (const g of (m.grants || [])) out.push(["pill warn", "grant " + g, "access granted by the delegate grant '" + g + "' (delegate grant show " + g + ")"]);
+  for (const g of (m.allow || []))
+    if (!(g === "flash" && m.orb)) out.push(["pill bad", "may " + g, "--allow " + g + ": the guard '" + g + "' is lifted for this task"]);
   if (m.chain) out.push(["pill", "chain " + m.chain, "a step of the delegate chain " + m.chain]);
   return out;
 }

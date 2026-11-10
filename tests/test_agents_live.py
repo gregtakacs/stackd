@@ -178,3 +178,17 @@ def test_mode_kept_and_sanitized():
         assert a["service"] == "postgres" and len(a["chain"]) == 120 and "evil" not in a and a["orb"] is None
         assert rows["b"]["mode"]["here"] is False and rows["b"]["mode"]["runner"] is None
         assert rows["c"]["mode"] is None
+
+
+def test_mode_grants_and_allow():
+    with _Srv() as s:
+        k = s.mint("delegate-g")
+        s.req("POST", "/agents/progress", k, snap(task="g", mode={
+            "runner": "docker", "grants": ["orb-desk", "printer", "BAD name", 7] + ["x%d" % i for i in range(20)],
+            "allow": ["flash", "../evil"]}))
+        s.req("POST", "/agents/progress", k, snap(task="h", mode={"runner": "docker", "grants": "orb-desk"}))
+        rows = {r["task"]: r for r in s.req("GET", "/agents/live", ADMIN)[1]["sessions"]}
+        g = rows["g"]["mode"]
+        assert g["grants"][:2] == ["orb-desk", "printer"] and len(g["grants"]) == 10
+        assert "BAD name" not in g["grants"] and g["allow"] == ["flash"]
+        assert rows["h"]["mode"]["grants"] == []
