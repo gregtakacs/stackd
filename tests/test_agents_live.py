@@ -162,3 +162,19 @@ if __name__ == "__main__":
                 fails += 1
                 print(f"FAIL {name}: {type(e).__name__}: {e}")
     sys.exit(1 if fails else 0)
+
+
+def test_mode_kept_and_sanitized():
+    with _Srv() as s:
+        k = s.mint("delegate-m")
+        s.req("POST", "/agents/progress", k, snap(task="a", mode={
+            "runner": "docker", "here": False, "raw": True, "egress": "filtered", "orb": "",
+            "service": "postgres", "chain": "h1" * 100, "evil": 1}))
+        s.req("POST", "/agents/progress", k, snap(task="b", mode={"here": "yes", "runner": ["x"]}))
+        s.req("POST", "/agents/progress", k, snap(task="c"))
+        rows = {r["task"]: r for r in s.req("GET", "/agents/live", ADMIN)[1]["sessions"]}
+        a = rows["a"]["mode"]
+        assert a["runner"] == "docker" and a["raw"] is True and a["here"] is False
+        assert a["service"] == "postgres" and len(a["chain"]) == 120 and "evil" not in a and a["orb"] is None
+        assert rows["b"]["mode"]["here"] is False and rows["b"]["mode"]["runner"] is None
+        assert rows["c"]["mode"] is None

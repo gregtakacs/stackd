@@ -736,6 +736,13 @@ class _Handler(BaseHTTPRequestHandler):
                   for r in (b.get("recent") or [])[-30:] if isinstance(r, dict)]
         nudges = {cls._clip(k, 20): int(v) for k, v in list((b.get("nudges") or {}).items())[:10]
                   if isinstance(v, int)}
+        # how a worker round runs (delegate): container/native, in place, raw, egress, orb, chain
+        m = b.get("mode") if isinstance(b.get("mode"), dict) else {}
+        def ms(k, n):
+            return cls._clip(m[k], n) if isinstance(m.get(k), str) and m[k] else None
+        mode = {"runner": ms("runner", 20), "here": m.get("here") is True, "raw": m.get("raw") is True,
+                "egress": ms("egress", 20), "orb": ms("orb", 60), "service": ms("service", 40),
+                "chain": ms("chain", 120)} if m else None
         return {
             "task": cls._clip(b.get("task"), 120), "round": num("round"),
             "kind": ("claude" if b.get("kind") == "claude" else "worker"),
@@ -745,7 +752,7 @@ class _Handler(BaseHTTPRequestHandler):
             "started_at": num("started_at", float), "steps": num("steps"),
             "tool_calls": num("tool_calls"), "tool_errors": num("tool_errors"),
             "output_tokens": num("output_tokens"), "context_tokens": num("context_tokens"),
-            "nudges": nudges, "todos": todos, "recent": recent,
+            "nudges": nudges, "todos": todos, "recent": recent, "mode": mode,
             "last_text": cls._clip(b.get("last_text"), 600),
             "final": bool(b.get("final")), "reporter": reporter, "updated_at": time.time(),
         }

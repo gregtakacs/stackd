@@ -3742,17 +3742,43 @@ function agBuild(a) {
   });
   return d;
 }
+// The status pill: what the round is doing, or how it ended.
+function agPill(a) {
+  const st = a.final ? (a.status || "finished") : (a.phase || "running");
+  const cls = !a.final ? "prog" : /^(done|finished)$/.test(st) ? "ok" : /aborted|error|timeout|failed|truncated/.test(st) ? "bad" : "warn";
+  return { cls: "pill ag-st " + cls, text: (a.final ? "" : "● ") + st };
+}
+// How a delegate round runs, as chips: where it runs (container / native / in place), its
+// network, and raw / orb / service / chain. Older reporters send no mode: no chips.
+function agModeChips(m) {
+  if (!m) return [];
+  const out = [];
+  if (m.here) out.push(["pill warn", "in place", "edits the user's checkout directly: native, unsandboxed, no commits"]);
+  else if (m.runner === "native") out.push(["pill warn", "native", "runs as the user, outside a container (file tools fenced, bash is not)"]);
+  else if (m.runner === "docker") out.push(["pill info", "container", "delegate-worker container, own worktree and branch"]);
+  if (!m.here && m.runner === "docker" && !m.orb) {
+    if (m.egress === "open") out.push(["pill warn", "LAN open", "egress open: the worker can reach the LAN"]);
+    else if (m.egress === "filtered") out.push(["pill", "egress filtered", "model endpoint + public internet only, no LAN"]);
+  }
+  if (m.orb) out.push(["pill warn", "orb " + m.orb, "attached to a physical orb: LAN and serial access"]);
+  if (m.raw) out.push(["pill", "raw", "raw: the user's text sent verbatim, no spec"]);
+  if (m.service) out.push(["pill", m.service, "throwaway " + m.service + " service for this task"]);
+  if (m.chain) out.push(["pill", "chain " + m.chain, "a step of the delegate chain " + m.chain]);
+  return out;
+}
 function agRender(d, a, now) {
   const head = d.querySelector(".ag-head");
   head.innerHTML = "";
   head.append(el("span", "ag-task", a.task));
   if (a.kind === "claude") head.append(el("span", "pill info", "Claude agent"));
-  const st = a.final ? (a.status || "finished") : (a.phase || "running");
-  const cls = !a.final ? "prog" : /^(done|finished)$/.test(st) ? "ok" : /aborted|error|timeout|failed|truncated/.test(st) ? "bad" : "warn";
-  head.append(el("span", "pill " + cls, (a.final ? "" : "● ") + st));
+  const pill = agPill(a);
+  head.append(el("span", pill.cls, pill.text));
   if (a.kind !== "claude") head.append(el("span", "muted", `round ${a.round ?? "?"}`));
   const where = [(a.repo || "").split("/").pop(), a.branch].filter(Boolean).join(" · ");
   if (where) head.append(el("span", "muted", where));
+  for (const [cls, text, tip] of agModeChips(a.mode)) {
+    const c = el("span", cls, text); c.title = tip; head.append(c);
+  }
   const right = el("span", "muted"); right.style.marginLeft = "auto"; right.style.fontSize = ".74rem";
   right.textContent = [a.model, a.reporter && "key " + a.reporter, a.host].filter(Boolean).join(" · ");
   head.append(right);
@@ -3881,7 +3907,14 @@ async function loadAgents() {
     let d = AG_NODES.get(agKey(a));
     if (!d) { d = agBuild(a); AG_NODES.set(agKey(a), d); }
     if (d.parentNode !== box) box.append(d);
-    if (agSelecting(d)) continue;                                 // don't yank text out from under a selection
+    // Don't yank text out from under a selection, but keep its status true: a card whose name
+    // was selected froze on "verifying" while the round had finished (owner, 2026-11-09). The
+    // pill is updated in place, so the selected text stays put.
+    if (agSelecting(d)) {
+      const p = d.querySelector(".ag-head .ag-st"), want = agPill(a);
+      if (p && (p.className !== want.cls || p.textContent !== want.text)) { p.className = want.cls; p.textContent = want.text; }
+      continue;
+    }
     agRender(d, a, now);
   }
 }
