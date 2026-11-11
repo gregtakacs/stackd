@@ -280,3 +280,21 @@ def test_mode_grants_and_allow():
         assert g["grants"][:2] == ["orb-desk", "printer"] and len(g["grants"]) == 10
         assert "BAD name" not in g["grants"] and g["allow"] == ["flash"]
         assert rows["h"]["mode"]["grants"] == []
+
+
+
+def test_worker_rows_name_their_lead():
+    """A worker task named in a lead's children, directly or through its chain, carries that
+    lead's card key as `lead`, so the dashboard can draw it under the lead; others carry None."""
+    with _Srv() as s:
+        w, c = s.mint("delegate-box"), s.mint("claude-box")
+        s.req("POST", "/agents/progress", w, snap(task="gorb-os-h2-1"))
+        s.req("POST", "/agents/progress", w, snap(task="gorb-os-g4-1", mode={"chain": "g4-gorb"}))
+        s.req("POST", "/agents/progress", w, snap(task="other-task"))
+        s.req("POST", "/agents/progress", c, snap(task="Lead H2", kind="claude", round=None,
+                                                   children=["task:gorb-os-h2-1", "chain:g4-gorb"]))
+        rows = {r["task"]: r for r in s.req("GET", "/agents/live", ADMIN)[1]["sessions"]}
+        assert rows["gorb-os-h2-1"]["lead"] == "claude-box\u0000Lead H2"
+        assert rows["gorb-os-g4-1"]["lead"] == "claude-box\u0000Lead H2"
+        assert rows["other-task"]["lead"] is None
+        assert "lead" not in rows["Lead H2"]

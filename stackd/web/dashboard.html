@@ -175,6 +175,8 @@
   .ag-title, .ag-chips { display:flex; align-items:baseline; gap:8px; flex-wrap:wrap; }
   .ag-chips { margin-top:6px; gap:6px; }
   .ag-host + .ag-host { margin-top:14px; }
+  .ag-kids { margin:4px 0 8px 18px; padding-left:10px; border-left:2px solid var(--border); }
+  .ag-kids:empty { display:none; }
   .ag-host-h { font-size:.7rem; font-weight:700; letter-spacing:.08em; color:var(--dim); margin:0 0 6px 2px; }
   /* the card's buttons: always the same four slots in the same corner, whatever the chips and
      names beside them wrap to; a button a round doesn't have keeps its slot, invisibly */
@@ -4028,7 +4030,11 @@ async function loadAgents() {
   const card = $("#agentsCard"), box = $("#agents");
   card.classList.toggle("hidden", !ss.length);
   const live = new Set(ss.map(agKey));
-  for (const [k, node] of AG_NODES) if (!live.has(k)) { node.remove(); AG_NODES.delete(k); }
+  for (const [k, node] of AG_NODES) if (!live.has(k)) {
+    // a lead that leaves hands its remaining workers back to the machine group on this pass
+    if (node.agKids) { node.agKids.replaceWith(...node.agKids.childNodes); }
+    node.remove(); AG_NODES.delete(k);
+  }
   // one group per machine the agents run on (DOCKER-BOY, the laptop, …), in name order
   const hostOf = a => (a.host || "unknown host").toUpperCase();
   const hosts = [...new Set(ss.map(hostOf))].sort();
@@ -4038,11 +4044,23 @@ async function loadAgents() {
     if (!g) { g = el("div", "ag-host"); g.append(el("div", "ag-host-h", h), el("div", "ag-host-b")); AG_GROUPS.set(h, g); }
     box.append(g);          // re-appending keeps the name order without rebuilding the cards
   }
-  for (const a of ss) {
+  // A lead's worker tasks sit under it (the daemon names each worker row's `lead`); leads are
+  // placed first so their child box exists, then every other card goes under its lead or, with
+  // no live lead, straight into its machine's group.
+  const leadLive = new Set(ss.filter(a => a.kind === "claude").map(agKey));
+  const ordered = [...ss.filter(a => a.kind === "claude"), ...ss.filter(a => a.kind !== "claude")];
+  for (const a of ordered) {
     let d = AG_NODES.get(agKey(a));
     if (!d) { d = agBuild(a); AG_NODES.set(agKey(a), d); }
-    const body = AG_GROUPS.get(hostOf(a)).querySelector(".ag-host-b");
-    if (d.parentNode !== body) body.append(d);
+    let body = AG_GROUPS.get(hostOf(a)).querySelector(".ag-host-b");
+    if (a.kind === "claude") {
+      if (!d.agKids) d.agKids = el("div", "ag-kids");
+      if (d.parentNode !== body) body.append(d);
+      if (d.nextSibling !== d.agKids) d.after(d.agKids);
+    } else if (a.lead && leadLive.has(a.lead) && AG_NODES.get(a.lead)?.agKids) {
+      body = AG_NODES.get(a.lead).agKids;
+    }
+    if (a.kind !== "claude" && d.parentNode !== body) body.append(d);
     // Don't yank text out from under a selection, but keep its status true: a card whose name
     // was selected froze on "verifying" while the round had finished (owner, 2026-11-09). The
     // pill is updated in place, so the selected text stays put.

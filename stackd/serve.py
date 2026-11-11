@@ -922,9 +922,22 @@ class _Handler(BaseHTTPRequestHandler):
         with self._agents_lock:
             self._agents_prune(now)
             rows = []
+            # which Claude lead started each worker task: its children name the task or its chain
+            lead_of_task, lead_of_chain = {}, {}
+            for k, r in self._agents.items():
+                if r.get("kind") == "claude":
+                    lk = f"{k[0]}\u0000{k[1]}"
+                    for c in r.get("children") or []:
+                        if c.startswith("task:"):
+                            lead_of_task.setdefault(c[5:], lk)
+                        elif c.startswith("chain:"):
+                            lead_of_chain.setdefault(c[6:], lk)
             for k, r in sorted(self._agents.items(), key=lambda kv: kv[1].get("started_at") or 0):
                 hist = self._agent_rounds.get(k) or []
                 extra = {}
+                if r.get("kind") != "claude":
+                    ch = (r.get("mode") or {}).get("chain")
+                    extra["lead"] = lead_of_task.get(r.get("task")) or (lead_of_chain.get(ch) if ch else None)
                 if r.get("kind") == "claude" and r.get("children"):
                     kids = set(r["children"])
                     w = {"tasks": 0, "rounds": 0, "in": 0, "cached": 0, "out": 0}
