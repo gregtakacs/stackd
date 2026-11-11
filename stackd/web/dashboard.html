@@ -3164,7 +3164,7 @@ function renderExplorer() {
     "<th class=num title='share of input tokens a frontier API prefix cache (Anthropic-style: 5-min TTL, 1024-token minimum prefix) would have served as cache reads — the synthetic estimate the savings already price in, not the local engine&#39;s own cache reuse'>cache %</th>" +
     "<th class=num>tok out</th>" +
     "<th class=num title='engine-measured generation tok/s (from /metrics counters, pro-rated by token share)'>gen t/s</th>" +
-    "<th class=num title='engine-measured prompt/prefill tok/s (from /metrics counters, pro-rated by token share)'>pre t/s</th>" +
+    "<th class=num title='engine-measured prefill tok/s: prompt tokens the engine computed (prefix-cache hits excluded) over prefill time, from /metrics counters, pro-rated by token share; days before 2026-11-11 show –'>pre t/s</th>" +
     "<th class=num title='token-weighted mean context per request (Σctx² / Σctx — weights each request by its own size, so tiny agent calls do not swamp it; hover for arith. mean, biggest request, engine peak)'>ctx</th>" +
     tiers.map(t2 => `<th class="num xp-sorth" data-tier="${t2.label}">${t2.label}` +
       `<br><span style="font-weight:400;font-size:.9em">net $</span></th>`).join("") +

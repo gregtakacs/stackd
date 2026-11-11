@@ -14,7 +14,7 @@ import sqlite3
 import time
 from dataclasses import dataclass
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 RETAIN_DAYS = 40
 
 _SCHEMA = """
@@ -339,6 +339,15 @@ class Store:
                 self.conn.execute(f"ALTER TABLE {tbl} DROP COLUMN {col}")
             except sqlite3.OperationalError:
                 pass
+
+        # v11: prefill speed counts computed prompt tokens only. Rows before this counted
+        # tokens restored from the engines' prefix caches too (SGLang showed tens of thousands
+        # of tok/s), and the split was never stored, so they can't be corrected: their prefill
+        # totals are zeroed once (the dashboard shows '–' for those days) and decode, context
+        # and usage are left as they are. Keyed off a meta flag, so it runs exactly once.
+        if self.get_meta("prefill_basis") != "computed":
+            self.conn.execute("UPDATE engine_daily SET prefill_tok = 0, prefill_ms = 0")
+            self.set_meta("prefill_basis", "computed")
 
         self.set_meta("schema_version", str(SCHEMA_VERSION))
 

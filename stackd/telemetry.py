@@ -361,6 +361,33 @@ def _prom_label(text: str, metric: str, label: str):
     return None
 
 
+def _computed_prompt_tokens(t: str, engine: str):
+    """Prompt tokens the engine actually COMPUTED (cache hits excluded), cumulative, or None.
+
+    Prefill speed is "how fast the engine computes a prompt". Counting tokens restored from a
+    prefix/radix/HiCache tier made SGLang report tens of thousands of tok/s on cache-heavy
+    agent traffic (owner, 2026-11-11), so every engine uses computed tokens only:
+    - SGLang: realtime_tokens_total{mode="prefill_compute"}, else prompt minus cached tokens;
+    - vLLM: the per-request KV-computed sum, else prompt minus prefix-cache hit tokens.
+    llama.cpp's prompt counter already counts only processed tokens."""
+    def _sub(total, hits):
+        if total is None:
+            return None
+        return max(total - (hits or 0), 0.0)
+    if engine == "sglang":
+        c = _prom_sum(t, "sglang:realtime_tokens_total", mode="prefill_compute")
+        if c is not None:
+            return c
+        return _sub(_prom_sum(t, "sglang:prompt_tokens_total"), _prom_sum(t, "sglang:cached_tokens_total"))
+    if engine == "vllm":
+        c = _prom_sum(t, "vllm:request_prefill_kv_computed_tokens_sum")
+        if c is not None:
+            return c
+        return _sub(_prom_sum(t, "vllm:prompt_tokens_total"),
+                    _prom_sum(t, "vllm:prefix_cache_hits_total") or _prom_sum(t, "vllm:prefix_cache_hits"))
+    return None
+
+
 def _prom_sum(text: str, metric: str, **match) -> float | None:
     """Sum every series of `metric` whose label set contains all of `match`
     (label=value). No `match` -> sum across every series of that name. `_prom`
@@ -676,7 +703,8 @@ def engine_telemetry(endpoint: str, template: str) -> dict:
             # tok/s, sglang:token_usage 0..1 KV fill, sglang:spec_accept_rate)
             # AND monotonic token counters. Prefer the gauges while a request
             # runs; hold the last session's numbers when idle (same as vLLM).
-            m = _prom(_http_text(ep + "/metrics"))
+            mtext_sg = _http_text(ep + "/metrics")
+            m = _prom(mtext_sg)
             running = int(m.get("sglang:num_running_reqs") or 0)
             d["running"] = running
             d["waiting"] = int(m.get("sglang:num_queue_reqs") or 0)
@@ -718,7 +746,8 @@ def engine_telemetry(endpoint: str, template: str) -> dict:
 
             cur = {"ts": now, "running": running,
                    "gen_tok": m.get("sglang:generation_tokens_total"),
-                   "prompt_tok": m.get("sglang:prompt_tokens_total")}
+                   # computed prompt tokens only: cache hits don't count as prefill speed
+                   "prompt_tok": _computed_prompt_tokens(mtext_sg, "sglang")}
             hist = st.setdefault("hist", [])
             hist.append(cur)
             st["hist"] = [h for h in hist if now - h["ts"] <= 20.0][-60:]
@@ -804,8 +833,7 @@ def engine_counters(endpoint: str, template: str) -> dict | None:
             out["gen_tok"] = _prom_sum(mtext, "vllm:generation_tokens_total")
             # real KV-computed prefill tokens (excludes vLLM's own prefix-cache
             # hits) paired with the matching time sum -> honest prefill tok/s
-            out["prompt_tok"] = (_prom_sum(mtext, "vllm:request_prefill_kv_computed_tokens_sum")
-                                 or _prom_sum(mtext, "vllm:prompt_tokens_total"))
+            out["prompt_tok"] = _computed_prompt_tokens(mtext, "vllm")
             out["prefill_s"] = _prom_sum(mtext, "vllm:request_prefill_time_seconds_sum")
             out["running"] = int(_prom_sum(mtext, "vllm:num_requests_running") or 0)
             frac = m.get("vllm:kv_cache_usage_perc")
@@ -821,18 +849,11 @@ def engine_counters(endpoint: str, template: str) -> dict | None:
             out["gen_tok"] = (_prom_sum(t, "sglang:generation_tokens_total", is_streaming="true")
                               or _prom_sum(t, "sglang:generation_tokens_total"))
             out["gen_s"] = _prom_sum(t, "sglang:inter_token_latency_seconds_sum")
-            # prefill: the `prefill_forward` stage wall time is the cost to turn
-            # the WHOLE prompt into a decode-ready state — it includes restoring
-            # KV pages from the radix/HiCache/NIXL tiers, not just fresh compute.
-            # So the numerator must be every token that stage made ready
-            # (compute + cache), else a prefix hit craters the rate (a few
-            # thousand computed tokens over compute+restore seconds). This is
-            # "effective" prefill throughput — how fast the prompt is ingested,
-            # cache included — and it matches the live card's basis.
-            _pf_c = _prom_sum(t, "sglang:realtime_tokens_total", mode="prefill_compute")
-            _pf_h = _prom_sum(t, "sglang:realtime_tokens_total", mode="prefill_cache")
-            out["prompt_tok"] = (((_pf_c or 0) + (_pf_h or 0))
-                                 or _prom_sum(t, "sglang:prompt_tokens_total"))
+            # prefill: tokens the engine COMPUTED over the prefill_forward stage time. That
+            # stage also restores KV from the radix/HiCache/NIXL tiers, so a heavy cache hit
+            # reads a little slower than pure compute, but cached tokens never inflate it
+            # (they made the dashboard show tens of thousands of tok/s; owner, 2026-11-11).
+            out["prompt_tok"] = _computed_prompt_tokens(t, "sglang")
             out["prefill_s"] = (_prom_sum(t, "sglang:per_stage_req_latency_seconds_sum",
                                           stage="prefill_forward")
                                 or _prom_sum(t, "sglang:time_to_first_token_seconds_sum"))
