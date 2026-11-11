@@ -4042,8 +4042,13 @@ async function loadAgents() {
   for (const h of hosts) {
     let g = AG_GROUPS.get(h);
     if (!g) { g = el("div", "ag-host"); g.append(el("div", "ag-host-h", h), el("div", "ag-host-b")); AG_GROUPS.set(h, g); }
-    box.append(g);          // re-appending keeps the name order without rebuilding the cards
   }
+  // Move a group only when the order is actually wrong: moving an element resets the scroll of
+  // everything inside it, which threw every activity feed back to the top on each poll and hid
+  // the "↑ N new" button (2026-11-11).
+  const want = hosts.map(h => AG_GROUPS.get(h));
+  const have = [...box.children].filter(n => n.classList.contains("ag-host"));
+  if (want.length !== have.length || want.some((g, i) => g !== have[i])) for (const g of want) box.append(g);
   // A lead's worker tasks sit under it (the daemon names each worker row's `lead`); leads are
   // placed first so their child box exists, then every other card goes under its lead or, with
   // no live lead, straight into its machine's group.
