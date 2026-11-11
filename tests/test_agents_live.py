@@ -76,7 +76,7 @@ def test_expiry_finished_and_stale():
         s.req("POST", "/agents/progress", k, snap(task="alive"))
         H = s.handler
         with H._agents_lock:
-            H._agents[("ttl", "done")]["updated_at"] -= H.AGENT_LINGER_S + 1
+            H._agents[("ttl", "done")]["updated_at"] -= H.AGENT_LINGER_WORKER_S + 1
             H._agents[("ttl", "dead")]["updated_at"] -= H.AGENT_STALE_S + 1
             H._agents[("ttl", "alive")]["updated_at"] -= H.AGENT_STALE_S - 10    # running, heard from recently
         rows = s.req("GET", "/agents/live", ADMIN)[1]["sessions"]
@@ -149,6 +149,94 @@ def test_prompt_and_report_kept_beside_the_card():
         # the next round of the same task starts without the old texts
         r = s.req("POST", "/agents/progress", k, snap(started_at=time.time(), round=2))[1]
         assert r["need_prompt"] is True and s.req("GET", q + "report", ADMIN)[0] == 404
+
+
+def test_rounds_kept_together_with_the_reason_for_each():
+    with _Srv() as s:
+        k = s.mint("delegate-rounds")
+        q = "/agents/doc?reporter=delegate-rounds&task=repo-feat&which="
+        t1 = time.time() - 600
+        s.req("POST", "/agents/progress", k, snap(started_at=t1, prompt="SPEC"))
+        s.req("POST", "/agents/progress", k, snap(started_at=t1, final=True, status="done-but-verify-failed",
+                                                   report="REPORT-1"))
+        fb = ("REVIEW FEEDBACK (round 2) from the orchestrator on your previous round.\n\n<feedback>\n"
+              "1. the relink test never runs\n2. drop the debug print\n</feedback>\n")
+        t2 = time.time() - 60
+        s.req("POST", "/agents/progress", k, snap(started_at=t2, round=2, prompt=fb))
+        row = s.req("GET", "/agents/live", ADMIN)[1]["sessions"][0]
+        assert row["round"] == 2 and row["reason"] == "1. the relink test never runs 2. drop the debug print"
+        assert [(h["round"], h["status"], h["reason"], h["has_report"]) for h in row["rounds"]] == \
+            [(1, "done-but-verify-failed", None, True)]
+        assert "docs" not in row["rounds"][0]                               # the poll stays light
+        assert s.req("GET", q + "report&round=1", ADMIN)[1]["text"] == "REPORT-1"   # round 1 still opens
+        assert s.req("GET", q + "prompt&round=1", ADMIN)[1]["text"] == "SPEC"
+        assert s.req("GET", q + "prompt", ADMIN)[1]["text"] == fb             # the current round
+        # round 2 ends and lingers out before the chain's retry arrives: still filed
+        s.req("POST", "/agents/progress", k, snap(started_at=t2, round=2, final=True, status="done-but-verify-failed"))
+        H = s.handler
+        with H._agents_lock:
+            H._agents[("delegate-rounds", "repo-feat")]["updated_at"] -= H.AGENT_LINGER_WORKER_S + 1
+        assert s.req("GET", "/agents/live", ADMIN)[1]["sessions"] == []
+        retry = ("REVIEW FEEDBACK (round 3) ...\n<feedback>\nThe harness ran this step's verify command after "
+                 "your round and it FAILED (exit 2). Here is the tail\n</feedback>")
+        s.req("POST", "/agents/progress", k, snap(started_at=time.time(), round=3, prompt=retry))
+        row = s.req("GET", "/agents/live", ADMIN)[1]["sessions"][0]
+        assert row["reason"] == "chain retry: verify failed (exit 2)"
+        assert [(h["round"], h["reason"]) for h in row["rounds"]] == \
+            [(1, None), (2, "1. the relink test never runs 2. drop the debug print")]
+        # the task started over (delegate rm + run): no stale history
+        s.req("POST", "/agents/progress", k, snap(started_at=time.time(), round=1, prompt="SPEC2"))
+        row = s.req("GET", "/agents/live", ADMIN)[1]["sessions"][0]
+        assert row["rounds"] == [] and row["reason"] is None
+
+
+def test_round_reason_shapes():
+    from stackd.serve import _Handler as H  # noqa: E402
+    assert H._round_reason(None) is None
+    assert H._round_reason("<feedback>\nYour last round was cut off (timeout). Re-check</feedback>") == "chain retry: timeout"
+    assert H._round_reason("<feedback>Your last round ended without completing the step (status: partial). F</feedback>") \
+        == "chain retry: partial"
+    assert H._round_reason("just do the thing   now") == "just do the thing now"      # a raw continue
+    assert len(H._round_reason("<feedback>" + "x" * 5000 + "</feedback>")) == 400
+
+
+def test_finished_worker_stays_until_rm_and_claude_lead_totals_its_workers():
+    with _Srv() as s:
+        w, c = s.mint("delegate-box"), s.mint("claude-box")
+        H = s.handler
+        s.req("POST", "/agents/progress", w, snap(task="gorb-os-h2-1", final=True, status="done",
+                                                   input_tokens=1000, cached_tokens=50000, output_tokens=700))
+        s.req("POST", "/agents/progress", w, snap(task="gorb-os-g4-1", round=2, mode={"chain": "g4-gorb"},
+                                                   input_tokens=10, cached_tokens=20, output_tokens=30))
+        with H._agents_lock:   # an hour later, a finished worker round is still on the board
+            H._agents[("delegate-box", "gorb-os-h2-1")]["updated_at"] -= H.AGENT_LINGER_S + 3600
+        tasks = sorted(r["task"] for r in s.req("GET", "/agents/live", ADMIN)[1]["sessions"])
+        assert tasks == ["gorb-os-g4-1", "gorb-os-h2-1"]
+        # the lead that started them: its own usage, and its workers' totals (by task and by chain)
+        s.req("POST", "/agents/progress", c, snap(task="Lead H2 · ae5294", kind="claude", round=None,
+                                                   children=["task:gorb-os-h2-1", "chain:g4-gorb"],
+                                                   usage={"input": 5, "cache_read": 900, "cache_write": 80, "output": 60}))
+        lead = next(r for r in s.req("GET", "/agents/live", ADMIN)[1]["sessions"] if r["kind"] == "claude")
+        assert lead["usage"] == {"input": 5, "cache_read": 900, "cache_write": 80, "output": 60}
+        assert lead["worker_usage"] == {"tasks": 2, "rounds": 2, "in": 1010, "cached": 50020, "out": 730}
+        assert "children" not in lead                                       # the poll stays light
+        # `delegate rm` takes the card off; the lead's total keeps counting it
+        assert s.req("POST", "/agents/progress", w, {"task": "gorb-os-h2-1", "removed": True})[0] == 200
+        rows = s.req("GET", "/agents/live", ADMIN)[1]["sessions"]
+        assert "gorb-os-h2-1" not in [r["task"] for r in rows]
+        assert next(r for r in rows if r["kind"] == "claude")["worker_usage"]["out"] == 730
+
+
+def test_full_board_evicts_the_oldest_finished_card():
+    with _Srv() as s:
+        k = s.mint("many")
+        H = s.handler
+        s.req("POST", "/agents/progress", k, snap(task="old-done", final=True, status="done"))
+        for i in range(H.AGENT_MAX - 1):
+            s.req("POST", "/agents/progress", k, snap(task=f"t{i}"))
+        assert s.req("POST", "/agents/progress", k, snap(task="new"))[0] == 200
+        tasks = {r["task"] for r in s.req("GET", "/agents/live", ADMIN)[1]["sessions"]}
+        assert "new" in tasks and "old-done" not in tasks
 
 
 if __name__ == "__main__":

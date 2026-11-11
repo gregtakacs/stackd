@@ -357,6 +357,13 @@ class _Handler(BaseHTTPRequestHandler):
     # The round's full texts, beside the card so /agents/live stays light: what was sent
     # (prompt) and what came back (report), same key as _agents. GET /agents/doc reads them.
     _agent_docs: dict = {}
+    # Earlier rounds of the same task (a delegate continue / chain retry): one compact row per
+    # round, newest last, with that round's texts kept so its prompt/response still open, and
+    # why the round after it was needed (the feedback the next round was sent).
+    _agent_rounds: dict = {}
+    # Token use per worker task, round by round, kept apart from the cards so a lead's total
+    # survives `delegate rm`: {task: {"chain": name, "rounds": {n: {in, cached, out}}, "at": t}}.
+    _task_tokens: dict = {}
     _agents_lock = threading.Lock()
     # {"to": <profile>, "since": <epoch>} while an activate is converging, so the
     # dashboard header can show the switch immediately even though status() is
@@ -713,9 +720,47 @@ class _Handler(BaseHTTPRequestHandler):
     AGENT_STALE_CLAUDE_S = 1800   # a working Claude agent can go quiet for a while (thinking)
     AGENT_STALE_WAITING_S = 4 * 3600  # one that said it is waiting (on a delegate chain) can stay
                                       # silent for hours: its hook only fires when it works
-    AGENT_LINGER_S = 900     # a finished round stays visible this long (time to review it)
-    AGENT_MAX = 50
+    AGENT_LINGER_S = 900     # a finished Claude agent stays visible this long (time to review it)
+    # a finished worker round stays while its task exists: `delegate rm` takes it off (it posts
+    # {"task", "removed": true}), or the reader dismisses it; this is only the backstop
+    AGENT_LINGER_WORKER_S = 3 * 86400
+    AGENT_MAX = 100          # when full, the oldest finished card makes room; only live ones count
+    AGENT_TOKENS_KEEP_S = 86400   # a task's token tally outlives its card (a lead's totals)
     AGENT_DOC_MAX = 200_000   # chars per text (a delegate prompt is capped at ~120 KB)
+    AGENT_ROUNDS_MAX = 8      # earlier rounds kept per task
+    AGENT_ROUNDS_KEEP_S = 6 * 3600   # a task's history outlives its card this long (review, then continue)
+
+    @classmethod
+    def _agent_archive(cls, key, rec: dict, docs: dict | None) -> None:
+        """File a round that ended (or was replaced) under its task's history."""
+        docs = docs or {}
+        hist = cls._agent_rounds.setdefault(key, [])
+        if any(h["round"] == rec.get("round") and h["started_at"] == rec.get("started_at") for h in hist):
+            return
+        hist.append({"round": rec.get("round"), "status": rec.get("status") or rec.get("phase"),
+                     "final": rec.get("final"), "started_at": rec.get("started_at"),
+                     "ended_at": rec.get("updated_at"), "steps": rec.get("steps"),
+                     "tool_calls": rec.get("tool_calls"), "reason": docs.get("reason"), "filed_at": time.time(),
+                     "docs": {k: docs[k] for k in ("prompt", "report") if docs.get(k)}})
+        del hist[:-cls.AGENT_ROUNDS_MAX]
+
+    @staticmethod
+    def _round_reason(prompt: str | None) -> str | None:
+        """Why a later round was needed, from its prompt: the feedback delegate wrapped in
+        <feedback>, a chain retry's cause, or (a raw continue) the text itself. Short."""
+        if not prompt:
+            return None
+        m = re.search(r"<feedback>\s*(.*?)\s*</feedback>", prompt, re.S)
+        body = (m.group(1) if m else prompt).strip()
+        v = re.search(r"verify command after your round and it FAILED \(exit (\S+?)\)", body)
+        if v:
+            return f"chain retry: verify failed (exit {v.group(1)})"
+        c = re.search(r"Your last round (?:ended without completing the step \(status: ([\w-]+)\)|was cut off \(([\w-]+)\))", body)
+        if c:
+            return f"chain retry: {c.group(1) or c.group(2)}"
+        if body.startswith("Your round ended without the required closing summary"):
+            return "nudge: no closing summary"
+        return re.sub(r"\s+", " ", body)[:400] or None
 
     @staticmethod
     def _clip(v, n):
@@ -759,6 +804,13 @@ class _Handler(BaseHTTPRequestHandler):
             "started_at": num("started_at", float), "steps": num("steps"),
             "tool_calls": num("tool_calls"), "tool_errors": num("tool_errors"),
             "output_tokens": num("output_tokens"), "context_tokens": num("context_tokens"),
+            "input_tokens": num("input_tokens"), "cached_tokens": num("cached_tokens"),
+            "parent": cls._clip(b.get("parent"), 120) or None,
+            # a Claude agent: the delegate tasks/chains it started, and its own token use
+            "children": [cls._clip(c, 200) for c in (b.get("children") or [])[-200:] if isinstance(c, str)],
+            "usage": ({k: int(v) for k, v in b["usage"].items()
+                       if k in ("input", "cache_read", "cache_write", "output") and isinstance(v, int)}
+                      if isinstance(b.get("usage"), dict) else None),
             "nudges": nudges, "todos": todos, "recent": recent, "mode": mode,
             "last_text": cls._clip(b.get("last_text"), 600),
             "final": bool(b.get("final")), "reporter": reporter, "updated_at": time.time(),
@@ -774,9 +826,18 @@ class _Handler(BaseHTTPRequestHandler):
                 stale = cls.AGENT_STALE_WAITING_S
             else:
                 stale = cls.AGENT_STALE_CLAUDE_S
-            if age > (cls.AGENT_LINGER_S if r["final"] else stale):
+            linger = cls.AGENT_LINGER_S if r.get("kind") == "claude" else cls.AGENT_LINGER_WORKER_S
+            if age > (linger if r["final"] else stale):
+                if r["final"] and r.get("kind") != "claude" and r.get("round"):
+                    cls._agent_archive(k, r, cls._agent_docs.get(k))   # the next round may come later
                 del cls._agents[k]
                 cls._agent_docs.pop(k, None)
+        for t, v in list(cls._task_tokens.items()):
+            if now - v["at"] > cls.AGENT_TOKENS_KEEP_S:
+                del cls._task_tokens[t]
+        for k, hist in list(cls._agent_rounds.items()):
+            if k not in cls._agents and now - (hist[-1].get("filed_at") or 0) > cls.AGENT_ROUNDS_KEEP_S:
+                del cls._agent_rounds[k]
 
     def _agents_progress(self):
         if int(self.headers.get("content-length") or 0) > 786432:
@@ -794,17 +855,41 @@ class _Handler(BaseHTTPRequestHandler):
         with self._agents_lock:
             self._agents_prune(now)
             key = (reporter, rec["task"])
+            if body.get("removed") is True:          # `delegate rm`: the task and its card are gone
+                self._agents.pop(key, None)
+                self._agent_docs.pop(key, None)
+                self._agent_rounds.pop(key, None)
+                return self._send_json(200, {"ok": True})
             if key not in self._agents and len(self._agents) >= self.AGENT_MAX:
-                return self._send_json(429, {"error": {"message": "too many live agent sessions"}})
+                done = sorted((r["updated_at"], k) for k, r in self._agents.items() if r["final"])
+                if not done:
+                    return self._send_json(429, {"error": {"message": "too many live agent sessions"}})
+                old = done[0][1]                       # the oldest finished card makes room
+                self._agents.pop(old, None)
+                self._agent_docs.pop(old, None)
+            if rec["kind"] != "claude" and rec["round"] is not None:
+                tt = self._task_tokens.setdefault(rec["task"], {"chain": None, "rounds": {}, "at": now})
+                tt["at"], tt["chain"] = now, (rec["mode"] or {}).get("chain") or tt["chain"]
+                tt["rounds"][rec["round"]] = {"in": rec["input_tokens"] or 0, "cached": rec["cached_tokens"] or 0,
+                                              "out": rec["output_tokens"] or 0}
             # texts arrive once (prompt at the start, report at the end) and are kept across
             # the light snapshots in between; a new round of the same task starts fresh
             docs = self._agent_docs.get(key)
             if docs is None or docs.get("round") != rec["round"] or docs.get("started_at") != rec["started_at"]:
+                prev = self._agents.get(key)
+                hist = self._agent_rounds.get(key) or []
+                last = prev.get("round") if prev else (hist[-1]["round"] if hist else None)
+                if rec["round"] is not None and last is not None and rec["round"] <= last:
+                    self._agent_rounds.pop(key, None)       # the task started over (rm + run)
+                elif prev is not None and rec["round"] is not None:
+                    self._agent_archive(key, prev, docs)    # a later round: file the one before
                 docs = {"round": rec["round"], "started_at": rec["started_at"]}
             for k in ("prompt", "report"):
                 v = body.get(k)
                 if isinstance(v, str) and v:
                     docs[k] = v[:self.AGENT_DOC_MAX]
+            if (rec["round"] or 1) > 1 and docs.get("prompt") and "reason" not in docs:
+                docs["reason"] = self._round_reason(docs["prompt"])
             self._agent_docs[key] = docs
             rec["has_prompt"], rec["has_report"] = bool(docs.get("prompt")), bool(docs.get("report"))
             self._agents[key] = rec
@@ -820,8 +905,12 @@ class _Handler(BaseHTTPRequestHandler):
         if which not in ("prompt", "report"):
             return self._send_json(400, {"error": {"message": "which must be prompt or report"}})
         key = ((q.get("reporter") or [""])[0], (q.get("task") or [""])[0])
+        rnd = (q.get("round") or [""])[0]
         with self._agents_lock:
-            text = (self._agent_docs.get(key) or {}).get(which)
+            docs = self._agent_docs.get(key) or {}
+            if rnd and str(docs.get("round")) != rnd:      # an earlier round of the task
+                docs = next((h["docs"] for h in self._agent_rounds.get(key) or [] if str(h["round"]) == rnd), {})
+            text = docs.get(which)
         if not text:
             return self._send_json(404, {"error": {"message": f"no {which} for that session"}})
         return self._send_json(200, {"which": which, "text": text})
@@ -832,7 +921,25 @@ class _Handler(BaseHTTPRequestHandler):
         now = time.time()
         with self._agents_lock:
             self._agents_prune(now)
-            rows = sorted(self._agents.values(), key=lambda r: r.get("started_at") or 0)
+            rows = []
+            for k, r in sorted(self._agents.items(), key=lambda kv: kv[1].get("started_at") or 0):
+                hist = self._agent_rounds.get(k) or []
+                extra = {}
+                if r.get("kind") == "claude" and r.get("children"):
+                    kids = set(r["children"])
+                    w = {"tasks": 0, "rounds": 0, "in": 0, "cached": 0, "out": 0}
+                    for t, v in self._task_tokens.items():
+                        if "task:" + t in kids or (v["chain"] and "chain:" + v["chain"] in kids):
+                            w["tasks"] += 1
+                            for x in v["rounds"].values():
+                                w["rounds"] += 1
+                                for f in ("in", "cached", "out"):
+                                    w[f] += x[f]
+                    extra["worker_usage"] = w if w["tasks"] else None
+                rows.append({**{x: y for x, y in r.items() if x != "children"}, **extra, "reason": (self._agent_docs.get(k) or {}).get("reason"),
+                             "rounds": [{**{x: h[x] for x in h if x not in ("docs", "filed_at")},
+                                         "has_prompt": "prompt" in h["docs"], "has_report": "report" in h["docs"]}
+                                        for h in hist]})
         return self._send_json(200, {"now": now, "sessions": rows})
 
     # -- named API keys (admin only) ----------------------------------------------------

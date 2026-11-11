@@ -170,7 +170,36 @@
   /* live coding-agent sessions (delegate) */
   .ag { border:1px solid var(--border); border-radius:var(--radius); padding:12px 14px; background:var(--surface2); }
   .ag + .ag { margin-top:10px; }
-  .ag-head { display:flex; align-items:baseline; gap:8px; flex-wrap:wrap; }
+  .ag-top { display:flex; align-items:flex-start; gap:10px; }
+  .ag-head { flex:1; min-width:0; }
+  .ag-title, .ag-chips { display:flex; align-items:baseline; gap:8px; flex-wrap:wrap; }
+  .ag-chips { margin-top:6px; gap:6px; }
+  .ag-host + .ag-host { margin-top:14px; }
+  .ag-host-h { font-size:.7rem; font-weight:700; letter-spacing:.08em; color:var(--dim); margin:0 0 6px 2px; }
+  /* the card's buttons: always the same four slots in the same corner, whatever the chips and
+     names beside them wrap to; a button a round doesn't have keeps its slot, invisibly */
+  .ag-acts { display:flex; gap:6px; flex:none; align-items:center; }
+  .ag-acts button { white-space:nowrap; }
+  .ag-acts button.ag-gap { visibility:hidden; }
+  .ag-acts .ag-fold { width:2.2em; padding-left:0; padding-right:0; }
+  .ag-mini { font-size:.8rem; line-height:1.45; margin-top:6px; }
+  .ag-mini .of { color:var(--dim); font-size:.74rem; margin-left:6px; text-transform:none; letter-spacing:0; }
+  .ag-mini .done { color:var(--dim); text-decoration:line-through; }
+  .ag-mini .now { color:var(--yellow); }
+  .ag-mini div { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .ag.folded .ag-cols { display:none; }
+  .ag-why { font-size:.78rem; margin-top:6px; color:var(--text); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .ag-why b { color:var(--yellow); font-weight:600; }
+  .ag-rounds { font-size:.76rem; margin:2px 0 10px; }
+  .ag-rounds .r { display:flex; align-items:center; gap:8px; padding:3px 0; border-top:1px dashed var(--border); }
+  .ag-rounds .r:first-of-type { border-top:0; }
+  .ag-rounds .r .n { font-weight:700; min-width:2.2em; }
+  .ag-rounds .r .why { color:var(--dim); flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .ag-rounds .r button { padding:0 8px; font-size:.7rem; }
+  .ag-rmini { display:flex; gap:6px; flex-wrap:wrap; margin-top:6px; font-size:.72rem; }
+  .ag.folded .ag-rounds { display:none; }
+  .ag:not(.folded) .ag-rmini { display:none; }
+  .ag:not(.folded) .ag-mini { display:none; }
   .ag-task { font-weight:700; font-size:.95rem; overflow-wrap:anywhere; }
   .ag-stats { display:flex; gap:14px; flex-wrap:wrap; font-size:.78rem; color:var(--dim); margin:6px 0 10px;
     font-variant-numeric:tabular-nums; }
@@ -3719,9 +3748,13 @@ const agDur = s => { s = Math.max(0, Math.round(s)); const h = Math.floor(s / 36
 // activity feed's scroll and wipe any text selection. The feed keeps the reader's position;
 // new lines while scrolled down show a "↑ N new" jump instead of moving the text.
 const AG_NODES = new Map();
+const AG_GROUPS = new Map();   // host → its group (heading + cards)
 const agKey = a => a.reporter + "\u0000" + a.task;
 const agDismissKey = a => "stackd_ag_dismiss:" + agKey(a) + "\u0000" + a.round + "\u0000" + Math.round(a.started_at || 0);
 const agLineKey = e => (e.t || 0) + "|" + (e.kind || "") + "|" + (e.text || "").slice(0, 40);
+const agFoldKey = a => "stackd_ag_fold:" + agKey(a);
+// a new agent arrives folded; only a card the reader opened stays open
+function agFolded(a) { try { return localStorage.getItem(agFoldKey(a)) !== "open"; } catch (e) { return true; } }
 function agDismissed(a) { try { return !!localStorage.getItem(agDismissKey(a)); } catch (e) { return false; } }
 function agSelecting(node) {
   const sel = window.getSelection && window.getSelection();
@@ -3729,7 +3762,11 @@ function agSelecting(node) {
 }
 function agBuild(a) {
   const d = el("div", "ag");
-  d.innerHTML = `<div class="ag-head"></div><div class="ag-stats"></div>
+  d.innerHTML = `<div class="ag-top"><div class="ag-head"></div><div class="ag-acts">
+      <button class="sm ag-fold"></button><button class="sm ag-prompt">prompt</button>
+      <button class="sm ag-report">response</button><button class="sm ag-x" aria-label="dismiss this finished round">×</button>
+    </div></div><div class="ag-why hidden"></div><div class="ag-rmini"></div><div class="ag-stats"></div>
+    <div class="ag-rounds hidden"></div><div class="ag-mini"></div>
     <div class="ag-cols"><div><div class="ag-sub">plan</div><div class="ag-todo"></div></div>
     <div><div class="ag-sub" style="display:flex;align-items:center;gap:8px;">activity
       <button class="sm ag-new hidden" style="padding:0 8px;font-size:.7rem;"></button></div>
@@ -3737,6 +3774,22 @@ function agBuild(a) {
   const feed = d.querySelector(".ag-feed"), jump = d.querySelector(".ag-new");
   d._pending = 0; d._lines = null;          // null: nothing rendered yet (an empty feed still needs its placeholder)
   jump.onclick = () => { feed.scrollTop = 0; };
+  // folded: the plan's previous, current and next item and x/y only; remembered per agent
+  const fold = d.querySelector(".ag-fold");
+  const setFold = on => {
+    d.classList.toggle("folded", on);
+    fold.textContent = on ? "▸" : "▾";
+    fold.title = on ? "show the stats, the whole plan and the activity" : "fold: only the plan's current step";
+    fold.setAttribute("aria-expanded", String(!on));
+  };
+  setFold(agFolded(a));
+  fold.onclick = () => { const on = !d.classList.contains("folded");
+    try { on ? localStorage.removeItem(agFoldKey(a)) : localStorage.setItem(agFoldKey(a), "open"); } catch (e) {}
+    setFold(on); };
+  d.querySelector(".ag-prompt").onclick = () => d._a && agDoc(d._a, "prompt", "prompt");
+  d.querySelector(".ag-report").onclick = () => d._a && agDoc(d._a, "report", "response");
+  d.querySelector(".ag-x").onclick = () => { const x = d._a; if (!x) return;
+    try { localStorage.setItem(agDismissKey(x), "1"); } catch (e) {} loadAgents._at = 0; loadAgents(); };
   feed.addEventListener("scroll", () => {
     if (feed.scrollTop <= 4 && d._pending) { d._pending = 0; jump.classList.add("hidden"); }
   });
@@ -3773,8 +3826,11 @@ function agModeChips(m) {
   return out;
 }
 function agRender(d, a, now) {
-  const head = d.querySelector(".ag-head");
+  let head = d.querySelector(".ag-head");
   head.innerHTML = "";
+  const title = el("div", "ag-title"), chips = el("div", "ag-chips");
+  head.append(title, chips);
+  head = title;
   head.append(el("span", "ag-task", a.task));
   if (a.kind === "claude") head.append(el("span", "pill info", "Claude agent"));
   const pill = agPill(a);
@@ -3783,26 +3839,52 @@ function agRender(d, a, now) {
   const where = [(a.repo || "").split("/").pop(), a.branch].filter(Boolean).join(" · ");
   if (where) head.append(el("span", "muted", where));
   for (const [cls, text, tip] of agModeChips(a.mode)) {
-    const c = el("span", cls, text); c.title = tip; head.append(c);
+    const c = el("span", cls, text); c.title = tip; chips.append(c);
   }
-  const right = el("span", "muted"); right.style.marginLeft = "auto"; right.style.fontSize = ".74rem";
-  right.textContent = [a.model, a.reporter && "key " + a.reporter, a.host].filter(Boolean).join(" · ");
-  head.append(right);
-  // what was sent to the agent, and what it sent back (the worker's round report, a Claude
-  // agent's hand-back), in full; fetched on demand so the poll stays small
-  for (const [which, label, has, tip] of [
-    ["prompt", "prompt", a.has_prompt, a.kind === "claude" ? "the brief this agent was started with" : "the prompt this round was sent"],
-    ["report", "response", a.has_report, a.kind === "claude" ? "what this agent handed back" : "the round's report: what came back to the orchestrator"]]) {
-    if (!has) continue;
-    const b = el("button", "sm", label); b.title = tip;
-    b.onclick = () => agDoc(a, which, label);
-    head.append(b);
+  const right = el("span", "muted"); right.style.fontSize = ".74rem";
+  right.textContent = [a.model, a.reporter && "key " + a.reporter].filter(Boolean).join(" · ");   // the host is the group heading
+  if (right.textContent) chips.append(right);
+  chips.classList.toggle("hidden", !chips.childElementCount);
+  // the buttons live in .ag-acts (built once): what was sent to the agent, what it sent back
+  // (fetched on demand so the poll stays small), and dismiss once the round is over
+  d._a = a;
+  const slot = (sel, show, tip) => { const b = d.querySelector(sel);
+    b.classList.toggle("ag-gap", !show); b.disabled = !show; b.tabIndex = show ? 0 : -1; b.title = show ? tip : ""; };
+  slot(".ag-prompt", a.has_prompt, a.kind === "claude" ? "the brief this agent was started with" : "the prompt this round was sent");
+  slot(".ag-report", a.has_report, a.kind === "claude" ? "what this agent handed back" : "the round's report: what came back to the orchestrator");
+  slot(".ag-x", a.final, "dismiss");
+  // rounds of the same task kept together: why this round was needed, and the ones before it
+  const why = d.querySelector(".ag-why"); why.innerHTML = "";
+  why.classList.toggle("hidden", !a.reason);
+  if (a.reason) { why.append(el("b", null, `why round ${a.round}: `), a.reason); why.title = a.reason; }
+  const prior = a.rounds || [];
+  const rmini = d.querySelector(".ag-rmini"), rfull = d.querySelector(".ag-rounds");
+  rmini.innerHTML = ""; rfull.innerHTML = "";
+  rfull.classList.toggle("hidden", !prior.length);
+  for (const h of prior) {
+    const p = agPill({ final: h.final, status: h.status, phase: h.status });
+    const chip = el("span", p.cls, `r${h.round} ${p.text.replace("● ", "")}`);
+    chip.title = h.reason ? `why round ${h.round}: ${h.reason}` : `round ${h.round}`;
+    rmini.append(chip);
+    const row = el("div", "r");
+    const took = h.started_at && h.ended_at ? agDur(h.ended_at - h.started_at) : "";
+    row.append(el("span", "n", `r${h.round}`), el("span", p.cls, p.text.replace("● ", "")));
+    if (took) row.append(el("span", "muted", took));
+    if (h.tool_calls != null) row.append(el("span", "muted", `${fmtNum(h.tool_calls)} calls`));
+    const w = el("span", "why", h.reason ? "why: " + h.reason : h.round === 1 ? "the spec" : "");
+    w.title = h.reason || "";
+    row.append(w);
+    for (const [which, label, has] of [["prompt", "prompt", h.has_prompt], ["report", "response", h.has_report]]) {
+      if (!has) continue;
+      const b = el("button", "sm", label);
+      b.onclick = () => agDoc(a, which, label, h.round);
+      row.append(b);
+    }
+    rfull.append(row);
   }
-  if (a.final) {
-    const x = el("button", "sm", "×"); x.title = "dismiss"; x.setAttribute("aria-label", "dismiss this finished round");
-    x.onclick = () => { try { localStorage.setItem(agDismissKey(a), "1"); } catch (e) {} loadAgents._at = 0; loadAgents(); };
-    head.append(x);
-  }
+  if (prior.length) rmini.append(el("span", "pill prog", `r${a.round} ${agPill(a).text.replace("● ", "")}`));
+  rmini.classList.toggle("hidden", !prior.length);
+  if (prior.length) rfull.prepend(el("div", "ag-sub", "earlier rounds"));
   const stats = d.querySelector(".ag-stats"); stats.innerHTML = "";
   const age = now - (a.updated_at || now);
   const add = (label, val, color) => { const x = el("span"); const b = el("b", null, val); if (color) b.style.color = color;
@@ -3812,6 +3894,23 @@ function agRender(d, a, now) {
   if (a.steps != null) add("steps", fmtNum(a.steps));
   add(`tool calls${a.tool_errors ? ` (${a.tool_errors} failed)` : ""}`, fmtNum(a.tool_calls ?? 0));
   if (a.output_tokens != null) add("tokens out", fmtSI(a.output_tokens));
+  if (a.input_tokens != null || a.cached_tokens != null) {
+    const tin = (a.input_tokens || 0) + (a.cached_tokens || 0);
+    if (tin) add(`in (${fmtSI(a.cached_tokens || 0)} cached)`, fmtSI(tin));
+  }
+  // a Claude lead: its own token use, and the delegate rounds it started (by task and chain)
+  if (a.usage) {
+    const u = a.usage, tin = (u.input || 0) + (u.cache_read || 0) + (u.cache_write || 0);
+    const x = el("span"); x.title = `Claude, this agent: ${fmtNum(u.input || 0)} fresh in, ${fmtNum(u.cache_read || 0)} cache reads, ${fmtNum(u.cache_write || 0)} cache writes, ${fmtNum(u.output || 0)} out`;
+    x.append("Claude ", el("b", null, fmtSI(u.output || 0)), " out · ", el("b", null, fmtSI(tin)), " in");
+    stats.append(x);
+  }
+  if (a.worker_usage) {
+    const w = a.worker_usage, x = el("span");
+    x.title = `its delegate workers (local model): ${w.tasks} task(s), ${w.rounds} round(s); ${fmtNum(w.in)} fresh in, ${fmtNum(w.cached)} cached in, ${fmtNum(w.out)} out`;
+    x.append("workers ", el("b", null, fmtSI(w.out)), " out · ", el("b", null, fmtSI(w.in + w.cached)), ` in · ${w.tasks} task${w.tasks === 1 ? "" : "s"}`);
+    stats.append(x);
+  }
   if (a.context_tokens) add("context", fmtSI(a.context_tokens));
   const nud = Object.entries(a.nudges || {}).map(([k, v]) => `${k}×${v}`).join(", ");
   if (nud) add("recovered", nud);
@@ -3838,6 +3937,25 @@ function agRender(d, a, now) {
     todo.append(el("div", st === "completed" ? "done" : st === "in_progress" ? "now" : null, `${mark} ${t.content}`));
   }
   if (unticked) todo.append(el("div", "muted", `worker left ${unticked} item${unticked > 1 ? "s" : ""} unticked; the round was verified done`));
+  // the folded view: previous, current and next item, and how far along
+  const mini = d.querySelector(".ag-mini"); mini.innerHTML = "";
+  const stOf = t => verifiedDone ? "completed" : t.status;
+  const nDone = todos.filter(t => stOf(t) === "completed").length;
+  // (the elapsed time is on the stats row, which a folded card keeps)
+  mini.classList.toggle("hidden", !todos.length && a.kind === "claude");
+  mini.append(el("div", "ag-sub", todos.length ? `plan ${nDone}/${todos.length}` : "plan"));
+  if (!todos.length) mini.append(el("div", "muted", "no todo list yet"));
+  else {
+    let cur = todos.findIndex(t => stOf(t) === "in_progress");
+    if (cur < 0) cur = todos.findIndex(t => stOf(t) !== "completed");
+    if (cur < 0) mini.append(el("div", "done", `✓ ${todos[todos.length - 1].content}`), el("div", "muted", "all done"));
+    else {
+      const row = (t, cls, mark) => mini.append(el("div", cls, `${mark} ${t.content}`));
+      if (cur > 0) row(todos[cur - 1], stOf(todos[cur - 1]) === "completed" ? "done" : null, stOf(todos[cur - 1]) === "completed" ? "✓" : "○");
+      row(todos[cur], stOf(todos[cur]) === "in_progress" ? "now" : null, stOf(todos[cur]) === "in_progress" ? "▸" : "○");
+      if (cur + 1 < todos.length) row(todos[cur + 1], null, "○");
+    }
+  }
   // feed: newest first; keep the reader's place when they have scrolled down
   const feed = d.querySelector(".ag-feed"), jump = d.querySelector(".ag-new");
   const lines = (a.recent || []).slice().reverse();
@@ -3870,7 +3988,7 @@ function agRender(d, a, now) {
     if (d._pending) { jump.textContent = `↑ ${d._pending} new`; jump.classList.remove("hidden"); }
   }
 }
-async function agDoc(a, which, label) {
+async function agDoc(a, which, label, round) {
   let dlg = $("#agDoc");
   if (!dlg) {
     dlg = el("dialog", "ag-doc"); dlg.id = "agDoc";
@@ -3885,13 +4003,15 @@ async function agDoc(a, which, label) {
     document.body.append(dlg);
   }
   const pre = dlg.querySelector("pre");
-  dlg.querySelector(".ttl").textContent = `${a.task}${a.round != null ? ` · round ${a.round}` : ""} — ${label}`;
+  const rn = round ?? a.round;
+  dlg.querySelector(".ttl").textContent = `${a.task}${rn != null ? ` · round ${rn}` : ""} — ${label}`;
   dlg.querySelector(".sz").textContent = "";
   pre.textContent = "loading…";
   if (!dlg.open) dlg.showModal();
   pre.scrollTop = 0;
   try {
     const q = new URLSearchParams({ reporter: a.reporter || "", task: a.task || "", which });
+    if (round != null) q.set("round", String(round));
     const r = await api("/agents/doc?" + q);
     pre.textContent = r.text || "";
     dlg.querySelector(".sz").textContent = `${fmtNum((r.text || "").length)} chars`;
@@ -3909,10 +4029,20 @@ async function loadAgents() {
   card.classList.toggle("hidden", !ss.length);
   const live = new Set(ss.map(agKey));
   for (const [k, node] of AG_NODES) if (!live.has(k)) { node.remove(); AG_NODES.delete(k); }
+  // one group per machine the agents run on (DOCKER-BOY, the laptop, …), in name order
+  const hostOf = a => (a.host || "unknown host").toUpperCase();
+  const hosts = [...new Set(ss.map(hostOf))].sort();
+  for (const [h, g] of AG_GROUPS) if (!hosts.includes(h)) { g.remove(); AG_GROUPS.delete(h); }
+  for (const h of hosts) {
+    let g = AG_GROUPS.get(h);
+    if (!g) { g = el("div", "ag-host"); g.append(el("div", "ag-host-h", h), el("div", "ag-host-b")); AG_GROUPS.set(h, g); }
+    box.append(g);          // re-appending keeps the name order without rebuilding the cards
+  }
   for (const a of ss) {
     let d = AG_NODES.get(agKey(a));
     if (!d) { d = agBuild(a); AG_NODES.set(agKey(a), d); }
-    if (d.parentNode !== box) box.append(d);
+    const body = AG_GROUPS.get(hostOf(a)).querySelector(".ag-host-b");
+    if (d.parentNode !== body) body.append(d);
     // Don't yank text out from under a selection, but keep its status true: a card whose name
     // was selected froze on "verifying" while the round had finished (owner, 2026-11-09). The
     // pill is updated in place, so the selected text stays put.
