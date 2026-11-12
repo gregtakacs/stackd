@@ -870,6 +870,28 @@ class _Handler(BaseHTTPRequestHandler):
             "final": bool(b.get("final")), "reporter": reporter, "updated_at": time.time(),
         }
 
+    def _agents_accept(self, task: str, reporter: str, rnd, accept: dict):
+        """A round `delegate accept` closed as delegator-verified: recolour the live card and that
+        round's history entry to `accepted`, carrying the note + the status it overrode. Display
+        only. The card is patched, not rebuilt, so its plan/feed survive; if it already aged off
+        the board there is nothing to recolour and the terminal archive stays the record."""
+        key = (reporter, task)
+        note = self._clip(accept.get("note"), 300)
+        before = self._clip(accept.get("status_before"), 40)
+        rnd = rnd if isinstance(rnd, int) else None
+        with self._agents_lock:
+            hit = False
+            rec = self._agents.get(key)
+            if rec is not None and (rnd is None or rec.get("round") == rnd):
+                rec.update(status="accepted", final=True, updated_at=time.time(),
+                           accept_note=note, status_before=before)
+                hit = True
+            for h in (self._agent_rounds.get(key) or []):
+                if rnd is None or h.get("round") == rnd:
+                    h.update(status="accepted", final=True, accept_note=note, status_before=before)
+                    hit = True
+        return self._send_json(200, {"ok": True, "updated": hit})
+
     @classmethod
     def _agents_prune(cls, now: float) -> None:
         for k, r in list(cls._agents.items()):
@@ -904,6 +926,9 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send_json(400, {"error": {"message": "missing 'task'"}})
         c = self._caller()
         reporter = c["name"] if c and c["kind"] == "key" else "admin"
+        acc = body.get("accept")
+        if isinstance(acc, dict):        # `delegate accept`: recolour, don't rebuild the card
+            return self._agents_accept(str(body.get("task")).strip(), reporter, body.get("round"), acc)
         rec = self._agent_record(body, reporter)
         now = time.time()
         with self._agents_lock:

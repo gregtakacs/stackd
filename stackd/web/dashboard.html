@@ -3797,11 +3797,36 @@ function agBuild(a) {
   });
   return d;
 }
+// What each delegate round status means, for the pill's hover. One source of truth: the main
+// pill, the folded mini-chip and every earlier-round chip all read it (owner, 2026-11-12 —
+// "a yellow pill and a red pill and a green pill sit next to each other with no legend").
+const AG_STATUS = {
+  running:   ["live", "the worker is in a round right now"],
+  worker:    ["live", "the worker is thinking / calling tools"],
+  verifying: ["live", "the worker finished its round; the harness is running the verify command"],
+  done:      ["ok", "the worker reported done and the verify command passed"],
+  finished:  ["ok", "the round ended normally"],
+  accepted:  ["ok", "the round ended FAILED but a supervisor verified the work by hand and closed it (hover the pill for why)"],
+  partial:   ["warn", "the round ended without finishing every acceptance criterion in the spec"],
+  "no-status": ["warn", "the worker stopped without writing its required closing STATUS block"],
+  "done-but-verify-failed": ["warn", "worker said done, but the verify command exited non-zero (green only if a later round or a supervisor accept fixed it)"],
+  interrupted: ["bad", "the harness died before the round could report"],
+  aborted:   ["bad", "stopped by `delegate stop`; whatever was done is committed, reported as aborted"],
+  "worker-error": ["bad", "the worker process errored out"],
+  timeout:   ["bad", "the round hit the wall-clock limit (DELEGATE_TIMEOUT)"],
+  truncated: ["bad", "the round was cut off mid-turn (usually an oversized tool payload)"],
+  "stale?":  ["warn", "no progress reported for a while — possibly wedged"],
+};
 // The status pill: what the round is doing, or how it ended.
 function agPill(a) {
   const st = a.final ? (a.status || "finished") : (a.phase || "running");
-  const cls = !a.final ? "prog" : /^(done|finished)$/.test(st) ? "ok" : /aborted|error|timeout|failed|truncated/.test(st) ? "bad" : "warn";
-  return { cls: "pill ag-st " + cls, text: (a.final ? "" : "● ") + st };
+  // "accepted" is green too (the supervisor verified the work), but the word differs from
+  // "done" and it carries the override note as a title, so it is never mistaken for a clean pass.
+  const cls = !a.final ? "prog" : /^(done|finished|accepted)$/.test(st) ? "ok" : /aborted|error|timeout|failed|truncated/.test(st) ? "bad" : "warn";
+  const h = AG_STATUS[st];
+  let help = h ? h[1] : (a.final ? "this round ended with status " + st : "the round is live");
+  if (st === "accepted" && a.accept_note) help = `delegator-verified (overrode ${a.status_before || "a failed round"}): ${a.accept_note}`;
+  return { cls: "pill ag-st " + cls, text: (a.final ? "" : "● ") + st, help };
 }
 // How a delegate round runs, as chips: where it runs (container / native / in place), its
 // network, and raw / orb / service / chain. Older reporters send no mode: no chips.
@@ -3836,7 +3861,8 @@ function agRender(d, a, now) {
   head.append(el("span", "ag-task", a.task));
   if (a.kind === "claude") head.append(el("span", "pill info", "Claude agent"));
   const pill = agPill(a);
-  head.append(el("span", pill.cls, pill.text));
+  const pillEl = el("span", pill.cls, pill.text); pillEl.title = pill.help;
+  head.append(pillEl);
   if (a.kind !== "claude") head.append(el("span", "muted", `round ${a.round ?? "?"}`));
   const where = [(a.repo || "").split("/").pop(), a.branch].filter(Boolean).join(" · ");
   if (where) head.append(el("span", "muted", where));
@@ -3866,11 +3892,12 @@ function agRender(d, a, now) {
   for (const h of prior) {
     const p = agPill({ final: h.final, status: h.status, phase: h.status });
     const chip = el("span", p.cls, `r${h.round} ${p.text.replace("● ", "")}`);
-    chip.title = h.reason ? `why round ${h.round}: ${h.reason}` : `round ${h.round}`;
+    chip.title = p.help + (h.reason ? ` — why round ${h.round}: ${h.reason}` : "");
     rmini.append(chip);
     const row = el("div", "r");
     const took = h.started_at && h.ended_at ? agDur(h.ended_at - h.started_at) : "";
-    row.append(el("span", "n", `r${h.round}`), el("span", p.cls, p.text.replace("● ", "")));
+    const rstat = el("span", p.cls, p.text.replace("● ", "")); rstat.title = p.help;
+    row.append(el("span", "n", `r${h.round}`), rstat);
     if (took) row.append(el("span", "muted", took));
     if (h.tool_calls != null) row.append(el("span", "muted", `${fmtNum(h.tool_calls)} calls`));
     const w = el("span", "why", h.reason ? "why: " + h.reason : h.round === 1 ? "the spec" : "");
@@ -3884,7 +3911,10 @@ function agRender(d, a, now) {
     }
     rfull.append(row);
   }
-  if (prior.length) rmini.append(el("span", "pill prog", `r${a.round} ${agPill(a).text.replace("● ", "")}`));
+  // the current round's chip uses the SAME class as the pill: a retried-and-succeeded final round
+  // was pinned to "prog" (yellow) here even though its own pill had gone green (owner, 2026-11-12)
+  if (prior.length) { const c = el("span", pill.cls, `r${a.round} ${pill.text.replace("● ", "")}`);
+    c.title = pill.help; rmini.append(c); }
   rmini.classList.toggle("hidden", !prior.length);
   if (prior.length) rfull.prepend(el("div", "ag-sub", "earlier rounds"));
   const stats = d.querySelector(".ag-stats"); stats.innerHTML = "";
