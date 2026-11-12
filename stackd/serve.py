@@ -385,6 +385,7 @@ class _Handler(BaseHTTPRequestHandler):
     # is exactly where the socketserver tracebacks already land under `docker logs`.
     def handle_one_request(self):
         self._t_log = time.monotonic()
+        self._body_read = False        # this request's body, if any, has not been consumed yet
         super().handle_one_request()
 
     def _log_ctx(self) -> str:
@@ -415,6 +416,19 @@ class _Handler(BaseHTTPRequestHandler):
     # -- helpers ------------------------------------------------------------------
     def _send_json(self, code: int, payload: dict, extra_headers: dict | None = None):
         raw = json.dumps(payload).encode()
+        # An error returned before the request body was read leaves that body sitting in a
+        # keep-alive socket, and the client's *next* request line is then mis-parsed as
+        # garbage ("Bad request syntax" 400) — which poisons every later turn on a connection
+        # the client reuses (opencode keeps one, live). A POST/PUT/PATCH rejected before its
+        # body was consumed can only be answered honestly by ending the connection (2026-11-12:
+        # my own `delegate accept` test against a stale key reproduced the whole cascade on the
+        # access log). Healthy keep-alive is untouched: this fires only on a desynced socket.
+        if (code >= 400 and self.command in ("POST", "PUT", "PATCH")
+                and not getattr(self, "_body_read", False)):
+            self.close_connection = True
+            if extra_headers is None:
+                extra_headers = {}
+            extra_headers.setdefault("connection", "close")
         self.send_response(code)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(raw)))
@@ -511,6 +525,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _read_body(self) -> bytes:
         n = int(self.headers.get("content-length") or 0)
+        self._body_read = True
         return self.rfile.read(n) if n else b""
 
     def _admin(self) -> bool:
