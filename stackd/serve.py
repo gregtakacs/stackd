@@ -794,7 +794,9 @@ class _Handler(BaseHTTPRequestHandler):
         hist.append({"round": rec.get("round"), "status": rec.get("status") or rec.get("phase"),
                      "final": rec.get("final"), "started_at": rec.get("started_at"),
                      "ended_at": rec.get("updated_at"), "steps": rec.get("steps"),
-                     "tool_calls": rec.get("tool_calls"), "reason": docs.get("reason"), "filed_at": time.time(),
+                     "tool_calls": rec.get("tool_calls"),
+                     "busy_ms": rec.get("busy_ms") or {}, "busy_n": rec.get("busy_n") or {},
+                     "reason": docs.get("reason"), "filed_at": time.time(),
                      "docs": {k: docs[k] for k in ("prompt", "report") if docs.get(k)}})
         del hist[:-cls.AGENT_ROUNDS_MAX]
 
@@ -819,6 +821,23 @@ class _Handler(BaseHTTPRequestHandler):
     @staticmethod
     def _clip(v, n):
         return str(v)[:n] if v is not None else None
+
+    _BUSY_KEYS = ("exec", "files", "search", "web", "other")
+
+    @classmethod
+    def _busy(cls, v, cap: int = 86_400_000) -> dict:
+        """A reporter's per-bucket ms (or call counts): drop unknown keys, bad types and
+        anything out of range; the whole dict is display-only so a bad entry just disappears."""
+        if not isinstance(v, dict):
+            return {}
+        out = {}
+        for k in cls._BUSY_KEYS:
+            x = v.get(k)
+            if isinstance(x, bool):
+                continue
+            if isinstance(x, (int, float)) and 0 <= x <= cap:
+                out[k] = int(x)
+        return out
 
     @classmethod
     def _agent_record(cls, b: dict, reporter: str) -> dict:
@@ -859,6 +878,9 @@ class _Handler(BaseHTTPRequestHandler):
             "tool_calls": num("tool_calls"), "tool_errors": num("tool_errors"),
             "output_tokens": num("output_tokens"), "context_tokens": num("context_tokens"),
             "input_tokens": num("input_tokens"), "cached_tokens": num("cached_tokens"),
+            # ms of completed tool calls this round, per bucket (exec/files/search/web/other);
+            # anything the elapsed window has left over is model+idle. Display-only, best-effort.
+            "busy_ms": cls._busy(b.get("busy_ms")), "busy_n": cls._busy(b.get("busy_n"), cap=10000),
             "parent": cls._clip(b.get("parent"), 120) or None,
             # a Claude agent: the delegate tasks/chains it started, and its own token use
             "children": [cls._clip(c, 200) for c in (b.get("children") or [])[-200:] if isinstance(c, str)],
@@ -950,7 +972,9 @@ class _Handler(BaseHTTPRequestHandler):
                 tt = self._task_tokens.setdefault(rec["task"], {"chain": None, "rounds": {}, "at": now})
                 tt["at"], tt["chain"] = now, (rec["mode"] or {}).get("chain") or tt["chain"]
                 tt["rounds"][rec["round"]] = {"in": rec["input_tokens"] or 0, "cached": rec["cached_tokens"] or 0,
-                                              "out": rec["output_tokens"] or 0}
+                                              "out": rec["output_tokens"] or 0,
+                                              "busy": rec.get("busy_ms") or {},
+                                              "el": max(0, int((time.time() - (rec.get("started_at") or time.time())) * 1000))}
             # texts arrive once (prompt at the start, report at the end) and are kept across
             # the light snapshots in between; a new round of the same task starts fresh
             docs = self._agent_docs.get(key)
@@ -1019,14 +1043,24 @@ class _Handler(BaseHTTPRequestHandler):
                     extra["lead"] = lead_of_task.get(r.get("task")) or (lead_of_chain.get(ch) if ch else None)
                 if r.get("kind") == "claude" and r.get("children"):
                     kids = set(r["children"])
-                    w = {"tasks": 0, "rounds": 0, "in": 0, "cached": 0, "out": 0}
+                    w = {"tasks": 0, "rounds": 0, "in": 0, "cached": 0, "out": 0, "elapsed_ms": 0,
+                         "busy": {k: 0 for k in self._BUSY_KEYS}}
                     for t, v in self._task_tokens.items():
                         if "task:" + t in kids or (v["chain"] and "chain:" + v["chain"] in kids):
                             w["tasks"] += 1
                             for x in v["rounds"].values():
                                 w["rounds"] += 1
-                                for f in ("in", "cached", "out"):
-                                    w[f] += x[f]
+                                for f in ("in", "cached", "out", "el"):
+                                    if f == "el":
+                                        w["elapsed_ms"] += x.get("el", 0)
+                                    else:
+                                        w[f] += x[f]
+                                for bk, bv in (x.get("busy") or {}).items():
+                                    if bk in w["busy"]:
+                                        w["busy"][bk] += bv
+                    w["busy"] = {k: v for k, v in w["busy"].items() if v}
+                    if not w["busy"]:
+                        del w["busy"]; del w["elapsed_ms"]
                     extra["worker_usage"] = w if w["tasks"] else None
                 rows.append({**{x: y for x, y in r.items() if x != "children"}, **extra, "reason": (self._agent_docs.get(k) or {}).get("reason"),
                              "rounds": [{**{x: h[x] for x in h if x not in ("docs", "filed_at")},

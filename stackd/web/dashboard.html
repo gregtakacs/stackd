@@ -206,6 +206,32 @@
   .ag-stats { display:flex; gap:14px; flex-wrap:wrap; font-size:.78rem; color:var(--dim); margin:6px 0 10px;
     font-variant-numeric:tabular-nums; }
   .ag-stats b { color:var(--text); font-weight:600; }
+  /* duty-cycle strip: how the round's wall-clock was spent — LLM inference vs exec vs files vs
+     search vs web vs other. Only shown when the reporter sent busy_ms. Hover a segment. */
+  .ag-busy { display:flex; align-items:center; gap:8px; margin:0 0 10px; font-size:.72rem; }
+  .ag-busy.ag-busy-row { flex-basis:100%; margin:2px 0 0; }   /* inside .ag-stats: own line */
+  .ag-busy .bttl { color:var(--dim); }
+  .ag-busy-track { flex:1; display:flex; height:6px; border-radius:3px; overflow:hidden;
+    background:var(--surface2); border:1px solid var(--border); min-width:60px; }
+  .ag-busy-seg { height:100%; min-width:1px; }
+  .ag-busy-seg.s-model  { background:var(--accent); }
+  .ag-busy-seg.s-exec   { background:var(--yellow); }
+  .ag-busy-seg.s-files  { background:var(--green); }
+  .ag-busy-seg.s-search { background:var(--purple); }
+  .ag-busy-seg.s-web    { background:#38bdf8; }
+  .ag-busy-seg.s-other  { background:var(--dim); }
+  .ag-busy-legend { display:flex; gap:8px; flex-wrap:wrap; color:var(--dim); }
+  .ag-busy-legend i { font-style:normal; padding-left:10px; position:relative; }
+  .ag-busy-legend i::before { content:""; position:absolute; left:0; top:.35em; width:6px; height:6px; border-radius:2px; background:currentColor; }
+  .ag-busy-legend .l-model  { color:var(--accent); }
+  .ag-busy-legend .l-exec   { color:var(--yellow); }
+  .ag-busy-legend .l-files  { color:var(--green); }
+  .ag-busy-legend .l-search { color:var(--purple); }
+  .ag-busy-legend .l-web    { color:#38bdf8; }
+  .ag-busy-legend .l-other  { color:var(--dim); }
+  .ag-rounds .r .ag-busy { margin:0; width:80px; }
+  .ag-rounds .r .ag-busy .bttl, .ag-rounds .r .ag-busy .ag-busy-legend { display:none; }
+  .ag-rounds .r .ag-busy-track { height:5px; }
   .ag-cols { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1.6fr); gap:14px; }
   @media (max-width:760px) { .ag-cols { grid-template-columns:minmax(0,1fr); } }
   .ag-sub { font-size:.7rem; text-transform:uppercase; letter-spacing:.05em; color:var(--dim); margin-bottom:4px; }
@@ -3817,6 +3843,38 @@ const AG_STATUS = {
   truncated: ["bad", "the round was cut off mid-turn (usually an oversized tool payload)"],
   "stale?":  ["warn", "no progress reported for a while — possibly wedged"],
 };
+// Where a round's wall-clock went. The reporter sends busy_ms per bucket (exec/files/search/
+// web/other) and busy_n (count per bucket); everything the elapsed window has left over is
+// model time (LLM thinking + the harness gaps between steps). Compact stacked bar + tiny
+// legend; hover a segment for the duration, count, and percentage.
+const AG_BUSY_ORDER = ["model","exec","files","search","web","other"];
+const AG_BUSY_LABEL = { model:"LLM", exec:"bash", files:"files", search:"search", web:"web", other:"other" };
+function agBusy(a, elapsed_s) {
+  const bm = a.busy_ms || {}, bn = a.busy_n || {};
+  const tool = AG_BUSY_ORDER.slice(1).reduce((s,k)=>s+(bm[k]||0),0);
+  if (!tool && !(a.usage || a.worker_usage)) return null;    // nothing to show (old reporter, or zero tool time)
+  const e_ms = Math.max(0, elapsed_s*1000);
+  const model = Math.max(0, e_ms - tool);
+  const segs = { model, ...Object.fromEntries(AG_BUSY_ORDER.slice(1).map(k=>[k, bm[k]||0])) };
+  const tot = e_ms > 0 ? e_ms : Object.values(segs).reduce((s,v)=>s+v,0);
+  if (tot <= 0) return null;
+  const wrap = el("div","ag-busy");
+  const track = el("div","ag-busy-track");
+  const leg = el("div","ag-busy-legend");
+  for (const k of AG_BUSY_ORDER) {
+    const ms = segs[k]; if (!ms) continue;
+    const s = el("span","ag-busy-seg s-"+k);
+    s.style.flexGrow = (ms/tot).toFixed(4);
+    const pc = 100*ms/tot;
+    const pctl = pc >= 1 ? Math.round(pc)+"%" : "<1%";
+    const n  = k==="model" ? "" : (bn[k] ? ` · ${fmtNum(bn[k])} call${bn[k]===1?"":"s"}` : "");
+    s.title = `${AG_BUSY_LABEL[k]} ${agDur(ms/1000)} (${pctl})${n}`;
+    track.append(s);
+    const l = el("i","l-"+k, `${AG_BUSY_LABEL[k]} ${pctl}`); l.title = s.title; leg.append(l);
+  }
+  wrap.append(el("span","bttl","duty-cycle"), track, leg);
+  return wrap;
+}
 // The status pill: what the round is doing, or how it ended.
 function agPill(a) {
   const st = a.final ? (a.status || "finished") : (a.phase || "running");
@@ -3900,6 +3958,7 @@ function agRender(d, a, now) {
     row.append(el("span", "n", `r${h.round}`), rstat);
     if (took) row.append(el("span", "muted", took));
     if (h.tool_calls != null) row.append(el("span", "muted", `${fmtNum(h.tool_calls)} calls`));
+    if (h.started_at && h.ended_at) { const b = agBusy(h, h.ended_at - h.started_at); if (b) row.append(b); }
     const w = el("span", "why", h.reason ? "why: " + h.reason : h.round === 1 ? "the spec" : "");
     w.title = h.reason || "";
     row.append(w);
@@ -3954,6 +4013,15 @@ function agRender(d, a, now) {
       : `no update for ${agDur(age)}`);
     if (a.kind !== "claude") w.style.color = "var(--yellow)"; stats.append(w);
   }
+  // the duty-cycle strip: only when the reporter sent busy_ms (or, for a Claude lead, when the
+  // rollup accumulated tool time across its workers). It lives inside .ag-stats so the next
+  // poll's stats.innerHTML = "" clears it (one per card, never one per tick); the ag-busy-row
+  // class forces it onto its own line at the END of the stats row, under every number.
+  const elapsed_s = (a.started_at ? ((a.final ? a.updated_at : now) - a.started_at) : 0);
+  const busyEl = a.kind === "claude" && a.worker_usage
+    ? agBusy({ busy_ms: a.worker_usage.busy, busy_n: {} }, (a.worker_usage.elapsed_ms || elapsed_s*1000)/1000)
+    : agBusy(a, elapsed_s);
+  if (busyEl) { busyEl.classList.add("ag-busy-row"); stats.append(busyEl); }
   const todo = d.querySelector(".ag-todo"); todo.innerHTML = "";
   const todos = a.todos || [];
   if (!todos.length) todo.append(el("div", "muted", a.kind === "claude"

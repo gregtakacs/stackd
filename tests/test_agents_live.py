@@ -239,6 +239,52 @@ def test_full_board_evicts_the_oldest_finished_card():
         assert "new" in tasks and "old-done" not in tasks
 
 
+def test_busy_ms_kept_sanitized_and_totalled_on_its_lead():
+    # A duty-cycle: the reporter sends per-bucket tool ms + call counts; the dashboard tiles
+    # them against the elapsed window. Bad entries disappear; the same numbers roll up onto
+    # the Claude lead that started the round; a lead whose workers sent none keeps the old
+    # shape exactly (no 'busy' key) so nothing downstream of it has to change.
+    with _Srv() as s:
+        w, c = s.mint("delegate-b"), s.mint("claude-b")
+        s.req("POST", "/agents/progress", w,
+              snap(task="duty-1", busy_ms={"exec": 120000, "files": 8000, "search": 1500,
+                                            "web": 500, "other": 200},
+                   busy_n={"exec": 30, "files": 40, "search": 3, "web": 1, "other": 5}))
+        r = next(x for x in s.req("GET", "/agents/live", ADMIN)[1]["sessions"] if x["task"] == "duty-1")
+        assert r["busy_ms"]["exec"] == 120000 and r["busy_n"]["files"] == 40
+        # sanitizer: unknown keys, negative/non-number/bool entries all dropped; range capped
+        s.req("POST", "/agents/progress", w, snap(task="duty-bad", busy_ms={
+            "exec": -5, "files": "x", "search": True, "web": 500, "evil": 99,
+            "other": 10**15}))
+        r = next(x for x in s.req("GET", "/agents/live", ADMIN)[1]["sessions"] if x["task"] == "duty-bad")
+        assert r["busy_ms"] == {"web": 500}
+        # not-a-dict / missing → {}
+        s.req("POST", "/agents/progress", w, snap(task="duty-none", busy_ms="nope"))
+        assert next(x for x in s.req("GET", "/agents/live", ADMIN)[1]["sessions"]
+                    if x["task"] == "duty-none")["busy_ms"] == {}
+        # the lead totals its workers' tool time and elapsed, in one rollup dict
+        s.req("POST", "/agents/progress", c, snap(task="Lead D", kind="claude", round=None,
+                                                   children=["task:duty-1"], usage={"output": 1}))
+        lead = next(x for x in s.req("GET", "/agents/live", ADMIN)[1]["sessions"] if x["kind"] == "claude")
+        wu = lead["worker_usage"]
+        assert wu["busy"] == {"exec": 120000, "files": 8000, "search": 1500, "web": 500, "other": 200}
+        assert wu["elapsed_ms"] > 0 and wu["tasks"] == 1
+
+
+def test_claude_lead_without_busy_data_keeps_the_old_worker_usage_shape():
+    # A lead whose workers were reported by an older reporter (no busy_ms): worker_usage must
+    # stay byte-identical to what it was before the duty-cycle existed, or anything reading
+    # the shape downstream has to special-case a new key that is never there.
+    with _Srv() as s:
+        w, c = s.mint("delegate-o"), s.mint("claude-o")
+        s.req("POST", "/agents/progress", w, snap(task="old-no-busy", final=True, status="done"))
+        s.req("POST", "/agents/progress", c, snap(task="Old Lead", kind="claude", round=None,
+                                                   children=["task:old-no-busy"],
+                                                   usage={"input": 1, "output": 2}))
+        lead = next(r for r in s.req("GET", "/agents/live", ADMIN)[1]["sessions"] if r["kind"] == "claude")
+        assert set(lead["worker_usage"]) == {"tasks", "rounds", "in", "cached", "out"}
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in list(globals().items()):
