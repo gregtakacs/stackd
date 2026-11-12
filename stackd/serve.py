@@ -17,6 +17,7 @@ import os
 import pathlib
 import re
 import signal
+import sys
 import threading
 import time
 import urllib.error
@@ -370,8 +371,46 @@ class _Handler(BaseHTTPRequestHandler):
     # still returning the stale (pre-switch) snapshot.
     _switch: dict | None = None
 
-    def log_message(self, fmt, *args):  # quieter than the default stderr spew
+    def log_message(self, fmt, *args):  # the two overrides below replace both callers
         pass
+
+    # -- access log ---------------------------------------------------------------
+    # Until now stderr saw nothing for a served request: a 400 from anywhere — an
+    # http.server grammar refusal, an auth reject, an upstream error relayed by
+    # _relay — left no line, and a client reporting a bare "Bad Request" was a dead
+    # end (2026-11-12: three opencode turns died that way with nothing to point at).
+    # log_request fires inside every send_response (so every _send_json/_send_bytes
+    # path and every relayed status), log_error inside every send_error (http.server's
+    # own 400/414/431 grammar refusals). One greppable line per event on stderr, which
+    # is exactly where the socketserver tracebacks already land under `docker logs`.
+    def handle_one_request(self):
+        self._t_log = time.monotonic()
+        super().handle_one_request()
+
+    def _log_ctx(self) -> str:
+        peer = "{}:{}".format(*self.client_address[:2]) if self.client_address else "-"
+        cl = getattr(self, "headers", None) and self.headers.get("content-length") or "-"
+        ua = (getattr(self, "headers", None) and self.headers.get("user-agent") or "-")[:60]
+        return "client={} req={} ua={!r}".format(peer, cl, ua)
+
+    def log_request(self, code="-", size="-"):
+        t0 = getattr(self, "_t_log", None)
+        path = (getattr(self, "path", "-") or "-")[:120]
+        sys.stderr.write(
+            "stackd: {} {} -> {} bytes={}{} {}\n".format(
+                getattr(self, "command", "-"), path, code, size,
+                " t={}ms".format(int((time.monotonic() - t0) * 1000)) if t0 else "",
+                self._log_ctx(),
+            )
+        )
+
+    def log_error(self, format, *args):
+        sys.stderr.write(
+            "stackd: REFUSED {}: {} {}\n".format(
+                (getattr(self, "requestline", "") or "-").split(" ")[0][:80] or "-",
+                (format % args) if args else format, self._log_ctx(),
+            )
+        )
 
     # -- helpers ------------------------------------------------------------------
     def _send_json(self, code: int, payload: dict, extra_headers: dict | None = None):
