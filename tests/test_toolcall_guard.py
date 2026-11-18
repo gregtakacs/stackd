@@ -221,9 +221,21 @@ class _Up(BaseHTTPRequestHandler):
                 evs = [{"choices": [{"index": 0, "delta": {"content": "on it\n"}}]},
                        {"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"name": "edit", "arguments": args}}]}}]},
                        {"choices": [{"index": 0, "delta": {}, "finish_reason": fr}]}]
+            if scenario == "slow_call":            # a tool call written over ~1 s, in pieces
+                args = GOOD
+                evs = [{"id": "chatcmpl-slow1", "choices": [{"index": 0, "delta": {"content": "on it\n"}}]}]
+                evs += [{"id": "chatcmpl-slow1", "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": ({"name": "edit", "arguments": args[i:i + 4]} if i == 0 else {"arguments": args[i:i + 4]})}]}}]}
+                        for i in range(0, len(args), 4)]
+                evs += [{"id": "chatcmpl-slow1", "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}]
+                # stackd reads upstream 8 KB at a time, as a real stream fills that in well under
+                # a second; pad each event past it so the relay sees each piece as it is written
+                for e in evs:
+                    e["x_pad"] = "." * 9000
             for e in evs:
                 self.wfile.write(("data: " + json.dumps(e) + "\n\n").encode())
                 self.wfile.flush()
+                if scenario == "slow_call":
+                    time.sleep(0.15)
             self.wfile.write(b'data: {"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}}\n\n')
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
@@ -351,3 +363,33 @@ def test_relay_forwards_reasoning_only_length_untouched():
     assert resp["choices"][0]["finish_reason"] == "length"
     assert "tool_calls" not in resp["choices"][0]["message"]
     assert resp["choices"][0]["message"]["content"] == "thinking..."
+
+
+# ---- a held call keeps the stream alive, and every stream logs how it ended -------
+
+def test_relay_pings_while_holding_and_logs_the_end(monkeypatch):
+    import io, stackd.serve as serve
+    monkeypatch.setattr(serve, "_HOLD_PING_S", 0.2)
+    err = io.StringIO()
+    monkeypatch.setattr(serve.sys, "stderr", err)
+    attempts, (kind, raw) = _drive("slow_call", streaming=True)
+    assert kind == "sse" and attempts == [32768]
+    assert b": stackd: holding a tool call" in raw              # the hold was not silent
+    args = ""
+    for line in raw.split(b"\n"):
+        line = line.strip()
+        if line.startswith(b"data:") and line != b"data: [DONE]":
+            for ch in json.loads(line[5:].strip()).get("choices") or []:
+                for tc in (ch.get("delta") or {}).get("tool_calls") or []:
+                    args += (tc.get("function") or {}).get("arguments") or ""
+    assert json.loads(args) == {"path": "a", "ln": 7}           # the comments broke nothing
+    end = [l for l in err.getvalue().splitlines() if l.startswith("stackd: END ")]
+    assert len(end) == 1 and "how=done" in end[0] and "id=chatcmpl-slow1" in end[0]
+    assert int(end[0].split("hold_max=")[1].split("ms")[0]) >= 200
+
+
+def test_relay_without_a_hold_sends_no_comment(monkeypatch):
+    import stackd.serve as serve
+    monkeypatch.setattr(serve, "_HOLD_PING_S", 0.2)
+    _, (kind, raw) = _drive("complete", streaming=True)
+    assert kind == "sse" and b": stackd:" not in raw

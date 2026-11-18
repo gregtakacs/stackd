@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import hmac
+import http.client
 import json
 import logging
 import os
@@ -167,6 +168,12 @@ def _live_trim(gpu: dict, host: dict, engs: dict, inflight: dict | None = None) 
 
 
 _PROXY_READ_TIMEOUT_S = 600.0
+# While _ToolCallGate holds a streamed tool call, the client sees nothing until the call is
+# whole — 28 s for a 4.8k-token write on 2026-11-17, after which the connection back to the
+# client was gone (BrokenPipe) and the client, never told, waited out its own 15 min timeout.
+# An SSE comment every this-many seconds of holding keeps the stream visibly alive for every
+# idle timer between here and the client; SSE clients ignore comment lines by spec. 0 = off.
+_HOLD_PING_S = float(os.environ.get("STACKD_HOLD_PING_S", "10"))
 _KEEPALIVE_EVERY_S = 15.0
 # How long a warm that is nearly done may still be waited out inline (so a request
 # landing seconds before a profile finishes loading is served normally instead of
@@ -2063,9 +2070,14 @@ class _Handler(BaseHTTPRequestHandler):
                 if len(tail) > _TAILCAP:
                     del tail[: len(tail) - _TAILCAP]
 
+        out = {"bytes": 0, "events": 0, "last": time.monotonic(), "hold_max": 0.0, "id": None}
+
         def _wc(b: bytes) -> None:   # one chunked-transfer frame + flush
             self.wfile.write(f"{len(b):x}\r\n".encode() + b + b"\r\n")
             self.wfile.flush()
+            out["bytes"] += len(b)
+            out["events"] += 1
+            out["last"] = time.monotonic()
 
         with up:
             ctype = up.headers.get("content-type", "application/octet-stream")
@@ -2081,33 +2093,60 @@ class _Handler(BaseHTTPRequestHandler):
                 gate = (_ToolCallGate(toolcall_safe_model, declared_tools,
                                       continuation=(url, toolcall_continue) if toolcall_continue else None)
                         if toolcall_safe_model else None)
-                while True:
-                    chunk = up.read(8192)
-                    if not chunk:
-                        break
-                    if t_first is None:
-                        t_first = time.monotonic()
-                    _tee(chunk)
-                    lb += chunk
-                    while b"\n\n" in lb:
-                        evt, lb = lb.split(b"\n\n", 1)
-                        evt += b"\n\n"
-                        if on_chunk and evt.strip() != b"data: [DONE]":
-                            on_chunk()
-                        for oe in (gate.handle(evt) if gate else (evt,)):
-                            if inject_timings:
-                                if not usage_merged and b'"usage"' in oe:
-                                    merged = _merge_usage_evt(oe, t0, t_first, time.monotonic())
-                                    if merged:
-                                        oe, usage_merged = merged, True
-                                if oe.strip() == b"data: [DONE]" and not usage_merged:
-                                    extra = _timing_sse_line(bytes(tail), t0, t_first, time.monotonic())
-                                    if extra:
-                                        _wc(extra)
-                            _wc(oe)
-                if lb:
-                    _wc(lb)
-                self.wfile.write(b"0\r\n\r\n")
+                how = "done"
+                try:
+                    while True:
+                        chunk = up.read(8192)
+                        if not chunk:
+                            break
+                        if t_first is None:
+                            t_first = time.monotonic()
+                        _tee(chunk)
+                        lb += chunk
+                        while b"\n\n" in lb:
+                            evt, lb = lb.split(b"\n\n", 1)
+                            evt += b"\n\n"
+                            if out["id"] is None and evt.startswith(b"data: {"):
+                                m = re.search(rb'"id"\s*:\s*"([^"]{1,80})"', evt)
+                                if m:
+                                    out["id"] = m.group(1).decode(errors="replace")
+                            if on_chunk and evt.strip() != b"data: [DONE]":
+                                on_chunk()
+                            for oe in (gate.handle(evt) if gate else (evt,)):
+                                if inject_timings:
+                                    if not usage_merged and b'"usage"' in oe:
+                                        merged = _merge_usage_evt(oe, t0, t_first, time.monotonic())
+                                        if merged:
+                                            oe, usage_merged = merged, True
+                                    if oe.strip() == b"data: [DONE]" and not usage_merged:
+                                        extra = _timing_sse_line(bytes(tail), t0, t_first, time.monotonic())
+                                        if extra:
+                                            _wc(extra)
+                                _wc(oe)
+                        if gate and gate.holding and not gate.resolved:
+                            quiet = time.monotonic() - out["last"]
+                            out["hold_max"] = max(out["hold_max"], quiet)
+                            if _HOLD_PING_S > 0 and quiet >= _HOLD_PING_S:
+                                _wc(b": stackd: holding a tool call until it is whole\n\n")
+                    if lb:
+                        _wc(lb)
+                    self.wfile.write(b"0\r\n\r\n")
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as e:
+                    # The client (or a proxy in front) closed while we streamed. Say so, and
+                    # stop reading upstream: closing `up` ends the generation for nobody.
+                    how = "client-gone:" + type(e).__name__
+                    self.close_connection = True
+                except (TimeoutError, OSError, http.client.HTTPException) as e:
+                    how = "upstream-error:" + type(e).__name__
+                    self.close_connection = True
+                sys.stderr.write(
+                    "stackd: END {} {} -> {} how={} sent={}B events={} first={}ms total={}ms "
+                    "hold_max={}ms id={} {}\n".format(
+                        self.command, (self.path or "-")[:120], up.status, how,
+                        out["bytes"], out["events"],
+                        int((t_first - t0) * 1000) if t_first else -1,
+                        int((time.monotonic() - t0) * 1000), int(out["hold_max"] * 1000),
+                        out["id"] or "-", self._log_ctx()))
             else:
                 data = up.read()
                 _tee(data)
